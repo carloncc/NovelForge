@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/logo.png" width="96" alt="NovelForge" />
+
 # NovelForge
 
 **AI 小说 → 视觉小说转换工具** · AI-powered Novel to Visual Novel Converter
