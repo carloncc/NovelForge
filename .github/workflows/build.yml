@@ -14,7 +14,7 @@ jobs:
       matrix:
         include:
           - platform: windows-latest
-            args: "--bundles nsis msi"
+            args: "--bundles nsis"
           - platform: macos-latest
             args: "--bundles app dmg"
           - platform: ubuntu-22.04
