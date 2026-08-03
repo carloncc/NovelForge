@@ -54,12 +54,14 @@ Tauri 2 + Vue 3 + WebGAL · 轻量快速 · API 全自定义
 
 ```bash
 pnpm install
+pnpm prepare:template   # 下载 WebGAL 引擎模板（仅首次，约 75MB，自动裁剪）
 pnpm tauri dev
 ```
 
 ### 打包发布
 
 ```bash
+pnpm prepare:template   # 如未执行过
 pnpm tauri build
 ```
 产物在 `src-tauri/target/release/bundle/`（Windows exe / macOS dmg / Linux AppImage）。
