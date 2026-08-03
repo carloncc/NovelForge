@@ -29,5 +29,6 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 [profile.release]
 opt-level = "s"
 strip = true
-lto = true
-codegen-units = 1
+# 4G 内存环境兼容：thin LTO + 多 codegen 单元（内存占用远低于 full LTO + 单单元）
+lto = "thin"
+codegen-units = 4
