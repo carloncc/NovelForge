@@ -1,0 +1,10 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+resources/
+*.log
+output/
+.novel2vn/
+.DS_Store
+Thumbs.db

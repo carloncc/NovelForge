@@ -1,0 +1,145 @@
+import type { CharacterCard, ExtractionResult, ItemCard, SceneCard } from "./types";
+import { chatJson } from "../api/openaiCompatible";
+import { voiceLibraryFor } from "../stores/config";
+import type { ApiConfig } from "./types";
+
+const SYSTEM_PROMPT = `你是视觉小说制作人。从小说文本中提取制作视觉小说所需的结构化信息。
+要求：
+1. characters：所有有台词或推动剧情的主要角色（最多 10 个）。
+   - id: 英文或拼音小写（如 linxiao），必须唯一
+   - name: 中文姓名
+   - appearance: 外貌描述（发型、眼睛、体型、气质）
+   - clothing: 服装描述（颜色、款式）
+   - personality: 性格特征
+   - voiceDesc: 适合的音色描述（如"清冷的女声"）
+   - voiceName: TTS 音色标识，必须从下面"可用音色列表"中选择最接近的一个（如果没有完全匹配的，选最接近的；不要编造列表外的值）
+   - imagePrompt: 用于 AI 绘画生成立绘的完整英文 prompt，包含人物全身像、服装、发型、表情、背景纯色（保证可抠图），风格统一为"动漫风格，精美立绘"
+   - color: 角色的主题色（十六进制，用于 UI）
+2. scenes：故事中出现的地点场景（最多 12 个）。
+   - id: 唯一标识（如 classroom）
+   - location: 地点名（如"城门前"）
+   - atmosphere: 氛围（如"阴沉的黄昏"）
+   - time: 时间
+   - imagePrompt: 生成背景图的英文 prompt，无人物，动漫场景风格
+3. items：重要的物品（获得、交接、使用的关键道具，最多 10 个）。
+   - id: 唯一标识
+   - name: 物品名
+   - appearance: 外观描述
+   - note: 它在剧情中的意义
+   - imagePrompt: 生成物品特写图的英文 prompt，居中构图，干净浅色背景
+
+只输出 JSON，不要输出任何其他文字。`;
+
+function truncate(text: string, maxChars: number): string {
+  return text.length > maxChars ? text.slice(0, maxChars) + "\n……(截断)" : text;
+}
+
+export async function extractFromNovel(
+  cfg: ApiConfig,
+  novelText: string,
+  title: string,
+  onUsage?: (pt: number, ct: number) => void,
+): Promise<ExtractionResult> {
+  const lib = voiceLibraryFor(cfg);
+  const user = `小说标题：${title}\n\n可用音色列表：${lib.join(", ")}\n\n以下是小说全文（可能截断）：\n${truncate(novelText, 70000)}`;
+  const result = await chatJson<ExtractionResult>(cfg, SYSTEM_PROMPT, user, { maxTokens: 6000, onUsage });
+  if (!Array.isArray(result.characters)) throw new Error("提取结果缺少 characters 字段");
+  result.scenes = result.scenes ?? [];
+  result.items = result.items ?? [];
+  result.title = result.title || title;
+  for (const c of result.characters) {
+    if (!c.voiceName || !lib.includes(c.voiceName)) {
+      c.voiceName = lib[0] || c.voiceName || "default";
+    }
+  }
+  return result;
+}
+
+export function demoExtract(novelText: string, title: string): ExtractionResult {
+  const characters: CharacterCard[] = [
+    {
+      id: "linche",
+      name: "林澈",
+      appearance: "黑色短发，眼神锐利，身材修长，面容冷峻",
+      clothing: "深蓝守夜人风衣，银色肩甲，黑色长靴",
+      personality: "沉默寡言，重情重义，背负着守护城池的使命",
+      voiceDesc: "低沉冷峻的男声",
+      voiceName: "linche",
+      imagePrompt:
+        "anime style, full body portrait of a tall young man with short black hair and sharp eyes, wearing a dark blue night-watchman coat with silver shoulder armor and black boots, cold determined expression, standing pose, plain white background, clean illustration",
+      color: "#3b5bdb",
+    },
+    {
+      id: "suwanqing",
+      name: "苏晚晴",
+      appearance: "长发及腰，杏眼含星，气质温婉，身姿轻盈",
+      clothing: "浅紫色长裙，白色披肩，玉簪挽发",
+      personality: "温柔坚定，聪明勇敢，是城主之女",
+      voiceDesc: "温柔清亮的少女声",
+      voiceName: "suwanqing",
+      imagePrompt:
+        "anime style, full body portrait of a graceful young woman with long flowing hair and starry eyes, wearing a light purple long dress with white shawl and jade hairpin, gentle smile, standing pose, plain white background, clean illustration",
+      color: "#9775fa",
+    },
+    {
+      id: "tiejiang",
+      name: "老铁匠",
+      appearance: "花白胡须，皮肤黝黑，双手粗糙有力，体格魁梧",
+      clothing: "粗布短褂，皮围裙",
+      personality: "豪爽直率，技艺精湛",
+      voiceDesc: "浑厚苍老的男声",
+      voiceName: "tiejiang",
+      imagePrompt:
+        "anime style, full body portrait of an old muscular blacksmith with grey beard and tanned skin, wearing rough cloth jacket and leather apron, holding a hammer, warm smile, standing pose, plain white background, clean illustration",
+      color: "#868e96",
+    },
+  ];
+
+  const scenes: SceneCard[] = [
+    {
+      id: "citygate",
+      location: "城门前",
+      atmosphere: "黄昏，暮色笼罩，寒风凛冽",
+      time: "黄昏",
+      imagePrompt:
+        "anime background art, ancient city gate at dusk, towering stone walls, gloomy sky with orange sunset glow, cold wind feeling, distant mountains, no people, cinematic lighting",
+    },
+    {
+      id: "forge",
+      location: "铁匠铺",
+      atmosphere: "炉火通红，铁器叮当，温暖而有烟火气",
+      time: "夜晚",
+      imagePrompt:
+        "anime background art, a cozy blacksmith forge at night, glowing furnace with red flames, hanging iron tools and weapons on the wall, warm torchlight, wooden workbench, no people, cinematic lighting",
+    },
+    {
+      id: "manor",
+      location: "城主府",
+      atmosphere: "庄严肃穆，灯火通明",
+      time: "夜晚",
+      imagePrompt:
+        "anime background art, a grand lord manor hall at night, tall pillars, warm candlelight, red carpets and banners, majestic and solemn atmosphere, no people, cinematic lighting",
+    },
+  ];
+
+  const items: ItemCard[] = [
+    {
+      id: "xingyun",
+      name: "星陨剑",
+      appearance: "剑身幽蓝如夜空，剑刃映着星光，剑柄缠着银色丝线",
+      note: "传说中的神兵，传说曾在千年前击退魔潮",
+      imagePrompt:
+        "anime style item illustration, a legendary sword with a deep blue starry blade glowing with star light, silver wire wrapped hilt, centered composition, clean light gray background, product shot style",
+    },
+    {
+      id: "yupai",
+      name: "护心玉佩",
+      appearance: "温润的白色玉佩，刻着云纹，系着红绳",
+      note: "苏晚晴的信物，据说有守护之力",
+      imagePrompt:
+        "anime style item illustration, a warm white jade pendant with cloud patterns tied with red string, centered composition, clean light gray background, product shot style",
+    },
+  ];
+
+  return { title, characters, scenes, items };
+}

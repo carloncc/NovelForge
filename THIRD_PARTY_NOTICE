@@ -1,0 +1,19 @@
+Third-Party Notices
+===================
+
+NovelForge bundles the WebGAL visual novel engine to preview and run the
+generated games.
+
+WebGAL
+------
+- Project: https://github.com/OpenWebGAL/WebGAL
+- License: Mozilla Public License 2.0 (MPL-2.0)
+- Bundled location: src-tauri/templates/webgal/
+- Usage: WebGAL is used unmodified as the runtime engine for generated games.
+  Games published with NovelForge must retain WebGAL copyright notices, per
+  WebGAL license terms. Game content itself is owned by the game author.
+
+Additional WebGAL requirements (from the official download page):
+1. Games created with WebGAL must retain WebGAL-related copyright statements
+   when published.
+2. All risks arising from the use of this software are borne by the user.

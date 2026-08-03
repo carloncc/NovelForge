@@ -1,0 +1,288 @@
+import type { ChapterScript, ExtractionResult, ProjectMeta } from "./types";
+import type { RenderAssets } from "./render";
+import { renderChapter, renderConfig, renderStart, sanitizeId } from "./render";
+import { tauri } from "../utils/tauri";
+
+export interface AssembleInput {
+  outputDir: string;
+  title: string;
+  gameKey: string;
+  templateDir: string;
+  chapters: ChapterScript[];
+  cards: ExtractionResult;
+  assets: RenderAssets;
+  introCard?: boolean;
+  figureEmotions?: boolean;
+  useBgm?: boolean;
+  log: (msg: string) => void;
+}
+
+function baseName(p: string): string {
+  return p.split(/[\\/]/).pop() || p;
+}
+
+export async function assembleProject(input: AssembleInput): Promise<{ gameDir: string; meta: ProjectMeta }> {
+  const { outputDir, title, gameKey, templateDir } = input;
+  await tauri.mkdirAll(outputDir);
+  await tauri.mkdirAll(`${outputDir}/game/scene`);
+  await tauri.mkdirAll(`${outputDir}/game/background`);
+  await tauri.mkdirAll(`${outputDir}/game/figure`);
+  await tauri.mkdirAll(`${outputDir}/game/vocal`);
+  await tauri.mkdirAll(`${outputDir}/game/bgm`);
+
+  // 清理旧场景文件（章节减少后防止残留）
+  try {
+    const sceneEntries = await tauri.listDir(`${outputDir}/game/scene`);
+    for (const e of sceneEntries) {
+      if (!e.isDir && e.name.endsWith(".txt")) {
+        await tauri.removePath(e.path).catch(() => {});
+      }
+    }
+  } catch {
+    /* 目录不可用 */
+  }
+
+  input.log("复制引擎文件…");
+  const engineFiles = [
+    "index.html",
+    "manifest.json",
+    "webgal-engine.json",
+    "webgal-serviceworker.js",
+  ];
+  for (const f of engineFiles) {
+    try {
+      await tauri.copyFile(`${templateDir}/${f}`, `${outputDir}/${f}`);
+    } catch {
+      input.log(`跳过引擎文件 ${f}（模板中不存在）`);
+    }
+  }
+  await copyDirIfExists(`${templateDir}/assets`, `${outputDir}/assets`);
+  await copyDirIfExists(`${templateDir}/icons`, `${outputDir}/icons`);
+  await copyDirIfExists(`${templateDir}/game/template`, `${outputDir}/game/template`);
+  await copyDirIfExists(`${templateDir}/game/animation`, `${outputDir}/game/animation`);
+
+  input.log("渲染剧本文件…");
+  const chapterCount = input.chapters.length;
+  const seenCharacters = new Set<string>();
+  const videos = await detectVideos(outputDir);
+  const bgmMap = input.useBgm === false ? {} : await detectBgm(outputDir, input.chapters);
+  await tauri.writeTextFile(
+    `${outputDir}/game/scene/start.txt`,
+    renderStart(chapterCount, title),
+  );
+  for (const chapter of input.chapters) {
+    const txt = renderChapter(chapter, {
+      title,
+      gameKey,
+      characters: input.cards.characters,
+      items: input.cards.items,
+      assets: { ...input.assets, bgm: bgmMap },
+      videos,
+      seenCharacters,
+      introCard: input.introCard,
+      figureEmotions: input.figureEmotions,
+    }, chapterCount);
+    await tauri.writeTextFile(`${outputDir}/game/scene/ch${chapter.chapter + 1}.txt`, txt);
+  }
+
+  await tauri.writeTextFile(
+    `${outputDir}/game/config.txt`,
+    renderConfig(title, gameKey),
+  );
+
+  input.log("复制素材…");
+  await copyAssets(input.assets, outputDir);
+
+  await writeVideoPlan(outputDir, input.chapters, videos);
+  await writeExportGuide(outputDir, title);
+
+  const meta: ProjectMeta = {
+    title,
+    gameKey,
+    chapterCount,
+    charCount: input.cards.characters.length,
+    sceneCount: input.chapters.reduce((n, c) => n + c.scenes.length, 0),
+    lineCount: input.chapters.reduce(
+      (n, c) => n + c.scenes.reduce((m, s) => m + s.lines.length, 0),
+      0,
+    ),
+    outputDir,
+    webgalVersion: "4.6.3",
+    generatedAt: new Date().toISOString(),
+  };
+  await tauri.writeTextFile(
+    `${outputDir}/.novel2vn/meta.json`,
+    JSON.stringify(meta, null, 2),
+  );
+  await tauri.writeTextFile(
+    `${outputDir}/.novel2vn/cards.json`,
+    JSON.stringify(input.cards, null, 2),
+  );
+
+  return { gameDir: outputDir, meta };
+}
+
+async function copyAssets(assets: RenderAssets, outputDir: string): Promise<void> {
+  const seen = new Set<string>();
+  const copy = async (path: string | undefined, destDir: string): Promise<void> => {
+    if (!path) return;
+    const name = baseName(path);
+    if (seen.has(destDir + name)) return;
+    seen.add(destDir + name);
+    try {
+      await tauri.copyFile(path, `${destDir}/${name}`);
+    } catch {
+      /* skip missing */
+    }
+  };
+
+  for (const p of Object.values(assets.bg)) await copy(p, `${outputDir}/game/background`);
+  for (const p of Object.values(assets.cg)) await copy(p, `${outputDir}/game/background`);
+  for (const p of Object.values(assets.figure)) await copy(p, `${outputDir}/game/figure`);
+  for (const p of Object.values(assets.item)) await copy(p, `${outputDir}/game/figure`);
+  for (const p of Object.values(assets.vocal)) await copy(p, `${outputDir}/game/vocal`);
+}
+
+async function copyDirIfExists(src: string, dst: string): Promise<void> {
+  try {
+    if (await tauri.pathExists(src)) {
+      await tauri.copyDirAll(src, dst);
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+async function detectVideos(outputDir: string): Promise<Record<string, string>> {
+  const videos: Record<string, string> = {};
+  const vdir = `${outputDir}/game/video`;
+  try {
+    await tauri.mkdirAll(vdir);
+    const entries = await tauri.listDir(vdir);
+    for (const e of entries) {
+      const m = e.name.match(/^video_(.+)\.(mp4|webm|ogg)$/i);
+      if (m) videos[m[1]] = `${vdir}/${e.name}`;
+    }
+  } catch {
+    /* video 目录不可用 */
+  }
+  return videos;
+}
+
+const BGM_RULES: [RegExp, string[]][] = [
+  [/battle|war|fight|combat|tense|tension/i, ["战", "肃杀", "紧迫", "战斗", "紧张", "魔"]],
+  [/calm|peace|quiet|gentle|piano|soft|slow/i, ["宁", "静", "安", "平", "温", "舒缓"]],
+  [/sad|sorrow|tear|grief/i, ["悲", "哀", "伤", "离别"]],
+  [/happy|joy|bright|cheer|light|warm/i, ["欢", "轻快", "暖", "明"]],
+  [/mystery|dark|suspense|moon/i, ["神秘", "悬疑", "暗", "夜色", "月"]],
+  [/morning|dawn|sunrise/i, ["晨", "朝", "阳光"]],
+];
+
+function matchBgm(fileName: string, bgmDesc: string): boolean {
+  return BGM_RULES.some(([re, words]) => re.test(fileName) && words.some((w) => bgmDesc.includes(w)));
+}
+
+async function detectBgm(
+  outputDir: string,
+  chapters: ChapterScript[],
+): Promise<Record<string, string>> {
+  const bgmMap: Record<string, string> = {};
+  const bgmDir = `${outputDir}/game/bgm`;
+  let files: string[] = [];
+  try {
+    await tauri.mkdirAll(bgmDir);
+    const entries = await tauri.listDir(bgmDir);
+    files = entries
+      .filter((e) => !e.isDir && /\.(mp3|ogg|wav|m4a|opus)$/i.test(e.name))
+      .map((e) => e.name);
+  } catch {
+    /* bgm 目录不可用 */
+  }
+  if (!files.length) return bgmMap;
+  for (const chapter of chapters) {
+    for (const scene of chapter.scenes) {
+      if (!scene.bgm) continue;
+      const hit = files.find((f) => matchBgm(f, scene.bgm!));
+      if (hit) bgmMap[scene.id] = `${bgmDir}/${hit}`;
+    }
+  }
+  return bgmMap;
+}
+
+async function writeVideoPlan(
+  outputDir: string,
+  chapters: ChapterScript[],
+  videos: Record<string, string>,
+): Promise<void> {
+  const points = chapters.flatMap((c) =>
+    c.scenes.flatMap((s) =>
+      (s.videoPoints || []).map((vp) => ({
+        chapter: c.chapter + 1,
+        sceneLocation: s.location,
+        ...vp,
+        enabled: !!videos[sanitizeId(vp.id)],
+      })),
+    ),
+  );
+  if (!points.length) return;
+
+  const lines: string[] = [
+    "NovelForge 视频推荐清单",
+    "======================",
+    "以下位置适合插入视频演出（AI 推荐，是否生成由你决定）：",
+    "在即梦 / 可灵 / 海螺 等平台用下方「视频提示词」生成视频，",
+    "将 mp4 命名为 video_<id>.mp4 放入 game/video/ 文件夹，",
+    "重新生成项目（或在预览页刷新）后会自动启用视频演出。",
+    "",
+  ];
+  for (const p of points) {
+    lines.push(`第 ${p.chapter} 章（${p.sceneLocation}）${p.enabled ? "【已启用】" : "【未生成】"}`);
+    lines.push(`  [${p.id}] ${p.title}`);
+    lines.push(`  描述：${p.description}`);
+    lines.push(`  提示词：${p.videoPrompt}`);
+    lines.push(`  建议时长：${p.durationSecs} 秒`);
+    lines.push(`  文件名：video_${sanitizeId(p.id)}.mp4`);
+    lines.push("");
+  }
+  await tauri.writeTextFile(`${outputDir}/video_plan.txt`, lines.join("\n"));
+}
+
+async function writeExportGuide(outputDir: string, title: string): Promise<void> {
+  const lines = [
+    `「${title}」导出说明（NovelForge 生成）`,
+    "==============================================",
+    "",
+    "1) 网页版（手机/PC 浏览器即玩，零成本）",
+    "   整个文件夹即完整网页游戏。部署到任意静态托管（GitHub Pages / Vercel / 服务器 / 网盘），",
+    "   或直接用浏览器打开 index.html。手机浏览器同样可玩。",
+    "",
+    `2) PC 端 exe`,
+    `   下载 WebGAL Terre 编辑器：https://www.openwebgal.com/zh-cn/download/`,
+    `   打开 Terre → 「打开项目」→ 选择目录：${outputDir}`,
+    `   （或新建项目指向 game 文件夹）→ 点击「发布游戏」→ 选择 Windows 导出 exe。`,
+    "",
+    "3) 手机端 APK",
+    "   使用官方构建工具：https://github.com/OpenWebGAL/webgal-apk-build-tool",
+    "   读取本项目文件夹 + 签名信息一键构建 APK（需 Android SDK）。",
+    "",
+    "4) 自定义修改",
+    "   剧本文件：game/scene/ch*.txt（文本编辑器直接改，保存后预览刷新生效）",
+    "   立绘：game/figure/ · 背景：game/background/ · 配音：game/vocal/ · 视频：game/video/",
+    "   视频推荐位：见同目录 video_plan.txt",
+    "   BGM：把音乐文件（mp3/ogg）放入 game/bgm/，文件名含关键词自动按氛围播放：",
+    "     战斗氛围 → 文件名含 battle/war/fight（如 battle_theme.mp3）",
+    "     宁静氛围 → 文件名含 calm/peace/piano（如 calm_piano.mp3）",
+    "     悲伤氛围 → 文件名含 sad/sorrow（如 sad_theme.mp3）",
+    "     欢快氛围 → 文件名含 happy/joy/bright（如 happy_theme.mp3）",
+    "     神秘氛围 → 文件名含 mystery/dark/moon（如 mystery_theme.mp3）",
+    "",
+    "注意：发布时须保留 WebGAL 版权声明（MPL-2.0），游戏本身版权归你所有。",
+  ];
+  await tauri.writeTextFile(`${outputDir}/导出说明.txt`, lines.join("\n"));
+}
+
+export function gameKeyFor(title: string): string {
+  const key = title.replace(/[^a-zA-Z0-9]/g, "").slice(0, 8);
+  const pad = "a1b2c3d4";
+  return (key || "nov2vn") + pad.slice(0, Math.max(0, 8 - (key || "nov2vn").length));
+}
