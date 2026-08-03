@@ -72,5 +72,8 @@ onBeforeUnmount(() => {
   <div v-if="url" style="margin-top: 12px">
     <iframe :key="reloadKey" class="preview-frame" :src="url" />
   </div>
-  <div v-else class="card empty">启动预览后在此显示游戏画面</div>
+  <div class="card empty">
+    <img src="/src/assets/empty-preview.png" alt="" style="width: 300px; opacity: 0.9; margin-bottom: 12px" />
+    <p>启动预览后在此显示游戏画面</p>
+  </div>
 </template>

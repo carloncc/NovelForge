@@ -367,7 +367,10 @@ function onCardsSaved(cards: unknown): void {
 
   <div v-else-if="tab === 'cards'">
     <EditCards v-if="projectState.lastResult" :cards="projectState.lastResult.cards" @saved="onCardsSaved" />
-    <div v-else class="empty">尚无生成结果，先运行一次生成</div>
+    <div class="empty">
+      <img src="/src/assets/empty-generate.png" alt="" style="width: 260px; opacity: 0.9; margin-bottom: 12px" />
+      <p>尚无生成结果，先运行一次生成</p>
+    </div>
   </div>
 
   <div v-else-if="tab === 'video'">
@@ -395,7 +398,10 @@ function onCardsSaved(cards: unknown): void {
         </p>
       </div>
     </div>
-    <div v-else class="empty">暂无视频推荐位（重新生成后出现）</div>
+    <div class="empty">
+      <img src="/src/assets/empty-generate.png" alt="" style="width: 220px; opacity: 0.9; margin-bottom: 12px" />
+      <p>暂无视频推荐位（重新生成后出现）</p>
+    </div>
   </div>
 
   <div v-else-if="tab === 'script'">
@@ -410,7 +416,10 @@ function onCardsSaved(cards: unknown): void {
       </div>
       <pre style="background: #0b0e14; border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin-top: 10px; max-height: 420px; overflow: auto; font-size: 12px; line-height: 1.7; white-space: pre-wrap">{{ scriptFiles.find((f) => f.name === currentScript)?.text }}</pre>
     </div>
-    <div v-else class="empty">暂无剧本文件（生成后出现）</div>
+    <div class="empty">
+      <img src="/src/assets/empty-generate.png" alt="" style="width: 220px; opacity: 0.9; margin-bottom: 12px" />
+      <p>暂无剧本文件（生成后出现）</p>
+    </div>
   </div>
 
   <div v-else>
