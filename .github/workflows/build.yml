@@ -44,6 +44,9 @@ jobs:
 
       - run: pnpm install
 
+      - name: Fetch WebGAL engine template
+        run: pnpm prepare:template
+
       - name: Build with Tauri
         uses: tauri-apps/tauri-action@v0
         env:
@@ -51,7 +54,17 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "NovelForge ${{ github.ref_name }}"
-          releaseBody: "See the assets to download this version and install."
+          releaseBody: |
+            NovelForge ${{ github.ref_name }}
+
+            ## 安装包
+            - **Windows**: `NovelForge_*-x64-setup.exe`（安装版）/ `NovelForge_*-x64_en-US.msi`
+            - **macOS**: `NovelForge_*_aarch64.dmg` / `NovelForge_*_x64.dmg`
+            - **Linux**: `.deb` / `.rpm` / `.AppImage`
+
+            ## 使用
+            1. 首次运行前需配置 API（文本 LLM 必填，图像/TTS 可选）
+            2. 导入小说 → 生成 → 预览 → 导出
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
