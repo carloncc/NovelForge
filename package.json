@@ -5,9 +5,11 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vue-tsc --noEmit && vite build",
+    "build": "node scripts/check-template.mjs && vue-tsc --noEmit && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "prepare:template": "node scripts/fetch-webgal-template.mjs",
+    "check:template": "node scripts/check-template.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.9.0",

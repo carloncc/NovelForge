@@ -8,3 +8,5 @@ output/
 .novel2vn/
 .DS_Store
 Thumbs.db
+src-tauri/templates/webgal/
+docs/logo-candidates/
