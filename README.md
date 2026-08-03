@@ -36,12 +36,17 @@ Tauri 2 + Vue 3 + WebGAL · 轻量快速 · API 全自定义
 |---|---|---|
 | ![导入](docs/screenshots/import.png) | ![配置](docs/screenshots/config.png) | ![生成](docs/screenshots/generate.png) |
 
+| 导出 | 游戏标题 | 游戏剧情 |
+|---|---|---|
+| ![导出](docs/screenshots/export.png) | ![标题](docs/screenshots/game-title.png) | ![剧情](docs/screenshots/game-story.png) |
+
 ## 快速开始
 
 ### 环境要求
 - Node.js 18+ · pnpm
 - Rust（仅开发/打包需要）：https://rustup.rs
 - Windows / macOS / Linux
+- Linux 用户建议安装中文字体（界面中文显示）：`sudo apt install fonts-noto-cjk`
 
 ### 开发运行
 
