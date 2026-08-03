@@ -15,8 +15,8 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const TARGET = join(ROOT, "src-tauri", "templates", "webgal");
 const VERSION = "4.6.3";
 const URLS = [
-  `https://ghfast.top/https://github.com/OpenWebGAL/WebGAL/releases/download/${VERSION}/WebGAL-${VERSION}-web.zip`,
   `https://github.com/OpenWebGAL/WebGAL/releases/download/${VERSION}/WebGAL-${VERSION}-web.zip`,
+  `https://ghfast.top/https://github.com/OpenWebGAL/WebGAL/releases/download/${VERSION}/WebGAL-${VERSION}-web.zip`,
 ];
 const DOWNLOAD_TIMEOUT_MS = 300_000;
 
@@ -80,13 +80,29 @@ async function main() {
   await mkdir(TARGET, { recursive: true });
   const unzip = spawnSync("unzip", ["-o", zip, "-d", TARGET], { stdio: "ignore" });
   if (unzip.status !== 0) {
-    const py = spawnSync(
-      "python3",
-      ["-c", `import zipfile; zipfile.ZipFile("${zip}").extractall("${TARGET}")`],
-      { stdio: "inherit" },
+    // Windows runner：尝试 PowerShell Expand-Archive
+    const ps = spawnSync(
+      "powershell",
+      ["-NoProfile", "-Command", `Expand-Archive -Force -Path '${zip}' -DestinationPath '${TARGET}'`],
+      { stdio: "ignore" },
     );
-    if (py.status !== 0) {
-      throw new Error("解压失败：需要安装 unzip 或 python3");
+    if (ps.status !== 0) {
+      // 通用兜底：python3 / python
+      let pyOk = false;
+      for (const py of ["python3", "python"]) {
+        const r = spawnSync(
+          py,
+          ["-c", `import zipfile; zipfile.ZipFile(r"${zip}").extractall(r"${TARGET}")`],
+          { stdio: "ignore" },
+        );
+        if (r.status === 0) {
+          pyOk = true;
+          break;
+        }
+      }
+      if (!pyOk) {
+        throw new Error("解压失败：需要 unzip / powershell / python 之一");
+      }
     }
   }
 
