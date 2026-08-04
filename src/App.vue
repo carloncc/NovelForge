@@ -5,6 +5,7 @@ import ConfigPage from "./pages/ConfigPage.vue";
 import GeneratePage from "./pages/GeneratePage.vue";
 import PreviewPage from "./pages/PreviewPage.vue";
 import ExportPage from "./pages/ExportPage.vue";
+import AboutDialog from "./components/AboutDialog.vue";
 import { configState } from "./stores/config";
 import { projectState, restoreProject } from "./stores/project";
 import { tauri } from "./utils/tauri";
@@ -18,6 +19,7 @@ const pages = [
   { id: "export", label: "导出", comp: ExportPage },
 ];
 const current = ref("import");
+const aboutOpen = ref(false);
 
 const icons: Record<string, string> = {
   import: "M13.5 6H10C8.89543 6 8 6.89543 8 8V18C8 19.1046 8.89543 20 10 20H18C19.1046 20 20 19.1046 20 18V11.5M13.5 6L20 11.5M13.5 6V11.5H20M7 16H6C4.89543 16 4 15.1046 4 14V6C4 4.89543 4.89543 4 6 4H14C15.1046 4 16 4.89543 16 6V7",
@@ -44,8 +46,12 @@ onMounted(async () => {
   <div class="sidebar">
     <div class="logo">
       <img src="/src/assets/logo.png" alt="NovelForge" />
-      <span class="name">NovelForge</span>
+      <div class="name-wrap">
+        <span class="name">NovelForge</span>
+        <span class="tagline">AI 视觉小说工坊</span>
+      </div>
     </div>
+    <div class="nav-group-label">导航</div>
     <button
       v-for="p in pages"
       :key="p.id"
@@ -58,9 +64,13 @@ onMounted(async () => {
       </svg>
       <span>{{ p.label }}</span>
     </button>
-    <div class="version">NovelForge {{ versionText }}</div>
+    <div class="sidebar-footer">
+      <span class="version">{{ versionText }}</span>
+      <button class="about-btn" @click="aboutOpen = true">关于</button>
+    </div>
   </div>
   <div class="main">
     <component :is="pages.find((p) => p.id === current)!.comp" />
   </div>
+  <AboutDialog :open="aboutOpen" @close="aboutOpen = false" />
 </template>

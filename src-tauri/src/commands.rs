@@ -3,7 +3,7 @@ use chardetng::EncodingDetector;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tauri::Manager;
@@ -349,4 +349,119 @@ pub fn cutout_image(data_b64: String, threshold: f32) -> Result<String, String> 
 #[tauri::command]
 pub fn has_transparency(data_b64: String) -> Result<bool, String> {
     crate::cutout::has_transparency(&data_b64)
+}
+
+#[tauri::command]
+pub fn build_zip(
+    source_dir: String,
+    zip_path: String,
+    exclude: Vec<String>,
+) -> Result<serde_json::Value, String> {
+    let src = std::path::PathBuf::from(&source_dir);
+    if !src.is_dir() {
+        return Err("源目录不存在".to_string());
+    }
+    if let Some(parent) = std::path::Path::new(&zip_path).parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
+    }
+    let file = std::fs::File::create(&zip_path).map_err(|e| format!("创建 zip 失败: {e}"))?;
+    let mut writer = zip::ZipWriter::new(std::io::BufWriter::new(file));
+    let options: zip::write::SimpleFileOptions =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+    fn is_excluded(path: &std::path::Path, exclude: &[String]) -> bool {
+        path.components().any(|c| {
+            if let std::path::Component::Normal(n) = c {
+                let s = n.to_string_lossy();
+                exclude.iter().any(|e| s == e.as_str() || s.ends_with(e.as_str()))
+            } else {
+                false
+            }
+        })
+    }
+
+    let mut file_count = 0u64;
+    let mut total_size = 0u64;
+
+    fn walk(
+        dir: &std::path::Path,
+        prefix: &str,
+        writer: &mut zip::ZipWriter<std::io::BufWriter<std::fs::File>>,
+        options: zip::write::SimpleFileOptions,
+        exclude: &[String],
+        file_count: &mut u64,
+        total_size: &mut u64,
+    ) -> Result<(), String> {
+        for entry in std::fs::read_dir(dir).map_err(|e| format!("读取目录失败: {e}"))? {
+            let entry = entry.map_err(|e| format!("读取条目失败: {e}"))?;
+            let path = entry.path();
+            if is_excluded(&path, exclude) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            let zip_name = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if path.is_dir() {
+                writer
+                    .add_directory(zip_name.clone(), options)
+                    .map_err(|e| format!("写入目录失败: {e}"))?;
+                walk(&path, &zip_name, writer, options, exclude, file_count, total_size)?;
+            } else {
+                let data = std::fs::read(&path).map_err(|e| format!("读取文件失败: {e}"))?;
+                writer
+                    .start_file(zip_name, options)
+                    .map_err(|e| format!("写入文件失败: {e}"))?;
+                writer
+                    .write_all(&data)
+                    .map_err(|e| format!("写入数据失败: {e}"))?;
+                *file_count += 1;
+                *total_size += data.len() as u64;
+            }
+        }
+        Ok(())
+    }
+
+    walk(&src, "", &mut writer, options, &exclude, &mut file_count, &mut total_size)?;
+    writer.finish().map_err(|e| format!("zip 收尾失败: {e}"))?;
+
+    Ok(serde_json::json!({ "fileCount": file_count, "sizeBytes": total_size }))
+}
+
+#[cfg(test)]
+mod zip_tests {
+    use super::build_zip;
+    use std::io::Write;
+
+    #[test]
+    fn zip_excludes_and_keeps_utf8_names() {
+        let dir = std::env::temp_dir().join("novelforge_zip_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".novel2vn")).unwrap();
+        std::fs::create_dir_all(dir.join("game")).unwrap();
+        std::fs::write(dir.join("game/中文名.txt"), "hello").unwrap();
+        std::fs::write(dir.join(".novel2vn/cache.json"), "secret").unwrap();
+        std::fs::write(dir.join("index.html"), "<html/>").unwrap();
+
+        let zip_path = dir.join("out.zip");
+        let res = build_zip(
+            dir.to_string_lossy().to_string(),
+            zip_path.to_string_lossy().to_string(),
+            vec![".novel2vn".to_string()],
+        );
+        assert!(res.is_ok(), "build_zip 失败: {:?}", res.err());
+
+        let f = std::fs::File::open(&zip_path).unwrap();
+        let mut reader = zip::ZipArchive::new(f).unwrap();
+        let names: Vec<String> = (0..reader.len())
+            .map(|i| reader.by_index(i).unwrap().name().to_string())
+            .collect();
+        assert!(names.iter().any(|n| n.contains("中文名")), "中文文件名丢失: {names:?}");
+        assert!(names.iter().any(|n| n == "index.html"), "根文件丢失: {names:?}");
+        assert!(!names.iter().any(|n| n.contains(".novel2vn")), "排除目录被打包: {names:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

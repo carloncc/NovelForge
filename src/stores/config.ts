@@ -6,6 +6,16 @@ interface ConfigFile {
   presets: ApiPreset[];
   activePresetId: string;
   outputDir?: string;
+  recentOutputDirs?: string[];
+}
+
+export function addRecentOutputDir(dir: string): void {
+  if (!dir) return;
+  configState.recentOutputDirs = [dir, ...(configState.recentOutputDirs ?? []).filter((d) => d !== dir)].slice(0, 8);
+}
+
+export function removeRecentOutputDir(dir: string): void {
+  configState.recentOutputDirs = (configState.recentOutputDirs ?? []).filter((d) => d !== dir);
 }
 
 function makeId(): string {
@@ -67,6 +77,7 @@ export const configState = reactive<ConfigFile>({
   }],
   activePresetId: "",
   outputDir: "",
+  recentOutputDirs: [],
 });
 void loadPersisted();
 
@@ -80,6 +91,7 @@ async function loadPersisted() {
       configState.activePresetId = parsed.activePresetId || parsed.presets[0].id;
     }
     configState.outputDir = parsed.outputDir || "";
+    configState.recentOutputDirs = parsed.recentOutputDirs ?? [];
   } catch {
     /* ignore */
   }
@@ -98,6 +110,7 @@ watch(
             presets: configState.presets,
             activePresetId: configState.activePresetId,
             outputDir: configState.outputDir,
+            recentOutputDirs: configState.recentOutputDirs,
           }),
         )
         .catch(() => {});

@@ -45,6 +45,7 @@ pub fn run() {
             commands::get_default_output_dir,
             commands::cutout_image,
             commands::has_transparency,
+            commands::build_zip,
         ])
         .setup(|app| {
             if let Ok(dir) = app.path().app_config_dir() {

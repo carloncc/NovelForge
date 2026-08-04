@@ -27,7 +27,7 @@ async function main() {
   ];
 
   const logs: string[] = [];
-  const result = await generateImages(undefined, scripts, cards, materials, `${work}/cache`, (ev) => logs.push(ev.message));
+  const { images: result } = await generateImages(undefined, scripts, cards, materials, `${work}/cache`, (ev) => logs.push(ev.message));
 
   const figureOk = result.figure["linche"] && (await tauri.pathExists(result.figure["linche"]));
   const itemOk = result.item["xingyun"] && (await tauri.pathExists(result.item["xingyun"]));

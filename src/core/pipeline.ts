@@ -3,6 +3,7 @@ import type {
   ChapterScript,
   CostStats,
   ExtractionResult,
+  FailedTask,
   GenerationOptions,
   MaterialAsset,
   NovelDoc,
@@ -73,11 +74,34 @@ export class Pipeline {
   };
   private cacheRoot = "";
   private aborted = false;
+  private failedTasks: FailedTask[] = [];
 
   constructor(private input: PipelineInput) {}
 
   abort(): void {
     this.aborted = true;
+  }
+
+  private recordFailure(f: FailedTask): void {
+    this.failedTasks.push(f);
+    this.input.log({
+      step: f.step,
+      message: `失败（可在「失败项」查看重试）：${f.message}`,
+      level: "error",
+      at: f.at,
+      taskId: f.id,
+      taskKind: f.kind,
+    });
+  }
+
+  private checkBudget(): void {
+    const b = this.options.budgetYuan ?? 0;
+    if (b > 0) {
+      const total = this.cost.llmCostYuan + this.cost.imageCostYuan + this.cost.ttsCostYuan;
+      if (total > b) {
+        throw new Error(`超出预算 ¥${b}（本次累计 ¥${total.toFixed(2)}），已中止；可调高预算或勾选「跳过缓存」重跑`);
+      }
+    }
   }
 
   private log(msg: string, level: PipelineEvent["level"] = "info", step = "管线"): void {
@@ -149,10 +173,22 @@ export class Pipeline {
       }
     }
     if (!cards) {
-      cards = demo
-        ? demoExtract(input.novel.fullText, input.novel.fileName.replace(/\.txt$/i, ""))
-        : await extractFromNovel(input.llm!, input.novel.fullText, input.novel.fileName.replace(/\.txt$/i, ""), onUsage);
+      try {
+        cards = demo
+          ? demoExtract(input.novel.fullText, input.novel.fileName.replace(/\.txt$/i, ""))
+          : await extractFromNovel(input.llm!, input.novel.fullText, input.novel.fileName.replace(/\.txt$/i, ""), onUsage);
+      } catch (e) {
+        this.recordFailure({
+          id: "extract",
+          kind: "llm",
+          step: "提取",
+          message: (e as Error).message,
+          at: Date.now(),
+        });
+        throw e;
+      }
       await tauri.writeTextFile(cardsCache, JSON.stringify({ ...cards, _novelFp: novelFp }, null, 2));
+      this.checkBudget();
       log({
         step: "提取",
         message: `提取完成：${cards.characters.length} 角色 / ${cards.scenes.length} 场景 / ${cards.items.length} 物品`,
@@ -197,10 +233,22 @@ export class Pipeline {
             level: "info",
             at: Date.now(),
           });
-          script = demo
-            ? demoScriptAll([chapter], cards!)[0]
-            : await scriptChapter(input.llm!, chapter, cards!, onUsage);
+          try {
+            script = demo
+              ? demoScriptAll([chapter], cards!)[0]
+              : await scriptChapter(input.llm!, chapter, cards!, onUsage);
+          } catch (e) {
+            this.recordFailure({
+              id: `chapter_${chapter.index + 1}`,
+              kind: "script",
+              step: "剧本",
+              message: `第 ${chapter.index + 1} 章：${(e as Error).message}`,
+              at: Date.now(),
+            });
+            throw e;
+          }
           await tauri.writeTextFile(cacheFile, JSON.stringify(script, null, 2));
+          this.checkBudget();
         } else {
           log({
             step: "剧本",
@@ -232,7 +280,7 @@ export class Pipeline {
     // ③ 图像（用户素材优先；无图像 API 时仅用用户素材）
     if (this.options.useImage) {
       log({ step: "图像", message: "开始处理图像素材…", level: "info", at: Date.now() });
-      const images = await generateImages(
+      const { images, failed } = await generateImages(
         input.image,
         chapters,
         cards!,
@@ -242,9 +290,11 @@ export class Pipeline {
         2,
         this.options.figureEmotions,
       );
+      this.failedTasks.push(...failed);
       this.cost.imageCount = Object.values(images.bg).length + Object.values(images.cg).length + Object.values(images.figure).length + Object.values(images.item).length;
       this.cost.imageCostYuan = this.cost.imageCount * DEFAULT_PRICES.imageYuanEach;
       Object.assign(assets, images);
+      this.checkBudget();
       this.checkAbort();
     } else {
       log({
@@ -262,6 +312,7 @@ export class Pipeline {
       this.cost.ttsChars = Object.keys(vocal).reduce((n, k) => n + (vocal[k] ? 1 : 0), 0) * 20;
       this.cost.ttsCostYuan = (this.cost.ttsChars / 1e6) * DEFAULT_PRICES.ttsYuanPer1mChars;
       assets.vocal = vocal;
+      this.checkBudget();
     } else {
       log({ step: "配音", message: "配音已关闭或未配置 TTS API，跳过", level: "warn", at: Date.now() });
     }
@@ -290,7 +341,7 @@ export class Pipeline {
     });
     log({ step: "组装", message: "项目组装完成！", level: "success", at: Date.now() });
 
-    return { meta, cards: cards!, chapters, assets, cost: this.cost };
+    return { meta, cards: cards!, chapters, assets, cost: this.cost, failedTasks: this.failedTasks };
   }
 
   private checkAbort(): void {

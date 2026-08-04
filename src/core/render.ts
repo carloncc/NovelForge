@@ -197,7 +197,9 @@ function cleanConfigValue(text: string): string {
   return (text || "").replace(/[;\r\n]+/g, " ").trim().slice(0, 60);
 }
 
-export function renderConfig(title: string, gameKey: string): string {
+export type WebgalLanguage = "zh_CN" | "zh_TW" | "en" | "ja";
+
+export function renderConfig(title: string, gameKey: string, language: WebgalLanguage = "zh_CN"): string {
   return [
     `Game_name:${cleanConfigValue(title)};`,
     `Game_key:${cleanConfigValue(gameKey)};`,
@@ -205,6 +207,6 @@ export function renderConfig(title: string, gameKey: string): string {
     `Enable_Continue:true;`,
     `Enable_flowchart:true;`,
     `Show_panic:true;`,
-    `Default_Language:zh_CN;`,
+    `Default_Language:${language};`,
   ].join("\n");
 }

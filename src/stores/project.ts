@@ -36,6 +36,7 @@ export const projectState = reactive<ProjectState>({
     maxConcurrent: 2,
     videoPointsPerChapter: 2,
     characterIntroCard: true,
+    budgetYuan: 0,
   },
   lastResult: null,
   logs: [],
@@ -74,6 +75,7 @@ export async function restoreProject(outputDir: string): Promise<void> {
       cost: r.lastResult.cost,
       chapters,
       assets: {},
+      failedTasks: [],
     };
   }
 }

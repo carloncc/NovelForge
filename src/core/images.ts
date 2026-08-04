@@ -2,6 +2,7 @@ import type {
   ChapterScript,
   CharacterCard,
   ExtractionResult,
+  FailedTask,
   ImageTask,
   ItemCard,
   MaterialAsset,
@@ -158,8 +159,9 @@ export async function generateImages(
   log: (ev: PipelineEvent) => void,
   concurrency = 2,
   figureEmotions = true,
-): Promise<ImageResultMap> {
+): Promise<{ images: ImageResultMap; failed: FailedTask[] }> {
   const result: ImageResultMap = { bg: {}, cg: {}, figure: {}, item: {} };
+  const failed: FailedTask[] = [];
   const tasks = buildImageTasks(chapters, cards, {
     figurePerCharacter: 1,
     cgPerChapter: 3,
@@ -178,7 +180,26 @@ export async function generateImages(
   const runner = async () => {
     while (idx < tasks.length) {
       const task = tasks[idx++];
-      await processTask(task);
+      try {
+        await processTask(task);
+      } catch (e) {
+        // 单任务失败不阻断整章：记录并继续
+        failed.push({
+          id: task.id,
+          kind: "image",
+          step: "图像",
+          message: `${task.usage}：${(e as Error).message.slice(0, 140)}`,
+          at: Date.now(),
+        });
+        log({
+          step: "图像",
+          message: `失败（已跳过，可在「失败项」重试）：${task.usage}（${(e as Error).message.slice(0, 100)}）`,
+          level: "error",
+          at: Date.now(),
+          taskId: task.id,
+          taskKind: "image",
+        });
+      }
     }
   };
 
@@ -290,7 +311,7 @@ export async function generateImages(
     }
   }
 
-  return result;
+  return { images: result, failed };
 }
 
 function findMaterial(materials: MaterialAsset[], task: ImageTask): MaterialAsset | undefined {

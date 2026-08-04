@@ -7,33 +7,32 @@ import {
   addPreset,
   removePreset,
   configState,
-  activeConfig,
 } from "../stores/config";
 import { testLlm, testTts, testImage } from "../api/openaiCompatible";
 import type { ApiConfig, ChannelKey } from "../core/types";
 
-const channels: { key: ChannelKey; label: string; desc: string }[] = [
-  { key: "llm", label: "文本 LLM", desc: "角色/场景/物品提取与剧本生成" },
-  { key: "image", label: "图像 API", desc: "立绘 / 背景 / CG / 物品图生成" },
-  { key: "tts", label: "TTS 配音", desc: "逐句配音（可选）" },
+const channels: { key: ChannelKey; label: string; desc: string; icon: string }[] = [
+  { key: "llm", label: "文本 LLM", desc: "角色/场景/物品提取与剧本生成", icon: "M12 5v14M5 12h14" },
+  { key: "image", label: "图像 API", desc: "立绘 / 背景 / CG / 物品图生成", icon: "M4 17L9 12L13 16L17 12L20 15M4 5H20V19H4V5Z" },
+  { key: "tts", label: "TTS 配音", desc: "逐句配音（可选），音色可控", icon: "M12 6V18M8 9V15M16 9V15M5 11V13M19 11V13" },
 ];
 
-const testing = ref<{ key: ChannelKey; id: string; state: string } | null>(null);
+const testing = ref<{ key: ChannelKey; id: string } | null>(null);
 const testResult = ref<{ key: ChannelKey; id: string; ok: boolean; msg: string } | null>(null);
 
 async function runTest(kind: ChannelKey, cfg: ApiConfig): Promise<void> {
-  testing.value = { key: kind, id: cfg.id, state: "测试中…" };
+  testing.value = { key: kind, id: cfg.id };
   testResult.value = null;
   try {
     if (kind === "llm") {
       const reply = await testLlm(cfg);
-      testResult.value = { key: kind, id: cfg.id, ok: true, msg: `连接正常，模型回复：${reply.slice(0, 60)}` };
+      testResult.value = { key: kind, id: cfg.id, ok: true, msg: `正常：${reply.slice(0, 40)}` };
     } else if (kind === "tts") {
       await testTts(cfg);
-      testResult.value = { key: kind, id: cfg.id, ok: true, msg: "连接正常，语音合成可用" };
+      testResult.value = { key: kind, id: cfg.id, ok: true, msg: "正常，语音合成可用" };
     } else {
       await testImage(cfg);
-      testResult.value = { key: kind, id: cfg.id, ok: true, msg: "连接正常，图片生成可用（已消耗 1 张额度）" };
+      testResult.value = { key: kind, id: cfg.id, ok: true, msg: "正常（已消耗 1 张额度）" };
     }
   } catch (e) {
     testResult.value = { key: kind, id: cfg.id, ok: false, msg: (e as Error).message };
@@ -52,120 +51,115 @@ function setActive(kind: ChannelKey, id: string): void {
 </script>
 
 <template>
-  <div class="page-title">API 配置</div>
-  <div class="page-sub">
-    三通道全部自定义（OpenAI 兼容协议）：base_url + api_key + model。支持 DeepSeek / 通义 /
-    硅基流动 / Kimi / OpenAI / Ollama 等任意兼容服务，可保存多套配置切换。
-  </div>
-
-  <div class="card">
-    <div class="row" style="justify-content: space-between">
-      <div class="row" style="flex: 1">
-        <label class="field" style="margin-bottom: 0; flex: 2">
-          <span>当前配置组</span>
-          <select
-            :value="configState.activePresetId"
-            @change="configState.activePresetId = ($event.target as HTMLSelectElement).value"
-          >
-            <option v-for="p in configState.presets" :key="p.id" :value="p.id">{{ p.name }}</option>
-          </select>
-        </label>
-        <button class="btn secondary" style="align-self: flex-end" @click="addPreset">＋ 新建配置组</button>
-        <button
-          v-if="configState.presets.length > 1"
-          class="btn danger"
-          style="align-self: flex-end"
-          @click="removePreset(configState.activePresetId)"
-        >删除该组</button>
-      </div>
-    </div>
-  </div>
-
-  <div v-for="ch in channels" :key="ch.key" class="card">
-    <div class="row" style="justify-content: space-between">
+  <div class="inner">
+    <div class="page-head">
       <div>
-        <h3>{{ ch.label }}</h3>
-        <p style="color: var(--text-dim); font-size: 12px">{{ ch.desc }}</p>
+        <div class="page-title">API 配置</div>
+        <p class="page-sub">三通道全部自定义（OpenAI 兼容协议），可保存多套配置切换；DeepSeek / 通义 / 硅基流动 / Kimi / OpenAI / Ollama 均可</p>
       </div>
-      <div class="row" style="flex: none">
-        <button class="btn secondary small" @click="addConfig(ch.key)">＋ 添加配置</button>
+      <div class="page-actions">
+        <button class="btn secondary" @click="addPreset">＋ 新建配置组</button>
       </div>
     </div>
 
-    <div v-for="cfg in activePreset().channels[ch.key]" :key="cfg.id" style="margin-top: 14px; border-top: 1px solid var(--border); padding-top: 14px">
-      <div class="row" style="margin-bottom: 8px; align-items: flex-end">
-        <label class="field" style="flex: 1; margin-bottom: 0">
-          <span>配置名</span>
-          <input type="text" v-model="cfg.name" />
-        </label>
-        <button
-          class="btn small"
-          :class="cfgActive(ch.key, cfg.id) ? '' : 'secondary'"
-          @click="setActive(ch.key, cfg.id)"
-        >
-          {{ cfgActive(ch.key, cfg.id) ? "✓ 当前使用" : "设为当前" }}
-        </button>
-        <button class="btn danger small" @click="removeConfig(ch.key, cfg.id)">删除</button>
-      </div>
-      <div class="row">
-        <label class="field grow-2">
-          <span>Base URL</span>
-          <input type="text" v-model="cfg.baseUrl" placeholder="https://api.deepseek.com 或 …/v1" />
-        </label>
-        <label class="field">
-          <span>Model</span>
-          <input type="text" v-model="cfg.model" placeholder="deepseek-chat" />
-        </label>
-      </div>
-      <div class="row">
-        <label class="field grow-2">
-          <span>API Key</span>
-          <input type="password" v-model="cfg.apiKey" placeholder="sk-…" />
-        </label>
-        <label class="field">
-          <span>路径前缀（可选）</span>
-          <input type="text" v-model="cfg.extra!.pathPrefix" placeholder="留空自动补 /v1" />
-        </label>
-      </div>
-      <div class="row" style="margin-top: 4px">
-        <button class="btn small" :disabled="!!testing" @click="runTest(ch.key, cfg)">
-          {{ testing?.key === ch.key && testing?.id === cfg.id ? testing.state : "测试连接" }}
-        </button>
-        <span v-if="testResult && testResult.key === ch.key && testResult.id === cfg.id"
-          style="font-size: 12px; color: var(--ok)"
-          :style="{ color: testResult.ok ? 'var(--ok)' : 'var(--err)' }">
-          {{ testResult.msg }}
-        </span>
-      </div>
-      <div v-if="ch.key === 'tts'" style="margin-top: 8px">
-        <label class="field">
-          <span>可用音色列表（每行一个；AI 提取角色时从中挑选，TTS 失败自动回退第一个）</span>
-          <textarea
-            :value="(cfg.extra!.voiceLibrary as string[] | undefined)?.join('\n') ?? ''"
-            rows="4"
-            @change="
-              (e: any) => {
-                const list = (e.target as HTMLTextAreaElement).value
-                  .split('\n')
-                  .map((s: string) => s.trim())
-                  .filter(Boolean);
-                if (list.length) cfg.extra!.voiceLibrary = list;
-              }
-            "
-            placeholder="alloy&#10;echo&#10;fable&#10;onyx&#10;nova&#10;shimmer"
-          />
-        </label>
+    <div class="card" style="padding: var(--space-4)">
+      <div class="row" style="justify-content: space-between">
+        <div style="display: flex; gap: 6px; flex-wrap: wrap; align-items: center">
+          <span style="font-size: 12.5px; color: var(--text-dim); margin-right: 4px">配置组：</span>
+          <button
+            v-for="p in configState.presets"
+            :key="p.id"
+            class="btn small"
+            :class="configState.activePresetId === p.id ? '' : 'ghost'"
+            @click="configState.activePresetId = p.id"
+          >
+            {{ p.name }}
+          </button>
+        </div>
+        <button v-if="configState.presets.length > 1" class="btn danger small" @click="removePreset(configState.activePresetId)">删除该组</button>
       </div>
     </div>
-  </div>
 
-  <div class="card">
-    <h3>使用提示</h3>
-    <ul style="color: var(--text-dim); font-size: 13px; line-height: 2; padding-left: 18px">
-      <li>文本 LLM 必填（DeepSeek 约 ¥1-2/百万 token 最便宜）；图像 / TTS 可后补。</li>
-      <li>图像通道如支持参考图（如硅基流动部分模型），会自动用人物参考图保持角色一致性；不支持则自动降级为文生图。</li>
-      <li>TTS 的「音色」取角色卡 voiceName 字段，可在生成后于角色卡中调整。</li>
-      <li>配置自动保存到系统应用配置目录，可导入导出迁移。</li>
-    </ul>
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: var(--space-4)">
+      <div v-for="ch in channels" :key="ch.key" class="card" style="margin-bottom: 0">
+        <div class="card-head">
+          <div style="display: flex; align-items: center; gap: 10px">
+            <span style="width: 34px; height: 34px; border-radius: 9px; background: var(--gradient); display: flex; align-items: center; justify-content: center">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path :d="ch.icon" /></svg>
+            </span>
+            <div>
+              <div style="font-weight: 600; font-size: 14px">{{ ch.label }}</div>
+              <div style="font-size: 11.5px; color: var(--text-dim)">{{ ch.desc }}</div>
+            </div>
+          </div>
+          <div class="card-actions">
+            <button class="btn secondary small" @click="addConfig(ch.key)">＋</button>
+          </div>
+        </div>
+
+        <div v-for="cfg in activePreset().channels[ch.key]" :key="cfg.id" style="border-top: 1px solid var(--border); padding-top: var(--space-3); margin-top: var(--space-2)">
+          <div class="row" style="margin-bottom: 8px; align-items: flex-end">
+            <label class="field" style="flex: 1; margin-bottom: 0">
+              <span>配置名</span>
+              <input type="text" v-model="cfg.name" />
+            </label>
+            <button class="btn small" :class="cfgActive(ch.key, cfg.id) ? '' : 'ghost'" @click="setActive(ch.key, cfg.id)">
+              {{ cfgActive(ch.key, cfg.id) ? "✓ 使用中" : "设为当前" }}
+            </button>
+            <button class="btn danger small" @click="removeConfig(ch.key, cfg.id)">删</button>
+          </div>
+          <div class="row">
+            <label class="field grow-2">
+              <span>Base URL</span>
+              <input type="text" v-model="cfg.baseUrl" placeholder="https://api.deepseek.com" />
+            </label>
+            <label class="field">
+              <span>Model</span>
+              <input type="text" v-model="cfg.model" placeholder="deepseek-chat" />
+            </label>
+          </div>
+          <div class="row">
+            <label class="field grow-2">
+              <span>API Key</span>
+              <input type="password" v-model="cfg.apiKey" placeholder="sk-…" />
+            </label>
+            <label class="field">
+              <span>路径前缀（可选）</span>
+              <input type="text" v-model="cfg.extra!.pathPrefix" placeholder="留空自动 /v1" />
+            </label>
+          </div>
+          <div class="row" style="margin-top: 2px">
+            <button class="btn small" :class="testing?.key === ch.key && testing?.id === cfg.id ? 'is-loading' : 'ghost'" :disabled="!!testing" @click="runTest(ch.key, cfg)">
+              <span v-if="testing?.key === ch.key && testing?.id === cfg.id" class="spinner" />
+              {{ testing?.key === ch.key && testing?.id === cfg.id ? "测试中" : "测试连接" }}
+            </button>
+            <span
+              v-if="testResult && testResult.key === ch.key && testResult.id === cfg.id"
+              style="font-size: 12px"
+              :class="testResult.ok ? 'tag ok' : 'tag err'"
+            >
+              {{ testResult.msg }}
+            </span>
+          </div>
+          <details v-if="ch.key === 'tts'" style="margin-top: 8px">
+            <summary style="font-size: 12px; color: var(--text-dim); cursor: pointer">高级选项：音色列表</summary>
+            <label class="field" style="margin-top: 8px">
+              <span>可用音色（每行一个；AI 提取时从中挑选，失败自动回退第一个）</span>
+              <textarea
+                :value="(cfg.extra!.voiceLibrary as string[] | undefined)?.join('\n') ?? ''"
+                rows="4"
+                @change="
+                  (e: any) => {
+                    const list = (e.target as HTMLTextAreaElement).value.split('\n').map((s: string) => s.trim()).filter(Boolean);
+                    if (list.length) cfg.extra!.voiceLibrary = list;
+                  }
+                "
+                placeholder="alloy&#10;echo&#10;fable&#10;onyx&#10;nova&#10;shimmer"
+              />
+            </label>
+          </details>
+        </div>
+      </div>
+    </div>
   </div>
 </template>

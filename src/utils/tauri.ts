@@ -208,4 +208,8 @@ export const tauri = {
     if (isTauri()) return invoke("open_url", { url });
     return Promise.resolve();
   },
+  buildZip(sourceDir: string, zipPath: string, exclude: string[]): Promise<{ fileCount: number; sizeBytes: number }> {
+    if (isTauri()) return invoke("build_zip", { sourceDir, zipPath, exclude });
+    return Promise.reject(new Error("Web 环境不支持打包"));
+  },
 };

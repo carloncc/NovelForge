@@ -167,6 +167,7 @@ export interface PipelineResult {
   chapters: ChapterScript[];
   assets: unknown;
   cost: CostStats;
+  failedTasks: FailedTask[];
 }
 
 export interface MaterialAsset {
@@ -197,6 +198,7 @@ export interface GenerationOptions {
   maxConcurrent: number;
   videoPointsPerChapter: number;
   characterIntroCard: boolean;
+  budgetYuan: number;
   rerunChapters?: number[];
 }
 
@@ -206,6 +208,22 @@ export interface PipelineEvent {
   level: "info" | "success" | "warn" | "error";
   at: number;
   costDelta?: Partial<CostStats>;
+  taskId?: string;
+  taskKind?: "llm" | "image" | "tts" | "script";
+}
+
+export interface FailedTask {
+  id: string;
+  kind: "llm" | "image" | "tts" | "script";
+  step: string;
+  message: string;
+  at: number;
+}
+
+export interface ExportSettings {
+  title: string;
+  gameKey: string;
+  language: "zh_CN" | "zh_TW" | "en" | "ja";
 }
 
 export type LogSink = (ev: PipelineEvent) => void;
