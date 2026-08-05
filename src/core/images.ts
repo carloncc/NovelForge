@@ -36,6 +36,11 @@ const EMOTION_PROMPT_SUFFIX: Record<string, string> = {
   surprised: ", shocked surprised expression, wide eyes",
 };
 
+// 立绘/物品强制纯色背景：AI 无法输出透明 PNG，统一生成浅灰纯底，管线再色度键抠图（透明立绘）
+const FIGURE_BG_SUFFIX =
+  ", plain solid light gray background, no shadow, no gradient, no pattern, no other objects, no text, full body visible";
+const ITEM_BG_SUFFIX = ", plain solid light gray background, no shadow, no reflection, no text";
+
 export function buildImageTasks(
   chapters: ChapterScript[],
   cards: ExtractionResult,
@@ -55,7 +60,7 @@ export function buildImageTasks(
         kind: "figure",
         id: isNormal ? char.id : `${char.id}_${emo}`,
         emotion: emo,
-        prompt: char.imagePrompt + (EMOTION_PROMPT_SUFFIX[emo] ?? ""),
+        prompt: char.imagePrompt + (EMOTION_PROMPT_SUFFIX[emo] ?? "") + FIGURE_BG_SUFFIX,
         referenceImage: isNormal ? char.referenceImage : undefined,
         refFromTask: isNormal ? undefined : char.id,
         fileName: `figure_${sanitizeId(char.id)}_${emo}.png`,
@@ -70,7 +75,7 @@ export function buildImageTasks(
     tasks.push({
       kind: "item",
       id: item.id,
-      prompt: item.imagePrompt,
+      prompt: item.imagePrompt + ITEM_BG_SUFFIX,
       fileName: `item_${sanitizeId(item.id)}.png`,
       width: 1024,
       height: 1024,

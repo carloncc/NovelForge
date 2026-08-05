@@ -272,7 +272,8 @@ export async function webHasTransparency(dataB64: string): Promise<boolean> {
   }
 }
 
-/** 四角种子 flood-fill：移除接近纯色的背景（白/黑），生成透明 PNG */
+/** 色度键抠图（对齐 Rust 实现）：四角采样背景色 → flood-fill 连通约束 → 边缘羽化。
+ *  背景像素置透明，主体边界像素半透明渐变（抗锯齿），主体内部同色区域不受影响。 */
 export async function webCutoutImage(dataB64: string, threshold = 40): Promise<string> {
   try {
     const img = await loadImage(dataB64);
@@ -288,7 +289,7 @@ export async function webCutoutImage(dataB64: string, threshold = 40): Promise<s
     const px = imageData.data;
     const visited = new Uint8Array(w * h);
 
-    // 背景参考色：取四角像素平均
+    // 背景参考色：取四角区域平均（忽略透明像素）
     const corners = [
       [0, 0],
       [w - 1, 0],
@@ -298,23 +299,34 @@ export async function webCutoutImage(dataB64: string, threshold = 40): Promise<s
     let rSum = 0;
     let gSum = 0;
     let bSum = 0;
+    let n = 0;
     for (const [x, y] of corners) {
-      const i = (y * w + x) * 4;
-      rSum += px[i];
-      gSum += px[i + 1];
-      bSum += px[i + 2];
+      for (let dx = 0; dx < 4; dx++) {
+        for (let dy = 0; dy < 4; dy++) {
+          const i = ((y + dy) * w + (x + dx)) * 4;
+          if (px[i + 3] > 240) {
+            rSum += px[i];
+            gSum += px[i + 1];
+            bSum += px[i + 2];
+            n++;
+          }
+        }
+      }
     }
-    const bgR = rSum / 4;
-    const bgG = gSum / 4;
-    const bgB = bSum / 4;
-    const bgA = px[3];
-    if (bgA < 250) {
-      // 原图已含透明通道：不处理
-      return dataB64;
-    }
+    if (n === 0) return dataB64;
+    const bgR = rSum / n;
+    const bgG = gSum / n;
+    const bgB = bSum / n;
+
+    const thr = threshold * 3; // 完全透明容差（曼哈顿距离）
+    const thrEdge = threshold * 4.5; // 羽化区间上界
+
+    // 四角种子 flood-fill
     const stack: number[] = [];
     for (const [x, y] of corners) {
-      stack.push(y * w + x);
+      const i = (y * w + x) * 4;
+      const dist = Math.abs(px[i] - bgR) + Math.abs(px[i + 1] - bgG) + Math.abs(px[i + 2] - bgB);
+      if (dist <= thrEdge) stack.push(y * w + x);
     }
     while (stack.length) {
       const idx = stack.pop() as number;
@@ -322,8 +334,14 @@ export async function webCutoutImage(dataB64: string, threshold = 40): Promise<s
       visited[idx] = 1;
       const i = idx * 4;
       const dist = Math.abs(px[i] - bgR) + Math.abs(px[i + 1] - bgG) + Math.abs(px[i + 2] - bgB);
-      if (dist > threshold * 3) continue;
-      px[i + 3] = 0;
+      if (dist > thrEdge) continue;
+      if (dist <= thr) {
+        px[i + 3] = 0;
+      } else {
+        // 羽化：边缘半透明渐变（抗锯齿）
+        const t = 1 - (dist - thr) / (thrEdge - thr);
+        px[i + 3] = Math.round(px[i + 3] * (0.15 + 0.85 * t));
+      }
       const x = idx % w;
       const y = (idx / w) | 0;
       if (x > 0) stack.push(idx - 1);
@@ -332,7 +350,7 @@ export async function webCutoutImage(dataB64: string, threshold = 40): Promise<s
       if (y < h - 1) stack.push(idx + w);
     }
     let removed = 0;
-    for (let i = 3; i < px.length; i += 4) if (px[i] === 0) removed++;
+    for (let i = 3; i < px.length; i += 4) if (px[i] < 250) removed++;
     if (removed === 0) return dataB64;
     ctx.putImageData(imageData, 0, 0);
     return canvas.toDataURL("image/png").split(",")[1] ?? dataB64;

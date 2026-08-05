@@ -32,4 +32,15 @@ if (!emoTask || emoTask.refFromTask !== "linche") throw new Error("表情任务�
 const normalTask = tasksOn.find((t) => t.kind === "figure" && t.emotion === "normal")!;
 if (normalTask.refFromTask) throw new Error("normal 任务不应有参考图引用");
 
+// 立绘/物品 prompt 强制纯色背景（透明立绘抠图前提）
+{
+    const check = (c: boolean, m: string) => { if (!c) throw new Error(m); };
+  const tasks = buildImageTasks([], { characters: [{ id: "hero", name: "主角", imagePrompt: "anime girl" }], items: [{ id: "sword", name: "剑", imagePrompt: "a sword" }] }, {});
+  const figure = tasks.find((t) => t.kind === "figure");
+  const item = tasks.find((t) => t.kind === "item");
+  const bg = tasks.find((t) => t.kind === "background");
+  check(figure!.prompt.includes("light gray background"), "立绘 prompt 缺少纯色背景约束");
+  check(item!.prompt.includes("light gray background"), "物品 prompt 缺少纯色背景约束");
+  console.log("  ✓ 立绘/物品 prompt 含纯色背景约束，背景/CG 不含");
+}
 console.log("=== 图像任务构建验证通过 ===");

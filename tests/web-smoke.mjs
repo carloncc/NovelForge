@@ -89,6 +89,36 @@ if (smoke.previewUrl) {
   check("预览页面 HTTP", resp.status() === 200, String(resp.status()));
 }
 
+// 4. 抠图验证：灰底 (211,211,211) + 中心红块 → 四角 alpha=0、中心 alpha=255、颜色保留
+const cutout = await page.evaluate(async () => {
+  const wr = await import("/src/utils/webRuntime.ts");
+  const c = document.createElement("canvas");
+  c.width = 100;
+  c.height = 100;
+  const ctx = c.getContext("2d");
+  ctx.fillStyle = "rgb(211,211,211)";
+  ctx.fillRect(0, 0, 100, 100);
+  ctx.fillStyle = "rgb(255,0,0)";
+  ctx.fillRect(35, 35, 30, 30);
+  const b64 = c.toDataURL("image/png").split(",")[1];
+  const out = await wr.webCutoutImage(b64, 40);
+  const img = new Image();
+  await new Promise((res) => {
+    img.onload = res;
+    img.src = "data:image/png;base64," + out;
+  });
+  const c2 = document.createElement("canvas");
+  c2.width = img.width;
+  c2.height = img.height;
+  const ctx2 = c2.getContext("2d");
+  ctx2.drawImage(img, 0, 0);
+  const d = ctx2.getImageData(0, 0, 100, 100).data;
+  return { corner: d[3], center: d[(50 * 100 + 50) * 4 + 3], red: d[(50 * 100 + 50) * 4] };
+});
+check("抠图四角透明", cutout.corner === 0, `alpha=${cutout.corner}`);
+check("抠图中心保留", cutout.center === 255, `alpha=${cutout.center}`);
+check("抠图主体颜色保留", cutout.red > 200, `red=${cutout.red}`);
+
 const failed = results.filter((r) => !r.ok).length;
 console.log(`\n${results.length - failed}/${results.length} 通过`);
 await browser.close();
