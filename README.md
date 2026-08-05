@@ -88,7 +88,20 @@ pnpm tauri build
 | Kimi | LLM | `https://api.moonshot.cn/v1` | `moonshot-v1-8k` |
 | Ollama（本地） | LLM | `http://localhost:11434/v1` | `qwen2.5:7b` |
 
-任意 OpenAI 兼容服务均可；图像通道支持参考图（图生图）时自动用于角色一致性，不支持则自动降级文生图。
+### 通用适配器（图像 / TTS）
+
+各厂商图像与语音接口协议差异很大（OpenAI 兼容 / MiniMax 专有 / 阿里任务式异步），
+NovelForge 内置**配置驱动的通用适配器引擎**（`sync`/`async` 两种模式 + 字段映射模板），
+配置页「服务商模板」一键选用即可：
+
+| 服务商 | 图像 | TTS |
+|---|---|---|
+| OpenAI 兼容（智谱 CogView / 硅基流动 FLUX / OpenAI） | ✅ openai-image | ✅ openai-tts |
+| MiniMax（image-01 / speech-2.8） | ✅ minimax-image | ✅ minimax-tts（HEX 自动解码） |
+| 阿里百炼（wanx-v1 / CosyVoice） | ✅ dashscope-image（任务式轮询） | ✅ dashscope-tts |
+
+任意新厂商：在「高级 → 自定义适配器模板」粘贴 JSON 模板即可接入，无需改代码。
+图像通道支持参考图（图生图）时自动用于角色一致性，不支持则自动降级文生图。
 
 ## 输出项目结构（标准 WebGAL 项目）
 

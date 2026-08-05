@@ -4,6 +4,8 @@ export interface ApiConfig {
   baseUrl: string;
   apiKey: string;
   model: string;
+  /** 通用适配器模板 id（见 api/templates.ts）；空 = 兼容旧配置（OpenAI 兼容直连） */
+  adapter?: string;
   extra?: Record<string, unknown>;
 }
 

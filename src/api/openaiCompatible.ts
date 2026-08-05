@@ -1,5 +1,7 @@
 import { tauri } from "../utils/tauri";
 import type { ApiConfig } from "../core/types";
+import { unifiedImage, unifiedTts, utf8FromB64 } from "./universal";
+import { resolveTemplate, getTemplate } from "./templates";
 
 function b64ToUtf8(b64: string): string {
   const bin = atob(b64);
@@ -157,78 +159,13 @@ export async function generateImage(
   prompt: string,
   opts: { referenceImageB64?: string; size?: string } = {},
 ): Promise<{ dataB64: string; mime: string }> {
-  const base = normalizeBaseUrl(cfg.baseUrl, (cfg.extra?.pathPrefix as string) || undefined);
-  const body: Record<string, unknown> = {
-    model: cfg.model,
+  const tpl = resolveTemplate(cfg) ?? getTemplate("openai-image")!;
+  const [w, h] = (opts.size ?? "1024x1024").split("x").map((n) => parseInt(n, 10));
+  return unifiedImage(cfg, tpl, {
     prompt,
-    n: 1,
-    size: opts.size ?? "1024x1024",
-    response_format: "b64_json",
-  };
-  if (opts.referenceImageB64) {
-    body.image = opts.referenceImageB64;
-  }
-  const extraBody = cfg.extra?.imageBody as Record<string, unknown> | undefined;
-  if (extraBody) {
-    for (const [k, v] of Object.entries(extraBody)) {
-      if (body[k] === undefined) body[k] = v;
-    }
-  }
-
-  return withRetry(async () => {
-    const res = await tauri.http({
-      method: "POST",
-      url: `${base}/images/generations`,
-      headers: headersFor(cfg),
-      body: JSON.stringify(body),
-      timeoutSecs: 300,
-    });
-    if (res.status >= 500 || res.status === 429) {
-      throw { status: res.status, message: `HTTP ${res.status}` };
-    }
-    if (res.status >= 400) {
-      const raw = b64ToUtf8(res.bodyBase64);
-      throw new Error(`图像 API 错误 ${res.status}: ${raw.slice(0, 300)}`);
-    }
-
-    const text = b64ToUtf8(res.bodyBase64);
-    let data: any;
-    try {
-      data = JSON.parse(text);
-    } catch {
-      throw new Error(`图像 API 响应不是合法 JSON: ${text.slice(0, 300)}`);
-    }
-
-  const pick = (d: any): string | undefined => {
-    if (d?.data?.length) {
-      const first = d.data[0];
-      if (first?.b64_json) return first.b64_json;
-      if (first?.url) return first.url;
-    }
-    if (d?.images?.length) {
-      const first = d.images[0];
-      if (first?.b64_json) return first.b64_json;
-      if (first?.url) return first.url;
-      if (typeof first === "string") return first;
-    }
-    if (typeof d?.b64_json === "string") return d.b64_json;
-    if (typeof d?.url === "string") return d.url;
-    return undefined;
-  };
-
-  const picked = pick(data);
-  if (!picked) {
-    throw new Error(`图像 API 未返回图片: ${JSON.stringify(data).slice(0, 400)}`);
-  }
-  if (picked.startsWith("http")) {
-    const img = await tauri.http({
-      method: "GET",
-      url: picked,
-      timeoutSecs: 120,
-    });
-    return { dataB64: img.bodyBase64, mime: img.contentType.split(";")[0] || "image/png" };
-  }
-  return { dataB64: picked, mime: "image/png" };
+    width: w,
+    height: h,
+    referenceImageB64: opts.referenceImageB64,
   });
 }
 
@@ -236,17 +173,10 @@ export async function ttsSpeech(
   cfg: ApiConfig,
   text: string,
   voice: string,
-  timeoutSecs = 120,
+  _timeoutSecs = 120,
 ): Promise<{ dataB64: string; mime: string }> {
-  const base = normalizeBaseUrl(cfg.baseUrl, (cfg.extra?.pathPrefix as string) || undefined);
-  const res = await tauri.http({
-    method: "POST",
-    url: `${base}/audio/speech`,
-    headers: headersFor(cfg),
-    body: JSON.stringify({ model: cfg.model, input: text, voice, response_format: "mp3" }),
-    timeoutSecs,
-  });
-  return { dataB64: res.bodyBase64, mime: res.contentType.split(";")[0] || "audio/mpeg" };
+  const tpl = resolveTemplate(cfg) ?? getTemplate("openai-tts")!;
+  return unifiedTts(cfg, tpl, { text, voice });
 }
 
 export function testLlm(cfg: ApiConfig): Promise<string> {

@@ -1,6 +1,7 @@
 import { reactive, watch } from "vue";
 import type { ApiConfig, ApiPreset, ChannelKey } from "../core/types";
 import { tauri } from "../utils/tauri";
+import { getTemplate } from "../api/templates";
 
 interface ConfigFile {
   presets: ApiPreset[];
@@ -61,7 +62,33 @@ export function defaultApiConfig(kind: ChannelKey): ApiConfig {
 
 export function voiceLibraryFor(cfg: ApiConfig | undefined): string[] {
   const lib = cfg?.extra?.voiceLibrary;
-  return Array.isArray(lib) && lib.length ? (lib as string[]) : DEFAULT_VOICE_LIBRARY;
+  const base = Array.isArray(lib) && lib.length ? (lib as string[]) : DEFAULT_VOICE_LIBRARY;
+  // 合并模板自带音色
+  const tplVoices = cfg?.adapter ? (getTemplate(cfg.adapter)?.voices ?? []) : [];
+  return Array.from(new Set([...base, ...tplVoices]));
+}
+
+/** 应用服务商模板：填入 base_url / model / adapter / 音色库 */
+export function applyTemplate(cfg: ApiConfig, templateId: string): void {
+  const tpl = getTemplate(templateId);
+  if (!tpl) return;
+  cfg.adapter = templateId;
+  const defaults: Record<string, { baseUrl: string; model: string }> = {
+    "openai-image": { baseUrl: "https://open.bigmodel.cn/api/paas/v4", model: "cogview-3-flash" },
+    "openai-tts": { baseUrl: "https://open.bigmodel.cn/api/paas/v4", model: "glm-4-voice" },
+    "minimax-image": { baseUrl: "https://api.minimaxi.com", model: "image-01" },
+    "minimax-tts": { baseUrl: "https://api.minimaxi.com", model: "speech-2.8-hd" },
+    "dashscope-image": { baseUrl: "https://{workspaceId}.cn-beijing.maas.aliyuncs.com", model: "wanx-v1" },
+    "dashscope-tts": { baseUrl: "https://{workspaceId}.cn-beijing.maas.aliyuncs.com", model: "cosyvoice-v2" },
+  };
+  const d = defaults[templateId];
+  if (d) {
+    cfg.baseUrl = d.baseUrl;
+    cfg.model = d.model;
+  }
+  if (tpl.voices?.length) {
+    cfg.extra!.voiceLibrary = tpl.voices;
+  }
 }
 
 export const configState = reactive<ConfigFile>({

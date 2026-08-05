@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { computed, ref } from "vue";
 import {
   activePreset,
   addConfig,
@@ -7,8 +7,10 @@ import {
   addPreset,
   removePreset,
   configState,
+  applyTemplate,
 } from "../stores/config";
 import { testLlm, testTts, testImage } from "../api/openaiCompatible";
+import { templatesForCapability } from "../api/templates";
 import type { ApiConfig, ChannelKey } from "../core/types";
 
 const channels: { key: ChannelKey; label: string; desc: string; icon: string }[] = [
@@ -19,6 +21,28 @@ const channels: { key: ChannelKey; label: string; desc: string; icon: string }[]
 
 const testing = ref<{ key: ChannelKey; id: string } | null>(null);
 const testResult = ref<{ key: ChannelKey; id: string; ok: boolean; msg: string } | null>(null);
+const customOpen = ref<Record<string, boolean>>({});
+
+const templatesByChannel = computed(() => ({
+  image: templatesForCapability("image"),
+  tts: templatesForCapability("tts"),
+}));
+
+function onTemplateChange(kind: ChannelKey, cfg: ApiConfig, templateId: string): void {
+  if (!templateId) {
+    cfg.adapter = undefined;
+    return;
+  }
+  applyTemplate(cfg, templateId);
+}
+
+function toggleCustom(key: string): void {
+  customOpen.value[key] = !customOpen.value[key];
+}
+
+function showTemplateError(): void {
+  globalThis.alert("模板 JSON 格式错误");
+}
 
 async function runTest(kind: ChannelKey, cfg: ApiConfig): Promise<void> {
   testing.value = { key: kind, id: cfg.id };
@@ -98,6 +122,22 @@ function setActive(kind: ChannelKey, id: string): void {
         </div>
 
         <div v-for="cfg in activePreset().channels[ch.key]" :key="cfg.id" style="border-top: 1px solid var(--border); padding-top: var(--space-3); margin-top: var(--space-2)">
+          <template v-if="ch.key !== 'llm'">
+            <div class="row" style="margin-bottom: 8px">
+              <label class="field" style="margin-bottom: 0; flex: 1">
+                <span>服务商模板（通用适配器，可选）</span>
+                <select
+                  :value="cfg.adapter ?? ''"
+                  @change="(e: any) => onTemplateChange(ch.key, cfg, (e.target as HTMLSelectElement).value)"
+                >
+                  <option value="">（手动配置 / OpenAI 兼容）</option>
+                  <option v-for="t in templatesByChannel[ch.key]" :key="t.id" :value="t.id">{{ t.name }}</option>
+                  <option value="__custom__" disabled>── 自定义模板见下方高级选项 ──</option>
+                </select>
+              </label>
+              <button class="btn ghost small" style="align-self: flex-end" @click="toggleCustom(ch.key + ':' + cfg.id)">高级</button>
+            </div>
+          </template>
           <div class="row" style="margin-bottom: 8px; align-items: flex-end">
             <label class="field" style="flex: 1; margin-bottom: 0">
               <span>配置名</span>
@@ -155,6 +195,34 @@ function setActive(kind: ChannelKey, id: string): void {
                   }
                 "
                 placeholder="alloy&#10;echo&#10;fable&#10;onyx&#10;nova&#10;shimmer"
+              />
+            </label>
+          </details>
+          <details v-if="customOpen[ch.key + ':' + cfg.id]" style="margin-top: 8px">
+            <summary style="font-size: 12px; color: var(--text-dim); cursor: pointer">自定义适配器模板（JSON，优先级高于服务商模板）</summary>
+            <label class="field" style="margin-top: 8px">
+              <span>适配器模板（字段：id/name/capability/mode/endpoint/requestMap/response/poll/voices/rawResponse，见项目文档）</span>
+              <textarea
+                :value="(cfg.extra!.customTemplate as string | undefined) ?? ''"
+                rows="10"
+                style="font-family: var(--mono); font-size: 11.5px"
+                placeholder='{
+  "id": "my-image",
+  "capability": "image",
+  "mode": "sync",
+  "endpoint": "/v1/images/generations",
+  "requestMap": { "model": "$model", "prompt": "$prompt" },
+  "response": { "path": "data", "encoding": "base64" }
+}'
+                @change="
+                  (e: any) => {
+                    const v = (e.target as HTMLTextAreaElement).value.trim();
+                    cfg.extra!.customTemplate = v || undefined;
+                    if (v) {
+                      try { JSON.parse(v); } catch { showTemplateError(); }
+                    }
+                  }
+                "
               />
             </label>
           </details>
