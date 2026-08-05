@@ -1,4 +1,4 @@
-import { unifiedImage, unifiedTts, buildRequestBody, getByPath, joinUrl } from "../src/api/universal";
+import { unifiedImage, unifiedTts, buildRequestBody, getByPath, joinUrl, setByPath, buildMultipartBody } from "../src/api/universal";
 import { getTemplate, resolveTemplate } from "../src/api/templates";
 import type { ApiConfig } from "../src/core/types";
 
@@ -206,6 +206,92 @@ async function main(): Promise<void> {
   // ---------- 9. getByPath ----------
   assert(getByPath({ a: { b: [{ c: 42 }] } }, "a.b[0].c") === 42, "getByPath 数组路径失败");
   assert(getByPath({ data: { image_urls: ["x"] } }, "data.image_urls")?.[0] === "x", "getByPath 失败");
+
+  // ---------- 10. Gemini：endpoint {model} 占位 + 数组路径构造 + inlineData 提取 ----------
+  routes.length = 0;
+  let geminiUrl = "";
+  let geminiBody: any = null;
+  routes.push({
+    match: (u, b) => {
+      geminiUrl = u;
+      geminiBody = b;
+      return u.includes("/v1beta/models/") && u.endsWith(":generateContent");
+    },
+    respond: () => ({
+      status: 200,
+      contentType: "application/json",
+      body: {
+        candidates: [
+          {
+            content: {
+              parts: [{ inlineData: { mimeType: "image/png", data: "R0lOR0FOAA==" } }],
+            },
+          },
+        ],
+      },
+    }),
+  });
+  const geminiCfg = makeCfg({
+    baseUrl: "https://generativelanguage.googleapis.com",
+    model: "gemini-2.0-flash-exp",
+  });
+  const img4 = await unifiedImage(geminiCfg, getTemplate("gemini-image")!, { prompt: "星空", width: 1024, height: 1024 });
+  assert(img4.dataB64 === "R0lOR0FOAA==", "gemini inlineData 提取失败");
+  assert(img4.mime === "image/png", "gemini mime 错误");
+  assert(geminiUrl === "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent", `gemini URL 错误: ${geminiUrl}`);
+  assert(geminiBody.contents[0].parts[0].text === "星空", "gemini 数组路径构造失败");
+  assert(JSON.stringify(geminiBody.generationConfig.responseModalities) === JSON.stringify(["IMAGE"]), "gemini 常量数组失败");
+
+  // ---------- 11. Stability：multipart form + 原始二进制响应 + Authorization 头 ----------
+  routes.length = 0;
+  let stabHeaders: Record<string, string> = {};
+  let stabBody = "";
+  routes.push({
+    match: (u, b) => {
+      stabBody = typeof b === "string" ? b : JSON.stringify(b);
+      return u.includes("/v1/generation/");
+    },
+    respond: () => ({ status: 200, contentType: "image/png", body: "PNGRAW2" }),
+  });
+  const stabCfg = makeCfg({
+    baseUrl: "https://api.stability.ai",
+    apiKey: "sk-stab",
+    model: "stable-image-core",
+    adapter: "stability-image",
+  });
+  const img5 = await unifiedImage(stabCfg, getTemplate("stability-image")!, { prompt: "龙", width: 1024, height: 1024 });
+  assert(img5.dataB64 === Buffer.from("PNGRAW2").toString("base64"), "stability 二进制响应失败");
+  assert(stabBody.includes('name="prompt"') && stabBody.includes("龙"), "stability form 字段缺失");
+  assert(stabBody.includes("multipart/form-data") === false, "form body 不应含 content-type 头");
+
+  // ---------- 12. 错误信息提取 ----------
+  routes.length = 0;
+  routes.push({
+    match: () => true,
+    respond: () => ({
+      status: 400,
+      contentType: "application/json",
+      body: { base_resp: { status_code: 1004, status_message: "模型不存在或已下线" } },
+    }),
+  });
+  let gemErr = "";
+  try {
+    await unifiedImage(makeCfg(), getTemplate("openai-image")!, { prompt: "x" });
+  } catch (e) {
+    gemErr = (e as Error).message;
+  }
+  assert(gemErr.includes("模型不存在或已下线"), `错误提取失败: ${gemErr}`);
+
+  // ---------- 13. setByPath 数组创建 ----------
+  const deep = {};
+  setByPath(deep, "contents[0].parts[0].text", "hello");
+  assert((deep as any).contents[0].parts[0].text === "hello", "setByPath 数组创建失败");
+
+  // ---------- 14. buildMultipartBody ----------
+  const mp = buildMultipartBody({ prompt: "a", n: 2 });
+  assert(mp.contentType.includes("multipart/form-data; boundary="), "multipart boundary 缺失");
+  assert(mp.body.includes('name="n"') && mp.body.includes("\r\n2\r\n"), "multipart 字段序列化错误");
+  assert(mp.body.endsWith("--\r\n"), "multipart 结尾错误");
 
   console.log("=== 通用适配器引擎测试通过 ===");
 }

@@ -11,10 +11,14 @@ export interface AdapterTemplate {
   name: string;
   capability: Capability;
   mode: AdapterMode;
-  /** 相对 base_url 的路径（以 / 开头）或绝对 URL */
+  /** 相对 base_url 的路径（以 / 开头）或绝对 URL；支持 {model} 占位 */
   endpoint: string;
   method?: string;
   headers?: Record<string, string>;
+  /** 请求体格式：json（默认）/ form（multipart/form-data，requestMap 键为字面量字段名） */
+  contentType?: "json" | "form";
+  /** 鉴权方式，默认 Bearer（Authorization: Bearer {key}） */
+  auth?: { type: "bearer" } | { type: "header"; name: string };
   /** 请求体构造：字段 JSON 路径 → 值模板 */
   requestMap: Record<string, TemplateValue>;
   response: {
@@ -27,10 +31,13 @@ export interface AdapterTemplate {
   poll?: {
     /** 轮询端点，{taskId} 占位 */
     endpoint: string;
+    method?: "GET" | "POST";
     taskIdPath: string;
     statusPath: string;
     successWhen: string;
     failedWhen?: string;
+    /** 轮询请求体（POST 轮询时使用，可用 {taskId} 占位） */
+    requestBody?: Record<string, unknown>;
     /** 结果提取路径（数组或对象） */
     resultPath: string;
     resultItemPath?: string;
@@ -48,10 +55,13 @@ export type TemplateValue = string | { value: unknown } | { ref: string };
 
 export interface UnifiedImageInput {
   prompt: string;
+  negativePrompt?: string;
   width?: number;
   height?: number;
   referenceImageB64?: string;
   count?: number;
+  seed?: number;
+  format?: string;
 }
 
 export interface UnifiedTtsInput {
@@ -90,10 +100,27 @@ export function setByPath(obj: Record<string, unknown>, path: string, value: unk
   let cur = obj;
   for (let i = 0; i < parts.length - 1; i++) {
     const key = parts[i];
+    const arrMatch = key.match(/^(\w+)\[(\d+)\]$/);
+    if (arrMatch) {
+      const arrName = arrMatch[1];
+      const idx = parseInt(arrMatch[2], 10);
+      if (!Array.isArray(cur[arrName])) cur[arrName] = [];
+      const arr = cur[arrName] as unknown[];
+      if (arr[idx] === undefined) arr[idx] = {};
+      cur = arr[idx] as Record<string, unknown>;
+      continue;
+    }
     if (typeof cur[key] !== "object" || cur[key] === null) cur[key] = {};
     cur = cur[key] as Record<string, unknown>;
   }
-  cur[parts[parts.length - 1]] = value;
+  const last = parts[parts.length - 1];
+  const arrMatch = last.match(/^(\w+)\[(\d+)\]$/);
+  if (arrMatch) {
+    if (!Array.isArray(cur[arrMatch[1]])) cur[arrMatch[1]] = [];
+    (cur[arrMatch[1]] as unknown[])[parseInt(arrMatch[2], 10)] = value;
+  } else {
+    cur[last] = value;
+  }
 }
 
 /* ============ 尺寸转换 ============ */
@@ -140,6 +167,13 @@ export function buildRequestBody(
   template: AdapterTemplate,
   vars: Record<string, unknown>,
 ): Record<string, unknown> {
+  if (template.contentType === "form") {
+    const fields: Record<string, unknown> = {};
+    for (const [name, value] of Object.entries(template.requestMap)) {
+      fields[name] = evalValue(value, vars);
+    }
+    return fields;
+  }
   const body: Record<string, unknown> = {};
   for (const [path, value] of Object.entries(template.requestMap)) {
     setByPath(body, path, evalValue(value, vars));
@@ -163,6 +197,94 @@ function hexToBase64(hex: string): string {
   return btoa(binary);
 }
 
+const RESULT_KEYS = [
+  "b64_json",
+  "base64",
+  "data",
+  "audio",
+  "audio_url",
+  "image_url",
+  "image_urls",
+  "images",
+  "url",
+  "text",
+];
+
+/** 深度智能提取：递归查找常见结果字段（Gemini 的 inlineData.data 等深层结构也能取到） */
+function smartPick(raw: unknown, depth = 0): { value: unknown; mime?: string } | undefined {
+  if (Array.isArray(raw)) {
+    for (const item of raw) {
+      const hit = smartPick(item, depth + 1);
+      if (hit) return hit;
+    }
+    return undefined;
+  }
+  if (raw && typeof raw === "object") {
+    const obj = raw as Record<string, unknown>;
+    for (const key of RESULT_KEYS) {
+      if (key in obj) {
+        const v = obj[key];
+        if (Array.isArray(v)) {
+          if (v.length) {
+            const hit = smartPick(v[0], depth + 1);
+            if (hit) return hit;
+          }
+        } else if (v !== undefined && v !== null && v !== "") {
+          const mime =
+            typeof obj.mimeType === "string"
+              ? obj.mimeType
+              : key === "audio" || key === "audio_url"
+                ? "audio/mpeg"
+                : undefined;
+          return { value: v, mime };
+        }
+      }
+    }
+    if (obj.inlineData && typeof obj.inlineData === "object") {
+      const id = obj.inlineData as Record<string, unknown>;
+      if (typeof id.data === "string" && id.data) {
+        return { value: id.data, mime: typeof id.mimeType === "string" ? id.mimeType : undefined };
+      }
+    }
+    if (depth < 3) {
+      for (const v of Object.values(obj)) {
+        if (v && typeof v === "object") {
+          const hit = smartPick(v, depth + 1);
+          if (hit) return hit;
+        }
+      }
+    }
+    return undefined;
+  }
+  if (typeof raw === "string" && raw) return { value: raw };
+  return undefined;
+}
+
+/** 从任意响应中提取可读错误信息（各厂商错误字段不一） */
+export function smartErrorText(json: unknown): string | undefined {
+  if (!json || typeof json !== "object") return undefined;
+  const obj = json as Record<string, unknown>;
+  for (const key of ["status_message", "message", "msg", "error_message", "errorMsg"]) {
+    if (typeof obj[key] === "string" && obj[key]) return obj[key];
+  }
+  if (obj.error && typeof obj.error === "object") {
+    const e = obj.error as Record<string, unknown>;
+    if (typeof e.message === "string") return e.message;
+    if (typeof e.msg === "string") return e.msg;
+  }
+  if (obj.base_resp && typeof obj.base_resp === "object") {
+    const b = obj.base_resp as Record<string, unknown>;
+    if (typeof b.status_message === "string" && b.status_message) return b.status_message;
+  }
+  if (obj.output && typeof obj.output === "object") {
+    const o = obj.output as Record<string, unknown>;
+    for (const key of ["message", "msg", "status_message"]) {
+      if (typeof o[key] === "string" && o[key]) return o[key];
+    }
+  }
+  return undefined;
+}
+
 async function decodeResult(
   raw: unknown,
   template: AdapterTemplate,
@@ -176,17 +298,16 @@ async function decodeResult(
     if (!raw.length) throw new Error("结果数组为空");
     return decodeResult(raw[0], template, cfg);
   }
-  // 对象：智能提取常见字段
+  // 对象：深度智能提取常见字段
   if (raw && typeof raw === "object") {
-    const obj = raw as Record<string, unknown>;
-    const candidate =
-      obj.b64_json ?? obj.url ?? obj.audio ?? obj.audio_url ??
-      (Array.isArray(obj.image_urls) ? obj.image_urls[0] : undefined) ??
-      (Array.isArray(obj.images) ? obj.images[0] : undefined);
-    if (candidate !== undefined) {
-      return decodeResult(candidate, template, cfg);
+    const hit = smartPick(raw);
+    if (hit !== undefined && hit.value !== undefined) {
+      const itemMime = hit.mime ?? mime;
+      const sub = { ...template, response: { ...template.response, mime: itemMime } };
+      return decodeResult(hit.value, sub, cfg);
     }
-    throw new Error(`结果对象中未找到图片/音频字段：${JSON.stringify(obj).slice(0, 300)}`);
+    const errMsg = smartErrorText(raw);
+    throw new Error(errMsg ? `API 错误：${errMsg}` : `结果对象中未找到图片/音频字段：${JSON.stringify(raw).slice(0, 300)}`);
   }
 
   const value = String(raw);
@@ -212,24 +333,56 @@ function isRetryable(status: number, text: string): boolean {
 
 const RETRY_DELAYS = [800, 2500];
 
+/** 构造 multipart/form-data 字符串（跨 Tauri/浏览器统一，无需真实 FormData） */
+export function buildMultipartBody(
+  fields: Record<string, unknown>,
+): { body: string; contentType: string } {
+  const boundary = `novelforge-${Math.random().toString(36).slice(2, 12)}`;
+  const parts: string[] = [];
+  for (const [name, value] of Object.entries(fields)) {
+    parts.push(
+      `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${String(value)}\r\n`,
+    );
+  }
+  parts.push(`--${boundary}--\r\n`);
+  return { body: parts.join(""), contentType: `multipart/form-data; boundary=${boundary}` };
+}
+
+function authHeaders(cfg: ApiConfig, template: AdapterTemplate): Record<string, string> {
+  if (!cfg.apiKey) return {};
+  const auth = template.auth;
+  if (auth?.type === "header") return { [auth.name]: cfg.apiKey };
+  return { Authorization: `Bearer ${cfg.apiKey}` };
+}
+
 async function postJson(
   cfg: ApiConfig,
   url: string,
   body: Record<string, unknown>,
-  extraHeaders: Record<string, string> | undefined,
+  template: AdapterTemplate,
 ): Promise<{ status: number; json: unknown; raw: string }> {
   let lastErr: unknown;
+  const isForm = template.contentType === "form";
   for (let attempt = 0; attempt <= RETRY_DELAYS.length; attempt++) {
     try {
+      const headers: Record<string, string> = {
+        ...(isForm ? {} : { "Content-Type": "application/json" }),
+        ...authHeaders(cfg, template),
+        ...(template.headers ?? {}),
+      };
+      let payload: string;
+      if (isForm) {
+        const mp = buildMultipartBody(body);
+        headers["Content-Type"] = mp.contentType;
+        payload = mp.body;
+      } else {
+        payload = JSON.stringify(body);
+      }
       const res = await tauri.http({
         method: "POST",
         url,
-        headers: {
-          "Content-Type": "application/json",
-          ...(cfg.apiKey ? { Authorization: `Bearer ${cfg.apiKey}` } : {}),
-          ...(extraHeaders ?? {}),
-        },
-        body: JSON.stringify(body),
+        headers,
+        body: payload,
         timeoutSecs: 300,
       });
       const raw = utf8FromB64(res.bodyBase64);
@@ -237,7 +390,15 @@ async function postJson(
         throw { status: res.status, message: `HTTP ${res.status}` };
       }
       if (res.status >= 400) {
-        throw new Error(`API 错误 ${res.status}: ${raw.slice(0, 300)}`);
+        let errText = raw.slice(0, 300);
+        try {
+          const parsed = JSON.parse(raw);
+          const smart = smartErrorText(parsed);
+          if (smart) errText = smart;
+        } catch {
+          /* 非 JSON 错误体 */
+        }
+        throw new Error(`API 错误 ${res.status}: ${errText}`);
       }
       let json: unknown;
       try {
@@ -269,15 +430,22 @@ export function utf8FromB64(b64: string): string {
   }
 }
 
-async function getJson(cfg: ApiConfig, url: string): Promise<unknown> {
+async function getJson(cfg: ApiConfig, url: string, template: AdapterTemplate): Promise<unknown> {
   const res = await tauri.http({
     method: "GET",
     url,
-    headers: cfg.apiKey ? { Authorization: `Bearer ${cfg.apiKey}` } : {},
+    headers: authHeaders(cfg, template),
     timeoutSecs: 60,
   });
   if (res.status >= 400) {
-    throw new Error(`轮询请求失败 ${res.status}: ${utf8FromB64(res.bodyBase64).slice(0, 200)}`);
+    let errText = utf8FromB64(res.bodyBase64).slice(0, 200);
+    try {
+      const smart = smartErrorText(JSON.parse(utf8FromB64(res.bodyBase64)));
+      if (smart) errText = smart;
+    } catch {
+      /* 非 JSON */
+    }
+    throw new Error(`轮询请求失败 ${res.status}: ${errText}`);
   }
   return JSON.parse(utf8FromB64(res.bodyBase64));
 }
@@ -303,34 +471,54 @@ export function joinUrl(base: string, endpoint: string): string {
 
 export async function callUnified(ctx: CallContext): Promise<UnifiedResult> {
   const { cfg, template, vars } = ctx;
-  const url = joinUrl(cfg.baseUrl, template.endpoint);
+  const url = joinUrl(cfg.baseUrl, template.endpoint.replace("{model}", String(vars.model ?? "")));
   const body = buildRequestBody(template, vars);
 
   if (template.mode === "sync") {
     if (template.rawResponse) {
+      const isForm = template.contentType === "form";
+      const headers: Record<string, string> = {
+        ...(isForm ? {} : { "Content-Type": "application/json" }),
+        ...authHeaders(cfg, template),
+        ...(template.headers ?? {}),
+      };
+      let payload: string;
+      if (isForm) {
+        const mp = buildMultipartBody(body);
+        headers["Content-Type"] = mp.contentType;
+        payload = mp.body;
+      } else {
+        payload = JSON.stringify(body);
+      }
       const res = await tauri.http({
         method: "POST",
         url,
-        headers: {
-          "Content-Type": "application/json",
-          ...(cfg.apiKey ? { Authorization: `Bearer ${cfg.apiKey}` } : {}),
-          ...(template.headers ?? {}),
-        },
-        body: JSON.stringify(body),
+        headers,
+        body: payload,
         timeoutSecs: 300,
       });
       if (res.status >= 400) {
-        throw new Error(`API 错误 ${res.status}: ${utf8FromB64(res.bodyBase64).slice(0, 300)}`);
+        let errText = utf8FromB64(res.bodyBase64).slice(0, 300);
+        try {
+          const smart = smartErrorText(JSON.parse(utf8FromB64(res.bodyBase64)));
+          if (smart) errText = smart;
+        } catch {
+          /* 非 JSON */
+        }
+        throw new Error(`API 错误 ${res.status}: ${errText}`);
       }
       return {
         dataB64: res.bodyBase64,
         mime: (template.response.mime ?? res.contentType.split(";")[0]) || "application/octet-stream",
       };
     }
-    const { json } = await postJson(cfg, url, body, template.headers);
+    const { json } = await postJson(cfg, url, body, template);
     const raw = getByPath(json, template.response.path ?? "");
     if (raw === undefined || raw === null || raw === "") {
-      throw new Error(`响应中未找到结果字段「${template.response.path}」：${JSON.stringify(json).slice(0, 300)}`);
+      const errMsg = smartErrorText(json);
+      throw new Error(
+        errMsg ? `API 错误：${errMsg}` : `响应中未找到结果字段「${template.response.path}」：${JSON.stringify(json).slice(0, 300)}`,
+      );
     }
     return decodeResult(raw, template, cfg);
   }
@@ -338,20 +526,35 @@ export async function callUnified(ctx: CallContext): Promise<UnifiedResult> {
   // async：提交 → 轮询 → 取结果
   if (!template.poll) throw new Error("异步模板缺少 poll 配置");
   const poll = template.poll;
-  const { json: submitJson } = await postJson(cfg, url, body, template.headers);
+  const { json: submitJson } = await postJson(cfg, url, body, template);
   const taskId = getByPath(submitJson, poll.taskIdPath);
   if (!taskId || typeof taskId !== "string") {
-    throw new Error(`提交任务失败，未获取到 task_id：${JSON.stringify(submitJson).slice(0, 300)}`);
+    const errMsg = smartErrorText(submitJson);
+    throw new Error(
+      errMsg ? `API 错误：${errMsg}` : `提交任务失败，未获取到 task_id：${JSON.stringify(submitJson).slice(0, 300)}`,
+    );
   }
 
   const pollUrl = joinUrl(cfg.baseUrl, poll.endpoint.replace("{taskId}", taskId));
 
   for (let i = 0; i < poll.maxPolls; i++) {
     await new Promise((r) => setTimeout(r, poll.intervalMs));
-    const statusJson = await getJson(cfg, pollUrl);
+    let statusJson: unknown;
+    if (poll.method === "POST") {
+      const pollBody = (poll.requestBody ?? {}) as Record<string, unknown>;
+      if (poll.requestBody) {
+        for (const [k, v] of Object.entries(poll.requestBody)) {
+          if (v === "{taskId}") pollBody[k] = taskId;
+        }
+      }
+      statusJson = (await postJson(cfg, pollUrl, pollBody, template)).json;
+    } else {
+      statusJson = await getJson(cfg, pollUrl, template);
+    }
     const status = getByPath(statusJson, poll.statusPath);
     if (poll.failedWhen && String(status) === poll.failedWhen) {
-      throw new Error(`任务失败：${JSON.stringify(statusJson).slice(0, 300)}`);
+      const errMsg = smartErrorText(statusJson);
+      throw new Error(errMsg ? `API 错误：${errMsg}` : `任务失败：${JSON.stringify(statusJson).slice(0, 300)}`);
     }
     if (String(status) === poll.successWhen) {
       const results = getByPath(statusJson, poll.resultPath);
@@ -394,9 +597,14 @@ export async function unifiedImage(
     template,
     vars: {
       prompt: input.prompt,
+      negativePrompt: input.negativePrompt,
       model: cfg.model,
       refImage: input.referenceImageB64,
       count: input.count ?? 1,
+      seed: input.seed,
+      width: input.width,
+      height: input.height,
+      format: input.format,
       sizeRatio: sizeRatio(input.width, input.height),
       sizeString: sizeString(input.width, input.height),
       sizeOpenAI: sizeOpenAI(input.width, input.height),

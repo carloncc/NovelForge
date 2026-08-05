@@ -159,6 +159,38 @@ export const PRESET_TEMPLATES: AdapterTemplate[] = [
     ],
     description: "阿里百炼任务式语音合成：提交 speech-synthesis → 轮询 → audio_url。模型示例 cosyvoice-v2 / cosyvoice-v1；如字段有差异可在自定义模板中调整",
   },
+  {
+    id: "gemini-image",
+    name: "Google Gemini（gemini-2.5-flash-image / 2.0-flash-exp）",
+    capability: "image",
+    mode: "sync",
+    endpoint: "/v1beta/models/{model}:generateContent",
+    requestMap: {
+      "contents[0].parts[0].text": "$prompt",
+      "generationConfig.responseModalities": { value: ["IMAGE"] },
+    },
+    response: { path: "candidates", encoding: "base64", mime: "image/png" },
+    description:
+      "Google 图像生成：POST /v1beta/models/{model}:generateContent，响应 candidates[0].content.parts[0].inlineData.data。base_url 填 https://generativelanguage.googleapis.com",
+  },
+  {
+    id: "stability-image",
+    name: "Stability AI（stable-image-core / sd3.5 / sdxl）",
+    capability: "image",
+    mode: "sync",
+    endpoint: "/v1/generation/{model}/text-to-image",
+    contentType: "form",
+    auth: { type: "header", name: "Authorization" },
+    rawResponse: true,
+    requestMap: {
+      prompt: "$prompt",
+      aspect_ratio: "$sizeRatio",
+      output_format: { value: "png" },
+    },
+    response: { mime: "image/png" },
+    description:
+      "Stability AI 专有：multipart/form-data POST，响应为原始 PNG 二进制。key 填 sk-...（Authorization: sk-...，不带 Bearer）",
+  },
 ];
 
 export function getTemplate(id: string | undefined): AdapterTemplate | undefined {

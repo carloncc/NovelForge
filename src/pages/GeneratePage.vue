@@ -5,7 +5,7 @@ import { projectState, pushLog, clearLogs, scheduleSave, restoreProject } from "
 import { activeConfig, configState, addRecentOutputDir } from "../stores/config";
 import { Pipeline } from "../core/pipeline";
 import { resolveTemplateDir } from "../utils/template";
-import { tauri } from "../utils/tauri";
+import { tauri, isTauri } from "../utils/tauri";
 import { sanitizeId } from "../core/render";
 import EditCards from "../components/EditCards.vue";
 import StepIndicator from "../components/StepIndicator.vue";
@@ -69,6 +69,12 @@ const videoPoints = computed<(VideoSuggestion & { chapter: number; location: str
 });
 
 async function browseOutputDir(): Promise<void> {
+  if (!isTauri()) {
+    projectState.outputDir = await tauri.getDefaultOutputDir();
+    configState.outputDir = projectState.outputDir;
+    pushLog({ step: "项目", message: "Web 版输出目录固定为虚拟目录 /app/exports", level: "info", at: Date.now() });
+    return;
+  }
   const dir = await open({ directory: true, multiple: false });
   if (dir && typeof dir === "string") {
     projectState.outputDir = dir;

@@ -4,13 +4,16 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { projectState, addMaterial, removeMaterial, restoreProject } from "../stores/project";
 import { configState, addRecentOutputDir, removeRecentOutputDir } from "../stores/config";
 import { importNovelFile } from "../core/chapters";
-import { tauri } from "../utils/tauri";
+import { tauri, isTauri } from "../utils/tauri";
+import { vfsWriteTextFile, vfsWriteFileBase64 } from "../utils/vfsWeb";
 import { DEMO_NOVEL } from "../core/demoNovel";
 import type { MaterialAsset, NovelDoc } from "../core/types";
 import { splitChapters } from "../core/chapters";
 
 const error = ref("");
 const importing = ref(false);
+const novelInput = ref<HTMLInputElement | null>(null);
+const materialInput = ref<HTMLInputElement | null>(null);
 
 onMounted(async () => {
   if (!projectState.outputDir) {
@@ -19,6 +22,10 @@ onMounted(async () => {
 });
 
 async function pickNovel(): Promise<void> {
+  if (!isTauri()) {
+    novelInput.value?.click();
+    return;
+  }
   error.value = "";
   importing.value = true;
   try {
@@ -36,6 +43,25 @@ async function pickNovel(): Promise<void> {
   }
 }
 
+async function onNovelFile(e: Event): Promise<void> {
+  const input = e.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = "";
+  if (!file) return;
+  error.value = "";
+  importing.value = true;
+  try {
+    const text = await file.text();
+    const vPath = `/app/novel/${file.name}`;
+    await vfsWriteTextFile(vPath, text);
+    projectState.novel = await importNovelFile(vPath);
+  } catch (err) {
+    error.value = (err as Error).message;
+  } finally {
+    importing.value = false;
+  }
+}
+
 async function loadDemo(): Promise<void> {
   const doc: NovelDoc = {
     fileName: "星陨之城的守夜人.txt",
@@ -48,19 +74,73 @@ async function loadDemo(): Promise<void> {
 }
 
 async function pickMaterials(): Promise<void> {
+  if (!isTauri()) {
+    materialInput.value?.click();
+    return;
+  }
   const paths = await open({
     multiple: true,
     filters: [{ name: "图片", extensions: ["png", "jpg", "jpeg", "webp"] }],
   });
   if (!paths) return;
   for (const p of Array.isArray(paths) ? paths : [paths]) {
-    const name = p.split(/[\\/]/).pop() || "asset";
-    const lower = name.toLowerCase();
-    let kind: MaterialAsset["kind"] = "background";
-    if (/人|角色|char|figure|hero/.test(name)) kind = "character";
-    else if (/物|item|道具|sword|weapon|jade/.test(name)) kind = "item";
-    addMaterial({ name, path: p, kind, mime: lower.endsWith(".jpg") ? "image/jpeg" : "image/png" });
+    await addMaterialAsset(p);
   }
+}
+
+async function onMaterialFiles(e: Event): Promise<void> {
+  const input = e.target as HTMLInputElement;
+  const files = input.files ? [...input.files] : [];
+  input.value = "";
+  if (!files.length) return;
+  error.value = "";
+  importing.value = true;
+  try {
+    for (const file of files) {
+      const b64 = await fileToBase64(file);
+      const vPath = `/app/materials/${file.name}`;
+      await vfsWriteFileBase64(vPath, b64);
+      addMaterial({
+        name: file.name,
+        path: vPath,
+        kind: classifyMaterial(file.name),
+        mime: file.type || "image/png",
+      });
+    }
+  } catch (err) {
+    error.value = (err as Error).message;
+  } finally {
+    importing.value = false;
+  }
+}
+
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result ?? "");
+      resolve(result.includes(",") ? result.split(",")[1] : result);
+    };
+    reader.onerror = () => reject(new Error("文件读取失败"));
+    reader.readAsDataURL(file);
+  });
+}
+
+function classifyMaterial(name: string): MaterialAsset["kind"] {
+  if (/人|角色|char|figure|hero/.test(name)) return "character";
+  if (/物|item|道具|sword|weapon|jade/.test(name)) return "item";
+  return "background";
+}
+
+async function addMaterialAsset(p: string): Promise<void> {
+  const name = p.split(/[\\/]/).pop() || "asset";
+  const lower = name.toLowerCase();
+  addMaterial({
+    name,
+    path: p,
+    kind: classifyMaterial(name),
+    mime: lower.endsWith(".jpg") ? "image/jpeg" : "image/png",
+  });
 }
 
 function updateChapterTitle(i: number, title: string): void {
@@ -100,6 +180,7 @@ function loadRecentTitles(dir: string): string {
           <span v-if="importing" class="spinner" />
           {{ importing ? "读取中…" : "选择小说 txt" }}
         </button>
+        <input v-if="!isTauri()" ref="novelInput" type="file" accept=".txt,text/plain" style="display: none" @change="onNovelFile" />
       </div>
     </div>
 
@@ -158,6 +239,7 @@ function loadRecentTitles(dir: string): string {
         <h3>自定义素材库（可选）</h3>
         <div class="card-actions">
           <button class="btn secondary small" @click="pickMaterials">＋ 导入图片素材</button>
+          <input v-if="!isTauri()" ref="materialInput" type="file" accept="image/*" multiple style="display: none" @change="onMaterialFiles" />
         </div>
       </div>
       <p style="color: var(--text-dim); font-size: 12.5px; margin-bottom: var(--space-4)">

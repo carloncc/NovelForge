@@ -2,7 +2,8 @@
 import { computed, ref, watch } from "vue";
 import type { CharacterCard, ExtractionResult, ItemCard, SceneCard } from "../core/types";
 import { activeConfig, voiceLibraryFor } from "../stores/config";
-import { tauri } from "../utils/tauri";
+import { tauri, isTauri } from "../utils/tauri";
+import { vfsWriteFileBase64 } from "../utils/vfsWeb";
 import { projectState } from "../stores/project";
 import { saveEditedCards } from "../core/cards";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -12,6 +13,8 @@ const emit = defineEmits<{ saved: [cards: ExtractionResult] }>();
 
 const local = ref<ExtractionResult>(JSON.parse(JSON.stringify(props.cards)));
 const savedMsg = ref("");
+const refImgInput = ref<HTMLInputElement | null>(null);
+const refImgTarget = ref<CharacterCard | null>(null);
 const busy = ref(false);
 const openChar = ref<string | null>(null);
 const openItem = ref<string | null>(null);
@@ -29,6 +32,11 @@ watch(
 const voices = computed(() => voiceLibraryFor(activeConfig("tts")));
 
 async function pickReferenceImage(card: CharacterCard): Promise<void> {
+  if (!isTauri()) {
+    refImgTarget.value = card;
+    refImgInput.value?.click();
+    return;
+  }
   const picked = await open({
     multiple: false,
     filters: [{ name: "参考图", extensions: ["png", "jpg", "jpeg", "webp"] }],
@@ -41,6 +49,37 @@ async function pickReferenceImage(card: CharacterCard): Promise<void> {
   } catch (e) {
     savedMsg.value = `读取参考图失败：${(e as Error).message}`;
   }
+}
+
+async function onRefImgFile(e: Event): Promise<void> {
+  const input = e.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = "";
+  const card = refImgTarget.value;
+  if (!file || !card) return;
+  try {
+    const b64 = await fileToBase64(file);
+    const vPath = `/app/materials/ref_${Date.now()}_${file.name}`;
+    await vfsWriteFileBase64(vPath, b64);
+    card.referenceImage = b64;
+    savedMsg.value = `已为「${card.name}」设置参考图`;
+  } catch (err) {
+    savedMsg.value = `读取参考图失败：${(err as Error).message}`;
+  } finally {
+    refImgTarget.value = null;
+  }
+}
+
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result ?? "");
+      resolve(result.includes(",") ? result.split(",")[1] : result);
+    };
+    reader.onerror = () => reject(new Error("文件读取失败"));
+    reader.readAsDataURL(file);
+  });
 }
 
 async function save(): Promise<void> {
@@ -122,6 +161,7 @@ function reset(): void {
           <span v-else class="tag">未设置</span>
           <button class="btn secondary small" @click="pickReferenceImage(c)">从素材库选择…</button>
           <button v-if="c.referenceImage" class="btn danger small" @click="c.referenceImage = undefined">清除</button>
+          <input v-if="!isTauri()" ref="refImgInput" type="file" accept="image/*" style="display: none" @change="onRefImgFile" />
         </div>
       </div>
     </div>

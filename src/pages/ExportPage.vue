@@ -3,7 +3,8 @@ import { computed, ref, watch } from "vue";
 import { save, open } from "@tauri-apps/plugin-dialog";
 import { projectState, pushLog } from "../stores/project";
 import { configState, addRecentOutputDir } from "../stores/config";
-import { tauri } from "../utils/tauri";
+import { tauri, isTauri } from "../utils/tauri";
+import { vfsDownloadFile } from "../utils/vfsWeb";
 import { lintProject, type LintReport } from "../core/lint";
 import { renderConfig, type WebgalLanguage } from "../core/render";
 import type { ExportSettings } from "../core/types";
@@ -99,16 +100,28 @@ async function packZip(): Promise<void> {
   }
   const base = dir.split(/[\\/]/).filter(Boolean).pop() || "novelforge";
   const defaultPath = dir.replace(/[\\/]?$/, "") + `_${base}_web.zip`;
-  const target = await save({
-    defaultPath,
-    filters: [{ name: "ZIP 压缩包", extensions: ["zip"] }],
-  });
-  if (!target) return;
+
+  let target: string;
+  if (isTauri()) {
+    const picked = await save({
+      defaultPath,
+      filters: [{ name: "ZIP 压缩包", extensions: ["zip"] }],
+    });
+    if (!picked) return;
+    target = picked;
+  } else {
+    target = defaultPath;
+  }
 
   packing.value = true;
   try {
     const stats = await tauri.buildZip(dir, target, [".novel2vn"]);
-    setMsg(`打包完成：${stats.fileCount} 个文件，${(stats.sizeBytes / 1024 / 1024).toFixed(1)}MB（已排除缓存目录）`);
+    if (!isTauri()) {
+      await vfsDownloadFile(target, `${base}_web.zip`);
+    }
+    setMsg(
+      `打包完成：${stats.fileCount} 个文件，${(stats.sizeBytes / 1024 / 1024).toFixed(1)}MB${isTauri() ? "" : "（已下载）"}`,
+    );
     pushLog({
       step: "导出",
       message: `已打包网页版 zip：${target}（${stats.fileCount} 文件 / ${(stats.sizeBytes / 1024 / 1024).toFixed(1)}MB）`,

@@ -88,6 +88,27 @@ pnpm tauri build
 | Kimi | LLM | `https://api.moonshot.cn/v1` | `moonshot-v1-8k` |
 | Ollama（本地） | LLM | `http://localhost:11434/v1` | `qwen2.5:7b` |
 
+### Web 版（浏览器直接运行，无需打包）
+
+```bash
+npm run dev          # 或 pnpm dev，浏览器打开 http://localhost:5173
+```
+
+Web 版与桌面版功能一致，浏览器内自动启用等价实现：
+
+| 桌面（Tauri） | Web 版 |
+|---|---|
+| 本地文件系统 | IndexedDB 虚拟文件系统（数据持久化在浏览器） |
+| Rust HTTP 客户端（无 CORS 限制） | dev 服务器代理转发（`/__novelforge/proxy`） |
+| 内嵌本地预览服务器 | 前端 zip 打包上传 → dev 服务器解压静态服务（同源 iframe） |
+| Rust rembg 抠图 | canvas 四角 flood-fill 抠图（白/黑底自动去背景） |
+| WebGAL 引擎模板随包携带 | dev 服务器按需同步 `src-tauri/templates/webgal` 到 IndexedDB |
+| 系统文件选择对话框 | 浏览器 `<input type="file">` |
+| 导出 zip 到磁盘 | 导出 zip 自动触发浏览器下载 |
+
+> 生产部署：`npm run build` + `npm run preview`（preview 服务器同样提供代理/预览中间件，可反代部署）；
+> 纯静态托管（无后端）时 API 请求降级为浏览器直连（需厂商支持 CORS）。
+
 ### 通用适配器（图像 / TTS）
 
 各厂商图像与语音接口协议差异很大（OpenAI 兼容 / MiniMax 专有 / 阿里任务式异步），
@@ -102,6 +123,10 @@ NovelForge 内置**配置驱动的通用适配器引擎**（`sync`/`async` 两�
 
 任意新厂商：在「高级 → 自定义适配器模板」粘贴 JSON 模板即可接入，无需改代码。
 图像通道支持参考图（图生图）时自动用于角色一致性，不支持则自动降级文生图。
+
+预置模板另含 **Google Gemini**（`/v1beta/models/{model}:generateContent`，inlineData 自动提取）与
+**Stability AI**（multipart/form-data + 原始二进制响应）。引擎自动识别各厂商错误体
+（base_resp / error.message / output.message 等）并转成可读信息。
 
 ## 输出项目结构（标准 WebGAL 项目）
 
