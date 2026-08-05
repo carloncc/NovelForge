@@ -1,7 +1,7 @@
-import { tauri } from "./tauri";
+﻿import { tauri } from "./tauri";
 
 export async function resolveTemplateDir(): Promise<string> {
-  const res = await tauri.resourceDir();
+  const res = (await tauri.resourceDir()).replace(/\\/g, "/");
   const cand = `${res}/templates/webgal`;
   if (await tauri.pathExists(`${cand}/index.html`)) {
     return cand;
