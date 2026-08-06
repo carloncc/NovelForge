@@ -17,6 +17,16 @@ export interface ApiChannel {
 
 export type ChannelKey = "llm" | "image" | "tts";
 
+export type ApiProtocol =
+  | "openai-chat"
+  | "openai-image"
+  | "openai-speech"
+  | "siliconflow-image"
+  | "siliconflow-speech"
+  | "minimax-image"
+  | "minimax-speech"
+  | "custom-json";
+
 export interface ApiPreset {
   id: string;
   name: string;

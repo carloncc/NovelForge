@@ -7,6 +7,7 @@ import { vfsWriteFileBase64 } from "../utils/vfsWeb";
 import { projectState } from "../stores/project";
 import { saveEditedCards } from "../core/cards";
 import { open } from "@tauri-apps/plugin-dialog";
+import { errMsg } from "../utils/errors";
 
 const props = defineProps<{ cards: ExtractionResult }>();
 const emit = defineEmits<{ saved: [cards: ExtractionResult] }>();
@@ -47,7 +48,7 @@ async function pickReferenceImage(card: CharacterCard): Promise<void> {
     card.referenceImage = b64;
     savedMsg.value = `已为「${card.name}」设置参考图：${picked.split(/[\\/]/).pop()}`;
   } catch (e) {
-    savedMsg.value = `读取参考图失败：${(e as Error).message}`;
+    savedMsg.value = `读取参考图失败：${errMsg(e)}`;
   }
 }
 
@@ -92,7 +93,7 @@ async function save(): Promise<void> {
     });
     emit("saved", local.value);
   } catch (e) {
-    savedMsg.value = `保存失败：${(e as Error).message}`;
+    savedMsg.value = `保存失败：${errMsg(e)}`;
   } finally {
     busy.value = false;
   }

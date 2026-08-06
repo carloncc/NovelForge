@@ -1,5 +1,7 @@
-import type { ChapterInfo, NovelDoc } from "./types";
+﻿import type { ChapterInfo, NovelDoc } from "./types";
 import { tauri } from "../utils/tauri";
+import { basename, basenameWithoutExt } from "../utils/path";
+import { log } from "../utils/logger";
 
 const CHAPTER_RE =
   /^\s*(第[零〇一二三四五六七八九十百千万两\d]+[章节回卷部集幕篇](?:[\s·：:－—-][^。！？!?；;\n]{1,12})?|(?:序章|序言|楔子|尾声|终章|番外|后记|前言|引子)(?:[\s·：:－—-][^。！？!?；;\n]{1,12})?)\s*$/;
@@ -60,15 +62,26 @@ export interface ChapterAdjust {
 }
 
 export async function importNovelFile(path: string): Promise<NovelDoc> {
+  const done = log.time("chapters", `导入小说 ${path}`);
   const { text, encoding } = await tauri.readTextFile(path);
-  const fileName = path.split(/[\\/]/).pop() || "novel.txt";
-  const baseTitle = fileName.replace(/\.txt$/i, "");
+  const fileName = basename(path);
+  const baseTitle = basenameWithoutExt(path);
+  const chapters = splitChapters(text, baseTitle);
+  log.info("chapters", "小说导入完成", {
+    path,
+    fileName,
+    encoding,
+    charCount: text.length,
+    chapterCount: chapters.length,
+    chapterTitles: chapters.map((c) => c.title),
+  });
+  done(`章节=${chapters.length} 字数=${text.length}`);
   return {
     fileName,
     sourcePath: path,
     encoding,
     fullText: text,
-    chapters: splitChapters(text, baseTitle),
+    chapters,
   };
 }
 

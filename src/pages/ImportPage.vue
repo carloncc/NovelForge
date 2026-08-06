@@ -9,6 +9,8 @@ import { vfsWriteTextFile, vfsWriteFileBase64 } from "../utils/vfsWeb";
 import { DEMO_NOVEL } from "../core/demoNovel";
 import type { MaterialAsset, NovelDoc } from "../core/types";
 import { splitChapters } from "../core/chapters";
+import { errMsg } from "../utils/errors";
+import { log } from "../utils/logger";
 
 const error = ref("");
 const importing = ref(false);
@@ -36,8 +38,10 @@ async function pickNovel(): Promise<void> {
     if (!path || typeof path !== "string") return;
     const doc = await importNovelFile(path);
     projectState.novel = doc;
+    log.info("page", "导入小说成功", { path, chapters: doc.chapters.length, charCount: doc.fullText.length });
   } catch (e) {
-    error.value = (e as Error).message;
+    log.error("page", "导入小说失败", { error: errMsg(e) });
+    error.value = errMsg(e);
   } finally {
     importing.value = false;
   }
@@ -71,6 +75,7 @@ async function loadDemo(): Promise<void> {
     chapters: splitChapters(DEMO_NOVEL, "星陨之城的守夜人"),
   };
   projectState.novel = doc;
+  log.info("page", "加载示例小说", { chapters: doc.chapters.length, charCount: doc.fullText.length });
 }
 
 async function pickMaterials(): Promise<void> {

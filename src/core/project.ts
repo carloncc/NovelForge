@@ -1,7 +1,9 @@
-import type { ChapterScript, ExtractionResult, ProjectMeta } from "./types";
+﻿import type { ChapterScript, ExtractionResult, ProjectMeta } from "./types";
 import type { RenderAssets } from "./render";
 import { renderChapter, renderConfig, renderStart, sanitizeId } from "./render";
 import { tauri } from "../utils/tauri";
+import { basename, joinPath, normalizePath } from "../utils/path";
+import { log } from "../utils/logger";
 
 export interface AssembleInput {
   outputDir: string;
@@ -17,22 +19,26 @@ export interface AssembleInput {
   log: (msg: string) => void;
 }
 
-function baseName(p: string): string {
-  return p.split(/[\\/]/).pop() || p;
-}
-
 export async function assembleProject(input: AssembleInput): Promise<{ gameDir: string; meta: ProjectMeta }> {
   const { outputDir, title, gameKey, templateDir } = input;
-  await tauri.mkdirAll(outputDir);
-  await tauri.mkdirAll(`${outputDir}/game/scene`);
-  await tauri.mkdirAll(`${outputDir}/game/background`);
-  await tauri.mkdirAll(`${outputDir}/game/figure`);
-  await tauri.mkdirAll(`${outputDir}/game/vocal`);
-  await tauri.mkdirAll(`${outputDir}/game/bgm`);
+  const done = log.time("project", `组装项目「${title}」`);
+  log.info("project", "开始组装项目", { outputDir, templateDir, title, gameKey, chapters: input.chapters.length });
+  
+  // 标准化路径
+  const normalizedOutputDir = normalizePath(outputDir);
+  const normalizedTemplateDir = normalizePath(templateDir);
+  
+  await tauri.mkdirAll(normalizedOutputDir);
+  await tauri.mkdirAll(joinPath(normalizedOutputDir, "game/scene"));
+  await tauri.mkdirAll(joinPath(normalizedOutputDir, "game/background"));
+  await tauri.mkdirAll(joinPath(normalizedOutputDir, "game/figure"));
+  await tauri.mkdirAll(joinPath(normalizedOutputDir, "game/vocal"));
+  await tauri.mkdirAll(joinPath(normalizedOutputDir, "game/bgm"));
 
   // 清理旧场景文件（章节减少后防止残留）
   try {
-    const sceneEntries = await tauri.listDir(`${outputDir}/game/scene`);
+    const sceneDir = joinPath(normalizedOutputDir, "game/scene");
+    const sceneEntries = await tauri.listDir(sceneDir);
     for (const e of sceneEntries) {
       if (!e.isDir && e.name.endsWith(".txt")) {
         await tauri.removePath(e.path).catch(() => {});
@@ -51,25 +57,42 @@ export async function assembleProject(input: AssembleInput): Promise<{ gameDir: 
   ];
   for (const f of engineFiles) {
     try {
-      await tauri.copyFile(`${templateDir}/${f}`, `${outputDir}/${f}`);
+      await tauri.copyFile(
+        joinPath(normalizedTemplateDir, f),
+        joinPath(normalizedOutputDir, f)
+      );
     } catch {
       input.log(`跳过引擎文件 ${f}（模板中不存在）`);
     }
   }
-  await copyDirIfExists(`${templateDir}/assets`, `${outputDir}/assets`);
-  await copyDirIfExists(`${templateDir}/icons`, `${outputDir}/icons`);
-  await copyDirIfExists(`${templateDir}/game/template`, `${outputDir}/game/template`);
-  await copyDirIfExists(`${templateDir}/game/animation`, `${outputDir}/game/animation`);
+  await copyDirIfExists(
+    joinPath(normalizedTemplateDir, "assets"),
+    joinPath(normalizedOutputDir, "assets")
+  );
+  await copyDirIfExists(
+    joinPath(normalizedTemplateDir, "icons"),
+    joinPath(normalizedOutputDir, "icons")
+  );
+  await copyDirIfExists(
+    joinPath(normalizedTemplateDir, "game/template"),
+    joinPath(normalizedOutputDir, "game/template")
+  );
+  await copyDirIfExists(
+    joinPath(normalizedTemplateDir, "game/animation"),
+    joinPath(normalizedOutputDir, "game/animation")
+  );
 
   input.log("渲染剧本文件…");
   const chapterCount = input.chapters.length;
   const seenCharacters = new Set<string>();
-  const videos = await detectVideos(outputDir);
-  const bgmMap = input.useBgm === false ? {} : await detectBgm(outputDir, input.chapters);
+  const videos = await detectVideos(normalizedOutputDir);
+  const bgmMap = input.useBgm === false ? {} : await detectBgm(normalizedOutputDir, input.chapters);
+  
   await tauri.writeTextFile(
-    `${outputDir}/game/scene/start.txt`,
+    joinPath(normalizedOutputDir, "game/scene/start.txt"),
     renderStart(chapterCount, title),
   );
+  
   for (const chapter of input.chapters) {
     const txt = renderChapter(chapter, {
       title,
@@ -82,19 +105,22 @@ export async function assembleProject(input: AssembleInput): Promise<{ gameDir: 
       introCard: input.introCard,
       figureEmotions: input.figureEmotions,
     }, chapterCount);
-    await tauri.writeTextFile(`${outputDir}/game/scene/ch${chapter.chapter + 1}.txt`, txt);
+    await tauri.writeTextFile(
+      joinPath(normalizedOutputDir, `game/scene/ch${chapter.chapter + 1}.txt`),
+      txt
+    );
   }
 
   await tauri.writeTextFile(
-    `${outputDir}/game/config.txt`,
+    joinPath(normalizedOutputDir, "game/config.txt"),
     renderConfig(title, gameKey),
   );
 
   input.log("复制素材…");
-  await copyAssets(input.assets, outputDir);
+  await copyAssets(input.assets, normalizedOutputDir);
 
-  await writeVideoPlan(outputDir, input.chapters, videos);
-  await writeExportGuide(outputDir, title);
+  await writeVideoPlan(normalizedOutputDir, input.chapters, videos);
+  await writeExportGuide(normalizedOutputDir, title);
 
   const meta: ProjectMeta = {
     title,
@@ -106,41 +132,50 @@ export async function assembleProject(input: AssembleInput): Promise<{ gameDir: 
       (n, c) => n + c.scenes.reduce((m, s) => m + s.lines.length, 0),
       0,
     ),
-    outputDir,
+    outputDir: normalizedOutputDir,
     webgalVersion: "4.6.3",
     generatedAt: new Date().toISOString(),
   };
+  
   await tauri.writeTextFile(
-    `${outputDir}/.novel2vn/meta.json`,
+    joinPath(normalizedOutputDir, ".novel2vn/meta.json"),
     JSON.stringify(meta, null, 2),
   );
   await tauri.writeTextFile(
-    `${outputDir}/.novel2vn/cards.json`,
+    joinPath(normalizedOutputDir, ".novel2vn/cards.json"),
     JSON.stringify(input.cards, null, 2),
   );
 
-  return { gameDir: outputDir, meta };
+  done(`输出目录 ${normalizedOutputDir}`);
+  log.info("project", "项目组装完成", { outputDir: normalizedOutputDir, meta });
+
+  return { gameDir: normalizedOutputDir, meta };
 }
 
 async function copyAssets(assets: RenderAssets, outputDir: string): Promise<void> {
   const seen = new Set<string>();
   const copy = async (path: string | undefined, destDir: string): Promise<void> => {
     if (!path) return;
-    const name = baseName(path);
-    if (seen.has(destDir + name)) return;
-    seen.add(destDir + name);
+    const name = basename(path);
+    const destKey = destDir + name;
+    if (seen.has(destKey)) return;
+    seen.add(destKey);
     try {
-      await tauri.copyFile(path, `${destDir}/${name}`);
+      await tauri.copyFile(path, joinPath(destDir, name));
     } catch {
       /* skip missing */
     }
   };
 
-  for (const p of Object.values(assets.bg)) await copy(p, `${outputDir}/game/background`);
-  for (const p of Object.values(assets.cg)) await copy(p, `${outputDir}/game/background`);
-  for (const p of Object.values(assets.figure)) await copy(p, `${outputDir}/game/figure`);
-  for (const p of Object.values(assets.item)) await copy(p, `${outputDir}/game/figure`);
-  for (const p of Object.values(assets.vocal)) await copy(p, `${outputDir}/game/vocal`);
+  const bgDir = joinPath(outputDir, "game/background");
+  const figureDir = joinPath(outputDir, "game/figure");
+  const vocalDir = joinPath(outputDir, "game/vocal");
+
+  for (const p of Object.values(assets.bg)) await copy(p, bgDir);
+  for (const p of Object.values(assets.cg)) await copy(p, bgDir);
+  for (const p of Object.values(assets.figure)) await copy(p, figureDir);
+  for (const p of Object.values(assets.item)) await copy(p, figureDir);
+  for (const p of Object.values(assets.vocal)) await copy(p, vocalDir);
 }
 
 async function copyDirIfExists(src: string, dst: string): Promise<void> {
@@ -149,29 +184,30 @@ async function copyDirIfExists(src: string, dst: string): Promise<void> {
       await tauri.copyDirAll(src, dst);
     }
   } catch {
-    /* ignore */
+    /* skip missing */
   }
 }
 
 async function detectVideos(outputDir: string): Promise<Record<string, string>> {
-  const videos: Record<string, string> = {};
-  const vdir = `${outputDir}/game/video`;
+  const videoMap: Record<string, string> = {};
+  const videoDir = joinPath(outputDir, "game/video");
   try {
-    await tauri.mkdirAll(vdir);
-    const entries = await tauri.listDir(vdir);
+    await tauri.mkdirAll(videoDir);
+    const entries = await tauri.listDir(videoDir);
     for (const e of entries) {
-      const m = e.name.match(/^video_(.+)\.(mp4|webm|ogg)$/i);
-      if (m) videos[m[1]] = `${vdir}/${e.name}`;
+      if (e.isDir) continue;
+      const match = /^video_(.+)\.mp4$/i.exec(e.name);
+      if (match) videoMap[match[1]] = e.path;
     }
   } catch {
     /* video 目录不可用 */
   }
-  return videos;
+  return videoMap;
 }
 
-const BGM_RULES: [RegExp, string[]][] = [
-  [/battle|war|fight|combat|tense|tension/i, ["战", "肃杀", "紧迫", "战斗", "紧张", "魔"]],
-  [/calm|peace|quiet|gentle|piano|soft|slow/i, ["宁", "静", "安", "平", "温", "舒缓"]],
+const BGM_RULES: Array<[RegExp, string[]]> = [
+  [/battle|war|fight|combat|epic/i, ["战", "斗", "激昂", "紧张"]],
+  [/calm|peace|piano|ambient/i, ["静", "平", "安", "舒缓"]],
   [/sad|sorrow|tear|grief/i, ["悲", "哀", "伤", "离别"]],
   [/happy|joy|bright|cheer|light|warm/i, ["欢", "轻快", "暖", "明"]],
   [/mystery|dark|suspense|moon/i, ["神秘", "悬疑", "暗", "夜色", "月"]],
@@ -187,7 +223,7 @@ async function detectBgm(
   chapters: ChapterScript[],
 ): Promise<Record<string, string>> {
   const bgmMap: Record<string, string> = {};
-  const bgmDir = `${outputDir}/game/bgm`;
+  const bgmDir = joinPath(outputDir, "game/bgm");
   let files: string[] = [];
   try {
     await tauri.mkdirAll(bgmDir);
@@ -199,11 +235,12 @@ async function detectBgm(
     /* bgm 目录不可用 */
   }
   if (!files.length) return bgmMap;
+  
   for (const chapter of chapters) {
     for (const scene of chapter.scenes) {
       if (!scene.bgm) continue;
       const hit = files.find((f) => matchBgm(f, scene.bgm!));
-      if (hit) bgmMap[scene.id] = `${bgmDir}/${hit}`;
+      if (hit) bgmMap[scene.id] = joinPath(bgmDir, hit);
     }
   }
   return bgmMap;
@@ -244,7 +281,7 @@ async function writeVideoPlan(
     lines.push(`  文件名：video_${sanitizeId(p.id)}.mp4`);
     lines.push("");
   }
-  await tauri.writeTextFile(`${outputDir}/video_plan.txt`, lines.join("\n"));
+  await tauri.writeTextFile(joinPath(outputDir, "video_plan.txt"), lines.join("\n"));
 }
 
 async function writeExportGuide(outputDir: string, title: string): Promise<void> {
@@ -278,7 +315,7 @@ async function writeExportGuide(outputDir: string, title: string): Promise<void>
     "",
     "注意：发布时须保留 WebGAL 版权声明（MPL-2.0），游戏本身版权归你所有。",
   ];
-  await tauri.writeTextFile(`${outputDir}/导出说明.txt`, lines.join("\n"));
+  await tauri.writeTextFile(joinPath(outputDir, "导出说明.txt"), lines.join("\n"));
 }
 
 export function gameKeyFor(title: string): string {

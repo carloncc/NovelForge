@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import * as web from "./webRuntime";
+import { log, truncate } from "./logger";
 
 export interface FsEntry {
   name: string;
@@ -103,67 +104,100 @@ async function listDirFallback(path: string): Promise<FsEntry[]> {
     }));
 }
 
+/** 包装 Tauri/fallback 方法：记录入参、成功/失败日志（开发环境） */
+function wrap<A extends unknown[], R>(name: string, fn: (...args: A) => R): (...args: A) => R {
+  return (...args: A): R => {
+    log.debug("tauri", `调用 ${name}`, truncate(args.length === 1 ? args[0] : args));
+    try {
+      const r = fn(...args);
+      if (r instanceof Promise) {
+        return r.then(
+          (v) => {
+            log.debug("tauri", `调用 ${name} → 成功`, truncate(v));
+            return v;
+          },
+          (e: unknown) => {
+            log.error("tauri", `调用 ${name} 失败`, {
+              args: truncate(args.length === 1 ? args[0] : args),
+              error: e instanceof Error ? e.message : String(e),
+            });
+            throw e;
+          },
+        ) as R;
+      }
+      log.debug("tauri", `调用 ${name} → 成功`, truncate(r));
+      return r;
+    } catch (e) {
+      log.error("tauri", `调用 ${name} 失败`, {
+        args: truncate(args.length === 1 ? args[0] : args),
+        error: e instanceof Error ? e.message : String(e),
+      });
+      throw e;
+    }
+  };
+}
+
 export const tauri = {
-  http(args: {
+  http: wrap("http", (args: {
     method: string;
     url: string;
     headers?: Record<string, string>;
     body?: string;
     timeoutSecs?: number;
-  }): Promise<HttpResult> {
-    if (isTauri()) return invoke("http_request", args);
+  }): Promise<HttpResult> => {
+    if (isTauri()) return invoke("http_request", { args });
     return httpFallback(args);
-  },
-  readTextFile(path: string): Promise<{ text: string; encoding: string }> {
+  }),
+  readTextFile: wrap("readTextFile", (path: string): Promise<{ text: string; encoding: string }> => {
     if (isTauri()) return invoke("read_text_file", { path });
     return readTextFallback(path);
-  },
-  writeTextFile(path: string, content: string): Promise<void> {
+  }),
+  writeTextFile: wrap("writeTextFile", (path: string, content: string): Promise<void> => {
     if (isTauri()) return invoke("write_text_file", { path, content });
     return writeTextFallback(path, content);
-  },
-  readFileBase64(path: string): Promise<string> {
+  }),
+  readFileBase64: wrap("readFileBase64", (path: string): Promise<string> => {
     if (isTauri()) return invoke("read_file_base64", { path });
     return readFileBase64Fallback(path);
-  },
-  writeFileBase64(path: string, dataB64: string): Promise<void> {
+  }),
+  writeFileBase64: wrap("writeFileBase64", (path: string, dataB64: string): Promise<void> => {
     if (isTauri()) return invoke("write_file_base64", { path, dataB64 });
     return writeFileBase64Fallback(path, dataB64);
-  },
-  listDir(path: string): Promise<FsEntry[]> {
+  }),
+  listDir: wrap("listDir", (path: string): Promise<FsEntry[]> => {
     if (isTauri()) return invoke("list_dir", { path });
     return listDirFallback(path);
-  },
-  mkdirAll(path: string): Promise<void> {
+  }),
+  mkdirAll: wrap("mkdirAll", (path: string): Promise<void> => {
     if (isTauri()) return invoke("mkdir_all", { path });
     if (web.isWeb()) return web.webMkdirAll(path);
     return import("node:fs/promises").then(async (fs) => {
       await fs.mkdir(path, { recursive: true });
     });
-  },
-  copyFile(src: string, dst: string): Promise<void> {
+  }),
+  copyFile: wrap("copyFile", (src: string, dst: string): Promise<void> => {
     if (isTauri()) return invoke("copy_file", { src, dst });
     if (web.isWeb()) return web.webCopyFile(src, dst);
     return import("node:fs/promises").then(async (fs) => {
       await fs.mkdir(dst.substring(0, dst.lastIndexOf("/")), { recursive: true });
       await fs.copyFile(src, dst);
     });
-  },
-  copyDirAll(src: string, dst: string): Promise<void> {
+  }),
+  copyDirAll: wrap("copyDirAll", (src: string, dst: string): Promise<void> => {
     if (isTauri()) return invoke("copy_dir_all", { src, dst });
     if (web.isWeb()) return web.webCopyDirAll(src, dst);
     return import("node:fs/promises").then(async (fs) => {
       await fs.cp(src, dst, { recursive: true });
     });
-  },
-  removePath(path: string): Promise<void> {
+  }),
+  removePath: wrap("removePath", (path: string): Promise<void> => {
     if (isTauri()) return invoke("remove_path", { path });
     if (web.isWeb()) return web.webRemovePath(path);
     return import("node:fs/promises").then(async (fs) => {
       await fs.rm(path, { recursive: true, force: true });
     });
-  },
-  pathExists(path: string): Promise<boolean> {
+  }),
+  pathExists: wrap("pathExists", (path: string): Promise<boolean> => {
     if (isTauri()) return invoke("path_exists", { path });
     if (web.isWeb()) return web.webPathExists(path);
     return import("node:fs/promises").then(async (fs) => {
@@ -174,66 +208,66 @@ export const tauri = {
         return false;
       }
     });
-  },
-  appConfigDir(): Promise<string> {
+  }),
+  appConfigDir: wrap("appConfigDir", (): Promise<string> => {
     if (isTauri()) return invoke("app_config_dir");
     return Promise.resolve("/app/config");
-  },
-  resourceDir(): Promise<string> {
+  }),
+  resourceDir: wrap("resourceDir", (): Promise<string> => {
     if (isTauri()) return invoke("resource_dir");
     if (web.isWeb()) return Promise.resolve("/app/template");
     return Promise.resolve("/root/my_project/novelforge/resources");
-  },
-  readConfig(): Promise<string> {
+  }),
+  readConfig: wrap("readConfig", (): Promise<string> => {
     if (isTauri()) return invoke("read_config");
     if (web.isWeb()) return web.webReadConfig();
     return Promise.resolve("{}");
-  },
-  writeConfig(content: string): Promise<void> {
+  }),
+  writeConfig: wrap("writeConfig", (content: string): Promise<void> => {
     if (isTauri()) return invoke("write_config", { content });
     if (web.isWeb()) return web.webWriteConfig(content);
     return Promise.resolve();
-  },
-  startPreviewServer(root: string): Promise<{ url: string; port: number }> {
+  }),
+  startPreviewServer: wrap("startPreviewServer", (root: string): Promise<{ url: string; port: number }> => {
     if (isTauri()) return invoke("start_preview_server", { root });
     if (web.isWeb()) return web.webStartPreviewServer(root);
     return Promise.reject(new Error("Web 环境不支持预览服务器"));
-  },
-  stopPreviewServer(): Promise<void> {
+  }),
+  stopPreviewServer: wrap("stopPreviewServer", (): Promise<void> => {
     if (isTauri()) return invoke("stop_preview_server");
     return Promise.resolve();
-  },
-  openInExplorer(path: string): Promise<void> {
+  }),
+  openInExplorer: wrap("openInExplorer", (path: string): Promise<void> => {
     if (isTauri()) return invoke("open_in_explorer", { path });
     return Promise.resolve();
-  },
-  getDefaultOutputDir(): Promise<string> {
+  }),
+  getDefaultOutputDir: wrap("getDefaultOutputDir", (): Promise<string> => {
     if (isTauri()) return invoke("get_default_output_dir");
     if (web.isWeb()) return Promise.resolve("/app/exports");
     return Promise.resolve("/root/my_project/game");
-  },
-  cutoutImage(dataB64: string, threshold?: number): Promise<string> {
+  }),
+  cutoutImage: wrap("cutoutImage", (dataB64: string, threshold?: number): Promise<string> => {
     if (isTauri()) return invoke("cutout_image", { dataB64, threshold: threshold ?? 40 });
     if (web.isWeb()) return web.webCutoutImage(dataB64, threshold);
     return Promise.resolve(dataB64);
-  },
-  hasTransparency(dataB64: string): Promise<boolean> {
+  }),
+  hasTransparency: wrap("hasTransparency", (dataB64: string): Promise<boolean> => {
     if (isTauri()) return invoke("has_transparency", { dataB64 });
     if (web.isWeb()) return web.webHasTransparency(dataB64);
     // Node 环境无解码能力：视为已透明，跳过抠图（避免损坏文件）
     return Promise.resolve(true);
-  },
-  openUrl(url: string): Promise<void> {
+  }),
+  openUrl: wrap("openUrl", (url: string): Promise<void> => {
     if (isTauri()) return invoke("open_url", { url });
     if (web.isWeb()) {
       window.open(url, "_blank");
       return Promise.resolve();
     }
     return Promise.resolve();
-  },
-  buildZip(sourceDir: string, zipPath: string, exclude: string[]): Promise<{ fileCount: number; sizeBytes: number }> {
+  }),
+  buildZip: wrap("buildZip", (sourceDir: string, zipPath: string, exclude: string[]): Promise<{ fileCount: number; sizeBytes: number }> => {
     if (isTauri()) return invoke("build_zip", { sourceDir, zipPath, exclude });
     if (web.isWeb()) return web.webBuildZip(sourceDir, zipPath, exclude);
     return Promise.reject(new Error("Web 环境不支持打包"));
-  },
+  }),
 };

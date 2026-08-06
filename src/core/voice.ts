@@ -1,9 +1,11 @@
-import type { ChapterScript, CharacterCard, PipelineEvent, ApiConfig } from "./types";
+﻿import type { ChapterScript, CharacterCard, PipelineEvent, ApiConfig } from "./types";
 import { ttsSpeech } from "../api/openaiCompatible";
 import { tauri } from "../utils/tauri";
+import { errMsg } from "../utils/errors";
 import { cacheDirFor, cacheHit } from "./cache";
 import { sanitizeId } from "./render";
 import { voiceLibraryFor } from "../stores/config";
+import { log as logger } from "../utils/logger";
 
 export async function generateVoice(
   cfg: ApiConfig,
@@ -16,6 +18,7 @@ export async function generateVoice(
   const vocal: Record<string, string> = {};
   const cacheDir = cacheDirFor(cacheRoot, "vocal");
   await tauri.mkdirAll(cacheDir);
+  logger.info("voice", "开始生成配音", { characters: characters.length, concurrency });
 
   const library = voiceLibraryFor(cfg);
   const fallbackVoice = library[0] || "default";
@@ -62,7 +65,7 @@ export async function generateVoice(
         if (job.voice !== fallbackVoice) {
           log({
             step: "配音",
-            message: `音色 ${job.voice} 失败，回退默认音色重试：${(e as Error).message.slice(0, 100)}`,
+            message: `音色 ${job.voice} 失败，回退默认音色重试：${errMsg(e).slice(0, 100)}`,
             level: "warn",
             at: Date.now(),
           });
@@ -90,5 +93,6 @@ export async function generateVoice(
 
   const workers = Array.from({ length: concurrency }, () => runner());
   await Promise.all(workers);
+  logger.info("voice", "配音生成完成", { total: jobs.length, success: Object.keys(vocal).length });
   return vocal;
 }

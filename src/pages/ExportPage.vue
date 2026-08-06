@@ -7,6 +7,8 @@ import { tauri, isTauri } from "../utils/tauri";
 import { vfsDownloadFile } from "../utils/vfsWeb";
 import { lintProject, type LintReport } from "../core/lint";
 import { renderConfig, type WebgalLanguage } from "../core/render";
+import { errMsg } from "../utils/errors";
+import { log } from "../utils/logger";
 import type { ExportSettings } from "../core/types";
 
 const message = ref("");
@@ -56,8 +58,14 @@ async function runLint(): Promise<void> {
   try {
     if (!outputDir.value) throw new Error("尚未生成项目");
     lintReport.value = await lintProject(outputDir.value);
+    log.info("page", "项目检查完成", {
+      dir: outputDir.value,
+      errors: lintReport.value.errors.length,
+      warnings: lintReport.value.warnings.length,
+    });
   } catch (e) {
-    setMsg(`检查失败：${(e as Error).message}`, false);
+    log.error("page", "项目检查失败", { error: errMsg(e) });
+    setMsg(`检查失败：${errMsg(e)}`, false);
   } finally {
     linting.value = false;
   }
@@ -84,7 +92,7 @@ async function applySettings(): Promise<void> {
     setMsg("游戏配置已应用（标题 / Game_key / 界面语言）");
     pushLog({ step: "导出", message: `已应用导出设置：${title} / ${key} / ${settings.value.language}`, level: "success", at: Date.now() });
   } catch (e) {
-    setMsg(`应用失败：${(e as Error).message}`, false);
+    setMsg(`应用失败：${errMsg(e)}`, false);
   }
 }
 
@@ -119,6 +127,7 @@ async function packZip(): Promise<void> {
     if (!isTauri()) {
       await vfsDownloadFile(target, `${base}_web.zip`);
     }
+    log.info("page", "打包 zip 完成", { dir, target, fileCount: stats.fileCount, sizeBytes: stats.sizeBytes });
     setMsg(
       `打包完成：${stats.fileCount} 个文件，${(stats.sizeBytes / 1024 / 1024).toFixed(1)}MB${isTauri() ? "" : "（已下载）"}`,
     );
@@ -129,7 +138,8 @@ async function packZip(): Promise<void> {
       at: Date.now(),
     });
   } catch (e) {
-    setMsg(`打包失败：${(e as Error).message}`, false);
+    log.error("page", "打包 zip 失败", { dir, target, error: errMsg(e) });
+    setMsg(`打包失败：${errMsg(e)}`, false);
   } finally {
     packing.value = false;
   }

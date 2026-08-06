@@ -20,6 +20,8 @@ import { generateVoice } from "./voice";
 import { assembleProject, gameKeyFor } from "./project";
 import { cacheDirFor } from "./cache";
 import { tauri } from "../utils/tauri";
+import { errMsg } from "../utils/errors";
+import { log as logger } from "../utils/logger";
 
 export interface PipelineInput {
   novel: NovelDoc;
@@ -127,6 +129,21 @@ export class Pipeline {
   async run(): Promise<PipelineResult> {
     const { input } = this;
     this.cacheRoot = `${input.outputDir}/.novel2vn/cache`;
+    const runStart = logger.time("pipeline", "管线整体运行");
+    logger.info("pipeline", "开始运行", {
+      demo: !input.llm?.apiKey,
+      outputDir: input.outputDir,
+      templateDir: input.templateDir,
+      chapterCount: input.novel.chapters.length,
+      options: {
+        useImage: input.options.useImage,
+        useTts: input.options.useTts,
+        useBgm: input.options.useBgm,
+        figureEmotions: input.options.figureEmotions,
+        skipCache: input.options.skipCache,
+        rerunChapters: input.options.rerunChapters,
+      },
+    });
     await tauri.mkdirAll(this.cacheRoot);
     const cacheDir = cacheDirFor(this.cacheRoot, "");
 
@@ -182,7 +199,7 @@ export class Pipeline {
           id: "extract",
           kind: "llm",
           step: "提取",
-          message: (e as Error).message,
+          message: errMsg(e),
           at: Date.now(),
         });
         throw e;
@@ -198,6 +215,12 @@ export class Pipeline {
     } else {
       log({ step: "提取", message: "[缓存] 复用角色/场景/物品卡", level: "info", at: Date.now() });
     }
+    logger.info("pipeline", "提取阶段完成", {
+      fromCache: !!cards && (cards as { _novelFp?: string })._novelFp !== undefined,
+      characters: cards!.characters.length,
+      scenes: cards!.scenes.length,
+      items: cards!.items.length,
+    });
     this.checkAbort();
 
     // ② 分章剧本
@@ -242,7 +265,7 @@ export class Pipeline {
               id: `chapter_${chapter.index + 1}`,
               kind: "script",
               step: "剧本",
-              message: `第 ${chapter.index + 1} 章：${(e as Error).message}`,
+              message: `第 ${chapter.index + 1} 章：${errMsg(e)}`,
               at: Date.now(),
             });
             throw e;
@@ -273,7 +296,13 @@ export class Pipeline {
       }
       ensureUniqueSceneIds(script);
       chapters.push(script);
+      logger.debug("pipeline", `第 ${chapter.index + 1} 章剧本就绪`, {
+        title: chapter.title,
+        scenes: script.scenes.length,
+        lines: script.scenes.reduce((n, s) => n + s.lines.length, 0),
+      });
     }
+    logger.info("pipeline", "剧本阶段完成", { totalChapters: chapters.length });
 
     const assets: RenderAssets = { bg: {}, cg: {}, figure: {}, item: {}, vocal: {}, bgm: {} };
 
@@ -296,6 +325,13 @@ export class Pipeline {
       Object.assign(assets, images);
       this.checkBudget();
       this.checkAbort();
+      logger.info("pipeline", "图像阶段完成", {
+        bg: Object.keys(images.bg).length,
+        cg: Object.keys(images.cg).length,
+        figure: Object.keys(images.figure).length,
+        item: Object.keys(images.item).length,
+        failed: failed.length,
+      });
     } else {
       log({
         step: "图像",
@@ -313,6 +349,7 @@ export class Pipeline {
       this.cost.ttsCostYuan = (this.cost.ttsChars / 1e6) * DEFAULT_PRICES.ttsYuanPer1mChars;
       assets.vocal = vocal;
       this.checkBudget();
+      logger.info("pipeline", "配音阶段完成", { vocalCount: Object.keys(vocal).length });
     } else {
       log({ step: "配音", message: "配音已关闭或未配置 TTS API，跳过", level: "warn", at: Date.now() });
     }
@@ -340,6 +377,13 @@ export class Pipeline {
       log: (m) => this.log(m, "info", "组装"),
     });
     log({ step: "组装", message: "项目组装完成！", level: "success", at: Date.now() });
+
+    runStart("完成");
+    logger.info("pipeline", "管线运行结束", {
+      cost: this.cost,
+      failedTasks: this.failedTasks.length,
+      chapters: chapters.length,
+    });
 
     return { meta, cards: cards!, chapters, assets, cost: this.cost, failedTasks: this.failedTasks };
   }

@@ -2,6 +2,8 @@
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { projectState } from "../stores/project";
 import { tauri } from "../utils/tauri";
+import { errMsg } from "../utils/errors";
+import { log } from "../utils/logger";
 
 const url = ref("");
 const starting = ref(false);
@@ -26,8 +28,10 @@ async function startPreview(): Promise<void> {
     const res = await tauri.startPreviewServer(dir);
     url.value = res.url;
     reloadKey.value++;
+    log.info("page", "预览服务器启动", { dir, url: res.url });
   } catch (e) {
-    error.value = (e as Error).message;
+    log.error("page", "预览服务器启动失败", { dir, error: errMsg(e) });
+    error.value = errMsg(e);
   } finally {
     starting.value = false;
   }

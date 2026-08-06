@@ -1,7 +1,8 @@
-import { tauri } from "../utils/tauri";
+﻿import { tauri } from "../utils/tauri";
+import { cleanPath, safeFilename } from "../utils/path";
 
 export function cacheDirFor(cacheRoot: string, section: string): string {
-  return `${cacheRoot}/${section}`.replace(/\/+$/, "");
+  return cleanPath(`${cacheRoot}/${section}`);
 }
 
 export async function cacheHit(dir: string, fileName: string): Promise<string | null> {
@@ -15,9 +16,9 @@ export async function cacheHit(dir: string, fileName: string): Promise<string | 
 }
 
 export function jsonKey(kind: string, key: string): string {
-  return `${kind}_${key.replace(/[^\w\u4e00-\u9fa5-]/g, "_")}.json`;
+  return `${kind}_${safeFilename(key, 100)}.json`;
 }
 
 export function slugify(s: string): string {
-  return s.replace(/[\\/:*?"<>|\s]+/g, "_").slice(0, 60);
+  return safeFilename(s, 60);
 }

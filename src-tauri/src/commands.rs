@@ -11,6 +11,7 @@ use tauri::Manager;
 use crate::{preview, server};
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HttpRequestArgs {
     pub method: String,
     pub url: String,
@@ -215,7 +216,10 @@ pub fn resource_dir(app: tauri::AppHandle) -> Result<String, String> {
         .path()
         .resource_dir()
         .map_err(|e| format!("获取资源目录失败: {e}"))?;
-    Ok(dir.to_string_lossy().to_string())
+    // Windows 下 Tauri 可能返回 \\?\ 扩展长度路径前缀，去掉它避免前端拼接路径时解析失败
+    let s = dir.to_string_lossy();
+    let s = s.strip_prefix("\\\\?\\").unwrap_or(&s).to_string();
+    Ok(s.replace("\\", "/"))
 }
 
 #[tauri::command]

@@ -8,6 +8,7 @@
 import { zipSync } from "fflate";
 import type { FsEntry, HttpResult } from "./tauri";
 import * as vfs from "./vfsWeb";
+import { log, truncate } from "./logger";
 
 export function isWeb(): boolean {
   return typeof window !== "undefined" && typeof indexedDB !== "undefined";
@@ -64,7 +65,8 @@ export async function webHttp(args: {
     if (!resp.ok) throw new Error(`代理不可用 ${resp.status}`);
     const json = (await resp.json()) as { status: number; contentType: string; bodyBase64: string };
     return { status: json.status, contentType: json.contentType, bodyBase64: json.bodyBase64 };
-  } catch {
+  } catch (e) {
+    log.warn("webRuntime", "同源代理失败，尝试直连", { url: args.url, error: (e as Error).message });
     return directFetch(args);
   }
 }
@@ -126,7 +128,9 @@ async function ensureTemplateLocal(path: string): Promise<void> {
 async function ensureTemplateTree(): Promise<void> {
   const index = `${TEMPLATE_ROOT}/index.html`;
   if (await vfs.vfsExists(index)) return;
+  log.info("webRuntime", "开始同步模板树到 IndexedDB", { root: TEMPLATE_ROOT });
   await ensureTemplateLocal(TEMPLATE_ROOT);
+  log.info("webRuntime", "模板树同步完成");
 }
 
 /* ============ 文件操作 ============ */
@@ -208,6 +212,7 @@ export async function webWriteConfig(content: string): Promise<void> {
 /* ============ 预览（zip 上传 → dev server 解压静态服务） ============ */
 
 export async function webStartPreviewServer(root: string): Promise<{ url: string; port: number }> {
+  log.info("webRuntime", "web 预览启动", { root });
   await ensureTemplateTree();
   const files = await vfs.vfsCollectFiles(root, [`${root}/.novel2vn`]);
   if (!files.length) throw new Error(`预览失败：目录为空（${root}）`);
@@ -222,6 +227,7 @@ export async function webStartPreviewServer(root: string): Promise<{ url: string
   });
   if (!resp.ok) throw new Error(`预览上传失败 ${resp.status}`);
   const json = (await resp.json()) as { url: string };
+  log.info("webRuntime", "web 预览就绪", { url: json.url, files: files.length });
   return { url: json.url, port: 0 };
 }
 

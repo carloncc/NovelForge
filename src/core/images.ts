@@ -1,4 +1,4 @@
-import type {
+﻿import type {
   ChapterScript,
   CharacterCard,
   ExtractionResult,
@@ -12,8 +12,10 @@ import type {
 import type { ApiConfig } from "./types";
 import { generateImage } from "../api/openaiCompatible";
 import { tauri } from "../utils/tauri";
+import { errMsg } from "../utils/errors";
 import { cacheDirFor, cacheHit } from "./cache";
 import { sanitizeId } from "./render";
+import { log as logger } from "../utils/logger";
 
 export interface ImageResultMap {
   bg: Record<string, string>;
@@ -147,7 +149,7 @@ async function ensureCutout(
   } catch (e) {
     log({
       step: "图像",
-      message: `抠图失败，保留原图：${task.usage}（${(e as Error).message.slice(0, 100)}）`,
+      message: `抠图失败，保留原图：${task.usage}（${errMsg(e).slice(0, 100)}）`,
       level: "warn",
       at: Date.now(),
     });
@@ -176,6 +178,16 @@ export async function generateImages(
 
   const cacheDir = cacheDirFor(cacheRoot, "images");
   await tauri.mkdirAll(cacheDir);
+  logger.info("images", "开始生成图像素材", {
+    totalTasks: tasks.length,
+    bg: tasks.filter((t) => t.kind === "background").length,
+    cg: tasks.filter((t) => t.kind === "cg").length,
+    figure: tasks.filter((t) => t.kind === "figure").length,
+    item: tasks.filter((t) => t.kind === "item").length,
+    cfg: !!cfg,
+    figureEmotions,
+    concurrency,
+  });
 
   // 两阶段执行：先完成 normal 立绘与其他任务，再执行表情差分任务（以 normal 为参考图保持一致）
   const firstPass = tasks.filter((t) => t.kind !== "figure" || !t.emotion || t.emotion === "normal");
@@ -193,7 +205,7 @@ export async function generateImages(
           id: task.id,
           kind: "image",
           step: "图像",
-          message: `${task.usage}：${(e as Error).message.slice(0, 140)}`,
+          message: `${task.usage}：${errMsg(e).slice(0, 140)}`,
           at: Date.now(),
         });
         log({
@@ -227,6 +239,7 @@ export async function generateImages(
     if (cached) {
       path = cached;
       source = "缓存";
+      logger.debug("images", "图像命中缓存", { id: task.id, fileName: task.fileName });
     } else {
       const mat = findMaterial(materials, task);
       if (mat) {
@@ -257,7 +270,7 @@ export async function generateImages(
           if (task.referenceImage) {
             log({
               step: "图像",
-              message: `参考图失败，降级文生图：${task.usage}（${(e as Error).message.slice(0, 120)}）`,
+              message: `参考图失败，降级文生图：${task.usage}（${errMsg(e).slice(0, 120)}）`,
               level: "warn",
               at: Date.now(),
             });
@@ -283,6 +296,7 @@ export async function generateImages(
       const prefix = source === "缓存" ? "[缓存] " : source.startsWith("用户素材") ? `[用户素材] ` : "";
       log({ step: "图像", message: `${prefix}${task.usage}${source.startsWith("用户素材") ? ` <- ${source.replace("用户素材 ", "")}` : ""}`, level: "success", at: Date.now() });
       record(task, path);
+      logger.debug("images", "图像任务完成", { id: task.id, kind: task.kind, usage: task.usage, source, path });
     }
   };
 
@@ -315,6 +329,14 @@ export async function generateImages(
       if (cg) scene.cgFile = cg;
     }
   }
+
+  logger.info("images", "图像素材生成完成", {
+    bg: Object.keys(result.bg).length,
+    cg: Object.keys(result.cg).length,
+    figure: Object.keys(result.figure).length,
+    item: Object.keys(result.item).length,
+    failed: failed.length,
+  });
 
   return { images: result, failed };
 }

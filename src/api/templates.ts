@@ -52,8 +52,8 @@ export const PRESET_TEMPLATES: AdapterTemplate[] = [
       n: "$count",
       response_format: { value: "base64" },
     },
-    response: { path: "data.image_urls", encoding: "none", mime: "image/png" },
-    description: "MiniMax 专有：POST /v1/image_generation，响应 data.image_urls（url 或 base64）",
+    response: { path: "data.image_base64", encoding: "none", mime: "image/png" },
+    description: "MiniMax 专有：POST /v1/image_generation，响应 data.image_base64（请求已强制 response_format=base64）",
   },
   {
     id: "minimax-tts",

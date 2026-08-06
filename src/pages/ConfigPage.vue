@@ -11,6 +11,8 @@ import {
 } from "../stores/config";
 import { testLlm, testTts, testImage } from "../api/openaiCompatible";
 import { templatesForCapability } from "../api/templates";
+import { errMsg } from "../utils/errors";
+import { log } from "../utils/logger";
 import type { ApiConfig, ChannelKey } from "../core/types";
 
 const channels: { key: ChannelKey; label: string; desc: string; icon: string }[] = [
@@ -47,6 +49,7 @@ function showTemplateError(): void {
 async function runTest(kind: ChannelKey, cfg: ApiConfig): Promise<void> {
   testing.value = { key: kind, id: cfg.id };
   testResult.value = null;
+  log.info("page", `测试连接 ${kind}`, { model: cfg.model, baseUrl: cfg.baseUrl });
   try {
     if (kind === "llm") {
       const reply = await testLlm(cfg);
@@ -58,8 +61,10 @@ async function runTest(kind: ChannelKey, cfg: ApiConfig): Promise<void> {
       await testImage(cfg);
       testResult.value = { key: kind, id: cfg.id, ok: true, msg: "正常（已消耗 1 张额度）" };
     }
+    log.info("page", `测试连接 ${kind} 成功`);
   } catch (e) {
-    testResult.value = { key: kind, id: cfg.id, ok: false, msg: (e as Error).message };
+    log.error("page", `测试连接 ${kind} 失败`, { error: errMsg(e) });
+    testResult.value = { key: kind, id: cfg.id, ok: false, msg: errMsg(e) };
   } finally {
     testing.value = null;
   }

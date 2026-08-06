@@ -1,4 +1,4 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import { computed, nextTick, ref, watch } from "vue";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { projectState, pushLog, clearLogs, scheduleSave, restoreProject } from "../stores/project";
@@ -7,6 +7,8 @@ import { Pipeline } from "../core/pipeline";
 import { resolveTemplateDir } from "../utils/template";
 import { tauri, isTauri } from "../utils/tauri";
 import { sanitizeId } from "../core/render";
+import { errMsg } from "../utils/errors";
+import { log as logger, dumpLogHistory } from "../utils/logger";
 import EditCards from "../components/EditCards.vue";
 import StepIndicator from "../components/StepIndicator.vue";
 import type { FailedTask, PipelineEvent, VideoSuggestion } from "../core/types";
@@ -147,13 +149,18 @@ async function saveLogs(): Promise<void> {
     `项目：${out}`,
     `失败项：${failedTasks.value.length} 个`,
     "",
+    "== 界面日志 ==",
     ...projectState.logs.map((l) => `[${new Date(l.at).toLocaleTimeString()}] [${l.step}] ${l.message}`),
+    "",
+    "== 详细诊断日志 ==",
+    dumpLogHistory(),
   ].join("\n");
   try {
     await tauri.writeTextFile(path, text);
+    logger.info("page", "日志已保存", { path });
     copiedMsg.value = `日志已保存：${path}`;
   } catch (e) {
-    copiedMsg.value = `保存失败：${(e as Error).message}`;
+    copiedMsg.value = `保存失败：${errMsg(e)}`;
   }
   setTimeout(() => (copiedMsg.value = ""), 3000);
 }
@@ -204,6 +211,12 @@ async function start(): Promise<void> {
     error.value = "请先在「导入小说」页导入小说（或加载示例小说）";
     return;
   }
+  logger.info("page", "用户点击开始生成", {
+    hasNovel: true,
+    chapterCount: novel.chapters.length,
+    outputDir: projectState.outputDir,
+    options: { ...projectState.options, rerunChapters: rerunChapters.value ?? undefined },
+  });
   const llm = activeConfig("llm");
   const image = activeConfig("image");
   const tts = activeConfig("tts");
@@ -250,8 +263,10 @@ async function start(): Promise<void> {
     await checkVideos();
     log({ step: "完成", message: `全部完成！项目输出到 ${result.meta.outputDir}，可前往「预览」页试玩`, level: "success", at: Date.now() });
   } catch (e) {
-    const msg = (e as Error).message;
+    const msg = errMsg(e);
+    logger.error("page", "生成失败", { message: msg });
     if (msg === "已中止") {
+      logger.warn("page", "生成被用户中止");
       log({ step: "中止", message: "已停止生成，进度已保存（缓存命中部分不会重复计费）", level: "warn", at: Date.now() });
     } else {
       error.value = msg;

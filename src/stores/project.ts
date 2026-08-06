@@ -9,6 +9,7 @@ import type {
 } from "../core/types";
 import { saveProjectState, restoreProjectState } from "../utils/persist";
 import { tauri } from "../utils/tauri";
+import { log } from "../utils/logger";
 
 export interface ProjectState {
   novel: NovelDoc | null;
@@ -50,6 +51,11 @@ export function scheduleSave(): void {
   saveTimer = window.setTimeout(() => {
     saveTimer = undefined;
     const lastResult = projectState.lastResult;
+    log.debug("store", "持久化项目状态", {
+      hasNovel: !!projectState.novel,
+      materials: projectState.materials.length,
+      outputDir: projectState.outputDir,
+    });
     void saveProjectState({
       novel: projectState.novel,
       materials: projectState.materials,
@@ -63,12 +69,18 @@ export function scheduleSave(): void {
 }
 
 export async function restoreProject(outputDir: string): Promise<void> {
+  log.info("store", "恢复项目状态", { outputDir });
   const r = await restoreProjectState(outputDir);
   if (r.novel) projectState.novel = r.novel;
   if (r.materials?.length) projectState.materials = r.materials;
   if (r.options) projectState.options = { ...projectState.options, ...r.options };
   if (r.lastResult) {
     const chapters = await loadCachedChapters(outputDir);
+    log.debug("store", "恢复项目完成", {
+      hasNovel: !!r.novel,
+      materials: r.materials?.length ?? 0,
+      cachedChapters: chapters.length,
+    });
     projectState.lastResult = {
       meta: r.lastResult.meta,
       cards: r.lastResult.cards,

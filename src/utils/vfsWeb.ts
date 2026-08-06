@@ -1,3 +1,6 @@
+﻿import { dirname } from "./path";
+import { log, truncate } from "./logger";
+
 /**
  * 浏览器 IndexedDB 虚拟文件系统。
  * Web 版所有文件操作落盘到 IndexedDB（键 = 路径），路径以 / 开头，根目录为 /app。
@@ -79,30 +82,27 @@ async function txKeys(): Promise<string[]> {
   });
 }
 
-function normalize(p: string): string {
+function normalizePath(p: string): string {
   const parts = p.split(/[\\/]/).filter(Boolean);
   return "/" + parts.join("/");
 }
 
-function parentPath(p: string): string {
-  const parts = p.split("/").filter(Boolean);
-  parts.pop();
-  return "/" + parts.join("/");
-}
+
 
 /** 确保目录链存在 */
 async function ensureDir(path: string): Promise<void> {
-  const normalized = normalize(path);
+  const normalized = normalizePath(path);
   if (normalized === "/") return;
   const cur = await txGet(normalized);
   if (cur?.kind === "dir") return;
   await txPut(normalized, { kind: "dir" });
-  await ensureDir(parentPath(normalized));
+  await ensureDir(dirname(normalized));
 }
 
 export async function vfsWriteFile(path: string, data: ArrayBuffer): Promise<void> {
-  const normalized = normalize(path);
-  await ensureDir(parentPath(normalized));
+  const normalized = normalizePath(path);
+  log.debug("vfs", "写入文件", { path: normalized, size: data.byteLength });
+  await ensureDir(dirname(normalized));
   await txPut(normalized, { kind: "file", data });
 }
 
@@ -111,8 +111,11 @@ export async function vfsWriteTextFile(path: string, content: string): Promise<v
 }
 
 export async function vfsReadFile(path: string): Promise<ArrayBuffer | undefined> {
-  const node = await txGet(normalize(path));
-  if (!node || node.kind !== "file") return undefined;
+  const node = await txGet(normalizePath(path));
+  if (!node || node.kind !== "file") {
+    log.debug("vfs", "读取文件未命中", { path });
+    return undefined;
+  }
   return node.data;
 }
 
@@ -142,7 +145,7 @@ export async function vfsWriteFileBase64(path: string, dataB64: string): Promise
 }
 
 export async function vfsListDir(path: string): Promise<VfsEntry[]> {
-  const prefix = normalize(path);
+  const prefix = normalizePath(path);
   const keys = await txKeys();
   const entries = new Map<string, VfsEntry>();
   for (const key of keys) {
@@ -172,16 +175,16 @@ export async function vfsListDir(path: string): Promise<VfsEntry[]> {
 }
 
 export async function vfsMkdirAll(path: string): Promise<void> {
-  await ensureDir(normalize(path));
+  await ensureDir(normalizePath(path));
 }
 
 export async function vfsExists(path: string): Promise<boolean> {
-  const node = await txGet(normalize(path));
+  const node = await txGet(normalizePath(path));
   return node !== undefined;
 }
 
 export async function vfsRemove(path: string): Promise<void> {
-  const normalized = normalize(path);
+  const normalized = normalizePath(path);
   const keys = await txKeys();
   for (const key of keys) {
     if (key === normalized || key.startsWith(normalized + "/")) {
@@ -197,7 +200,7 @@ export async function vfsCopyFile(src: string, dst: string): Promise<void> {
 }
 
 export async function vfsCopyDirAll(src: string, dst: string): Promise<void> {
-  const prefix = normalize(src);
+  const prefix = normalizePath(src);
   const keys = await txKeys();
   await vfsMkdirAll(dst);
   for (const key of keys) {
@@ -205,7 +208,7 @@ export async function vfsCopyDirAll(src: string, dst: string): Promise<void> {
       const rel = key.slice(prefix.length);
       const node = await txGet(key);
       if (node?.kind === "file") {
-        await vfsWriteFile(normalize(dst + rel), node.data);
+        await vfsWriteFile(normalizePath(dst + rel), node.data);
       }
     }
   }
@@ -216,12 +219,12 @@ export async function vfsCollectFiles(
   root: string,
   excludePrefixes: string[] = [],
 ): Promise<{ path: string; data: ArrayBuffer }[]> {
-  const prefix = normalize(root);
+  const prefix = normalizePath(root);
   const keys = await txKeys();
   const out: { path: string; data: ArrayBuffer }[] = [];
   for (const key of keys) {
     if (!key.startsWith(prefix + "/")) continue;
-    if (excludePrefixes.some((ep) => key.startsWith(normalize(ep)))) continue;
+    if (excludePrefixes.some((ep) => key.startsWith(normalizePath(ep)))) continue;
     const node = await txGet(key);
     if (node?.kind === "file") {
       out.push({ path: key.slice(prefix.length + 1), data: node.data });
@@ -244,3 +247,4 @@ export async function vfsDownloadFile(path: string, downloadName: string): Promi
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
+

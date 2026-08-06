@@ -42,7 +42,7 @@ export async function extractFromNovel(
 ): Promise<ExtractionResult> {
   const lib = voiceLibraryFor(cfg);
   const user = `小说标题：${title}\n\n可用音色列表：${lib.join(", ")}\n\n以下是小说全文（可能截断）：\n${truncate(novelText, 70000)}`;
-  const result = await chatJson<ExtractionResult>(cfg, SYSTEM_PROMPT, user, { maxTokens: 6000, onUsage });
+  const result = await chatJson<ExtractionResult>(cfg, SYSTEM_PROMPT, user, { maxTokens: 8000, onUsage });
   if (!Array.isArray(result.characters)) throw new Error("提取结果缺少 characters 字段");
   result.scenes = result.scenes ?? [];
   result.items = result.items ?? [];

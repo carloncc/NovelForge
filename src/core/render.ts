@@ -1,4 +1,4 @@
-import type { ChapterScript, CharacterCard, ItemCard, SceneJSON } from "./types";
+﻿import type { ChapterScript, CharacterCard, ItemCard, SceneJSON } from "./types";
 
 export interface RenderAssets {
   bg: Record<string, string>;
@@ -45,7 +45,7 @@ function sanitizeLabel(text: string): string {
   return (text || "章节").replace(/[\\/:*?"<>|\r\n;]/g, "_").slice(0, 30);
 }
 
-function fileName(f: string): string {
+function getBaseName(f: string): string {
   return f.split(/[\\/]/).pop() || f;
 }
 
@@ -60,7 +60,7 @@ function renderItemEvent(scene: SceneJSON, idx: number, opts: RenderOptions): st
   const out: string[] = [];
   out.push(`; ---- 物品演出：${name} ----`);
   if (file) {
-    out.push(`changeFigure:${fileName(file)} -id=item_${safeItemId} -next;`);
+    out.push(`changeFigure:${getBaseName(file)} -id=item_${safeItemId} -next;`);
   }
   out.push(`intro:「${esc(item?.name || ev.itemId)}」|${desc} -hold;`);
   if (file) {
@@ -92,12 +92,12 @@ export function renderChapter(
     // BGM：匹配到的音乐文件则播放（无则跳过，不影响流程）
     const bgmFile = opts.assets.bgm?.[scene.id];
     if (bgmFile) {
-      out.push(`bgm:${fileName(bgmFile)};`);
+      out.push(`bgm:${getBaseName(bgmFile)};`);
     }
 
     const bgFile = opts.assets.bg[scene.id];
     if (bgFile) {
-      out.push(`changeBg:${fileName(bgFile)} -next;`);
+      out.push(`changeBg:${getBaseName(bgFile)} -next;`);
     }
 
     // 视频推荐位：有用户放置的视频文件则播放，否则注释占位（不执行）
@@ -105,7 +105,7 @@ export function renderChapter(
       const vfile = opts.videos?.[sanitizeId(vp.id)];
       if (vfile) {
         out.push(`; ---- 视频演出：${comment(vp.title)} ----`);
-        out.push(`playVideo:${fileName(vfile)};`);
+        out.push(`playVideo:${getBaseName(vfile)};`);
       } else {
         out.push(`; [视频位] ${comment(vp.title)}：${comment(vp.description)}（提示词见 video_plan.txt，把生成的 mp4 命名为 video_${sanitizeId(vp.id)}.mp4 放入 video 文件夹后刷新即启用）`);
       }
@@ -114,10 +114,10 @@ export function renderChapter(
     const cgFile = opts.assets.cg[scene.id];
     const cg = scene.cgEvent;
     if (cg && cgFile) {
-      out.push(`changeBg:${fileName(cgFile)} -next;`);
-      out.push(`unlockCg:${fileName(cgFile)} -name=${esc(cg.title || cg.description || "CG")};`);
+      out.push(`changeBg:${getBaseName(cgFile)} -next;`);
+      out.push(`unlockCg:${getBaseName(cgFile)} -name=${esc(cg.title || cg.description || "CG")};`);
       out.push(`:${esc(cg.description || cg.title)};`);
-      out.push(`changeBg:${bgFile ? fileName(bgFile) : "none"} -next;`);
+      out.push(`changeBg:${bgFile ? getBaseName(bgFile) : "none"} -next;`);
     }
 
     const eventIdxByTrigger = new Map<number, number>();
@@ -142,7 +142,7 @@ export function renderChapter(
         const prev = scene.lines[i - 1];
         const isNewSpeaker = !(prev?.type === "dialogue" && prev.characterId === line.characterId);
         if (displayFile && (isNewSpeaker || displayFile !== figureFile)) {
-          out.push(`changeFigure:${fileName(displayFile)} -left -next;`);
+          out.push(`changeFigure:${getBaseName(displayFile)} -left -next;`);
         }
         // 首次登场资料演出：立绘 + 文本框资料卡（旁白形式，立绘保持可见）
         if (opts.introCard !== false && char && !opts.seenCharacters?.has(line.characterId)) {
@@ -155,7 +155,7 @@ export function renderChapter(
         const name = esc(char?.name || line.characterId || "???");
         const vocalKey = `ch${chapter.chapter}_${sanitizeId(scene.id)}_${i}`;
         const vocalFile = opts.assets.vocal[vocalKey];
-        const vocalArg = vocalFile ? ` -${fileName(vocalFile)}` : "";
+        const vocalArg = vocalFile ? ` -${getBaseName(vocalFile)}` : "";
         out.push(`${name}:${esc(line.text)}${vocalArg};`);
       } else if (line.monologue) {
         out.push(`intro:${esc(line.text)} -hold;`);
@@ -210,3 +210,4 @@ export function renderConfig(title: string, gameKey: string, language: WebgalLan
     `Default_Language:${language};`,
   ].join("\n");
 }
+
