@@ -211,6 +211,8 @@ export interface GenerationOptions {
   videoPointsPerChapter: number;
   characterIntroCard: boolean;
   budgetYuan: number;
+  /** 统一画风描述（英文/中文均可），用于让所有立绘/背景/CG 保持同一画风；留空使用默认画风 */
+  imageStyle?: string;
   rerunChapters?: number[];
 }
 

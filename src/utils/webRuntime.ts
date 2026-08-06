@@ -278,8 +278,8 @@ export async function webHasTransparency(dataB64: string): Promise<boolean> {
   }
 }
 
-/** 色度键抠图（对齐 Rust 实现）：四角采样背景色 → flood-fill 连通约束 → 边缘羽化。
- *  背景像素置透明，主体边界像素半透明渐变（抗锯齿），主体内部同色区域不受影响。 */
+/** 色度键抠图（对齐 Rust 实现）：边缘采样背景色 → 从四边 flood-fill 连通约束 → 边缘羽化。
+ *  只移除与边缘相连的背景区域，主体内部与背景相近的孤立像素（如脸部高光）不会被误删。 */
 export async function webCutoutImage(dataB64: string, threshold = 40): Promise<string> {
   try {
     const img = await loadImage(dataB64);
@@ -295,57 +295,67 @@ export async function webCutoutImage(dataB64: string, threshold = 40): Promise<s
     const px = imageData.data;
     const visited = new Uint8Array(w * h);
 
-    // 背景参考色：取四角区域平均（忽略透明像素）
-    const corners = [
-      [0, 0],
-      [w - 1, 0],
-      [0, h - 1],
-      [w - 1, h - 1],
-    ];
-    let rSum = 0;
-    let gSum = 0;
-    let bSum = 0;
-    let n = 0;
-    for (const [x, y] of corners) {
-      for (let dx = 0; dx < 4; dx++) {
-        for (let dy = 0; dy < 4; dy++) {
-          const i = ((y + dy) * w + (x + dx)) * 4;
-          if (px[i + 3] > 240) {
-            rSum += px[i];
-            gSum += px[i + 1];
-            bSum += px[i + 2];
-            n++;
-          }
-        }
+    // 背景参考色：边缘一圈采样，取各通道中位数（抗前景人物干扰）
+    const ring = 6;
+    const rs: number[] = [];
+    const gs: number[] = [];
+    const bs: number[] = [];
+    const pushPx = (x: number, y: number) => {
+      const i = (y * w + x) * 4;
+      if (px[i + 3] > 240) {
+        rs.push(px[i]);
+        gs.push(px[i + 1]);
+        bs.push(px[i + 2]);
+      }
+    };
+    for (let x = 0; x < w; x++) {
+      for (let y = 0; y < ring; y++) {
+        pushPx(x, y);
+        pushPx(x, h - 1 - y);
       }
     }
-    if (n === 0) return dataB64;
-    const bgR = rSum / n;
-    const bgG = gSum / n;
-    const bgB = bSum / n;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < ring; x++) {
+        pushPx(x, y);
+        pushPx(w - 1 - x, y);
+      }
+    }
+    if (rs.length < 8) return dataB64;
+    const median = (v: number[]) => v.slice().sort((a, b) => a - b)[(v.length / 2) | 0];
+    const bgR = median(rs);
+    const bgG = median(gs);
+    const bgB = median(bs);
 
-    const thr = threshold * 3; // 完全透明容差（曼哈顿距离）
-    const thrEdge = threshold * 4.5; // 羽化区间上界
+    const thr = threshold; // 完全透明容差（欧氏距离）
+    const thrEdge = thr + 40; // 羽化区间上界 / 扩散停止边界
 
-    // 四角种子 flood-fill
+    const dist = (i: number) => {
+      const dr = px[i] - bgR;
+      const dg = px[i + 1] - bgG;
+      const db = px[i + 2] - bgB;
+      return Math.sqrt(dr * dr + dg * dg + db * db);
+    };
+
+    // 从四条边播种 flood-fill
     const stack: number[] = [];
-    for (const [x, y] of corners) {
-      const i = (y * w + x) * 4;
-      const dist = Math.abs(px[i] - bgR) + Math.abs(px[i + 1] - bgG) + Math.abs(px[i + 2] - bgB);
-      if (dist <= thrEdge) stack.push(y * w + x);
+    for (let x = 0; x < w; x++) {
+      stack.push(x, (h - 1) * w + x);
+    }
+    for (let y = 1; y < h - 1; y++) {
+      stack.push(y * w, y * w + (w - 1));
     }
     while (stack.length) {
       const idx = stack.pop() as number;
       if (visited[idx]) continue;
       visited[idx] = 1;
       const i = idx * 4;
-      const dist = Math.abs(px[i] - bgR) + Math.abs(px[i + 1] - bgG) + Math.abs(px[i + 2] - bgB);
-      if (dist > thrEdge) continue;
-      if (dist <= thr) {
+      const d = dist(i);
+      if (d > thrEdge) continue; // 前景边界：不扩散
+      if (d <= thr) {
         px[i + 3] = 0;
       } else {
         // 羽化：边缘半透明渐变（抗锯齿）
-        const t = 1 - (dist - thr) / (thrEdge - thr);
+        const t = 1 - (d - thr) / (thrEdge - thr);
         px[i + 3] = Math.round(px[i + 3] * (0.15 + 0.85 * t));
       }
       const x = idx % w;

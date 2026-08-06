@@ -349,6 +349,14 @@ function onCardsSaved(cards: unknown): void {
             <input type="checkbox" v-model="projectState.options.characterIntroCard" /> 角色登场资料卡
           </label>
         </div>
+        <label class="field" style="margin-top: 12px">
+          <span>统一画风（留空用默认画风，所有立绘/背景/CG 保持一致）</span>
+          <input
+            type="text"
+            v-model="projectState.options.imageStyle"
+            placeholder="例：unified Japanese anime style, cel shading, clean line art"
+          />
+        </label>
       </div>
 
       <div class="card" style="margin-bottom: 0">

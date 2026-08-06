@@ -38,6 +38,7 @@ export const projectState = reactive<ProjectState>({
     videoPointsPerChapter: 2,
     characterIntroCard: true,
     budgetYuan: 0,
+    imageStyle: "",
   },
   lastResult: null,
   logs: [],

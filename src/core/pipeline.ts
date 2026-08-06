@@ -318,6 +318,7 @@ export class Pipeline {
         input.log,
         2,
         this.options.figureEmotions,
+        this.options.imageStyle,
       );
       this.failedTasks.push(...failed);
       this.cost.imageCount = Object.values(images.bg).length + Object.values(images.cg).length + Object.values(images.figure).length + Object.values(images.item).length;

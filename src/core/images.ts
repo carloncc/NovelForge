@@ -43,16 +43,28 @@ const FIGURE_BG_SUFFIX =
   ", plain solid light gray background, no shadow, no gradient, no pattern, no other objects, no text, full body visible";
 const ITEM_BG_SUFFIX = ", plain solid light gray background, no shadow, no reflection, no text";
 
+// 统一画风：保证同一项目内所有立绘/背景/CG 视觉风格一致（同一个“维度”）
+const DEFAULT_STYLE =
+  "unified Japanese anime style, cel shading, clean line art, consistent character design and proportions, cohesive color palette, high quality illustration";
+const STYLE_HINT = "consistent art direction, same visual style";
+
+function styleSuffix(style?: string): string {
+  const s = (style ?? "").trim();
+  if (!s) return `, ${DEFAULT_STYLE}`;
+  return `, ${s.replace(/[,，。.]+$/, "")}, ${STYLE_HINT}`;
+}
+
 export function buildImageTasks(
   chapters: ChapterScript[],
   cards: ExtractionResult,
-  opts: { figurePerCharacter?: number; cgPerChapter?: number; maxPerChapter?: number; figureEmotions?: boolean },
+  opts: { figurePerCharacter?: number; cgPerChapter?: number; maxPerChapter?: number; figureEmotions?: boolean; style?: string },
 ): ImageTask[] {
   const tasks: ImageTask[] = [];
   const figurePerCharacter = opts.figurePerCharacter ?? 1;
   const cgPerChapter = opts.cgPerChapter ?? 3;
   const maxPerChapter = opts.maxPerChapter ?? 12;
   const useEmotions = opts.figureEmotions !== false;
+  const style = styleSuffix(opts.style);
 
   for (const char of cards.characters) {
     const emotions = useEmotions ? FIGURE_EMOTIONS : ["normal"];
@@ -62,7 +74,7 @@ export function buildImageTasks(
         kind: "figure",
         id: isNormal ? char.id : `${char.id}_${emo}`,
         emotion: emo,
-        prompt: char.imagePrompt + (EMOTION_PROMPT_SUFFIX[emo] ?? "") + FIGURE_BG_SUFFIX,
+        prompt: char.imagePrompt + (EMOTION_PROMPT_SUFFIX[emo] ?? "") + style + FIGURE_BG_SUFFIX,
         referenceImage: isNormal ? char.referenceImage : undefined,
         refFromTask: isNormal ? undefined : char.id,
         fileName: `figure_${sanitizeId(char.id)}_${emo}.png`,
@@ -77,7 +89,7 @@ export function buildImageTasks(
     tasks.push({
       kind: "item",
       id: item.id,
-      prompt: item.imagePrompt + ITEM_BG_SUFFIX,
+      prompt: item.imagePrompt + style + ITEM_BG_SUFFIX,
       fileName: `item_${sanitizeId(item.id)}.png`,
       width: 1024,
       height: 1024,
@@ -92,7 +104,7 @@ export function buildImageTasks(
       tasks.push({
         kind: "background",
         id: scene.id,
-        prompt: scene.bgPrompt || `${scene.location} ${scene.atmosphere}, anime background, no people`,
+        prompt: (scene.bgPrompt || `${scene.location} ${scene.atmosphere}, anime background, no people`) + style,
         fileName: `bg_${sanitizeId(scene.id)}.png`,
         width: 1024,
         height: 576,
@@ -107,7 +119,7 @@ export function buildImageTasks(
         tasks.push({
           kind: "cg",
           id: `${chapter.chapter}_${scene.id}`,
-          prompt: scene.cgEvent.imagePrompt,
+          prompt: scene.cgEvent.imagePrompt + style,
           fileName: `cg_${chapter.chapter}_${sanitizeId(scene.id)}.png`,
           width: 1024,
           height: 576,
@@ -166,6 +178,7 @@ export async function generateImages(
   log: (ev: PipelineEvent) => void,
   concurrency = 2,
   figureEmotions = true,
+  style?: string,
 ): Promise<{ images: ImageResultMap; failed: FailedTask[] }> {
   const result: ImageResultMap = { bg: {}, cg: {}, figure: {}, item: {} };
   const failed: FailedTask[] = [];
@@ -174,6 +187,7 @@ export async function generateImages(
     cgPerChapter: 3,
     maxPerChapter: 12,
     figureEmotions,
+    style,
   });
 
   const cacheDir = cacheDirFor(cacheRoot, "images");
@@ -186,6 +200,7 @@ export async function generateImages(
     item: tasks.filter((t) => t.kind === "item").length,
     cfg: !!cfg,
     figureEmotions,
+    style: style ? style.slice(0, 80) : "(默认)",
     concurrency,
   });
 
