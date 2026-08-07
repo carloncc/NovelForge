@@ -1,5 +1,5 @@
 ﻿import type { ChapterScript, ExtractionResult, ProjectMeta } from "./types";
-import type { RenderAssets } from "./render";
+import type { RenderAssets, WebgalLanguage } from "./render";
 import { renderChapter, renderConfig, renderStart, sanitizeId } from "./render";
 import { tauri } from "../utils/tauri";
 import { basename, joinPath, normalizePath } from "../utils/path";
@@ -15,7 +15,11 @@ export interface AssembleInput {
   assets: RenderAssets;
   introCard?: boolean;
   figureEmotions?: boolean;
+  /** 人物动作（入场/情绪动作/镜头震动），默认开启 */
+  figureActions?: boolean;
   useBgm?: boolean;
+  /** 界面语言（默认 zh_CN）；正文语言由翻译阶段决定 */
+  language?: WebgalLanguage;
   log: (msg: string) => void;
 }
 
@@ -104,6 +108,7 @@ export async function assembleProject(input: AssembleInput): Promise<{ gameDir: 
       seenCharacters,
       introCard: input.introCard,
       figureEmotions: input.figureEmotions,
+      figureActions: input.figureActions,
     }, chapterCount);
     await tauri.writeTextFile(
       joinPath(normalizedOutputDir, `game/scene/ch${chapter.chapter + 1}.txt`),
@@ -113,7 +118,7 @@ export async function assembleProject(input: AssembleInput): Promise<{ gameDir: 
 
   await tauri.writeTextFile(
     joinPath(normalizedOutputDir, "game/config.txt"),
-    renderConfig(title, gameKey),
+    renderConfig(title, gameKey, input.language ?? "zh_CN"),
   );
 
   input.log("复制素材…");

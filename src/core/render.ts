@@ -19,6 +19,8 @@ export interface RenderOptions {
   seenCharacters?: Set<string>;
   introCard?: boolean;
   figureEmotions?: boolean;
+  /** 人物动作：入场/退场动画、情绪动作、剧情镜头震动；默认开启 */
+  figureActions?: boolean;
 }
 
 export function sanitizeId(id: string): string {
@@ -47,6 +49,31 @@ function sanitizeLabel(text: string): string {
 
 function getBaseName(f: string): string {
   return f.split(/[\\/]/).pop() || f;
+}
+
+/* ===== 人物动作：入场动画 + 情绪动作 + 剧情镜头震动 ===== */
+
+const ENTRANCES = ["enter-from-left", "enter-from-right", "enter-from-bottom"];
+
+/** 情绪 → 角色临时动作（作用于 fig-left，即当前说话角色所在插槽） */
+function motionFor(emotion?: string): string | null {
+  switch (emotion) {
+    case "angry":
+      return '[{"duration":0},{"position":{"x":-10,"y":0},"duration":70},{"position":{"x":10,"y":0},"duration":140},{"position":{"x":-10,"y":0},"duration":140},{"position":{"x":0,"y":0},"duration":70}]';
+    case "surprised":
+      return '[{"duration":0},{"scale":{"x":1.08,"y":1.08},"duration":180},{"scale":{"x":1,"y":1},"duration":180}]';
+    case "happy":
+      return '[{"duration":0},{"position":{"x":0,"y":-14},"duration":170},{"position":{"x":0,"y":0},"duration":170}]';
+    case "sad":
+      return '[{"duration":0},{"position":{"x":0,"y":6},"duration":320},{"position":{"x":0,"y":0},"duration":320}]';
+    default:
+      return null;
+  }
+}
+
+/** 旁白/剧情中有明显动作或冲击感 → 触发舞台镜头震动 */
+function isDramatic(text: string): boolean {
+  return /(轰鸣|爆炸|崩塌|巨响|震耳|怒吼|嘶吼|冲撞|猛然|狠狠|轰然|剧烈|颤抖|踉跄|飞扑|倒下|拔出|挥剑|斩|劈开)/.test(text);
 }
 
 function renderItemEvent(scene: SceneJSON, idx: number, opts: RenderOptions): string[] {
@@ -81,9 +108,16 @@ export function renderChapter(
   // 章节标签：供 WebGAL 流程图（任务/章节选择界面）显示与跳转
   out.push(`label:ch${chapter.chapter + 1}_${sanitizeLabel(chapter.title)};`);
   // 清场：避免上一章节的立绘残留
-  out.push(`changeFigure:none -left -next;`);
-  out.push(`changeFigure:none -next;`);
-  out.push(`changeFigure:none -right -next;`);
+  const useActions = opts.figureActions !== false;
+  const clearExit = useActions ? " -exit=exit" : "";
+  out.push(`changeFigure:none -left${clearExit} -next;`);
+  out.push(`changeFigure:none${clearExit} -next;`);
+  out.push(`changeFigure:none -right${clearExit} -next;`);
+  // 舞台立绘管理：同时最多 2 个角色（左/右插槽），新角色出现时按最近说话顺序驱逐
+  const stageSlot = new Map<string, "left" | "right">();
+  const stageOrder: string[] = [];
+  const lastFigureFile = new Map<string, string>();
+  let entranceIdx = 0;
 
   for (const scene of chapter.scenes) {
     out.push("");
@@ -134,16 +168,55 @@ export function renderChapter(
       if (line.type === "dialogue") {
         const char = opts.characters.find((c) => c.id === line.characterId);
         const figureFile = opts.assets.figure[line.characterId];
-        // 表情差分：情绪变化时切换对应表情立绘
+        // 立绘优先级：台词指定动作 → 对应动作立绘；否则表情差分立绘；否则默认立绘
         let displayFile = figureFile;
-        if (opts.figureEmotions !== false && line.emotion && line.emotion !== "normal") {
+        if (line.action) {
+          const actionFile = opts.assets.figure[`${line.characterId}_act_${sanitizeId(line.action)}`];
+          if (actionFile) displayFile = actionFile;
+        } else if (opts.figureEmotions !== false && line.emotion && line.emotion !== "normal") {
           displayFile = opts.assets.figure[`${line.characterId}_${line.emotion}`] ?? figureFile;
         }
-        const prev = scene.lines[i - 1];
-        const isNewSpeaker = !(prev?.type === "dialogue" && prev.characterId === line.characterId);
-        if (displayFile && (isNewSpeaker || displayFile !== figureFile)) {
-          out.push(`changeFigure:${getBaseName(displayFile)} -left -next;`);
+        // 舞台管理 + 人物动作：最多 2 个角色同台（左/右），新角色入场 / 表情切换 / 情绪动作
+        let slot = stageSlot.get(line.characterId);
+        const appearing = !!displayFile && !slot;
+        if (displayFile) {
+          if (appearing) {
+            // 分配插槽；左右满员则驱逐最久没说话的角色
+            const used = new Set(stageSlot.values());
+            if (!used.has("left")) {
+              slot = "left";
+            } else if (!used.has("right")) {
+              slot = "right";
+            } else {
+              const victim = stageOrder[stageOrder.length - 1];
+              const victimSlot = stageSlot.get(victim)!;
+              out.push(`changeFigure:none -${victimSlot}${useActions ? " -exit=exit" : ""} -next;`);
+              stageSlot.delete(victim);
+              stageOrder.splice(stageOrder.indexOf(victim), 1);
+              lastFigureFile.delete(victim);
+              slot = victimSlot;
+            }
+            stageSlot.set(line.characterId, slot);
+            if (useActions) {
+              const entrance = ENTRANCES[entranceIdx++ % ENTRANCES.length];
+              out.push(`changeFigure:${getBaseName(displayFile)} -${slot} -enter=${entrance} -next;`);
+            } else {
+              out.push(`changeFigure:${getBaseName(displayFile)} -${slot} -next;`);
+            }
+          } else if (displayFile !== lastFigureFile.get(line.characterId)) {
+            out.push(`changeFigure:${getBaseName(displayFile)} -${slot} -next;`);
+          }
+          lastFigureFile.set(line.characterId, displayFile);
         }
+        // 情绪动作：说话时的震动/弹出/跳动（入场那一句跳过，避免与入场动画叠加）
+        if (useActions && displayFile && !appearing && slot && line.emotion && line.emotion !== "normal") {
+          const motion = motionFor(line.emotion);
+          if (motion) out.push(`setTempAnimation:${motion} -target=fig-${slot} -next;`);
+        }
+        // 更新最近说话顺序（用于驱逐）
+        const oi = stageOrder.indexOf(line.characterId);
+        if (oi >= 0) stageOrder.splice(oi, 1);
+        stageOrder.unshift(line.characterId);
         // 首次登场资料演出：立绘 + 文本框资料卡（旁白形式，立绘保持可见）
         if (opts.introCard !== false && char && !opts.seenCharacters?.has(line.characterId)) {
           opts.seenCharacters?.add(line.characterId);
@@ -158,8 +231,14 @@ export function renderChapter(
         const vocalArg = vocalFile ? ` -${getBaseName(vocalFile)}` : "";
         out.push(`${name}:${esc(line.text)}${vocalArg};`);
       } else if (line.monologue) {
+        if (useActions && isDramatic(line.text)) {
+          out.push(`setAnimation:shake -target=stage-main -next;`);
+        }
         out.push(`intro:${esc(line.text)} -hold;`);
       } else {
+        if (useActions && isDramatic(line.text)) {
+          out.push(`setAnimation:shake -target=stage-main -next;`);
+        }
         out.push(`:${esc(line.text)};`);
       }
     });

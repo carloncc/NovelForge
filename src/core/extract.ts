@@ -14,6 +14,11 @@ const SYSTEM_PROMPT = `你是视觉小说制作人。从小说文本中提取制
    - voiceDesc: 适合的音色描述（如"清冷的女声"）
    - voiceName: TTS 音色标识，必须从下面"可用音色列表"中选择最接近的一个（如果没有完全匹配的，选最接近的；不要编造列表外的值）
    - imagePrompt: 用于 AI 绘画生成立绘的完整英文 prompt，包含人物全身像、服装、发型、表情、背景纯色（保证可抠图），风格统一为"动漫风格，精美立绘"
+   - threeViewPrompt: 用于生成该角色"三视图参考图"（正面/侧面/背面）的完整英文 prompt：同一角色设定、站姿自然、表情平静、全身可见、纯色背景。此图会作为该角色所有立绘/表情/动作的图生图参考，务必与人物的 imagePrompt 描述完全一致
+   - actions: 2-4 个该角色可能做出的经典动作（用于动作立绘，基于三视图图生图）：
+     - id: 简短英文标识（如 point/wave/cross/crouch/hold）
+     - name: 动作中文名（如 抬手、挥手、抱臂、蹲下、持剑）
+     - prompt: 该动作的完整英文 prompt，在保持人物外观（发型/服装/体型）完全一致的前提下描述动作姿态与表情，纯色背景，全身可见，动漫风格
    - color: 角色的主题色（十六进制，用于 UI）
 2. scenes：故事中出现的地点场景（最多 12 个）。
    - id: 唯一标识（如 classroom）
@@ -39,9 +44,11 @@ export async function extractFromNovel(
   novelText: string,
   title: string,
   onUsage?: (pt: number, ct: number) => void,
+  feedback?: string,
 ): Promise<ExtractionResult> {
   const lib = voiceLibraryFor(cfg);
-  const user = `小说标题：${title}\n\n可用音色列表：${lib.join(", ")}\n\n以下是小说全文（可能截断）：\n${truncate(novelText, 70000)}`;
+  const fb = feedback ? `\n\n用户对上一版提取结果的修改意见（请严格参考并落实）：${feedback}` : "";
+  const user = `小说标题：${title}\n\n可用音色列表：${lib.join(", ")}${fb}\n\n以下是小说全文（可能截断）：\n${truncate(novelText, 70000)}`;
   const result = await chatJson<ExtractionResult>(cfg, SYSTEM_PROMPT, user, { maxTokens: 8000, onUsage });
   if (!Array.isArray(result.characters)) throw new Error("提取结果缺少 characters 字段");
   result.scenes = result.scenes ?? [];
@@ -50,6 +57,13 @@ export async function extractFromNovel(
   for (const c of result.characters) {
     if (!c.voiceName || !lib.includes(c.voiceName)) {
       c.voiceName = lib[0] || c.voiceName || "default";
+    }
+    // 动作列表归一化：只保留 id/name/prompt 都合法的项
+    if (Array.isArray(c.actions)) {
+      c.actions = c.actions
+        .filter((a) => a && a.id && a.prompt)
+        .slice(0, 6)
+        .map((a) => ({ id: String(a.id).toLowerCase().replace(/[^a-z0-9_-]/g, "_"), name: a.name || a.id, prompt: a.prompt }));
     }
   }
   return result;
@@ -67,6 +81,13 @@ export function demoExtract(novelText: string, title: string): ExtractionResult 
       voiceName: "linche",
       imagePrompt:
         "anime style, full body portrait of a tall young man with short black hair and sharp eyes, wearing a dark blue night-watchman coat with silver shoulder armor and black boots, cold determined expression, standing pose, plain white background, clean illustration",
+      threeViewPrompt:
+        "anime style, three-view character reference sheet (front view / side view / back view) of a tall young man with short black hair and sharp eyes, dark blue night-watchman coat with silver shoulder armor and black boots, neutral standing pose, calm expression, full body visible, plain white background, clean illustration, same design in all three views",
+      actions: [
+        { id: "draw", name: "拔剑", prompt: "anime style, the tall young man in dark blue night-watchman coat with silver shoulder armor drawing a glowing blue sword from his back, fierce determined expression, dynamic stance, full body, plain white background, clean illustration" },
+        { id: "point", name: "抬手", prompt: "anime style, the tall young man in dark blue night-watchman coat with silver shoulder armor pointing forward with one arm, commanding expression, full body, plain white background, clean illustration" },
+        { id: "cross", name: "抱臂", prompt: "anime style, the tall young man in dark blue night-watchman coat with silver shoulder armor standing with arms crossed, cool confident expression, full body, plain white background, clean illustration" },
+      ],
       color: "#3b5bdb",
     },
     {
@@ -79,6 +100,12 @@ export function demoExtract(novelText: string, title: string): ExtractionResult 
       voiceName: "suwanqing",
       imagePrompt:
         "anime style, full body portrait of a graceful young woman with long flowing hair and starry eyes, wearing a light purple long dress with white shawl and jade hairpin, gentle smile, standing pose, plain white background, clean illustration",
+      threeViewPrompt:
+        "anime style, three-view character reference sheet (front view / side view / back view) of a graceful young woman with long flowing hair and starry eyes, light purple long dress with white shawl and jade hairpin, neutral standing pose, calm gentle expression, full body visible, plain white background, clean illustration, same design in all three views",
+      actions: [
+        { id: "wave", name: "挥手", prompt: "anime style, the graceful young woman in light purple long dress with white shawl waving one hand in greeting, bright smile, full body, plain white background, clean illustration" },
+        { id: "worry", name: "担忧", prompt: "anime style, the graceful young woman in light purple long dress with white shawl clasping her hands in front of her chest, worried expression, full body, plain white background, clean illustration" },
+      ],
       color: "#9775fa",
     },
     {

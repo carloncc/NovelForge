@@ -91,69 +91,66 @@ function setActive(kind: ChannelKey, id: string): void {
       </div>
     </div>
 
-    <div class="card" style="padding: var(--space-4)">
-      <div class="row" style="justify-content: space-between">
-        <div style="display: flex; gap: 6px; flex-wrap: wrap; align-items: center">
-          <span style="font-size: 12.5px; color: var(--text-dim); margin-right: 4px">配置组：</span>
-          <button
-            v-for="p in configState.presets"
-            :key="p.id"
-            class="btn small"
-            :class="configState.activePresetId === p.id ? '' : 'ghost'"
-            @click="configState.activePresetId = p.id"
-          >
-            {{ p.name }}
-          </button>
-        </div>
-        <button v-if="configState.presets.length > 1" class="btn danger small" @click="removePreset(configState.activePresetId)">删除该组</button>
+    <div class="card preset-bar">
+      <span class="preset-bar-label">配置组</span>
+      <div class="preset-pills">
+        <button
+          v-for="p in configState.presets"
+          :key="p.id"
+          class="preset-pill"
+          :class="{ active: configState.activePresetId === p.id }"
+          @click="configState.activePresetId = p.id"
+        >
+          <svg v-if="configState.activePresetId === p.id" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12" /></svg>
+          {{ p.name }}
+        </button>
       </div>
+      <button v-if="configState.presets.length > 1" class="btn danger small" style="margin-left: auto" @click="removePreset(configState.activePresetId)">删除该组</button>
     </div>
 
-    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: var(--space-4)">
-      <div v-for="ch in channels" :key="ch.key" class="card" style="margin-bottom: 0">
-        <div class="card-head">
+    <div class="cfg-grid">
+      <div v-for="ch in channels" :key="ch.key" class="card cfg-channel" style="margin-bottom: 0">
+        <div class="card-head cfg-channel-head">
           <div style="display: flex; align-items: center; gap: 10px">
-            <span style="width: 34px; height: 34px; border-radius: 9px; background: var(--gradient); display: flex; align-items: center; justify-content: center">
+            <span class="cfg-channel-icon">
               <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path :d="ch.icon" /></svg>
             </span>
             <div>
-              <div style="font-weight: 600; font-size: 14px">{{ ch.label }}</div>
-              <div style="font-size: 11.5px; color: var(--text-dim)">{{ ch.desc }}</div>
+              <div class="cfg-channel-title">{{ ch.label }}</div>
+              <div class="cfg-channel-desc">{{ ch.desc }}</div>
             </div>
           </div>
-          <div class="card-actions">
-            <button class="btn secondary small" @click="addConfig(ch.key)">＋</button>
-          </div>
+          <button class="btn secondary small" @click="addConfig(ch.key)">＋ 添加</button>
         </div>
 
-        <div v-for="cfg in activePreset().channels[ch.key]" :key="cfg.id" style="border-top: 1px solid var(--border); padding-top: var(--space-3); margin-top: var(--space-2)">
-          <template v-if="ch.key !== 'llm'">
-            <div class="row" style="margin-bottom: 8px">
-              <label class="field" style="margin-bottom: 0; flex: 1">
-                <span>服务商模板（通用适配器，可选）</span>
-                <select
-                  :value="cfg.adapter ?? ''"
-                  @change="(e: any) => onTemplateChange(ch.key, cfg, (e.target as HTMLSelectElement).value)"
-                >
-                  <option value="">（手动配置 / OpenAI 兼容）</option>
-                  <option v-for="t in templatesByChannel[ch.key]" :key="t.id" :value="t.id">{{ t.name }}</option>
-                  <option value="__custom__" disabled>── 自定义模板见下方高级选项 ──</option>
-                </select>
-              </label>
-              <button class="btn ghost small" style="align-self: flex-end" @click="toggleCustom(ch.key + ':' + cfg.id)">高级</button>
-            </div>
-          </template>
-          <div class="row" style="margin-bottom: 8px; align-items: flex-end">
-            <label class="field" style="flex: 1; margin-bottom: 0">
-              <span>配置名</span>
-              <input type="text" v-model="cfg.name" />
-            </label>
-            <button class="btn small" :class="cfgActive(ch.key, cfg.id) ? '' : 'ghost'" @click="setActive(ch.key, cfg.id)">
-              {{ cfgActive(ch.key, cfg.id) ? "✓ 使用中" : "设为当前" }}
+        <div v-for="cfg in activePreset().channels[ch.key]" :key="cfg.id" class="cfg-entry">
+          <div class="cfg-entry-head">
+            <input type="text" v-model="cfg.name" class="cfg-entry-name" placeholder="配置名" />
+            <button class="btn small cfg-active" :class="cfgActive(ch.key, cfg.id) ? 'is-active' : ''" @click="setActive(ch.key, cfg.id)">
+              <svg v-if="cfgActive(ch.key, cfg.id)" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12" /></svg>
+              {{ cfgActive(ch.key, cfg.id) ? "使用中" : "设为当前" }}
             </button>
-            <button class="btn danger small" @click="removeConfig(ch.key, cfg.id)">删</button>
+            <button class="btn ghost small cfg-del" @click="removeConfig(ch.key, cfg.id)">删除</button>
           </div>
-          <div class="row">
+
+          <div v-if="ch.key !== 'llm'" class="cfg-row">
+            <label class="field" style="flex: 1; margin-bottom: 0">
+              <span>服务商模板（通用适配器，可选）</span>
+              <select
+                :value="cfg.adapter ?? ''"
+                @change="(e: any) => onTemplateChange(ch.key, cfg, (e.target as HTMLSelectElement).value)"
+              >
+                <option value="">（手动配置 / OpenAI 兼容）</option>
+                <option v-for="t in templatesByChannel[ch.key]" :key="t.id" :value="t.id">{{ t.name }}</option>
+                <option value="__custom__" disabled>── 自定义模板见下方高级选项 ──</option>
+              </select>
+            </label>
+            <button class="btn ghost small" style="align-self: flex-end" @click="toggleCustom(ch.key + ':' + cfg.id)">
+              {{ customOpen[ch.key + ':' + cfg.id] ? "收起高级" : "高级" }}
+            </button>
+          </div>
+
+          <div class="cfg-row">
             <label class="field grow-2">
               <span>Base URL</span>
               <input type="text" v-model="cfg.baseUrl" placeholder="https://api.deepseek.com" />
@@ -163,7 +160,7 @@ function setActive(kind: ChannelKey, id: string): void {
               <input type="text" v-model="cfg.model" placeholder="deepseek-chat" />
             </label>
           </div>
-          <div class="row">
+          <div class="cfg-row">
             <label class="field grow-2">
               <span>API Key</span>
               <input type="password" v-model="cfg.apiKey" placeholder="sk-…" />
@@ -173,21 +170,24 @@ function setActive(kind: ChannelKey, id: string): void {
               <input type="text" v-model="cfg.extra!.pathPrefix" placeholder="留空自动 /v1" />
             </label>
           </div>
-          <div class="row" style="margin-top: 2px">
-            <button class="btn small" :class="testing?.key === ch.key && testing?.id === cfg.id ? 'is-loading' : 'ghost'" :disabled="!!testing" @click="runTest(ch.key, cfg)">
+
+          <div class="cfg-test-row">
+            <button class="btn small cfg-test-btn" :class="testing?.key === ch.key && testing?.id === cfg.id ? 'is-loading' : 'ghost'" :disabled="!!testing" @click="runTest(ch.key, cfg)">
               <span v-if="testing?.key === ch.key && testing?.id === cfg.id" class="spinner" />
+              <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4" /><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" /></svg>
               {{ testing?.key === ch.key && testing?.id === cfg.id ? "测试中" : "测试连接" }}
             </button>
             <span
               v-if="testResult && testResult.key === ch.key && testResult.id === cfg.id"
-              style="font-size: 12px"
-              :class="testResult.ok ? 'tag ok' : 'tag err'"
+              class="cfg-test-result"
+              :class="testResult.ok ? 'ok' : 'err'"
             >
               {{ testResult.msg }}
             </span>
           </div>
-          <details v-if="ch.key === 'tts'" style="margin-top: 8px">
-            <summary style="font-size: 12px; color: var(--text-dim); cursor: pointer">高级选项：音色列表</summary>
+
+          <details v-if="ch.key === 'tts'" class="cfg-details">
+            <summary>音色列表</summary>
             <label class="field" style="margin-top: 8px">
               <span>可用音色（每行一个；AI 提取时从中挑选，失败自动回退第一个）</span>
               <textarea
@@ -203,8 +203,8 @@ function setActive(kind: ChannelKey, id: string): void {
               />
             </label>
           </details>
-          <details v-if="customOpen[ch.key + ':' + cfg.id]" style="margin-top: 8px">
-            <summary style="font-size: 12px; color: var(--text-dim); cursor: pointer">自定义适配器模板（JSON，优先级高于服务商模板）</summary>
+          <details v-if="customOpen[ch.key + ':' + cfg.id]" class="cfg-details">
+            <summary>自定义适配器模板（JSON，优先级高于服务商模板）</summary>
             <label class="field" style="margin-top: 8px">
               <span>适配器模板（字段：id/name/capability/mode/endpoint/requestMap/response/poll/voices/rawResponse，见项目文档）</span>
               <textarea
@@ -231,6 +231,10 @@ function setActive(kind: ChannelKey, id: string): void {
               />
             </label>
           </details>
+        </div>
+
+        <div v-if="!activePreset().channels[ch.key].length" class="empty" style="padding: var(--space-4) 0">
+          <p>暂无 {{ ch.label }} 配置，点击右上角「＋ 添加」</p>
         </div>
       </div>
     </div>

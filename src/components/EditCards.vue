@@ -8,6 +8,7 @@ import { projectState } from "../stores/project";
 import { saveEditedCards } from "../core/cards";
 import { open } from "@tauri-apps/plugin-dialog";
 import { errMsg } from "../utils/errors";
+import { recognizeCharacter } from "../core/recognize";
 
 const props = defineProps<{ cards: ExtractionResult }>();
 const emit = defineEmits<{ saved: [cards: ExtractionResult] }>();
@@ -20,6 +21,36 @@ const busy = ref(false);
 const openChar = ref<string | null>(null);
 const openItem = ref<string | null>(null);
 const openScene = ref<string | null>(null);
+const charRecognizing = ref<string | null>(null);
+
+async function recognizeChar(c: CharacterCard): Promise<void> {
+  if (!c.referenceImage) {
+    savedMsg.value = "请先为该角色设置参考图（从素材库选择或上传）";
+    return;
+  }
+  const cfg = activeConfig("llm");
+  if (!cfg?.apiKey) {
+    savedMsg.value = "未配置文本 LLM，无法识别角色（请先在「API 配置」页配置）";
+    return;
+  }
+  charRecognizing.value = c.id;
+  savedMsg.value = "";
+  try {
+    const r = await recognizeCharacter(cfg, c.referenceImage);
+    if (r.name) c.name = r.name;
+    if (r.appearance) c.appearance = r.appearance;
+    if (r.clothing) c.clothing = r.clothing;
+    if (r.personality) c.personality = r.personality;
+    if (r.voiceDesc) c.voiceDesc = r.voiceDesc;
+    if (r.imagePrompt) c.imagePrompt = r.imagePrompt;
+    if (r.threeViewPrompt) c.threeViewPrompt = r.threeViewPrompt;
+    savedMsg.value = `已根据参考图识别「${c.name}」的设定与提示词，确认后点「保存卡片」`;
+  } catch (e) {
+    savedMsg.value = `识别失败：${errMsg(e)}`;
+  } finally {
+    charRecognizing.value = null;
+  }
+}
 
 // 父组件卡片更新（重新生成后）时同步刷新本地副本
 watch(
@@ -156,6 +187,10 @@ function reset(): void {
           <span>立绘提示词（imagePrompt）</span>
           <textarea v-model="c.imagePrompt" rows="3" />
         </label>
+        <label class="field">
+          <span>三视图提示词（threeViewPrompt，可选）</span>
+          <textarea v-model="c.threeViewPrompt" rows="3" placeholder="留空则由立绘提示词自动推导" />
+        </label>
         <div class="row">
           <span style="font-size: 12px; color: var(--text-dim)">参考图（图生图保持一致）：</span>
           <span v-if="c.referenceImage" class="tag ok">已设置</span>
@@ -163,6 +198,13 @@ function reset(): void {
           <button class="btn secondary small" @click="pickReferenceImage(c)">从素材库选择…</button>
           <button v-if="c.referenceImage" class="btn danger small" @click="c.referenceImage = undefined">清除</button>
           <input v-if="!isTauri()" ref="refImgInput" type="file" accept="image/*" style="display: none" @change="onRefImgFile" />
+        </div>
+        <div class="row" style="margin-top: 8px">
+          <button class="btn small" :disabled="charRecognizing === c.id || !c.referenceImage" @click="recognizeChar(c)">
+            <span v-if="charRecognizing === c.id" class="spinner" />
+            {{ charRecognizing === c.id ? "AI 识别中…" : "用参考图 AI 识别角色（生成描述/提示词）" }}
+          </button>
+          <span v-if="c.referenceImage" style="font-size: 11.5px; color: var(--text-faint)">AI 会按参考图生成外貌/服装/性格/立绘与三视图提示词，填入上方字段</span>
         </div>
       </div>
     </div>

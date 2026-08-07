@@ -246,6 +246,73 @@ export async function chatJson<T>(
     }
   }
 }
+/** 视觉问答：把图片(base64) + 文本发给多模态模型，返回文本回复（供图像自检用） */
+export async function chatVision(
+  cfg: ApiConfig,
+  system: string,
+  userText: string,
+  imageB64: string,
+  opts: ChatOptions = {},
+): Promise<string> {
+  const base = normalizeBaseUrl(cfg.baseUrl, (cfg.extra?.pathPrefix as string) || undefined);
+  const done = log.time("api", `chatVision ${cfg.model}`);
+  log.debug("api", "chatVision 请求", {
+    base,
+    model: cfg.model,
+    apiKey: maskKey(cfg.apiKey),
+    imageB64Len: imageB64.length,
+    userTextLen: userText.length,
+  });
+  const body: Record<string, unknown> = {
+    model: cfg.model,
+    messages: [
+      { role: "system", content: system },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: userText },
+          { type: "image_url", image_url: { url: `data:image/png;base64,${imageB64}` } },
+        ],
+      },
+    ],
+    temperature: 0.1,
+  };
+  if (opts.maxTokens) body.max_tokens = opts.maxTokens;
+
+  const content = await withRetry(async () => {
+    const res = await tauri.http({
+      method: "POST",
+      url: `${base}/chat/completions`,
+      headers: headersFor(cfg),
+      body: JSON.stringify(body),
+      timeoutSecs: opts.timeoutSecs ?? 120,
+    });
+    if (res.status >= 500 || res.status === 429) {
+      throw { status: res.status, message: `HTTP ${res.status}` };
+    }
+    if (res.status >= 400) {
+      const raw = b64ToUtf8(res.bodyBase64);
+      throw new Error(`LLM 返回错误 ${res.status}: ${raw.slice(0, 300)}`);
+    }
+    const text = b64ToUtf8(res.bodyBase64);
+    let data: any;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      throw new Error(`LLM 响应不是合法 JSON: ${text.slice(0, 300)}`);
+    }
+    if (!data.choices || !data.choices.length) {
+      throw new Error(`LLM 返回错误: ${JSON.stringify(data).slice(0, 400)}`);
+    }
+    const c = data.choices[0].message?.content ?? "";
+    const usage = data.usage || {};
+    opts.onUsage?.(usage.prompt_tokens ?? 0, usage.completion_tokens ?? 0);
+    return typeof c === "string" ? c : JSON.stringify(c);
+  });
+  done(`len=${content.length}`);
+  return content;
+}
+
 export interface ImageResult {
   fileName: string;
   dataB64: string;

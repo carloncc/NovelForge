@@ -35,6 +35,7 @@ interface ScriptModel {
       type: "dialogue" | "narration";
       characterId?: string;
       emotion?: string;
+      action?: string;
       monologue?: boolean;
       text: string;
     }[];
@@ -53,6 +54,7 @@ const SYSTEM_PROMPT = `你是视觉小说编剧。根据小说章节文本与角
    - bgm: 该场景氛围适合的背景音乐描述（中文，如"宁静的钢琴曲""肃杀的战鼓声"；没有合适氛围时留空字符串）
 4. lines 数组：按剧情顺序排列
    - dialogue: {type:"dialogue", characterId: 角色卡id, emotion:"normal|happy|sad|angry|surprised", text}
+   - 可选 action: 当该句台词有明显动作姿态（抬手指、拔剑、挥手、抱臂、蹲下等）时，从该角色的"动作列表"(见角色卡)中选最贴切的一个填 action: "动作id"；没有合适的动作就省略该字段
    - narration: {type:"narration", text}
    - 内心独白: {type:"narration", monologue:true, text}（数量要少，每章最多 2 条）
 5. CG 事件：挑本章 1-3 个最具画面感的"名场面"（战斗高潮、重要相遇、宏大场景），
@@ -68,7 +70,12 @@ const SYSTEM_PROMPT = `你是视觉小说编剧。根据小说章节文本与角
 
 function buildCharacterContext(chars: CharacterCard[]): string {
   return chars
-    .map((c) => `${c.id}（${c.name}）：外貌${c.appearance}；服装${c.clothing}；性格${c.personality}`)
+    .map((c) => {
+      const acts = Array.isArray(c.actions) && c.actions.length
+        ? `；动作列表：${c.actions.map((a) => `${a.id}(${a.name})`).join("、")}`
+        : "";
+      return `${c.id}（${c.name}）：外貌${c.appearance}；服装${c.clothing}；性格${c.personality}${acts}`;
+    })
     .join("\n");
 }
 
@@ -78,17 +85,33 @@ function buildItemContext(items: ItemCard[]): string {
     .join("\n");
 }
 
+export interface ScriptChapterOptions {
+  /** 剧本文风：整体按此风格改写台词与旁白（如"古风典雅"）；留空不调整 */
+  style?: string;
+  /** 用户对上一版剧本的意见，重新生成时严格参考 */
+  feedback?: string;
+}
+
 export async function scriptChapter(
   cfg: ApiConfig,
   chapter: ChapterInfo,
   cards: ExtractionResult,
   onUsage?: (pt: number, ct: number) => void,
+  opts: ScriptChapterOptions = {},
 ): Promise<ChapterScript> {
+  const extra: string[] = [];
+  if (opts.style) {
+    extra.push(`\n文风要求：请严格按「${opts.style}」这一风格来编写/改写本章的台词与旁白（包括遣词、语气、节奏），但保持人物设定与剧情走向不变。`);
+  }
+  if (opts.feedback) {
+    extra.push(`\n用户的修改意见（重新生成时请严格参考并落实）：${opts.feedback}`);
+  }
   const user = [
     `章节：第 ${chapter.index + 1} 章 ${chapter.title}`,
     `\n角色卡：\n${buildCharacterContext(cards.characters)}`,
     `\n物品卡：\n${buildItemContext(cards.items)}`,
     `\n场景卡：\n${cards.scenes.map((s) => `${s.id}（${s.location}）：${s.atmosphere}`).join("\n")}`,
+    ...extra,
     `\n章节正文：\n${chapter.text}`,
   ].join("\n");
 
@@ -101,6 +124,7 @@ export async function scriptChapter(
             type: "dialogue" as const,
             characterId: l.characterId || cards.characters[0]?.id || "narrator",
             emotion: l.emotion || "normal",
+            action: l.action || undefined,
             text: l.text,
           }
         : {

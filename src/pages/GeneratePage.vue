@@ -1,6 +1,6 @@
 ﻿<script setup lang="ts">
 import { computed, nextTick, ref, watch } from "vue";
-import { open, save } from "@tauri-apps/plugin-dialog";
+import { open } from "@tauri-apps/plugin-dialog";
 import { projectState, pushLog, clearLogs, scheduleSave, restoreProject } from "../stores/project";
 import { activeConfig, configState, addRecentOutputDir } from "../stores/config";
 import { Pipeline } from "../core/pipeline";
@@ -11,9 +11,23 @@ import { errMsg } from "../utils/errors";
 import { log as logger, dumpLogHistory } from "../utils/logger";
 import EditCards from "../components/EditCards.vue";
 import StepIndicator from "../components/StepIndicator.vue";
-import type { FailedTask, PipelineEvent, VideoSuggestion } from "../core/types";
+import type { AssetMap, FailedTask, PipelineEvent, StageFeedback, StageKey, VideoSuggestion } from "../core/types";
+import { STAGE_LABELS, STAGE_ORDER, LANGUAGES } from "../core/types";
+import {
+  regenerateCharacterFigures,
+  regenerateCharacterThreeView,
+  regenerateCharacterAction,
+  regenerateItemImage,
+  regenerateBackground,
+  regenerateCg,
+  regenerateVoiceLine,
+  regenerateCharacterVoice,
+  regenerateImages,
+  type RegenContext,
+} from "../core/regenerate";
+import { recognizeStyle } from "../core/recognize";
 
-const tab = ref<"run" | "cards" | "video" | "script" | "log" | "failed">("run");
+const tab = ref<"run" | "cards" | "video" | "script" | "log" | "failed" | "asset">("run");
 const error = ref("");
 const busy = ref(false);
 const pipelineRef = ref<Pipeline | null>(null);
@@ -23,7 +37,7 @@ const videoStatus = ref<Record<string, boolean>>({});
 const copiedMsg = ref("");
 const logPanelRef = ref<HTMLElement | null>(null);
 
-const PIPELINE_STEPS = ["提取", "剧本", "图像", "配音", "组装"];
+const PIPELINE_STEPS = ["翻译", "提取", "剧本", "图像", "配音", "组装"];
 const currentStep = ref(-1);
 const failedSteps = ref<number[]>([]);
 
@@ -69,6 +83,602 @@ const videoPoints = computed<(VideoSuggestion & { chapter: number; location: str
     ),
   );
 });
+
+/* ==================== 分阶段生成 ==================== */
+
+const selectedStages = ref<Record<StageKey, boolean>>({ translate: true, extract: true, script: true, image: true, voice: true, assemble: true });
+const stageFeedback = ref<Partial<Record<StageKey, string>>>({});
+
+/* ---- 风格参考图：上传图片 → AI 识别画风 → 写入统一画风约束 ---- */
+const styleRefSrc = ref("");
+const styleRecognizing = ref(false);
+const styleRefInput = ref<HTMLInputElement | null>(null);
+
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result ?? "");
+      resolve(result.includes(",") ? result.split(",")[1] : result);
+    };
+    reader.onerror = () => reject(new Error("文件读取失败"));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function pickStyleRef(): Promise<void> {
+  if (!isTauri()) {
+    styleRefInput.value?.click();
+    return;
+  }
+  const picked = await open({
+    multiple: false,
+    filters: [{ name: "参考图", extensions: ["png", "jpg", "jpeg", "webp"] }],
+  });
+  if (!picked || typeof picked !== "string") return;
+  try {
+    const b64 = await tauri.readFileBase64(picked);
+    styleRefSrc.value = `data:${mimeOf(picked)};base64,${b64}`;
+    pushLog({ step: "画风", message: `已选择风格参考图：${picked.split(/[\\/]/).pop()}`, level: "info", at: Date.now() });
+    void recognizeStyleAndApply(b64);
+  } catch (e) {
+    pushLog({ step: "画风", message: `读取参考图失败：${errMsg(e)}`, level: "error", at: Date.now() });
+  }
+}
+
+async function onStyleRefFile(e: Event): Promise<void> {
+  const input = e.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = "";
+  if (!file) return;
+  const b64 = await fileToBase64(file);
+  styleRefSrc.value = `data:${file.type || "image/png"};base64,${b64}`;
+  void recognizeStyleAndApply(b64);
+}
+
+async function recognizeStyleAndApply(b64: string): Promise<void> {
+  const cfg = activeConfig("llm");
+  if (!cfg?.apiKey) {
+    pushLog({ step: "画风", message: "未配置文本 LLM，无法识别画风；请先在「API 配置」页配置", level: "warn", at: Date.now() });
+    return;
+  }
+  styleRecognizing.value = true;
+  try {
+    const style = await recognizeStyle(cfg, b64);
+    projectState.options.imageStyle = style;
+    pushLog({ step: "画风", message: `已识别画风并写入「统一画风」：${style.slice(0, 100)}…`, level: "success", at: Date.now() });
+  } catch (e) {
+    pushLog({ step: "画风", message: `识别画风失败：${errMsg(e)}`, level: "error", at: Date.now() });
+  } finally {
+    styleRecognizing.value = false;
+  }
+}
+
+const selectedStagesList = computed<StageKey[]>(() => STAGE_ORDER.filter((s) => selectedStages.value[s]));
+
+/* ==================== 剧本 Tab 单章重生成 ==================== */
+
+const scriptChapterFeedback = ref<Record<number, string>>({});
+
+/* ==================== 素材 Tab ==================== */
+
+const assetMap = ref<AssetMap | null>(null);
+const assetTab = ref<"figure" | "item" | "bg" | "cg" | "voice">("figure");
+const assetBusy = ref("");
+const assetFeedback = ref<Record<string, string>>({ figure: "", item: "", bg: "", cg: "" });
+const voiceChapterFilter = ref(0);
+const voiceCharFilter = ref("");
+
+const FIGURE_EMOTIONS = ["normal", "happy", "sad", "angry", "surprised"];
+const EMOTION_LABELS: Record<string, string> = { normal: "默认", happy: "开心", sad: "悲伤", angry: "愤怒", surprised: "惊讶" };
+
+// 素材预览/试听：读成 base64 data-URL（桌面/网页通用，不依赖本地服务器）
+const thumbCache = ref<Record<string, string>>({});
+
+function mimeOf(p: string): string {
+  const l = p.toLowerCase();
+  if (l.endsWith(".png")) return "image/png";
+  if (l.endsWith(".jpg") || l.endsWith(".jpeg")) return "image/jpeg";
+  if (l.endsWith(".webp")) return "image/webp";
+  if (l.endsWith(".gif")) return "image/gif";
+  if (l.endsWith(".mp3")) return "audio/mpeg";
+  if (l.endsWith(".ogg")) return "audio/ogg";
+  if (l.endsWith(".wav")) return "audio/wav";
+  if (l.endsWith(".opus")) return "audio/opus";
+  return "application/octet-stream";
+}
+
+function thumbUrl(p: string): string {
+  if (!p) return "";
+  if (thumbCache.value[p]) return thumbCache.value[p];
+  void loadAssetDataUrl(p);
+  return "";
+}
+
+async function loadAssetDataUrl(p: string): Promise<string> {
+  if (thumbCache.value[p]) return thumbCache.value[p];
+  try {
+    const b64 = await tauri.readFileBase64(p);
+    thumbCache.value[p] = `data:${mimeOf(p)};base64,${b64}`;
+  } catch {
+    thumbCache.value[p] = "";
+  }
+  return thumbCache.value[p];
+}
+
+async function loadAssetMapNow(): Promise<void> {
+  try {
+    if (!projectState.outputDir) {
+      assetMap.value = null;
+      return;
+    }
+    const { text } = await tauri.readTextFile(`${projectState.outputDir}/.novel2vn/assets.json`);
+    assetMap.value = JSON.parse(text) as AssetMap;
+  } catch {
+    assetMap.value = null;
+  }
+}
+
+const figureRows = computed(() => {
+  const r = projectState.lastResult;
+  if (!r || !assetMap.value) return [];
+  return r.cards.characters.map((c) => ({
+    id: c.id,
+    name: c.name,
+    threeView: assetMap.value!.figure[`${c.id}_threeview`],
+    emotions: FIGURE_EMOTIONS.map((emo) => ({ emo, file: assetMap.value!.figure[emo === "normal" ? c.id : `${c.id}_${emo}`] })),
+    actions: (c.actions || []).map((a) => ({ id: a.id, name: a.name, file: assetMap.value!.figure[`${c.id}_act_${a.id}`] })),
+  }));
+});
+
+const itemRows = computed(() => {
+  const r = projectState.lastResult;
+  if (!r || !assetMap.value) return [];
+  return r.cards.items.map((it) => ({ id: it.id, name: it.name, file: assetMap.value!.item[it.id] }));
+});
+
+const bgRows = computed(() => {
+  const r = projectState.lastResult;
+  if (!r || !assetMap.value) return [];
+  return r.chapters.flatMap((ch) =>
+    ch.scenes.map((s) => ({ chapter: ch.chapter + 1, sceneId: s.id, location: s.location, file: assetMap.value!.bg[s.id] })),
+  );
+});
+
+const cgRows = computed(() => {
+  const r = projectState.lastResult;
+  if (!r || !assetMap.value) return [];
+  return r.chapters.flatMap((ch) =>
+    ch.scenes
+      .filter((s) => s.cgEvent)
+      .map((s) => ({ chapter: ch.chapter + 1, sceneId: s.id, title: s.cgEvent!.title, file: assetMap.value!.cg[`${ch.chapter}_${s.id}`] })),
+  );
+});
+
+const charNameOf = computed(() => {
+  const map: Record<string, string> = {};
+  for (const c of projectState.lastResult?.cards.characters ?? []) map[c.id] = c.name;
+  return (id: string) => map[id] || id;
+});
+
+const voiceRows = computed(() => {
+  const r = projectState.lastResult;
+  if (!r || !assetMap.value) return [];
+  const rows = r.chapters.flatMap((ch) =>
+    ch.scenes.flatMap((s) =>
+      s.lines.map((line, i) => {
+        if (line.type !== "dialogue") return null;
+        const key = `ch${ch.chapter}_${sanitizeId(s.id)}_${i}`;
+        return { key, chapter: ch.chapter + 1, scene: s.location, charId: line.characterId, text: line.text, file: assetMap.value!.vocal[key] };
+      }),
+    ),
+  ).filter((x): x is NonNullable<typeof x> => !!x);
+  return rows.filter(
+    (r) => (!voiceChapterFilter.value || r.chapter === voiceChapterFilter.value) && (!voiceCharFilter.value || r.charId === voiceCharFilter.value),
+  );
+});
+
+const voiceChapterOptions = computed(() => {
+  const r = projectState.lastResult;
+  if (!r) return [];
+  return r.chapters.map((c) => ({ value: c.chapter + 1, label: `第 ${c.chapter + 1} 章 ${c.title}` }));
+});
+
+const voiceCharOptions = computed(() => {
+  const r = projectState.lastResult;
+  if (!r) return [];
+  return r.cards.characters.map((c) => ({ value: c.id, label: c.name }));
+});
+
+/* ==================== 执行管线（分阶段） ==================== */
+
+interface ExecuteOptions {
+  stages: StageKey[];
+  feedback?: StageFeedback;
+  forceStages?: StageKey[];
+  clearLogsFirst?: boolean;
+  rerunChapters?: number[] | null;
+}
+
+async function execute(opts: ExecuteOptions): Promise<boolean> {
+  error.value = "";
+  const novel = projectState.novel;
+  if (!novel) {
+    error.value = "请先在「导入小说」页导入小说（或加载示例小说）";
+    return false;
+  }
+  if (!opts.stages.length) {
+    error.value = "请至少勾选一个要执行的阶段";
+    return false;
+  }
+  logger.info("page", "执行生成", {
+    stages: opts.stages,
+    hasFeedback: !!opts.feedback && Object.keys(opts.feedback).length > 0,
+    forceStages: opts.forceStages,
+  });
+  const llm = activeConfig("llm");
+  const image = activeConfig("image");
+  const tts = activeConfig("tts");
+  if (!llm?.apiKey) {
+    pushLog({
+      step: "提示",
+      message: "未配置文本 LLM API Key，将以演示模式运行（可完整验证剧本/渲染/组装流程）",
+      level: "warn",
+      at: Date.now(),
+    });
+  }
+  if (!projectState.outputDir) {
+    projectState.outputDir = await tauri.getDefaultOutputDir().catch(() => "");
+  }
+  if (opts.clearLogsFirst) {
+    clearLogs();
+    currentStep.value = -1;
+    failedSteps.value = [];
+  }
+  busy.value = true;
+  projectState.running = true;
+  const log = (ev: PipelineEvent) => pushLog(ev);
+  try {
+    const templateDir = await resolveTemplateDir();
+    const pipeline = new Pipeline({
+      novel,
+      materials: projectState.materials,
+      llm: llm?.apiKey ? llm : undefined,
+      image: projectState.options.useImage && image?.apiKey ? image : undefined,
+      tts: projectState.options.useTts && tts?.apiKey ? tts : undefined,
+      outputDir: projectState.outputDir,
+      templateDir,
+      options: {
+        ...projectState.options,
+        rerunChapters: opts.rerunChapters !== undefined ? opts.rerunChapters ?? undefined : rerunChapters.value ?? undefined,
+      },
+      stages: opts.stages,
+      feedback: opts.feedback,
+      forceStages: opts.forceStages,
+      log,
+    });
+    pipelineRef.value = pipeline;
+
+    log({
+      step: "开始",
+      message: `管线启动（阶段：${opts.stages.map((s) => STAGE_LABELS[s]).join(" → ")}）`,
+      level: "info",
+      at: Date.now(),
+    });
+    const result = await pipeline.run();
+    projectState.lastResult = result;
+    addRecentOutputDir(result.meta.outputDir);
+    if (opts.stages.includes("assemble")) {
+      await checkVideos();
+      await loadAssetMapNow();
+    }
+    if (opts.clearLogsFirst) tab.value = "cards";
+    log({ step: "完成", message: `全部完成！项目输出到 ${result.meta.outputDir}，可前往「预览」页试玩`, level: "success", at: Date.now() });
+    return true;
+  } catch (e) {
+    const msg = errMsg(e);
+    logger.error("page", "生成失败", { message: msg });
+    if (msg === "已中止") {
+      logger.warn("page", "生成被用户中止");
+      log({ step: "中止", message: "已停止生成，进度已保存（缓存命中部分不会重复计费）", level: "warn", at: Date.now() });
+    } else {
+      error.value = msg;
+      log({ step: "错误", message: msg, level: "error", at: Date.now() });
+    }
+    return false;
+  } finally {
+    busy.value = false;
+    projectState.running = false;
+    pipelineRef.value = null;
+  }
+}
+
+function start(): void {
+  void execute({ stages: selectedStagesList.value, clearLogsFirst: true });
+}
+
+/* ==================== 分阶段操作 ==================== */
+
+function runExtractRegen(): void {
+  const fb = stageFeedback.value.extract?.trim() || "";
+  void execute({
+    stages: ["extract", "script", "image", "assemble"],
+    feedback: fb ? { extract: fb } : undefined,
+    forceStages: ["extract"],
+    rerunChapters: null,
+  }).then(() => {
+    stageFeedback.value.extract = "";
+    void loadAssetMapNow();
+  });
+}
+
+function runScriptRegen(): void {
+  const fb = stageFeedback.value.script?.trim() || "";
+  const fbMap: Record<number, string> = {};
+  if (fb) for (const c of projectState.novel?.chapters ?? []) fbMap[c.index] = fb;
+  void execute({
+    stages: ["script", "assemble"],
+    feedback: fb ? { script: fbMap } : undefined,
+    forceStages: ["script"],
+    rerunChapters: null,
+  }).then(() => {
+    stageFeedback.value.script = "";
+  });
+}
+
+function runImageRegen(): void {
+  const fb = stageFeedback.value.image?.trim() || "";
+  void execute({
+    stages: ["image", "assemble"],
+    feedback: fb ? { image: fb } : undefined,
+    forceStages: ["image"],
+  }).then(() => {
+    stageFeedback.value.image = "";
+    void loadAssetMapNow();
+  });
+}
+
+function runVoiceRegen(): void {
+  void execute({ stages: ["voice", "assemble"], forceStages: ["voice"] }).then(() => void loadAssetMapNow());
+}
+
+function runAssemble(): void {
+  void execute({ stages: ["assemble"] });
+}
+
+function runTranslateRegen(): void {
+  const fb = stageFeedback.value.translate?.trim() || "";
+  void execute({
+    stages: ["translate", "extract", "script", "image", "assemble"],
+    feedback: fb ? { translate: fb } : undefined,
+    forceStages: ["translate"],
+    rerunChapters: null,
+  }).then(() => {
+    stageFeedback.value.translate = "";
+  });
+}
+
+function regenChapter(idx: number): void {
+  const fb = scriptChapterFeedback.value[idx]?.trim() ?? "";
+  void execute({
+    stages: ["script", "assemble"],
+    feedback: { script: { [idx]: fb } },
+    rerunChapters: null,
+  }).then(() => {
+    scriptChapterFeedback.value[idx] = "";
+    void loadScripts();
+  });
+}
+
+/* ==================== 素材 Tab 操作 ==================== */
+
+async function regenCtx(): Promise<RegenContext | null> {
+  const r = projectState.lastResult;
+  if (!r) return null;
+  const imageCfg = activeConfig("image");
+  const ttsCfg = activeConfig("tts");
+  return {
+    cfg: projectState.options.useImage && imageCfg?.apiKey ? imageCfg : undefined,
+    ttsCfg: projectState.options.useTts && ttsCfg?.apiKey ? ttsCfg : undefined,
+    chapters: r.chapters,
+    cards: r.cards,
+    materials: projectState.materials,
+    outputDir: projectState.outputDir,
+    log: (ev) => pushLog(ev),
+    style: projectState.options.imageStyle || undefined,
+    figureEmotions: projectState.options.figureEmotions,
+    threeView: projectState.options.characterPoses !== false,
+    actions: projectState.options.characterPoses !== false,
+    verifyCfg: projectState.options.imageSelfCheck && activeConfig("llm")?.apiKey ? activeConfig("llm") : undefined,
+  };
+}
+
+async function afterAssetRegen(label: string, resultsLength: number): Promise<void> {
+  pushLog({ step: "素材", message: `${label}：已重新生成 ${resultsLength} 项，正在重新组装…`, level: "success", at: Date.now() });
+  await execute({ stages: ["assemble"] });
+  await loadAssetMapNow();
+}
+
+async function regenFigureEmotion(charId: string, emo: string): Promise<void> {
+  const ctx = await regenCtx();
+  if (!ctx) return;
+  const fb = assetFeedback.value.figure?.trim() || undefined;
+  assetBusy.value = `figure:${charId}:${emo}`;
+  try {
+    const results = await regenerateImages(
+      ctx,
+      (t) => t.kind === "figure" && (emo === "normal" ? t.id === charId : t.id === `${charId}_${emo}`),
+      fb,
+    );
+    await afterAssetRegen(`立绘「${charId}」${EMOTION_LABELS[emo] ?? emo}`, results.length);
+  } catch (e) {
+    pushLog({ step: "素材", message: `重新生成立绘失败：${errMsg(e)}`, level: "error", at: Date.now() });
+  } finally {
+    assetBusy.value = "";
+    assetFeedback.value.figure = "";
+  }
+}
+
+async function regenAllFigure(charId: string): Promise<void> {
+  const ctx = await regenCtx();
+  if (!ctx) return;
+  const fb = assetFeedback.value.figure?.trim() || undefined;
+  assetBusy.value = `figure:${charId}`;
+  try {
+    const results = await regenerateCharacterFigures(ctx, charId, fb);
+    await afterAssetRegen(`立绘「${charId}」（全部表情）`, results.length);
+  } catch (e) {
+    pushLog({ step: "素材", message: `重新生成立绘失败：${errMsg(e)}`, level: "error", at: Date.now() });
+  } finally {
+    assetBusy.value = "";
+    assetFeedback.value.figure = "";
+  }
+}
+
+async function regenThreeView(charId: string): Promise<void> {
+  const ctx = await regenCtx();
+  if (!ctx) return;
+  const fb = assetFeedback.value.figure?.trim() || undefined;
+  assetBusy.value = `threeview:${charId}`;
+  try {
+    const results = await regenerateCharacterThreeView(ctx, charId, fb);
+    await afterAssetRegen(`三视图「${charId}」（联动重生成默认/表情/动作）`, results.length);
+  } catch (e) {
+    pushLog({ step: "素材", message: `重新生成三视图失败：${errMsg(e)}`, level: "error", at: Date.now() });
+  } finally {
+    assetBusy.value = "";
+    assetFeedback.value.figure = "";
+  }
+}
+
+async function regenAction(charId: string, actionId: string, actionName: string): Promise<void> {
+  const ctx = await regenCtx();
+  if (!ctx) return;
+  const fb = assetFeedback.value.figure?.trim() || undefined;
+  assetBusy.value = `action:${charId}:${actionId}`;
+  try {
+    const results = await regenerateCharacterAction(ctx, charId, actionId, fb);
+    await afterAssetRegen(`动作「${actionName}」（${charId}）`, results.length);
+  } catch (e) {
+    pushLog({ step: "素材", message: `重新生成动作失败：${errMsg(e)}`, level: "error", at: Date.now() });
+  } finally {
+    assetBusy.value = "";
+    assetFeedback.value.figure = "";
+  }
+}
+
+async function regenItem(id: string): Promise<void> {
+  const ctx = await regenCtx();
+  if (!ctx) return;
+  const fb = assetFeedback.value.item?.trim() || undefined;
+  assetBusy.value = `item:${id}`;
+  try {
+    const results = await regenerateItemImage(ctx, id, fb);
+    await afterAssetRegen(`物品图「${id}」`, results.length);
+  } catch (e) {
+    pushLog({ step: "素材", message: `重新生成物品图失败：${errMsg(e)}`, level: "error", at: Date.now() });
+  } finally {
+    assetBusy.value = "";
+    assetFeedback.value.item = "";
+  }
+}
+
+async function regenBg(sceneId: string): Promise<void> {
+  const ctx = await regenCtx();
+  if (!ctx) return;
+  const fb = assetFeedback.value.bg?.trim() || undefined;
+  assetBusy.value = `bg:${sceneId}`;
+  try {
+    const results = await regenerateBackground(ctx, sceneId, fb);
+    await afterAssetRegen(`背景「${sceneId}」`, results.length);
+  } catch (e) {
+    pushLog({ step: "素材", message: `重新生成背景失败：${errMsg(e)}`, level: "error", at: Date.now() });
+  } finally {
+    assetBusy.value = "";
+    assetFeedback.value.bg = "";
+  }
+}
+
+async function regenCgRow(chapter: number, sceneId: string): Promise<void> {
+  const ctx = await regenCtx();
+  if (!ctx) return;
+  const fb = assetFeedback.value.cg?.trim() || undefined;
+  assetBusy.value = `cg:${chapter}:${sceneId}`;
+  try {
+    const results = await regenerateCg(ctx, chapter - 1, sceneId, fb);
+    await afterAssetRegen(`CG「${sceneId}」`, results.length);
+  } catch (e) {
+    pushLog({ step: "素材", message: `重新生成 CG 失败：${errMsg(e)}`, level: "error", at: Date.now() });
+  } finally {
+    assetBusy.value = "";
+    assetFeedback.value.cg = "";
+  }
+}
+
+const audioRef = ref<HTMLAudioElement | null>(null);
+const playingVoiceKey = ref("");
+
+async function playVoice(key: string, file: string): Promise<void> {
+  if (playingVoiceKey.value === key) {
+    playingVoiceKey.value = "";
+    if (audioRef.value) audioRef.value.pause();
+    return;
+  }
+  const src = await loadAssetDataUrl(file);
+  if (!src) {
+    pushLog({ step: "素材", message: "读取配音文件失败", level: "warn", at: Date.now() });
+    return;
+  }
+  playingVoiceKey.value = key;
+  await nextTick();
+  if (audioRef.value) {
+    audioRef.value.src = src;
+    void audioRef.value.play().catch(() => {
+      pushLog({ step: "素材", message: "试听播放失败（可能音频编码不支持）", level: "warn", at: Date.now() });
+    });
+  }
+}
+
+async function regenVoice(key: string): Promise<void> {
+  const ctx = await regenCtx();
+  if (!ctx) return;
+  assetBusy.value = `voice:${key}`;
+  try {
+    const p = await regenerateVoiceLine(ctx, key);
+    pushLog(
+      {
+        step: "素材",
+        message: p ? `配音已重新生成：${key}` : `配音重新生成失败或未找到：${key}`,
+        level: p ? "success" : "warn",
+        at: Date.now(),
+      },
+    );
+    await execute({ stages: ["assemble"] });
+  } catch (e) {
+    pushLog({ step: "素材", message: `重新配音失败：${errMsg(e)}`, level: "error", at: Date.now() });
+  } finally {
+    assetBusy.value = "";
+    await loadAssetMapNow();
+  }
+}
+
+async function regenCharVoice(charId: string): Promise<void> {
+  const ctx = await regenCtx();
+  if (!ctx) return;
+  assetBusy.value = `voice-all:${charId}`;
+  try {
+    const n = await regenerateCharacterVoice(ctx, charId);
+    pushLog({ step: "素材", message: `角色「${charId}」全部配音已重新生成 ${n} 句`, level: "success", at: Date.now() });
+    await execute({ stages: ["assemble"] });
+  } catch (e) {
+    pushLog({ step: "素材", message: `重新配音失败：${errMsg(e)}`, level: "error", at: Date.now() });
+  } finally {
+    assetBusy.value = "";
+    await loadAssetMapNow();
+  }
+}
+
+/* ==================== 原有功能 ==================== */
 
 async function browseOutputDir(): Promise<void> {
   if (!isTauri()) {
@@ -168,7 +778,6 @@ async function saveLogs(): Promise<void> {
 async function retryFailed(): Promise<void> {
   const failed = failedTasks.value;
   if (!failed.length) return;
-  // 剧本失败 → 定位章节重跑；图像失败 → 清除对应缓存文件
   const chapterIds = new Set<number>();
   for (const f of failed) {
     if (f.kind === "script" && f.id.startsWith("chapter_")) {
@@ -204,81 +813,6 @@ function toggleChapterRerun(index: number, checked: boolean): void {
   }
 }
 
-async function start(): Promise<void> {
-  error.value = "";
-  const novel = projectState.novel;
-  if (!novel) {
-    error.value = "请先在「导入小说」页导入小说（或加载示例小说）";
-    return;
-  }
-  logger.info("page", "用户点击开始生成", {
-    hasNovel: true,
-    chapterCount: novel.chapters.length,
-    outputDir: projectState.outputDir,
-    options: { ...projectState.options, rerunChapters: rerunChapters.value ?? undefined },
-  });
-  const llm = activeConfig("llm");
-  const image = activeConfig("image");
-  const tts = activeConfig("tts");
-  if (!llm?.apiKey) {
-    pushLog({
-      step: "提示",
-      message: "未配置文本 LLM API Key，将以演示模式运行（可完整验证剧本/渲染/组装流程）",
-      level: "warn",
-      at: Date.now(),
-    });
-  }
-  if (!projectState.outputDir) {
-    projectState.outputDir = await tauri.getDefaultOutputDir().catch(() => "");
-  }
-  clearLogs();
-  currentStep.value = -1;
-  failedSteps.value = [];
-  busy.value = true;
-  projectState.running = true;
-  const log = (ev: PipelineEvent) => pushLog(ev);
-  try {
-    const templateDir = await resolveTemplateDir();
-    const pipeline = new Pipeline({
-      novel,
-      materials: projectState.materials,
-      llm: llm?.apiKey ? llm : undefined,
-      image: projectState.options.useImage && image?.apiKey ? image : undefined,
-      tts: projectState.options.useTts && tts?.apiKey ? tts : undefined,
-      outputDir: projectState.outputDir,
-      templateDir,
-      options: {
-        ...projectState.options,
-        rerunChapters: rerunChapters.value ?? undefined,
-      },
-      log,
-    });
-    pipelineRef.value = pipeline;
-
-    log({ step: "开始", message: "管线启动", level: "info", at: Date.now() });
-    const result = await pipeline.run();
-    projectState.lastResult = result;
-    addRecentOutputDir(result.meta.outputDir);
-    tab.value = "cards";
-    await checkVideos();
-    log({ step: "完成", message: `全部完成！项目输出到 ${result.meta.outputDir}，可前往「预览」页试玩`, level: "success", at: Date.now() });
-  } catch (e) {
-    const msg = errMsg(e);
-    logger.error("page", "生成失败", { message: msg });
-    if (msg === "已中止") {
-      logger.warn("page", "生成被用户中止");
-      log({ step: "中止", message: "已停止生成，进度已保存（缓存命中部分不会重复计费）", level: "warn", at: Date.now() });
-    } else {
-      error.value = msg;
-      log({ step: "错误", message: msg, level: "error", at: Date.now() });
-    }
-  } finally {
-    busy.value = false;
-    projectState.running = false;
-    pipelineRef.value = null;
-  }
-}
-
 function stop(): void {
   pipelineRef.value?.abort();
   error.value = "";
@@ -291,6 +825,10 @@ function onCardsSaved(cards: unknown): void {
   }
   scheduleSave();
 }
+
+function fileExistsLabel(file: string | undefined): string {
+  return file ? "已生成" : "未生成";
+}
 </script>
 
 <template>
@@ -298,7 +836,7 @@ function onCardsSaved(cards: unknown): void {
     <div class="page-head">
       <div>
         <div class="page-title">生成项目</div>
-        <p class="page-sub">AI 管线：提取 → 剧本 → 图像 → 配音 → 组装。全部可缓存、断点续跑。</p>
+        <p class="page-sub">AI 管线：提取 → 剧本 → 图像 → 配音 → 组装。可整体跑，也可分阶段单独执行与重生成。</p>
       </div>
       <div class="page-actions">
         <button class="btn" :disabled="busy" @click="start">
@@ -337,6 +875,15 @@ function onCardsSaved(cards: unknown): void {
             <input type="checkbox" v-model="projectState.options.figureEmotions" /> 表情差分（5 表情/角色）
           </label>
           <label style="display: flex; align-items: center; gap: 8px; font-size: 13px">
+            <input type="checkbox" v-model="projectState.options.figureActions" /> 人物动作（入场/情绪动作/镜头震动）
+          </label>
+          <label style="display: flex; align-items: center; gap: 8px; font-size: 13px">
+            <input type="checkbox" v-model="projectState.options.characterPoses" /> 角色三视图与动作立绘（图生图，形象更一致）
+          </label>
+          <label style="display: flex; align-items: center; gap: 8px; font-size: 13px" :title="'用多模态 LLM 核对生成图，不合格自动重生成 1 次（需文本 LLM 支持图片识别，会增加费用与耗时）'">
+            <input type="checkbox" v-model="projectState.options.imageSelfCheck" /> 图像自检（多模态核对，不合格自动重生成）
+          </label>
+          <label style="display: flex; align-items: center; gap: 8px; font-size: 13px">
             <input type="checkbox" v-model="projectState.options.useTts" /> 配音（TTS）
           </label>
           <label style="display: flex; align-items: center; gap: 8px; font-size: 13px">
@@ -350,12 +897,43 @@ function onCardsSaved(cards: unknown): void {
           </label>
         </div>
         <label class="field" style="margin-top: 12px">
+          <span>目标语言（先把小说翻译成该语言再生成，留空 = 用原文）</span>
+          <select v-model="projectState.options.language">
+            <option value="">不翻译（使用原文）</option>
+            <option v-for="l in LANGUAGES" :key="l.code" :value="l.code">{{ l.label }}</option>
+          </select>
+        </label>
+        <label class="field" style="margin-top: 12px">
           <span>统一画风（留空用默认画风，所有立绘/背景/CG 保持一致）</span>
           <input
             type="text"
             v-model="projectState.options.imageStyle"
             placeholder="例：unified Japanese anime style, cel shading, clean line art"
           />
+        </label>
+        <div class="row" style="align-items: flex-end; margin-top: 10px">
+          <div class="field" style="flex: 1; margin-bottom: 0">
+            <span>风格参考图（上传图片 → AI 识别画风并自动填入上方）</span>
+            <div class="row">
+              <button class="btn secondary small" :disabled="styleRecognizing" @click="pickStyleRef">
+                <span v-if="styleRecognizing" class="spinner" />
+                {{ styleRecognizing ? "AI 识别中…" : styleRefSrc ? "更换图片并重新识别" : "上传图片，AI 识别画风" }}
+              </button>
+              <span v-if="styleRefSrc" class="tag ok">已识别</span>
+              <button v-if="styleRefSrc" class="btn ghost small" @click="styleRefSrc = ''">清除</button>
+              <input ref="styleRefInput" type="file" accept="image/*" style="display: none" @change="onStyleRefFile" />
+            </div>
+          </div>
+          <img
+            v-if="styleRefSrc"
+            :src="styleRefSrc"
+            alt="风格参考图"
+            style="width: 72px; height: 72px; object-fit: cover; border-radius: 8px; border: 1px solid var(--border)"
+          />
+        </div>
+        <label class="field" style="margin-top: 12px">
+          <span>剧本风格（按此风格重写台词与旁白，留空不调整。例：古风典雅 / 幽默风趣 / 冷峻克制）</span>
+          <input type="text" v-model="projectState.options.scriptStyle" placeholder="例：古风典雅，多用对仗与典雅意象" />
         </label>
       </div>
 
@@ -388,6 +966,31 @@ function onCardsSaved(cards: unknown): void {
       </div>
     </div>
 
+    <div class="card" style="margin-top: var(--space-4)">
+      <div class="card-head">
+        <h3>本次执行阶段</h3>
+        <div class="card-actions">
+          <button class="btn ghost small" @click="selectedStages = { translate: true, extract: true, script: true, image: true, voice: true, assemble: true }">全选</button>
+          <button class="btn ghost small" @click="selectedStages = { translate: false, extract: false, script: false, image: false, voice: false, assemble: false }">全不选</button>
+        </div>
+      </div>
+      <div style="display: flex; flex-wrap: wrap; gap: 10px 22px">
+        <label v-for="s in STAGE_ORDER" :key="s" style="display: flex; align-items: center; gap: 6px; font-size: 13px">
+          <input type="checkbox" v-model="selectedStages[s]" />
+          {{ STAGE_LABELS[s] }}
+          <span v-if="s === 'translate'" style="color: var(--text-faint); font-size: 11px">小说→目标语言（需 LLM）</span>
+          <span v-else-if="s === 'extract'" style="color: var(--text-faint); font-size: 11px">角色/场景/物品卡</span>
+          <span v-else-if="s === 'script'" style="color: var(--text-faint); font-size: 11px">分章分镜</span>
+          <span v-else-if="s === 'image'" style="color: var(--text-faint); font-size: 11px">立绘/背景/CG/物品图</span>
+          <span v-else-if="s === 'voice'" style="color: var(--text-faint); font-size: 11px">逐句配音</span>
+          <span v-else style="color: var(--text-faint); font-size: 11px">写入游戏文件</span>
+        </label>
+      </div>
+      <p style="color: var(--text-dim); font-size: 12px; margin-top: var(--space-2)">
+        未勾选的阶段会复用已有结果（卡片/剧本/素材），不会重新计费；若某阶段从未运行过则会提示需先运行。
+      </p>
+    </div>
+
     <div class="card" v-if="projectState.novel" style="margin-top: var(--space-4)">
       <div class="card-head">
         <h3>本次重跑章节</h3>
@@ -409,11 +1012,51 @@ function onCardsSaved(cards: unknown): void {
       </div>
     </div>
 
+    <div class="card" v-if="projectState.lastResult" style="margin-top: var(--space-4)">
+      <div class="card-head"><h3>分阶段操作（不满意可单独重生成）</h3></div>
+      <div style="display: flex; flex-direction: column; gap: 10px">
+        <div class="stage-row">
+          <div class="stage-row-label"><span class="stage-dot">①</span><b>翻译</b></div>
+          <input type="text" v-model="stageFeedback.translate" placeholder="意见（可选）：如「人名保持拼音，语气更自然」…" />
+          <button class="btn small" :disabled="busy" @click="runTranslateRegen">重新翻译（连后续）</button>
+        </div>
+        <div class="stage-row">
+          <div class="stage-row-label"><span class="stage-dot">②</span><b>提取卡片</b></div>
+          <input type="text" v-model="stageFeedback.extract" placeholder="意见（可选）：如「主角要有两个女性角色」…" />
+          <button class="btn small" :disabled="busy" @click="runExtractRegen">重新提取（连剧本/图像）</button>
+        </div>
+        <div class="stage-row">
+          <div class="stage-row-label"><span class="stage-dot">③</span><b>剧本</b></div>
+          <input type="text" v-model="stageFeedback.script" placeholder="意见（可选）：如「对话更口语化，高潮更激烈」…" />
+          <button class="btn small" :disabled="busy" @click="runScriptRegen">重新剧本（全部章节）</button>
+        </div>
+        <div class="stage-row">
+          <div class="stage-row-label"><span class="stage-dot">④</span><b>图像</b></div>
+          <input type="text" v-model="stageFeedback.image" placeholder="意见（可选）：如「整体更有电影感，背景更精致」…" />
+          <button class="btn small" :disabled="busy" @click="runImageRegen">重新生成全部图像</button>
+        </div>
+        <div class="stage-row">
+          <div class="stage-row-label"><span class="stage-dot">⑤</span><b>配音</b></div>
+          <span style="color: var(--text-faint); font-size: 12px">TTS 不接收意见；如需重配请点击右侧按钮（全部重配）</span>
+          <button class="btn small" :disabled="busy" @click="runVoiceRegen">重新配音（全部）</button>
+        </div>
+        <div class="stage-row">
+          <div class="stage-row-label"><span class="stage-dot">⑥</span><b>组装</b></div>
+          <span style="color: var(--text-faint); font-size: 12px">把当前卡片/剧本/素材重新写入游戏目录</span>
+          <button class="btn small" :disabled="busy" @click="runAssemble">重新组装</button>
+        </div>
+      </div>
+      <p style="color: var(--text-dim); font-size: 12px; margin-top: var(--space-2)">
+        单条立绘 / 单句配音的重生成请在下方「素材」页操作。
+      </p>
+    </div>
+
     <p v-if="error" style="color: var(--err); margin: var(--space-3) 0">{{ error }}</p>
 
     <div class="tabs">
       <button class="tab" :class="{ active: tab === 'run' }" @click="tab = 'run'">状态与费用</button>
       <button class="tab" :class="{ active: tab === 'cards' }" @click="tab = 'cards'">卡片编辑</button>
+      <button class="tab" :class="{ active: tab === 'asset' }" @click="tab = 'asset'; loadAssetMapNow()">素材</button>
       <button class="tab" :class="{ active: tab === 'video' }" @click="tab = 'video'; checkVideos()">视频推荐位</button>
       <button class="tab" :class="{ active: tab === 'script' }" @click="tab = 'script'; loadScripts()">剧本</button>
       <button class="tab" :class="{ active: tab === 'failed' }" @click="tab = 'failed'">
@@ -464,6 +1107,157 @@ function onCardsSaved(cards: unknown): void {
       </div>
     </div>
 
+    <div v-else-if="tab === 'asset'">
+      <div v-if="!projectState.lastResult || !assetMap" class="empty">
+        <img src="/src/assets/empty-generate.png" alt="" style="width: 220px; opacity: 0.9; margin-bottom: 12px" />
+        <p>暂无素材（生成后出现）。生成后可在本页对单张立绘、背景、CG、物品图或单句配音单独重新生成。</p>
+      </div>
+      <template v-else>
+        <div class="asset-subtabs">
+          <button class="asset-subtab" :class="{ active: assetTab === 'figure' }" @click="assetTab = 'figure'">角色立绘</button>
+          <button class="asset-subtab" :class="{ active: assetTab === 'item' }" @click="assetTab = 'item'">物品图</button>
+          <button class="asset-subtab" :class="{ active: assetTab === 'bg' }" @click="assetTab = 'bg'">背景图</button>
+          <button class="asset-subtab" :class="{ active: assetTab === 'cg' }" @click="assetTab = 'cg'">CG</button>
+          <button class="asset-subtab" :class="{ active: assetTab === 'voice' }" @click="assetTab = 'voice'">配音</button>
+        </div>
+
+        <div class="card" style="margin-top: var(--space-4)">
+          <template v-if="assetTab === 'figure'">
+            <div class="card-head">
+              <h3>角色立绘（三视图 → 立绘/表情/动作）</h3>
+            </div>
+            <label class="field">
+              <span>对本区立绘的意见（可选）：</span>
+              <input type="text" v-model="assetFeedback.figure" placeholder="如：让「林澈」眼神更锐利、制服更有质感" />
+            </label>
+            <div v-for="row in figureRows" :key="row.id" class="asset-row">
+              <div class="asset-row-head">
+                <span class="asset-name">{{ row.name }}</span>
+                <span style="color: var(--text-faint); font-size: 11px">{{ row.id }}</span>
+                <span class="asset-file">{{ fileExistsLabel(row.threeView) }}</span>
+                <button class="btn small" :disabled="!!assetBusy" @click="regenThreeView(row.id)">重新生成三视图（联动全部）</button>
+                <button class="btn secondary small" :disabled="!!assetBusy" @click="regenAllFigure(row.id)">重新生成全部表情</button>
+              </div>
+              <div class="asset-thumb-row">
+                <div v-if="row.threeView" class="asset-thumb" :title="'三视图'">
+                  <img :src="thumbUrl(row.threeView)" alt="三视图" />
+                  <span class="thumb-label">三视图</span>
+                </div>
+                <div v-for="e in row.emotions" :key="e.emo" class="asset-thumb" :class="{ missing: !e.file }" :title="EMOTION_LABELS[e.emo]">
+                  <img v-if="e.file" :src="thumbUrl(e.file)" :alt="EMOTION_LABELS[e.emo]" />
+                  <span class="thumb-label">{{ EMOTION_LABELS[e.emo] }}</span>
+                  <button class="btn ghost small" :disabled="!!assetBusy" @click="regenFigureEmotion(row.id, e.emo)">重生成</button>
+                </div>
+              </div>
+              <div v-if="row.actions.length" style="border-top: 1px dashed var(--border); margin-top: 8px; padding-top: 8px">
+                <div class="asset-thumb-row">
+                  <div v-for="a in row.actions" :key="a.id" class="asset-thumb" :class="{ missing: !a.file }" :title="a.name">
+                    <img v-if="a.file" :src="thumbUrl(a.file)" :alt="a.name" />
+                    <span class="thumb-label">{{ a.name }}</span>
+                    <button class="btn ghost small" :disabled="!!assetBusy" @click="regenAction(row.id, a.id, a.name)">重生成</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </template>
+
+          <template v-else-if="assetTab === 'item'">
+            <div class="card-head"><h3>物品图</h3></div>
+            <label class="field">
+              <span>对本区物品图的意见（可选）：</span>
+              <input type="text" v-model="assetFeedback.item" placeholder="如：物品要更有质感、更有光泽" />
+            </label>
+            <div v-for="row in itemRows" :key="row.id" class="asset-row">
+              <div class="asset-row-head">
+                <span class="asset-name">{{ row.name }}</span>
+                <span style="color: var(--text-faint); font-size: 11px">{{ row.id }}</span>
+                <span class="asset-file">{{ fileExistsLabel(row.file) }}</span>
+                <button class="btn small" :disabled="!!assetBusy" @click="regenItem(row.id)">重新生成</button>
+              </div>
+            </div>
+          </template>
+
+          <template v-else-if="assetTab === 'bg'">
+            <div class="card-head"><h3>背景图</h3></div>
+            <label class="field">
+              <span>对本区背景图的意见（可选）：</span>
+              <input type="text" v-model="assetFeedback.bg" placeholder="如：画面更通透、更有纵深感" />
+            </label>
+            <div v-for="row in bgRows" :key="row.sceneId" class="asset-row">
+              <div class="asset-row-head">
+                <span class="tag">{{ row.chapter }}</span>
+                <span class="asset-name">{{ row.location }}</span>
+                <span style="color: var(--text-faint); font-size: 11px">{{ row.sceneId }}</span>
+                <span class="asset-file">{{ fileExistsLabel(row.file) }}</span>
+                <button class="btn small" :disabled="!!assetBusy" @click="regenBg(row.sceneId)">重新生成</button>
+              </div>
+            </div>
+          </template>
+
+          <template v-else-if="assetTab === 'cg'">
+            <div class="card-head"><h3>CG</h3></div>
+            <label class="field">
+              <span>对本区 CG 的意见（可选）：</span>
+              <input type="text" v-model="assetFeedback.cg" placeholder="如：构图更有冲击力、光影更戏剧化" />
+            </label>
+            <div v-for="row in cgRows" :key="row.sceneId" class="asset-row">
+              <div class="asset-row-head">
+                <span class="tag">{{ row.chapter }}</span>
+                <span class="asset-name">{{ row.title }}</span>
+                <span style="color: var(--text-faint); font-size: 11px">{{ row.sceneId }}</span>
+                <span class="asset-file">{{ fileExistsLabel(row.file) }}</span>
+                <button class="btn small" :disabled="!!assetBusy" @click="regenCgRow(row.chapter, row.sceneId)">重新生成</button>
+              </div>
+            </div>
+          </template>
+
+          <template v-else>
+            <div class="card-head">
+              <h3>配音</h3>
+              <div class="card-actions">
+                <button class="btn ghost small" v-for="c in voiceCharOptions" :key="c.value" @click="regenCharVoice(c.value)" :disabled="!!assetBusy">
+                  重配「{{ c.label }}」全部
+                </button>
+              </div>
+            </div>
+            <div class="row" style="margin-bottom: 12px">
+              <label class="field" style="flex: 1; margin-bottom: 0">
+                <span>章节筛选</span>
+                <select v-model="voiceChapterFilter">
+                  <option :value="0">全部章节</option>
+                  <option v-for="o in voiceChapterOptions" :key="o.value" :value="o.value">{{ o.label }}</option>
+                </select>
+              </label>
+              <label class="field" style="flex: 1; margin-bottom: 0">
+                <span>角色筛选</span>
+                <select v-model="voiceCharFilter">
+                  <option value="">全部角色</option>
+                  <option v-for="c in voiceCharOptions" :key="c.value" :value="c.value">{{ c.label }}</option>
+                </select>
+              </label>
+            </div>
+            <div v-for="row in voiceRows" :key="row.key" class="asset-row voice">
+              <div style="flex: 1; min-width: 0">
+                <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap">
+                  <span class="tag">{{ row.chapter }}</span>
+                  <span style="font-weight: 600; font-size: 13px">{{ charNameOf(row.charId) }}</span>
+                  <span style="color: var(--text-faint); font-size: 11px">{{ row.scene }}</span>
+                  <span class="tag" :class="row.file ? 'ok' : ''">{{ fileExistsLabel(row.file) }}</span>
+                </div>
+                <div style="color: var(--text-dim); font-size: 12px; margin-top: 4px; word-break: break-all">{{ row.text }}</div>
+              </div>
+              <div style="display: flex; align-items: center; gap: 6px; flex-shrink: 0">
+                <button v-if="row.file" class="btn ghost small" @click="playVoice(row.key, row.file)">{{ playingVoiceKey === row.key ? "⏸ 停止" : "▶ 试听" }}</button>
+                <button class="btn small" :disabled="!!assetBusy" @click="regenVoice(row.key)">重配</button>
+              </div>
+            </div>
+            <audio ref="audioRef" style="display: none" @ended="playingVoiceKey = ''"></audio>
+            <div v-if="!voiceRows.length" class="empty">该筛选下没有对白（或尚未生成配音）</div>
+          </template>
+        </div>
+      </template>
+    </div>
+
     <div v-else-if="tab === 'video'">
       <div class="card" v-if="videoPoints.length">
         <div class="card-head">
@@ -491,6 +1285,20 @@ function onCardsSaved(cards: unknown): void {
     </div>
 
     <div v-else-if="tab === 'script'">
+      <div class="card">
+        <div class="card-head">
+          <h3>分章剧本（按意见重写）</h3>
+          <div class="card-actions">
+            <button class="btn ghost small" @click="scriptChapterFeedback = {}">清空意见</button>
+          </div>
+        </div>
+        <p style="color: var(--text-dim); font-size: 12px; margin-bottom: var(--space-3)">选择章节 → 填写意见（可留空 = 直接重新生成）→ 点击「重新生成此章」。其余章节自动复用缓存。</p>
+        <div v-for="ch in projectState.novel?.chapters ?? []" :key="ch.index" class="stage-row" style="margin-bottom: 8px">
+          <div class="stage-row-label"><b>{{ ch.title }}</b></div>
+          <input type="text" v-model="scriptChapterFeedback[ch.index]" placeholder="意见（可选）：这一章节奏太慢，希望更快推进…" />
+          <button class="btn small" :disabled="busy" @click="regenChapter(ch.index)">重新生成此章</button>
+        </div>
+      </div>
       <div class="card" v-if="scriptFiles.length">
         <div class="row" style="justify-content: space-between">
           <select v-model="currentScript" style="flex: 1; max-width: 260px">

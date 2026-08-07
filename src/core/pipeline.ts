@@ -1,5 +1,7 @@
 import type {
   ApiConfig,
+  AssetMap,
+  ChapterInfo,
   ChapterScript,
   CostStats,
   ExtractionResult,
@@ -10,11 +12,14 @@ import type {
   PipelineEvent,
   PipelineResult,
   ProjectMeta,
+  StageFeedback,
+  StageKey,
 } from "./types";
-import type { RenderAssets } from "./render";
-import { chatCompletion } from "../api/openaiCompatible";
+import { STAGE_ORDER, languageName } from "./types";
+import type { RenderAssets, WebgalLanguage } from "./render";
 import { extractFromNovel, demoExtract } from "./extract";
 import { scriptChapter, demoScriptAll } from "./script";
+import { translateChapter } from "./translate";
 import { generateImages } from "./images";
 import { generateVoice } from "./voice";
 import { assembleProject, gameKeyFor } from "./project";
@@ -34,6 +39,12 @@ export interface PipelineInput {
   templateDir: string;
   options: GenerationOptions;
   log: (ev: PipelineEvent) => void;
+  /** 本次要执行的阶段（默认全部）。未勾选的阶段从磁盘缓存/产物读取，供分阶段生成 */
+  stages?: StageKey[];
+  /** 各阶段重生成意见，重跑该阶段时注入给 LLM */
+  feedback?: StageFeedback;
+  /** 强制重跑且跳过缓存的阶段（如「重新剧本/重新图像/重新配音」），即使没有意见也生效 */
+  forceStages?: StageKey[];
 }
 
 export const DEFAULT_PRICES = {
@@ -43,7 +54,7 @@ export const DEFAULT_PRICES = {
   ttsYuanPer1mChars: 500,
 };
 
-function titleHash(title: string): string {
+export function titleHash(title: string): string {
   let h = 5381;
   for (const ch of title) {
     h = ((h * 33) ^ ch.codePointAt(0)!) >>> 0;
@@ -77,6 +88,7 @@ export class Pipeline {
   private cacheRoot = "";
   private aborted = false;
   private failedTasks: FailedTask[] = [];
+  private onUsageCb?: (pt: number, ct: number) => void;
 
   constructor(private input: PipelineInput) {}
 
@@ -114,6 +126,10 @@ export class Pipeline {
     return this.input.options;
   }
 
+  private get feedback(): StageFeedback {
+    return this.input.feedback ?? {};
+  }
+
   private async readCachedJson<T>(file: string): Promise<T | null> {
     try {
       if (await tauri.pathExists(file)) {
@@ -126,21 +142,202 @@ export class Pipeline {
     return null;
   }
 
+  /* ---------- 从磁盘恢复中间产物（供分阶段运行） ---------- */
+
+  private async loadCards(): Promise<ExtractionResult | null> {
+    const base = `${this.input.outputDir}/.novel2vn`;
+    for (const f of ["cards.json", "cards_demo.json"]) {
+      const parsed = await this.readCachedJson<ExtractionResult>(`${base}/${f}`);
+      if (parsed && Array.isArray(parsed.characters)) return parsed;
+    }
+    return null;
+  }
+
+  private async loadChapters(): Promise<ChapterScript[]> {
+    try {
+      const entries = await tauri.listDir(this.cacheRoot);
+      const files = entries
+        .filter((e) => !e.isDir && /^script(_demo)?_ch\d+_/.test(e.name))
+        .sort((a, b) => a.name.localeCompare(b.name));
+      const chapters: ChapterScript[] = [];
+      for (const f of files) {
+        try {
+          const { text } = await tauri.readTextFile(f.path);
+          const sc = JSON.parse(text) as ChapterScript;
+          chapters[sc.chapter] = sc;
+        } catch {
+          /* 单个缓存损坏跳过 */
+        }
+      }
+      return chapters.filter(Boolean);
+    } catch {
+      return [];
+    }
+  }
+
+  private async loadAssetMap(): Promise<AssetMap | null> {
+    return this.readCachedJson<AssetMap>(`${this.input.outputDir}/.novel2vn/assets.json`);
+  }
+
+  private async loadMeta(): Promise<ProjectMeta | null> {
+    return this.readCachedJson<ProjectMeta>(`${this.input.outputDir}/.novel2vn/meta.json`);
+  }
+
+  private async persistAssets(assets: RenderAssets): Promise<void> {
+    try {
+      await tauri.writeTextFile(
+        `${this.input.outputDir}/.novel2vn/assets.json`,
+        JSON.stringify(
+          { bg: assets.bg, cg: assets.cg, figure: assets.figure, item: assets.item, vocal: assets.vocal },
+          null,
+          2,
+        ),
+      );
+    } catch {
+      /* 素材映射持久化失败不阻断 */
+    }
+  }
+
+  /** 卡片变化后使依赖卡片的缓存失效：剧本 + 立绘/物品图 */
+  private async invalidateAfterCardsChange(): Promise<{ script: number; images: number }> {
+    let script = 0;
+    let images = 0;
+    try {
+      const entries = await tauri.listDir(this.cacheRoot);
+      for (const e of entries) {
+        if (!e.isDir && /^script(_demo)?_ch\d+_/.test(e.name)) {
+          await tauri.removePath(e.path).catch(() => {});
+          script++;
+        }
+      }
+    } catch {
+      /* 目录不存在 */
+    }
+    try {
+      const imgDir = `${this.cacheRoot}/images`;
+      const entries = await tauri.listDir(imgDir);
+      for (const e of entries) {
+        if (!e.isDir && /^(figure_|item_)/.test(e.name)) {
+          await tauri.removePath(e.path).catch(() => {});
+          images++;
+        }
+      }
+    } catch {
+      /* images 目录不存在 */
+    }
+    return { script, images };
+  }
+
+  private applyVideoOptions(script: ChapterScript): void {
+    if (this.options.useVideoPoints) {
+      const videoLimit = this.options.videoPointsPerChapter ?? 2;
+      for (const scene of script.scenes) {
+        if (scene.videoPoints && scene.videoPoints.length > videoLimit) {
+          scene.videoPoints = scene.videoPoints.slice(0, videoLimit);
+        }
+      }
+    } else {
+      for (const scene of script.scenes) {
+        scene.videoPoints = [];
+      }
+    }
+  }
+
+  /* ---------- 翻译：把小说章节翻译为目标语言（缓存于 .novel2vn/translate/，不被提取指纹清理） ---------- */
+
+  private translateCacheFile(lang: string, ch: { index: number; title: string; text: string }): string {
+    return `${this.input.outputDir}/.novel2vn/translate/translate_${lang}_ch${ch.index + 1}_${titleHash(ch.title)}_${titleHash(ch.text)}.json`;
+  }
+
+  private async runTranslation(chapters: ChapterInfo[], lang: string): Promise<ChapterInfo[]> {
+    const cfg = this.input.llm!;
+    const dir = `${this.input.outputDir}/.novel2vn/translate`;
+    await tauri.mkdirAll(dir);
+    const force = this.input.forceStages?.includes("translate");
+    const feedback = this.feedback.translate;
+    const out: ChapterInfo[] = [];
+    for (const ch of chapters) {
+      this.checkAbort();
+      const cacheFile = this.translateCacheFile(lang, ch);
+      let cached: { title: string; text: string } | null = null;
+      if (!force) {
+        cached = await this.readCachedJson<{ title: string; text: string }>(cacheFile);
+      }
+      if (cached) {
+        this.input.log({
+          step: "翻译",
+          message: `[缓存] 第 ${ch.index + 1} 章译文：${cached.title}`,
+          level: "info",
+          at: Date.now(),
+        });
+        out.push({ ...ch, title: cached.title, text: cached.text });
+        continue;
+      }
+      this.input.log({
+        step: "翻译",
+        message: `翻译第 ${ch.index + 1} 章：${ch.title}`,
+        level: "info",
+        at: Date.now(),
+      });
+      try {
+        const tr = await translateChapter(cfg, ch, lang, this.onUsageCb, feedback);
+        await tauri.writeTextFile(cacheFile, JSON.stringify(tr, null, 2));
+        out.push({ ...ch, title: tr.title, text: tr.text });
+        this.checkBudget();
+      } catch (e) {
+        this.recordFailure({
+          id: `translate_${ch.index + 1}`,
+          kind: "llm",
+          step: "翻译",
+          message: `第 ${ch.index + 1} 章：${errMsg(e)}`,
+          at: Date.now(),
+        });
+        throw e;
+      }
+    }
+    this.input.log({
+      step: "翻译",
+      message: `翻译完成：${out.length} 章 → ${languageName(lang)}`,
+      level: "success",
+      at: Date.now(),
+    });
+    return out;
+  }
+
+  private async loadTranslation(chapters: ChapterInfo[], lang: string): Promise<ChapterInfo[] | null> {
+    const out: ChapterInfo[] = [];
+    let any = false;
+    for (const ch of chapters) {
+      const cached = await this.readCachedJson<{ title: string; text: string }>(this.translateCacheFile(lang, ch));
+      if (cached) {
+        out.push({ ...ch, title: cached.title, text: cached.text });
+        any = true;
+      } else {
+        out.push(ch);
+      }
+    }
+    return any ? out : null;
+  }
+
   async run(): Promise<PipelineResult> {
     const { input } = this;
     this.cacheRoot = `${input.outputDir}/.novel2vn/cache`;
     const runStart = logger.time("pipeline", "管线整体运行");
+    const stages = new Set<StageKey>(input.stages ?? (STAGE_ORDER as StageKey[]));
     logger.info("pipeline", "开始运行", {
       demo: !input.llm?.apiKey,
       outputDir: input.outputDir,
-      templateDir: input.templateDir,
       chapterCount: input.novel.chapters.length,
+      stages: Array.from(stages),
+      forceStages: input.forceStages,
+      hasFeedback: Object.keys(this.feedback).length > 0,
       options: {
         useImage: input.options.useImage,
         useTts: input.options.useTts,
         useBgm: input.options.useBgm,
         figureEmotions: input.options.figureEmotions,
         skipCache: input.options.skipCache,
+        scriptStyle: input.options.scriptStyle,
         rerunChapters: input.options.rerunChapters,
       },
     });
@@ -152,9 +349,10 @@ export class Pipeline {
       this.cost.llmTokens += pt + ct;
       this.cost.llmCostYuan += (pt / 1e6) * DEFAULT_PRICES.llmInYuanPer1m + (ct / 1e6) * DEFAULT_PRICES.llmOutYuanPer1m;
     };
+    this.onUsageCb = onUsage;
 
     const demo = !input.llm?.apiKey;
-    if (demo) {
+    if (demo && stages.has("extract")) {
       log({
         step: "提取",
         message: "未配置文本 LLM API，使用演示模式（内置示例小说的角色/场景/物品卡）",
@@ -163,227 +361,336 @@ export class Pipeline {
       });
     }
 
-    // ① 提取
-    log({ step: "提取", message: "开始提取角色/场景/物品卡…", level: "info", at: Date.now() });
-    let cards: ExtractionResult | undefined = input.cards;
-    const cachePrefix = demo ? "cards_demo" : "cards";
-    const cardsCache = `${input.outputDir}/.novel2vn/${cachePrefix}.json`;
-    // 小说指纹：源文件路径 + 章节正文内容哈希（不含章节标题，改标题不触发缓存作废）
-    const bodyText = input.novel.chapters.map((c) => c.text).join("\u0001");
-    let fpHash = 5381;
-    for (const ch of bodyText) {
-      fpHash = ((fpHash * 33) ^ ch.codePointAt(0)!) >>> 0;
-    }
-    const novelFp = `${input.novel.sourcePath}:${fpHash.toString(36)}`;
-    if (!cards && !this.options.skipCache) {
-      cards = (await this.readCachedJson<ExtractionResult>(cardsCache)) ?? undefined;
-      if (cards && (cards as { _novelFp?: string })._novelFp !== novelFp) {
-        log({
-          step: "提取",
-          message: "检测到小说内容变化（或更换了小说），旧缓存已作废，正在清理…",
-          level: "warn",
-          at: Date.now(),
-        });
-        await tauri.removePath(this.cacheRoot).catch(() => {});
-        await tauri.mkdirAll(this.cacheRoot);
-        cards = undefined;
+    /* ==================== ① 翻译（可选，先翻译再提取） ==================== */
+    const lang = (this.options.language ?? "").trim();
+    const canTranslate = !!input.llm && !!lang;
+    let workingChapters = input.novel.chapters;
+    if (stages.has("translate")) {
+      if (canTranslate) {
+        log({ step: "翻译", message: `开始把小说翻译为「${languageName(lang)}」…`, level: "info", at: Date.now() });
+        workingChapters = await this.runTranslation(input.novel.chapters, lang);
+      } else if (lang) {
+        log({ step: "翻译", message: "已设置目标语言但未配置文本 LLM，无法翻译，将使用原文生成", level: "warn", at: Date.now() });
+      } else {
+        log({ step: "翻译", message: "未设置目标语言，使用原文生成", level: "info", at: Date.now() });
+      }
+    } else if (canTranslate) {
+      const restored = await this.loadTranslation(input.novel.chapters, lang);
+      if (restored) {
+        workingChapters = restored;
+        log({ step: "翻译", message: `[缓存] 复用已翻译章节（${languageName(lang)}）`, level: "info", at: Date.now() });
+      } else {
+        log({ step: "翻译", message: "未勾选翻译阶段且无已翻译缓存，将使用原文", level: "warn", at: Date.now() });
       }
     }
-    if (!cards) {
-      try {
-        cards = demo
-          ? demoExtract(input.novel.fullText, input.novel.fileName.replace(/\.txt$/i, ""))
-          : await extractFromNovel(input.llm!, input.novel.fullText, input.novel.fileName.replace(/\.txt$/i, ""), onUsage);
-      } catch (e) {
-        this.recordFailure({
-          id: "extract",
-          kind: "llm",
-          step: "提取",
-          message: errMsg(e),
-          at: Date.now(),
-        });
-        throw e;
-      }
-      await tauri.writeTextFile(cardsCache, JSON.stringify({ ...cards, _novelFp: novelFp }, null, 2));
-      this.checkBudget();
-      log({
-        step: "提取",
-        message: `提取完成：${cards.characters.length} 角色 / ${cards.scenes.length} 场景 / ${cards.items.length} 物品`,
-        level: "success",
-        at: Date.now(),
-      });
-    } else {
-      log({ step: "提取", message: "[缓存] 复用角色/场景/物品卡", level: "info", at: Date.now() });
-    }
-    logger.info("pipeline", "提取阶段完成", {
-      fromCache: !!cards && (cards as { _novelFp?: string })._novelFp !== undefined,
-      characters: cards!.characters.length,
-      scenes: cards!.scenes.length,
-      items: cards!.items.length,
-    });
+    const workingNovel: NovelDoc = {
+      ...input.novel,
+      fullText: workingChapters.map((c) => c.text).join("\n\n"),
+      chapters: workingChapters,
+    };
     this.checkAbort();
 
-    // ② 分章剧本
-    const chapters: ChapterScript[] = [];
-    const activeChapters = input.novel.chapters.filter((c) => c.enabled !== false);
-    const rerunSet = new Set(this.options.rerunChapters ?? activeChapters.map((c) => c.index));
-    for (const chapter of activeChapters) {
-      this.checkAbort();
-      const cacheFile = `${cacheDir}/${demo ? "script_demo" : "script"}_ch${chapter.index + 1}_${titleHash(chapter.title)}.json`;
-      const selected = rerunSet.has(chapter.index);
-      let script: ChapterScript | null = null;
-      if (!selected) {
-        script = await this.readCachedJson<ChapterScript>(cacheFile);
-        if (script) {
-          log({ step: "剧本", message: `[缓存] 第 ${chapter.index + 1} 章（未勾选重跑，复用）：${chapter.title}`, level: "info", at: Date.now() });
-        } else {
+    /* ==================== ② 提取 ==================== */
+    let cards: ExtractionResult | undefined = input.cards;
+    if (stages.has("extract")) {
+      log({ step: "提取", message: "开始提取角色/场景/物品卡…", level: "info", at: Date.now() });
+      const cachePrefix = demo ? "cards_demo" : "cards";
+      const cardsCache = `${input.outputDir}/.novel2vn/${cachePrefix}.json`;
+      const extractFeedback = this.feedback.extract;
+      const forceExtract = input.forceStages?.includes("extract");
+      // 小说指纹：源文件路径 + 章节正文内容哈希（不含章节标题，改标题不触发缓存作废）
+      const bodyText = workingChapters.map((c) => c.text).join("\u0001");
+      let fpHash = 5381;
+      for (const ch of bodyText) {
+        fpHash = ((fpHash * 33) ^ ch.codePointAt(0)!) >>> 0;
+      }
+      const novelFp = `${input.novel.sourcePath}:${fpHash.toString(36)}`;
+      if (!cards && !this.options.skipCache && !extractFeedback && !forceExtract) {
+        cards = (await this.readCachedJson<ExtractionResult>(cardsCache)) ?? undefined;
+        if (cards && (cards as { _novelFp?: string })._novelFp !== novelFp) {
           log({
-            step: "剧本",
-            message: `第 ${chapter.index + 1} 章未勾选重跑且无缓存，跳过：${chapter.title}`,
+            step: "提取",
+            message: "检测到小说内容变化（或更换了小说），旧缓存已作废，正在清理…",
             level: "warn",
             at: Date.now(),
           });
-          continue;
+          await tauri.removePath(this.cacheRoot).catch(() => {});
+          await tauri.mkdirAll(this.cacheRoot);
+          cards = undefined;
         }
-      } else {
-        if (!this.options.skipCache) {
-          script = await this.readCachedJson<ChapterScript>(cacheFile);
-        }
-        if (!script) {
-          log({
-            step: "剧本",
-            message: `生成第 ${chapter.index + 1} 章剧本：${chapter.title}`,
-            level: "info",
+      }
+      if (!cards) {
+        try {
+          cards = demo
+            ? demoExtract(workingNovel.fullText, workingNovel.fileName.replace(/\.txt$/i, ""))
+            : await extractFromNovel(input.llm!, workingNovel.fullText, workingNovel.fileName.replace(/\.txt$/i, ""), onUsage, extractFeedback);
+        } catch (e) {
+          this.recordFailure({
+            id: "extract",
+            kind: "llm",
+            step: "提取",
+            message: errMsg(e),
             at: Date.now(),
           });
-          try {
-            script = demo
-              ? demoScriptAll([chapter], cards!)[0]
-              : await scriptChapter(input.llm!, chapter, cards!, onUsage);
-          } catch (e) {
-            this.recordFailure({
-              id: `chapter_${chapter.index + 1}`,
-              kind: "script",
+          throw e;
+        }
+        await tauri.writeTextFile(cardsCache, JSON.stringify({ ...cards, _novelFp: novelFp }, null, 2));
+        if (extractFeedback || forceExtract) {
+          const cleared = await this.invalidateAfterCardsChange();
+          this.log(`重新提取完成，已使 ${cleared.script} 个剧本缓存 / ${cleared.images} 个立绘物品图缓存失效，后续阶段将使用新卡片`, "success", "提取");
+        }
+        this.checkBudget();
+        log({
+          step: "提取",
+          message: `提取完成：${cards.characters.length} 角色 / ${cards.scenes.length} 场景 / ${cards.items.length} 物品`,
+          level: "success",
+          at: Date.now(),
+        });
+      } else {
+        log({ step: "提取", message: "[缓存] 复用角色/场景/物品卡", level: "info", at: Date.now() });
+      }
+      logger.info("pipeline", "提取阶段完成", {
+        fromCache: !!cards && (cards as { _novelFp?: string })._novelFp !== undefined,
+        characters: cards!.characters.length,
+        scenes: cards!.scenes.length,
+        items: cards!.items.length,
+      });
+    } else {
+      cards = cards ?? (await this.loadCards()) ?? undefined;
+      if (cards) {
+        log({ step: "提取", message: "[缓存] 复用角色/场景/物品卡", level: "info", at: Date.now() });
+      } else {
+        throw new Error("未勾选「提取」阶段且无卡片缓存，请先勾选提取或加载已有项目");
+      }
+    }
+    this.checkAbort();
+
+    /* ==================== ③ 分章剧本 ==================== */
+    const chapters: ChapterScript[] = [];
+    if (stages.has("script")) {
+      const activeChapters = workingChapters.filter((c) => c.enabled !== false);
+      const scriptForce = input.forceStages?.includes("script");
+      const rerunSet = new Set(
+        scriptForce ? activeChapters.map((c) => c.index) : (this.options.rerunChapters ?? activeChapters.map((c) => c.index)),
+      );
+      const feedbackSet = new Set(Object.keys(this.feedback.script ?? {}).map(Number));
+      const style = (this.options.scriptStyle ?? "").trim();
+      const styleFrag = style ? `_st${titleHash(style)}` : "";
+      for (const chapter of activeChapters) {
+        this.checkAbort();
+        const cacheFile = `${cacheDir}/${demo ? "script_demo" : "script"}_ch${chapter.index + 1}_${titleHash(chapter.title)}${styleFrag}.json`;
+        const hasFeedback = feedbackSet.has(chapter.index);
+        const selected = rerunSet.has(chapter.index);
+        let script: ChapterScript | null = null;
+        if (!selected && !hasFeedback) {
+          script = await this.readCachedJson<ChapterScript>(cacheFile);
+          if (script) {
+            log({ step: "剧本", message: `[缓存] 第 ${chapter.index + 1} 章（未勾选重跑，复用）：${chapter.title}`, level: "info", at: Date.now() });
+          } else {
+            log({
               step: "剧本",
-              message: `第 ${chapter.index + 1} 章：${errMsg(e)}`,
+              message: `第 ${chapter.index + 1} 章未勾选重跑且无缓存，跳过：${chapter.title}`,
+              level: "warn",
               at: Date.now(),
             });
-            throw e;
+            continue;
           }
-          await tauri.writeTextFile(cacheFile, JSON.stringify(script, null, 2));
-          this.checkBudget();
         } else {
-          log({
-            step: "剧本",
-            message: `[缓存] 第 ${chapter.index + 1} 章：${chapter.title}`,
-            level: "info",
-            at: Date.now(),
-          });
-        }
-      }
-      // 视频推荐点：开关 + 数量上限
-      if (this.options.useVideoPoints) {
-        const videoLimit = this.options.videoPointsPerChapter ?? 2;
-        for (const scene of script.scenes) {
-          if (scene.videoPoints && scene.videoPoints.length > videoLimit) {
-            scene.videoPoints = scene.videoPoints.slice(0, videoLimit);
+          if (!this.options.skipCache && !hasFeedback && !scriptForce) {
+            script = await this.readCachedJson<ChapterScript>(cacheFile);
+          }
+          if (!script) {
+            log({
+              step: "剧本",
+              message: `生成第 ${chapter.index + 1} 章剧本：${chapter.title}${hasFeedback ? "（按你的意见重写）" : ""}`,
+              level: "info",
+              at: Date.now(),
+            });
+            try {
+              script = demo
+                ? demoScriptAll([chapter], cards!)[0]
+                : await scriptChapter(input.llm!, chapter, cards!, onUsage, {
+                    style: style || undefined,
+                    feedback: this.feedback.script?.[chapter.index],
+                  });
+            } catch (e) {
+              this.recordFailure({
+                id: `chapter_${chapter.index + 1}`,
+                kind: "script",
+                step: "剧本",
+                message: `第 ${chapter.index + 1} 章：${errMsg(e)}`,
+                at: Date.now(),
+              });
+              throw e;
+            }
+            await tauri.writeTextFile(cacheFile, JSON.stringify(script, null, 2));
+            this.checkBudget();
+          } else {
+            log({
+              step: "剧本",
+              message: `[缓存] 第 ${chapter.index + 1} 章：${chapter.title}`,
+              level: "info",
+              at: Date.now(),
+            });
           }
         }
-      } else {
-        for (const scene of script.scenes) {
-          scene.videoPoints = [];
-        }
+        this.applyVideoOptions(script);
+        ensureUniqueSceneIds(script);
+        chapters.push(script);
+        logger.debug("pipeline", `第 ${chapter.index + 1} 章剧本就绪`, {
+          title: chapter.title,
+          scenes: script.scenes.length,
+          lines: script.scenes.reduce((n, s) => n + s.lines.length, 0),
+        });
       }
-      ensureUniqueSceneIds(script);
-      chapters.push(script);
-      logger.debug("pipeline", `第 ${chapter.index + 1} 章剧本就绪`, {
-        title: chapter.title,
-        scenes: script.scenes.length,
-        lines: script.scenes.reduce((n, s) => n + s.lines.length, 0),
-      });
+    } else {
+      const cachedChapters = await this.loadChapters();
+      if (cachedChapters.length) {
+        for (const c of cachedChapters) {
+          this.applyVideoOptions(c);
+          ensureUniqueSceneIds(c);
+          chapters.push(c);
+        }
+        log({ step: "剧本", message: `[缓存] 复用 ${chapters.length} 章剧本`, level: "info", at: Date.now() });
+      } else {
+        throw new Error("未勾选「剧本」阶段且无剧本缓存，请先勾选剧本或加载已有项目");
+      }
     }
     logger.info("pipeline", "剧本阶段完成", { totalChapters: chapters.length });
 
-    const assets: RenderAssets = { bg: {}, cg: {}, figure: {}, item: {}, vocal: {}, bgm: {} };
-
-    // ③ 图像（用户素材优先；无图像 API 时仅用用户素材）
-    if (this.options.useImage) {
-      log({ step: "图像", message: "开始处理图像素材…", level: "info", at: Date.now() });
-      const { images, failed } = await generateImages(
-        input.image,
-        chapters,
-        cards!,
-        input.materials,
-        this.cacheRoot,
-        input.log,
-        2,
-        this.options.figureEmotions,
-        this.options.imageStyle,
-      );
-      this.failedTasks.push(...failed);
-      this.cost.imageCount = Object.values(images.bg).length + Object.values(images.cg).length + Object.values(images.figure).length + Object.values(images.item).length;
-      this.cost.imageCostYuan = this.cost.imageCount * DEFAULT_PRICES.imageYuanEach;
-      Object.assign(assets, images);
-      this.checkBudget();
-      this.checkAbort();
-      logger.info("pipeline", "图像阶段完成", {
-        bg: Object.keys(images.bg).length,
-        cg: Object.keys(images.cg).length,
-        figure: Object.keys(images.figure).length,
-        item: Object.keys(images.item).length,
-        failed: failed.length,
-      });
-    } else {
-      log({
-        step: "图像",
-        message: "图像生成已关闭或未配置图像 API，跳过",
-        level: "warn",
-        at: Date.now(),
-      });
-    }
-
-    // ④ 配音
-    if (this.options.useTts && input.tts?.apiKey) {
-      log({ step: "配音", message: "开始生成配音…", level: "info", at: Date.now() });
-      const vocal = await generateVoice(input.tts, chapters, cards!.characters, this.cacheRoot, input.log, 2);
-      this.cost.ttsChars = Object.keys(vocal).reduce((n, k) => n + (vocal[k] ? 1 : 0), 0) * 20;
-      this.cost.ttsCostYuan = (this.cost.ttsChars / 1e6) * DEFAULT_PRICES.ttsYuanPer1mChars;
-      assets.vocal = vocal;
-      this.checkBudget();
-      logger.info("pipeline", "配音阶段完成", { vocalCount: Object.keys(vocal).length });
-    } else {
-      log({ step: "配音", message: "配音已关闭或未配置 TTS API，跳过", level: "warn", at: Date.now() });
-    }
-
-    this.checkAbort();
-
-    // 章节重新编号（过滤未启用的章节后）
+    // 章节重新编号（过滤未启用的章节后）→ 图像/配音/组装使用统一编号，保证素材键一致
     chapters.forEach((c, i) => {
       c.chapter = i;
     });
 
-    // ⑤ 组装
-    log({ step: "组装", message: `组装项目到 ${input.outputDir}…`, level: "info", at: Date.now() });
-    const { meta } = await assembleProject({
-      outputDir: input.outputDir,
-      title: cards!.title || input.novel.fileName.replace(/\.txt$/i, ""),
-      gameKey: gameKeyFor(cards!.title || input.novel.fileName),
-      templateDir: input.templateDir,
-      chapters,
-      cards: cards!,
-      assets,
-      introCard: this.options.characterIntroCard,
-      figureEmotions: this.options.figureEmotions,
-      useBgm: this.options.useBgm,
-      log: (m) => this.log(m, "info", "组装"),
-    });
-    log({ step: "组装", message: "项目组装完成！", level: "success", at: Date.now() });
+    const assets: RenderAssets = { bg: {}, cg: {}, figure: {}, item: {}, vocal: {}, bgm: {} };
+
+    // 未勾选图像/配音时，从磁盘恢复已生成的素材映射
+    if (!stages.has("image") || !stages.has("voice")) {
+      const existing = await this.loadAssetMap();
+      if (existing) {
+        assets.bg = existing.bg ?? {};
+        assets.cg = existing.cg ?? {};
+        assets.figure = existing.figure ?? {};
+        assets.item = existing.item ?? {};
+        assets.vocal = existing.vocal ?? {};
+      }
+    }
+
+    /* ==================== ④ 图像 ==================== */
+    if (stages.has("image")) {
+      if (this.options.useImage) {
+        log({ step: "图像", message: "开始处理图像素材…", level: "info", at: Date.now() });
+        const imageFeedback = this.feedback.image;
+        const imageForce = !!imageFeedback || input.forceStages?.includes("image");
+        const { images, failed } = await generateImages(
+          input.image,
+          chapters,
+          cards!,
+          input.materials,
+          this.cacheRoot,
+          input.log,
+          2,
+          this.options.figureEmotions,
+          this.options.imageStyle,
+          imageFeedback,
+          imageForce,
+          this.options.characterPoses !== false,
+          this.options.characterPoses !== false,
+          this.options.imageSelfCheck ? input.llm : undefined,
+        );
+        this.failedTasks.push(...failed);
+        this.cost.imageCount = Object.values(images.bg).length + Object.values(images.cg).length + Object.values(images.figure).length + Object.values(images.item).length;
+        this.cost.imageCostYuan = this.cost.imageCount * DEFAULT_PRICES.imageYuanEach;
+        Object.assign(assets, images);
+        await this.persistAssets(assets);
+        this.checkBudget();
+        this.checkAbort();
+        logger.info("pipeline", "图像阶段完成", {
+          bg: Object.keys(images.bg).length,
+          cg: Object.keys(images.cg).length,
+          figure: Object.keys(images.figure).length,
+          item: Object.keys(images.item).length,
+          failed: failed.length,
+        });
+      } else {
+        log({
+          step: "图像",
+          message: "图像生成已关闭或未配置图像 API，跳过",
+          level: "warn",
+          at: Date.now(),
+        });
+      }
+    } else {
+      log({ step: "图像", message: "未勾选图像阶段，复用已有素材", level: "info", at: Date.now() });
+    }
+
+    /* ==================== ⑤ 配音 ==================== */
+    if (stages.has("voice")) {
+      if (this.options.useTts && input.tts?.apiKey) {
+        log({ step: "配音", message: "开始生成配音…", level: "info", at: Date.now() });
+        const voiceForce = !!this.feedback.voice || input.forceStages?.includes("voice");
+        const vocal = await generateVoice(input.tts, chapters, cards!.characters, this.cacheRoot, input.log, 2, voiceForce);
+        this.cost.ttsChars = Object.keys(vocal).reduce((n, k) => n + (vocal[k] ? 1 : 0), 0) * 20;
+        this.cost.ttsCostYuan = (this.cost.ttsChars / 1e6) * DEFAULT_PRICES.ttsYuanPer1mChars;
+        assets.vocal = vocal;
+        await this.persistAssets(assets);
+        this.checkBudget();
+        logger.info("pipeline", "配音阶段完成", { vocalCount: Object.keys(vocal).length });
+      } else {
+        log({ step: "配音", message: "配音已关闭或未配置 TTS API，跳过", level: "warn", at: Date.now() });
+      }
+    } else {
+      log({ step: "配音", message: "未勾选配音阶段，复用已有配音", level: "info", at: Date.now() });
+    }
+
+    this.checkAbort();
+
+    /* ==================== ⑥ 组装 ==================== */
+    let meta: ProjectMeta | null = null;
+    if (stages.has("assemble")) {
+      log({ step: "组装", message: `组装项目到 ${input.outputDir}…`, level: "info", at: Date.now() });
+      const r = await assembleProject({
+        outputDir: input.outputDir,
+        title: cards!.title || workingNovel.fileName.replace(/\.txt$/i, ""),
+        gameKey: gameKeyFor(cards!.title || workingNovel.fileName),
+        templateDir: input.templateDir,
+        chapters,
+        cards: cards!,
+        assets,
+        introCard: this.options.characterIntroCard,
+        figureEmotions: this.options.figureEmotions,
+        figureActions: this.options.figureActions,
+        useBgm: this.options.useBgm,
+        language: (this.options.language as WebgalLanguage) || "zh_CN",
+        log: (m) => this.log(m, "info", "组装"),
+      });
+      meta = r.meta;
+      log({ step: "组装", message: "项目组装完成！", level: "success", at: Date.now() });
+    } else {
+      meta = await this.loadMeta();
+      if (!meta) {
+        meta = {
+          title: cards!.title || workingNovel.fileName.replace(/\.txt$/i, ""),
+          gameKey: gameKeyFor(cards!.title || workingNovel.fileName),
+          chapterCount: chapters.length,
+          charCount: cards!.characters.length,
+          sceneCount: chapters.reduce((n, c) => n + c.scenes.length, 0),
+          lineCount: chapters.reduce((n, c) => n + c.scenes.reduce((m, s) => m + s.lines.length, 0), 0),
+          outputDir: input.outputDir,
+          webgalVersion: "4.6.3",
+          generatedAt: new Date().toISOString(),
+        };
+      }
+      log({ step: "组装", message: "未勾选组装阶段，复用已有输出（可前往预览页试玩）", level: "info", at: Date.now() });
+    }
 
     runStart("完成");
     logger.info("pipeline", "管线运行结束", {
       cost: this.cost,
       failedTasks: this.failedTasks.length,
       chapters: chapters.length,
+      stages: Array.from(stages),
     });
 
     return { meta, cards: cards!, chapters, assets, cost: this.cost, failedTasks: this.failedTasks };
