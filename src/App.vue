@@ -9,6 +9,8 @@ import AboutDialog from "./components/AboutDialog.vue";
 import { configState } from "./stores/config";
 import { projectState, restoreProject } from "./stores/project";
 import { tauri } from "./utils/tauri";
+import { installLogFileSink } from "./utils/logFile";
+import { log } from "./utils/logger";
 import { version } from "../package.json";
 
 const pages = [
@@ -32,6 +34,8 @@ const icons: Record<string, string> = {
 const versionText = `v${version}`;
 
 onMounted(async () => {
+  const logPath = await installLogFileSink();
+  log.info("app", "应用启动，日志已落盘", { logPath });
   if (configState.outputDir) {
     projectState.outputDir = configState.outputDir;
     await restoreProject(configState.outputDir);

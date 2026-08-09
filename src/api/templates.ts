@@ -7,7 +7,7 @@ import type { AdapterTemplate } from "./universal";
 export const PRESET_TEMPLATES: AdapterTemplate[] = [
   {
     id: "openai-image",
-    name: "OpenAI 兼容图像（智谱 CogView / 硅基流动 FLUX / OpenAI）",
+    name: "OpenAI 兼容图像（智谱 CogView / OpenAI）",
     capability: "image",
     mode: "sync",
     endpoint: "/v1/images/generations",
@@ -18,9 +18,32 @@ export const PRESET_TEMPLATES: AdapterTemplate[] = [
       size: "$sizeOpenAI",
       response_format: { value: "b64_json" },
       image: "$refImage",
+      image2: "$refImage2",
+      image3: "$refImage3",
+      seed: "$seed",
     },
     response: { path: "data", encoding: "base64", mime: "image/png" },
     description: "标准 OpenAI 兼容：POST /v1/images/generations，响应 data[0].b64_json 或 url",
+  },
+  {
+    id: "siliconflow-image",
+    name: "硅基流动 FLUX（seed/负面提示词/图生图完整支持）",
+    capability: "image",
+    mode: "sync",
+    endpoint: "/v1/images/generations",
+    requestMap: {
+      model: "$model",
+      prompt: "$prompt",
+      negative_prompt: "$negativePrompt",
+      image_size: "$sizeOpenAI",
+      batch_size: "$count",
+      image: "$refImage",
+      image2: "$refImage2",
+      image3: "$refImage3",
+      seed: "$seed",
+    },
+    response: { path: "data", encoding: "base64", mime: "image/png" },
+    description: "硅基流动：POST /v1/images/generations，支持 seed（固定种子）与 negative_prompt（负面提示词），配合参考图可实现风格锚定。base_url 填 https://api.siliconflow.cn/v1",
   },
   {
     id: "openai-tts",
@@ -105,6 +128,8 @@ export const PRESET_TEMPLATES: AdapterTemplate[] = [
       "input.prompt": "$prompt",
       "parameters.size": "$sizeString",
       "parameters.n": "$count",
+      "parameters.seed": "$seed",
+      "parameters.negative_prompt": "$negativePrompt",
     },
     poll: {
       endpoint: "/api/v1/tasks/{taskId}",
@@ -168,6 +193,7 @@ export const PRESET_TEMPLATES: AdapterTemplate[] = [
     requestMap: {
       "contents[0].parts[0].text": "$prompt",
       "generationConfig.responseModalities": { value: ["IMAGE"] },
+      "generationConfig.seed": "$seed",
     },
     response: { path: "candidates", encoding: "base64", mime: "image/png" },
     description:
@@ -184,7 +210,9 @@ export const PRESET_TEMPLATES: AdapterTemplate[] = [
     rawResponse: true,
     requestMap: {
       prompt: "$prompt",
+      negative_prompt: "$negativePrompt",
       aspect_ratio: "$sizeRatio",
+      seed: "$seed",
       output_format: { value: "png" },
     },
     response: { mime: "image/png" },
@@ -208,7 +236,13 @@ export function resolveTemplate(cfg: { adapter?: string; extra?: Record<string, 
       /* 自定义模板解析失败则回退预置 */
     }
   }
-  return getTemplate(cfg.adapter);
+  const tpl = getTemplate(cfg.adapter);
+  if (tpl) return tpl;
+  // 旧配置未选适配器时：按协议自动映射（硅基流动自动启用 seed/负面提示词增强模板）
+  const protocol = cfg.extra?.protocol;
+  if (protocol === "siliconflow-image") return getTemplate("siliconflow-image");
+  if (protocol === "siliconflow-speech") return getTemplate("siliconflow-speech");
+  return undefined;
 }
 
 export function templatesForCapability(capability: "image" | "tts"): AdapterTemplate[] {

@@ -164,6 +164,49 @@ pub fn copy_file(src: String, dst: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub fn replace_path(src: String, dst: String) -> Result<(), String> {
+    let source = PathBuf::from(&src);
+    let destination = PathBuf::from(&dst);
+    let backup = PathBuf::from(format!("{dst}.replace-backup"));
+    if !source.exists() {
+        return Err(format!("替换失败：源路径不存在 {src}"));
+    }
+    if backup.exists() {
+        if backup.is_dir() {
+            std::fs::remove_dir_all(&backup)
+        } else {
+            std::fs::remove_file(&backup)
+        }
+        .map_err(|e| format!("清理替换备份失败: {e}"))?;
+    }
+    let had_destination = destination.exists();
+    if had_destination {
+        std::fs::rename(&destination, &backup).map_err(|e| format!("创建替换备份失败: {e}"))?;
+    }
+    if let Err(error) = std::fs::rename(&source, &destination) {
+        if had_destination {
+            if let Err(rollback_error) = std::fs::rename(&backup, &destination) {
+                return Err(format!(
+                    "发布替换路径失败: {error}; 回滚原路径也失败: {rollback_error}"
+                ));
+            }
+        }
+        return Err(format!("发布替换路径失败: {error}"));
+    }
+    if had_destination {
+        let cleanup = if backup.is_dir() {
+            std::fs::remove_dir_all(&backup)
+        } else {
+            std::fs::remove_file(&backup)
+        };
+        if let Err(error) = cleanup {
+            eprintln!("清理替换备份失败（发布已成功）: {error}");
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
 pub fn copy_dir_all(src: String, dst: String) -> Result<(), String> {
     copy_dir_recursive(Path::new(&src), Path::new(&dst))
 }
@@ -345,9 +388,40 @@ pub fn open_url(url: String) -> Result<(), String> {
     }
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CutoutResult {
+    pub data_b64: String,
+    /// 抠图方式：ai（isnet-anime 分割）/ chroma（色度键）
+    pub method: String,
+}
+
+/// 抠图：优先 AI 分割（isnet-anime，首次自动下载模型约 40MB），
+/// 模型不可用/下载失败/推理失败时自动回退到改进版色度键抠图。
 #[tauri::command]
-pub fn cutout_image(data_b64: String, threshold: f32) -> Result<String, String> {
-    crate::cutout::cutout(&data_b64, threshold)
+pub async fn cutout_image(
+    app: tauri::AppHandle,
+    data_b64: String,
+    threshold: f32,
+) -> Result<CutoutResult, String> {
+    let app2 = app.clone();
+    let data = data_b64.clone();
+    let ai = tauri::async_runtime::spawn_blocking(move || {
+        let model = crate::matte::ensure_model(&app2).ok()?;
+        crate::matte::ai_cutout(&data, &model)
+            .ok()
+            .map(|b| (b, "ai".to_string()))
+    })
+    .await
+    .map_err(|e| format!("AI 抠图线程异常: {e}"))?;
+    if let Some((data_b64, method)) = ai {
+        return Ok(CutoutResult { data_b64, method });
+    }
+    let data_b64 = crate::cutout::cutout(&data_b64, threshold)?;
+    Ok(CutoutResult {
+        data_b64,
+        method: "chroma".to_string(),
+    })
 }
 
 #[tauri::command]

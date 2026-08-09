@@ -12,6 +12,7 @@ import type {
   PipelineEvent,
   PipelineResult,
   ProjectMeta,
+  ProjectVisualBible,
   StageFeedback,
   StageKey,
 } from "./types";
@@ -20,6 +21,7 @@ import type { RenderAssets, WebgalLanguage } from "./render";
 import { extractFromNovel, demoExtract } from "./extract";
 import { scriptChapter, demoScriptAll } from "./script";
 import { translateChapter } from "./translate";
+import { aiSplitChapters, splitChaptersForFallback } from "./split";
 import { generateImages } from "./images";
 import { generateVoice } from "./voice";
 import { assembleProject, gameKeyFor } from "./project";
@@ -27,13 +29,17 @@ import { cacheDirFor } from "./cache";
 import { tauri } from "../utils/tauri";
 import { errMsg } from "../utils/errors";
 import { log as logger } from "../utils/logger";
+import { configIsUsable } from "../api/providers";
+import { assertVisualBibleApprovalStatus, assertVisualBibleReadyForImages } from "./visualBible";
 
 export interface PipelineInput {
   novel: NovelDoc;
   cards?: ExtractionResult;
   llm?: ApiConfig;
+  vision?: ApiConfig;
   image?: ApiConfig;
   tts?: ApiConfig;
+  visualBible?: ProjectVisualBible;
   materials: MaterialAsset[];
   outputDir: string;
   templateDir: string;
@@ -60,6 +66,38 @@ export function titleHash(title: string): string {
     h = ((h * 33) ^ ch.codePointAt(0)!) >>> 0;
   }
   return h.toString(36);
+}
+
+/** 小说全文指纹：源路径 + 正文内容哈希，用于分章/卡片缓存作废判断 */
+function novelFingerprint(fullText: string): string {
+  let h = 5381;
+  for (const ch of fullText) {
+    h = ((h * 33) ^ ch.codePointAt(0)!) >>> 0;
+  }
+  return `${fullText.length}:${h.toString(36)}`;
+}
+
+/** 分章入口：有 LLM 用 AI 分章，无 LLM 用规则回退 */
+async function splitNovelForPipeline(
+  cfg: ApiConfig | undefined,
+  fullText: string,
+  onUsage?: (pt: number, ct: number) => void,
+  feedback?: string,
+): Promise<ChapterInfo[]> {
+  if (!cfg?.apiKey) {
+    return splitChaptersForFallback(fullText);
+  }
+  return aiSplitChapters(cfg, fullText, onUsage, 40000, feedback);
+}
+
+/** 图片固定种子：用户指定则用之；否则按标题稳定派生，保证同一项目多次生成风格一致 */
+export function imageSeedFor(title: string, opts: GenerationOptions): number | undefined {
+  if (opts.imageSeed && opts.imageSeed > 0) return Math.floor(opts.imageSeed);
+  let h = 5381;
+  for (const ch of title) {
+    h = ((h * 33) ^ ch.codePointAt(0)!) >>> 0;
+  }
+  return h % 2147483647;
 }
 
 // 章节内场景 id 去重：LLM 可能输出重复 id，会导致背景图/配音/BGM 互相覆盖。
@@ -243,6 +281,56 @@ export class Pipeline {
     }
   }
 
+  /* ---------- 分章：把未切章的全文交给 AI 分章（缓存于 .novel2vn/split.json） ---------- */
+
+  private splitCacheFile(): string {
+    return `${this.input.outputDir}/.novel2vn/split.json`;
+  }
+
+  private async loadSplitChapters(): Promise<ChapterInfo[] | null> {
+    const parsed = await this.readCachedJson<{ fp: string; chapters: ChapterInfo[] }>(this.splitCacheFile());
+    if (!parsed || !Array.isArray(parsed.chapters) || !parsed.chapters.length) return null;
+    const currentFp = novelFingerprint(this.input.novel.fullText);
+    if (parsed.fp !== currentFp) {
+      logger.warn("pipeline", "分章缓存与当前小说内容不一致，已忽略", {
+        cached: parsed.fp.slice(0, 12),
+        current: currentFp.slice(0, 12),
+      });
+      return null;
+    }
+    return parsed.chapters;
+  }
+
+  private async runSplit(): Promise<ChapterInfo[]> {
+    const fullText = this.input.novel.fullText;
+    const fp = novelFingerprint(fullText);
+    const force = this.input.forceStages?.includes("split") || this.feedback.split;
+    const skipCache = this.options.skipCache;
+    if (!force && !skipCache) {
+      const cached = await this.loadSplitChapters();
+      if (cached) {
+        this.input.log({
+          step: "分章",
+          message: `[缓存] 复用已分章结果（${cached.length} 章）`,
+          level: "info",
+          at: Date.now(),
+        });
+        return cached;
+      }
+    }
+    this.input.log({
+      step: "分章",
+      message: "开始 AI 分章（识别章节标题并切分正文）…",
+      level: "info",
+      at: Date.now(),
+    });
+    const feedback = this.feedback.split;
+    const chapters = await splitNovelForPipeline(this.input.llm!, fullText, this.onUsageCb, feedback);
+    await tauri.mkdirAll(this.cacheRoot);
+    await tauri.writeTextFile(this.splitCacheFile(), JSON.stringify({ fp, chapters }, null, 2));
+    return chapters;
+  }
+
   /* ---------- 翻译：把小说章节翻译为目标语言（缓存于 .novel2vn/translate/，不被提取指纹清理） ---------- */
 
   private translateCacheFile(lang: string, ch: { index: number; title: string; text: string }): string {
@@ -256,6 +344,18 @@ export class Pipeline {
     const force = this.input.forceStages?.includes("translate");
     const feedback = this.feedback.translate;
     const out: ChapterInfo[] = [];
+    const total = chapters.length;
+    let done = 0;
+    const emitProgress = (title: string): void => {
+      done++;
+      this.input.log({
+        step: "翻译",
+        message: `进度 ${done}/${total}：${title}`,
+        level: "info",
+        at: Date.now(),
+        progress: { done, total, label: title },
+      });
+    };
     for (const ch of chapters) {
       this.checkAbort();
       const cacheFile = this.translateCacheFile(lang, ch);
@@ -270,6 +370,7 @@ export class Pipeline {
           level: "info",
           at: Date.now(),
         });
+        emitProgress(cached.title);
         out.push({ ...ch, title: cached.title, text: cached.text });
         continue;
       }
@@ -282,6 +383,7 @@ export class Pipeline {
       try {
         const tr = await translateChapter(cfg, ch, lang, this.onUsageCb, feedback);
         await tauri.writeTextFile(cacheFile, JSON.stringify(tr, null, 2));
+        emitProgress(tr.title);
         out.push({ ...ch, title: tr.title, text: tr.text });
         this.checkBudget();
       } catch (e) {
@@ -324,6 +426,7 @@ export class Pipeline {
     this.cacheRoot = `${input.outputDir}/.novel2vn/cache`;
     const runStart = logger.time("pipeline", "管线整体运行");
     const stages = new Set<StageKey>(input.stages ?? (STAGE_ORDER as StageKey[]));
+    if (stages.has("image") && input.options.useImage) assertVisualBibleApprovalStatus(input.visualBible);
     logger.info("pipeline", "开始运行", {
       demo: !input.llm?.apiKey,
       outputDir: input.outputDir,
@@ -361,21 +464,38 @@ export class Pipeline {
       });
     }
 
-    /* ==================== ① 翻译（可选，先翻译再提取） ==================== */
+    /* ==================== ① 分章（可选，把未切章的全文交给 AI 分章） ==================== */
+    let workingChapters = input.novel.chapters;
+    if (stages.has("split")) {
+      workingChapters = await this.runSplit();
+      log({
+        step: "分章",
+        message: `分章完成：共 ${workingChapters.length} 章`,
+        level: "success",
+        at: Date.now(),
+      });
+    } else {
+      const cachedSplit = await this.loadSplitChapters();
+      if (cachedSplit) {
+        workingChapters = cachedSplit;
+        log({ step: "分章", message: `[缓存] 复用已分章结果（${cachedSplit.length} 章）`, level: "info", at: Date.now() });
+      }
+    }
+
+    /* ==================== ② 翻译（可选，先翻译再提取） ==================== */
     const lang = (this.options.language ?? "").trim();
     const canTranslate = !!input.llm && !!lang;
-    let workingChapters = input.novel.chapters;
     if (stages.has("translate")) {
       if (canTranslate) {
         log({ step: "翻译", message: `开始把小说翻译为「${languageName(lang)}」…`, level: "info", at: Date.now() });
-        workingChapters = await this.runTranslation(input.novel.chapters, lang);
+        workingChapters = await this.runTranslation(workingChapters, lang);
       } else if (lang) {
         log({ step: "翻译", message: "已设置目标语言但未配置文本 LLM，无法翻译，将使用原文生成", level: "warn", at: Date.now() });
       } else {
         log({ step: "翻译", message: "未设置目标语言，使用原文生成", level: "info", at: Date.now() });
       }
     } else if (canTranslate) {
-      const restored = await this.loadTranslation(input.novel.chapters, lang);
+      const restored = await this.loadTranslation(workingChapters, lang);
       if (restored) {
         workingChapters = restored;
         log({ step: "翻译", message: `[缓存] 复用已翻译章节（${languageName(lang)}）`, level: "info", at: Date.now() });
@@ -476,6 +596,18 @@ export class Pipeline {
       const feedbackSet = new Set(Object.keys(this.feedback.script ?? {}).map(Number));
       const style = (this.options.scriptStyle ?? "").trim();
       const styleFrag = style ? `_st${titleHash(style)}` : "";
+      const scriptTotal = activeChapters.length;
+      let scriptDone = 0;
+      const emitScriptProgress = (title: string): void => {
+        scriptDone++;
+        log({
+          step: "剧本",
+          message: `进度 ${scriptDone}/${scriptTotal}：${title}`,
+          level: "info",
+          at: Date.now(),
+          progress: { done: scriptDone, total: scriptTotal, label: title },
+        });
+      };
       for (const chapter of activeChapters) {
         this.checkAbort();
         const cacheFile = `${cacheDir}/${demo ? "script_demo" : "script"}_ch${chapter.index + 1}_${titleHash(chapter.title)}${styleFrag}.json`;
@@ -537,6 +669,7 @@ export class Pipeline {
         this.applyVideoOptions(script);
         ensureUniqueSceneIds(script);
         chapters.push(script);
+        emitScriptProgress(chapter.title);
         logger.debug("pipeline", `第 ${chapter.index + 1} 章剧本就绪`, {
           title: chapter.title,
           scenes: script.scenes.length,
@@ -580,9 +713,14 @@ export class Pipeline {
     /* ==================== ④ 图像 ==================== */
     if (stages.has("image")) {
       if (this.options.useImage) {
+        await assertVisualBibleReadyForImages(input.outputDir, input.visualBible, workingNovel, cards!.characters);
+        if (this.options.imageSelfCheck && !configIsUsable(input.vision, "vision")) {
+          throw new Error("图像自检已启用，但图片识别 API 未配置或不可用；请先在 API 配置页完成配置");
+        }
         log({ step: "图像", message: "开始处理图像素材…", level: "info", at: Date.now() });
         const imageFeedback = this.feedback.image;
         const imageForce = !!imageFeedback || input.forceStages?.includes("image");
+        const baseSeed = imageSeedFor(cards!.title || workingNovel.fileName, this.options);
         const { images, failed } = await generateImages(
           input.image,
           chapters,
@@ -597,7 +735,11 @@ export class Pipeline {
           imageForce,
           this.options.characterPoses !== false,
           this.options.characterPoses !== false,
-          this.options.imageSelfCheck ? input.llm : undefined,
+          this.options.imageSelfCheck ? input.vision : undefined,
+          baseSeed,
+          this.options.styleAnchor !== false,
+          () => this.aborted,
+          input.visualBible,
         );
         this.failedTasks.push(...failed);
         this.cost.imageCount = Object.values(images.bg).length + Object.values(images.cg).length + Object.values(images.figure).length + Object.values(images.item).length;
@@ -630,7 +772,7 @@ export class Pipeline {
       if (this.options.useTts && input.tts?.apiKey) {
         log({ step: "配音", message: "开始生成配音…", level: "info", at: Date.now() });
         const voiceForce = !!this.feedback.voice || input.forceStages?.includes("voice");
-        const vocal = await generateVoice(input.tts, chapters, cards!.characters, this.cacheRoot, input.log, 2, voiceForce);
+        const vocal = await generateVoice(input.tts, chapters, cards!.characters, this.cacheRoot, input.log, 2, voiceForce, () => this.aborted);
         this.cost.ttsChars = Object.keys(vocal).reduce((n, k) => n + (vocal[k] ? 1 : 0), 0) * 20;
         this.cost.ttsCostYuan = (this.cost.ttsChars / 1e6) * DEFAULT_PRICES.ttsYuanPer1mChars;
         assets.vocal = vocal;
@@ -693,7 +835,7 @@ export class Pipeline {
       stages: Array.from(stages),
     });
 
-    return { meta, cards: cards!, chapters, assets, cost: this.cost, failedTasks: this.failedTasks };
+    return { meta, cards: cards!, chapters, assets, cost: this.cost, failedTasks: this.failedTasks, splitChapters: workingChapters };
   }
 
   private checkAbort(): void {

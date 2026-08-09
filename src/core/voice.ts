@@ -3,7 +3,7 @@ import { ttsSpeech } from "../api/openaiCompatible";
 import { tauri } from "../utils/tauri";
 import { errMsg } from "../utils/errors";
 import { cacheDirFor, cacheHit } from "./cache";
-import { sanitizeId } from "./render";
+import { sceneVocalKey } from "./render";
 import { voiceLibraryFor } from "../stores/config";
 import { log as logger } from "../utils/logger";
 
@@ -30,15 +30,30 @@ export function buildVoiceJobs(
   const jobs: VoiceJob[] = [];
   for (const chapter of chapters) {
     for (const scene of chapter.scenes) {
+      // 主流程台词
       scene.lines.forEach((line, i) => {
         if (line.type !== "dialogue") return;
-        const key = `ch${chapter.chapter}_${sanitizeId(scene.id)}_${i}`;
+        const key = sceneVocalKey(chapter.chapter, scene.id, i);
         jobs.push({
           key,
           file: `v_${key}.mp3`,
           text: line.text.slice(0, 500),
           voice: voiceName(line.characterId),
           charId: line.characterId,
+        });
+      });
+      // 分支选择台词（与渲染层的序号公式一致）
+      (scene.choices || []).forEach((choice, b) => {
+        choice.lines.forEach((line, j) => {
+          if (line.type !== "dialogue") return;
+          const key = sceneVocalKey(chapter.chapter, scene.id, scene.lines.length + 1000 * (b + 1) + j);
+          jobs.push({
+            key,
+            file: `v_${key}.mp3`,
+            text: line.text.slice(0, 500),
+            voice: voiceName(line.characterId),
+            charId: line.characterId,
+          });
         });
       });
     }
@@ -105,18 +120,34 @@ export async function generateVoice(
   log: (ev: PipelineEvent) => void,
   concurrency = 2,
   force = false,
+  isAborted?: () => boolean,
 ): Promise<Record<string, string>> {
   const vocal: Record<string, string> = {};
   await tauri.mkdirAll(cacheDirFor(cacheRoot, "vocal"));
   logger.info("voice", "开始生成配音", { characters: characters.length, concurrency, force });
 
   const jobs = buildVoiceJobs(cfg, chapters, characters);
+  const total = jobs.length;
+  let done = 0;
+  const emitProgress = (job: VoiceJob): void => {
+    done++;
+    const label = `${job.voice}「${job.text.slice(0, 12)}…」`;
+    log({
+      step: "配音",
+      message: `进度 ${done}/${total}：${label}`,
+      level: "info",
+      at: Date.now(),
+      progress: { done, total, label },
+    });
+  };
 
   let idx = 0;
   const runner = async () => {
     while (idx < jobs.length) {
+      if (isAborted?.()) return;
       const job = jobs[idx++];
       const path = await runVoiceJob(cfg, job, cacheRoot, log, force);
+      emitProgress(job);
       if (path) vocal[job.key] = path;
     }
   };

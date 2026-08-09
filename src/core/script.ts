@@ -3,6 +3,7 @@ import type {
   ChapterScript,
   CharacterCard,
   CgEvent,
+  Choice,
   ExtractionResult,
   ItemCard,
   ItemEvent,
@@ -39,6 +40,18 @@ interface ScriptModel {
       monologue?: boolean;
       text: string;
     }[];
+    choices?: {
+      id: string;
+      prompt: string;
+      lines: {
+        type: "dialogue" | "narration";
+        characterId?: string;
+        emotion?: string;
+        action?: string;
+        monologue?: boolean;
+        text: string;
+      }[];
+    }[];
   }[];
 }
 
@@ -65,8 +78,13 @@ const SYSTEM_PROMPT = `你是视觉小说编剧。根据小说章节文本与角
 7. 物品事件 itemEvents：当剧情中出现"获得/交接/展示/使用重要物品"时，在该场景标记：
    {itemId: 物品卡id, action: "obtain"|"exchange"|"show"|"key", description}
    triggerIndex 我会在渲染时根据文本顺序自动对齐，你只需把 itemEvents 写在对应场景中。
-8. 每章最后可以安排到下一章的自然收束，不要写 end 指令。
-9. 只输出 JSON，不要输出任何文字。`;
+8. 分支选择 choices（可选）：当剧情出现真正的"抉择时刻"（如留下/离开、相信/怀疑、帮助/旁观等影响角色关系的关键决定）时，
+   在该场景写 choices 数组（一个场景最多 1 次，每章最多 1 次）：
+   - 每个选项 {id: 短标识, prompt: 选项按钮文本（简洁有力，2-8 字）, lines: 该选项后的短暂分支剧情（1-4 句 dialogue/narration，格式与 lines 相同）}
+   - 分支剧情必须自然收束，玩家选择后最终都会汇合回主线继续，不要写 end / jump / 跳转指令
+   - 没有真正的抉择时刻就不要写 choices，宁可全线性也不强行加
+9. 每章最后可以安排到下一章的自然收束，不要写 end 指令。
+10. 只输出 JSON，不要输出任何文字。`;
 
 function buildCharacterContext(chars: CharacterCard[]): string {
   return chars
@@ -115,7 +133,7 @@ export async function scriptChapter(
     `\n章节正文：\n${chapter.text}`,
   ].join("\n");
 
-  const model = await chatJson<ScriptModel>(cfg, SYSTEM_PROMPT, user, { maxTokens: 8000, onUsage });
+  const model = await chatJson<ScriptModel>(cfg, SYSTEM_PROMPT, user, { maxTokens: 24000, onUsage });
 
   const scenes: SceneJSON[] = (model.scenes || []).map((s, i) => {
     const lines: Line[] = (s.lines || []).map((l) =>
@@ -151,6 +169,27 @@ export async function scriptChapter(
         }
       : undefined;
 
+    const mapLine = (l: ScriptModel["scenes"][number]["lines"][number]): Line =>
+      l.type === "dialogue"
+        ? {
+            type: "dialogue" as const,
+            characterId: l.characterId || cards.characters[0]?.id || "narrator",
+            emotion: l.emotion || "normal",
+            action: l.action || undefined,
+            text: l.text,
+          }
+        : {
+            type: "narration" as const,
+            text: l.text,
+            monologue: !!l.monologue,
+          };
+
+    const choices: Choice[] = (s.choices || []).slice(0, 3).map((c, k) => ({
+      id: c.id || `choice_${s.id || i}_${k}`,
+      prompt: (c.prompt || "继续").slice(0, 20),
+      lines: (c.lines || []).slice(0, 6).map(mapLine),
+    }));
+
     return {
       id: s.id || `s${i + 1}`,
       location: s.location,
@@ -169,6 +208,7 @@ export async function scriptChapter(
       })),
       lines,
       figures: [],
+      choices: choices.length ? choices : undefined,
     };
   });
 

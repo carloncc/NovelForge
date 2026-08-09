@@ -6,6 +6,7 @@ import type {
   NovelDoc,
   PipelineEvent,
   PipelineResult,
+  ProjectVisualBible,
 } from "../core/types";
 import { saveProjectState, restoreProjectState } from "../utils/persist";
 import { tauri } from "../utils/tauri";
@@ -17,6 +18,9 @@ export interface ProjectState {
   outputDir: string;
   options: GenerationOptions;
   lastResult: PipelineResult | null;
+  visualBible: ProjectVisualBible | null;
+  visualBibleWarnings: string[];
+  saveError: string | null;
   logs: PipelineEvent[];
   running: boolean;
 }
@@ -42,27 +46,25 @@ export const projectState = reactive<ProjectState>({
     characterIntroCard: true,
     budgetYuan: 0,
     imageStyle: "",
+    imageSeed: 0,
+    styleAnchor: true,
     scriptStyle: "",
     language: "",
   },
   lastResult: null,
+  visualBible: null,
+  visualBibleWarnings: [],
+  saveError: null,
   logs: [],
   running: false,
 });
 
 let saveTimer: number | undefined;
 
-export function scheduleSave(): void {
-  if (saveTimer) return;
-  saveTimer = window.setTimeout(() => {
-    saveTimer = undefined;
-    const lastResult = projectState.lastResult;
-    log.debug("store", "持久化项目状态", {
-      hasNovel: !!projectState.novel,
-      materials: projectState.materials.length,
-      outputDir: projectState.outputDir,
-    });
-    void saveProjectState({
+export async function persistCurrentProjectState(): Promise<boolean> {
+  const lastResult = projectState.lastResult;
+  try {
+    await saveProjectState({
       novel: projectState.novel,
       materials: projectState.materials,
       outputDir: projectState.outputDir,
@@ -70,13 +72,39 @@ export function scheduleSave(): void {
       lastResult: lastResult
         ? { meta: lastResult.meta, cards: lastResult.cards, cost: lastResult.cost }
         : null,
+      visualBible: projectState.visualBible,
     });
+    projectState.saveError = null;
+    return true;
+  } catch (error) {
+    projectState.saveError = error instanceof Error ? error.message : String(error);
+    log.error("store", "项目状态保存失败", {
+      outputDir: projectState.outputDir,
+      error: projectState.saveError,
+    });
+    return false;
+  }
+}
+
+export function scheduleSave(): void {
+  if (saveTimer) return;
+  saveTimer = window.setTimeout(() => {
+    saveTimer = undefined;
+    log.debug("store", "持久化项目状态", {
+      hasNovel: !!projectState.novel,
+      materials: projectState.materials.length,
+      outputDir: projectState.outputDir,
+    });
+    void persistCurrentProjectState();
   }, 800);
 }
 
 export async function restoreProject(outputDir: string): Promise<void> {
   log.info("store", "恢复项目状态", { outputDir });
   const r = await restoreProjectState(outputDir);
+  projectState.visualBible = r.visualBible;
+  projectState.visualBibleWarnings = r.warnings;
+  for (const warning of r.warnings) log.warn("store", warning, { outputDir });
   if (r.novel) projectState.novel = r.novel;
   if (r.materials?.length) projectState.materials = r.materials;
   if (r.options) projectState.options = { ...projectState.options, ...r.options };
@@ -133,6 +161,7 @@ watch(
       outputDir: projectState.outputDir,
       options: projectState.options,
       lastMeta: projectState.lastResult?.meta.generatedAt,
+      visualBible: projectState.visualBible,
     }),
   () => scheduleSave(),
   { deep: false },

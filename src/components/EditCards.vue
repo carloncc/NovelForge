@@ -9,6 +9,7 @@ import { saveEditedCards } from "../core/cards";
 import { open } from "@tauri-apps/plugin-dialog";
 import { errMsg } from "../utils/errors";
 import { recognizeCharacter } from "../core/recognize";
+import { configIsUsable } from "../api/providers";
 
 const props = defineProps<{ cards: ExtractionResult }>();
 const emit = defineEmits<{ saved: [cards: ExtractionResult] }>();
@@ -28,9 +29,9 @@ async function recognizeChar(c: CharacterCard): Promise<void> {
     savedMsg.value = "请先为该角色设置参考图（从素材库选择或上传）";
     return;
   }
-  const cfg = activeConfig("llm");
-  if (!cfg?.apiKey) {
-    savedMsg.value = "未配置文本 LLM，无法识别角色（请先在「API 配置」页配置）";
+  const cfg = activeConfig("vision");
+  if (!configIsUsable(cfg, "vision")) {
+    savedMsg.value = "图片识别 API 未配置或不可用，请先在「API 配置」页配置";
     return;
   }
   charRecognizing.value = c.id;

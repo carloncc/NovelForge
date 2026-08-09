@@ -63,7 +63,7 @@ function main(): void {
   assert(out1.includes("\\:"), "冒号未转义");
   assert(out1.includes("\\`"), "反引号未转义");
   assert(out1.includes("\\\\"), "反斜杠未转义");
-  assert(nonCommentLines(out1).length === 9, "行数异常（label+清场3+changeBg+changeFigure+2句+end）");
+  assert(nonCommentLines(out1).length === 10, "行数异常（label+清场3+章节标题卡+changeBg+changeFigure+2句+end）");
 
   // 2) 恶意角色名 → 不产生裸分号注入
   const s2 = makeScript();

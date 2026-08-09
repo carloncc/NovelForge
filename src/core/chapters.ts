@@ -79,8 +79,50 @@ export async function importNovelFile(path: string): Promise<NovelDoc> {
   return {
     fileName,
     sourcePath: path,
+    sourcePaths: [path],
     encoding,
     fullText: text,
+    chapters,
+  };
+}
+
+/**
+ * 多文件合并导入：把所有 txt 按顺序拼接为一部小说，导入时不切章。
+ * 章节划分留到「分章」阶段（运行管线时由 AI 完成）。
+ */
+export async function importNovelFiles(paths: string[]): Promise<NovelDoc> {
+  const done = log.time("chapters", `合并导入 ${paths.length} 个文件`);
+  const parts: { path: string; fileName: string; text: string; encoding: string }[] = [];
+  let totalChars = 0;
+  for (const p of paths) {
+    const { text, encoding } = await tauri.readTextFile(p);
+    parts.push({ path: p, fileName: basename(p), text, encoding });
+    totalChars += text.length;
+  }
+  const fullText = parts
+    .map((p) => p.text.replace(/\r/g, "").replace(/\n{3,}/g, "\n\n").trim())
+    .filter(Boolean)
+    .join("\n\n\n");
+  const fileName = parts.length === 1 ? parts[0].fileName : `${parts.length} 个文件合并`;
+  const baseTitle = basenameWithoutExt(parts[0].path);
+  // 合并导入不切章：仅作为单一章节占位，运行时分章阶段会替换
+  const chapters: ChapterInfo[] = [
+    { index: 0, title: baseTitle || "全文", text: fullText, charCount: fullText.length },
+  ];
+  log.info("chapters", "多文件合并导入完成", {
+    fileCount: parts.length,
+    fileNames: parts.map((p) => p.fileName),
+    encoding: parts.map((p) => p.encoding),
+    charCount: totalChars,
+    mergedCharCount: fullText.length,
+  });
+  done(`文件=${parts.length} 字数=${fullText.length}`);
+  return {
+    fileName,
+    sourcePath: parts[0].path,
+    sourcePaths: paths,
+    encoding: parts[0].encoding,
+    fullText,
     chapters,
   };
 }

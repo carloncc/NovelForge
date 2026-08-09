@@ -1109,6 +1109,12 @@ code {
   border-radius: var(--radius-sm);
   padding: 6px;
   background: var(--bg-soft);
+  cursor: zoom-in;
+}
+
+.asset-thumb:hover {
+  border-color: var(--primary);
+  box-shadow: var(--shadow-hover);
 }
 
 .asset-thumb.missing {
@@ -1133,6 +1139,121 @@ code {
   max-width: 100%;
   height: 30px;
   margin-top: 6px;
+}
+
+/* ===== 素材大图预览（可缩放/拖拽） ===== */
+.asset-preview {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: rgba(10, 8, 20, 0.86);
+  display: flex;
+  flex-direction: column;
+  animation: pageIn 160ms ease;
+}
+
+.asset-preview-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 16px;
+  background: rgba(0, 0, 0, 0.35);
+  color: #fff;
+}
+
+.asset-preview-label {
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.asset-preview-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.asset-preview-actions .btn {
+  color: #fff;
+  border-color: rgba(255, 255, 255, 0.35);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.asset-preview-actions .btn:hover {
+  background: rgba(255, 255, 255, 0.18);
+}
+
+.asset-preview-stage {
+  flex: 1;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  touch-action: none;
+}
+
+.asset-preview-img {
+  max-width: 96%;
+  max-height: 92%;
+  object-fit: contain;
+  user-select: none;
+  cursor: grab;
+  transform-origin: center center;
+  transition: none;
+}
+
+.asset-preview-img:active {
+  cursor: grabbing;
+}
+
+.asset-preview-loading {
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 14px;
+}
+
+/* ===== 实时进度条 ===== */
+.progress-bar {
+  width: 100%;
+  height: 8px;
+  border-radius: 99px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  border-radius: 99px;
+  background: var(--gradient);
+  transition: width 200ms ease;
+}
+
+.asset-regen-status {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 12px 0;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-soft);
+}
+
+.asset-regen-status .progress-bar {
+  flex: 1;
+  min-width: 120px;
+}
+
+.asset-regen-label {
+  font-size: 12px;
+  color: var(--text-dim);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ===== API 配置页 ===== */
@@ -1304,6 +1425,35 @@ code {
   background: var(--err-soft);
 }
 
+.cfg-model-field {
+  flex: 1;
+  min-width: 260px;
+}
+
+.cfg-model-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.cfg-model-row select {
+  flex: 1;
+  min-width: 0;
+}
+
+.cfg-model-error {
+  display: block;
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--err);
+}
+
+.cfg-model-loading {
+  font-weight: normal;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
 .cfg-details {
   margin-top: var(--space-3);
   border-top: 1px dashed var(--border);
@@ -1319,4 +1469,291 @@ code {
 
 .cfg-details summary:hover {
   color: var(--primary);
+}
+
+/* ===== 视觉圣经 ===== */
+.vb-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  flex-wrap: wrap;
+  background: var(--warn-soft);
+  border: 1px solid rgba(217, 119, 6, 0.24);
+  border-radius: var(--radius-md);
+  padding: 12px 16px;
+  margin-bottom: var(--space-4);
+}
+
+.vb-banner strong {
+  font-size: 14px;
+}
+
+.vb-banner p {
+  color: var(--text-dim);
+  font-size: 12px;
+  margin-top: 2px;
+}
+
+.tab-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: 10.5px;
+  font-weight: 600;
+  vertical-align: 1px;
+}
+
+.vb-panel .vb-sub {
+  color: var(--text-dim);
+  font-size: 12px;
+  margin-top: 2px;
+}
+
+.vb-section {
+  border-top: 1px solid var(--border);
+  padding-top: var(--space-4);
+  margin-top: var(--space-4);
+}
+
+.vb-section-title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: var(--space-3);
+}
+
+.vb-section-hint {
+  color: var(--text-faint);
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.vb-source-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+}
+
+.vb-source-option {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-hover);
+  padding: 12px 14px;
+  cursor: pointer;
+  transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+
+.vb-source-option:hover {
+  border-color: var(--primary);
+}
+
+.vb-source-option.active {
+  border-color: var(--primary);
+  background: var(--primary-soft);
+  box-shadow: var(--shadow-active);
+}
+
+.vb-source-option input[type="radio"] {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--primary);
+  margin-bottom: 4px;
+}
+
+.vb-source-name {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.vb-source-desc {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.vb-upload-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  margin-bottom: var(--space-3);
+}
+
+.vb-error {
+  color: var(--err);
+  background: var(--err-soft);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  padding: 7px 10px;
+  margin: var(--space-2) 0;
+  word-break: break-word;
+}
+
+.vb-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.vb-style-grid {
+  display: grid;
+  grid-template-columns: minmax(170px, 220px) 1fr;
+  gap: var(--space-4);
+  align-items: start;
+}
+
+.vb-preview-block {
+  min-width: 0;
+}
+
+.vb-preview-label {
+  color: var(--text-dim);
+  font-size: 11.5px;
+  font-weight: 500;
+  margin-bottom: 6px;
+}
+
+.vb-thumb {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  width: 100%;
+  min-height: 132px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-soft);
+  color: var(--text-faint);
+  font-size: 12px;
+  overflow: hidden;
+  cursor: zoom-in;
+}
+
+.vb-thumb:hover {
+  border-color: var(--primary);
+  box-shadow: var(--shadow-hover);
+}
+
+.vb-thumb.missing {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.vb-thumb img {
+  width: 100%;
+  height: 120px;
+  object-fit: contain;
+  background: #fff;
+}
+
+.vb-thumb .thumb-label {
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+.vb-preview-img {
+  width: 84px;
+  height: 84px;
+  object-fit: cover;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  flex-shrink: 0;
+}
+
+.vb-character-row {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-hover);
+  padding: 12px 14px;
+  margin-bottom: 10px;
+}
+
+.vb-character-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+.vb-character-actions {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.vb-character-body {
+  display: grid;
+  grid-template-columns: minmax(150px, 190px) minmax(150px, 190px) 1fr;
+  gap: var(--space-4);
+  align-items: start;
+  margin-top: 10px;
+}
+
+.vb-character-prompt {
+  min-width: 0;
+}
+
+.vb-character-prompt code {
+  display: block;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin-top: 6px;
+  padding: 8px 10px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.vb-approval-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  flex-wrap: wrap;
+  border-top: 1px solid var(--border);
+  padding-top: var(--space-4);
+  margin-top: var(--space-4);
+}
+
+.vb-approval-bar > div {
+  flex: 1;
+  min-width: 260px;
+}
+
+.vb-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-6) 0;
+  color: var(--text-dim);
+  text-align: center;
+}
+
+@media (max-width: 760px) {
+  .vb-style-grid,
+  .vb-character-body {
+    grid-template-columns: 1fr;
+  }
+
+  .vb-approval-bar {
+    align-items: stretch;
+  }
+
+  .vb-approval-bar .btn {
+    width: 100%;
+  }
 }

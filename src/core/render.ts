@@ -1,4 +1,4 @@
-﻿import type { ChapterScript, CharacterCard, ItemCard, SceneJSON } from "./types";
+﻿import type { ChapterScript, CharacterCard, ItemCard, Line, SceneJSON } from "./types";
 
 export interface RenderAssets {
   bg: Record<string, string>;
@@ -26,6 +26,11 @@ export interface RenderOptions {
 export function sanitizeId(id: string): string {
   const cleaned = (id || "").replace(/[^a-zA-Z0-9_-]/g, "_");
   return cleaned || "unnamed";
+}
+
+/** 台词配音键：渲染与配音阶段共用同一公式，保证键一致 */
+export function sceneVocalKey(chapter: number, sceneId: string, idx: number): string {
+  return `ch${chapter}_${sanitizeId(sceneId)}_${idx}`;
 }
 
 function esc(text: string): string {
@@ -113,20 +118,116 @@ export function renderChapter(
   out.push(`changeFigure:none -left${clearExit} -next;`);
   out.push(`changeFigure:none${clearExit} -next;`);
   out.push(`changeFigure:none -right${clearExit} -next;`);
+  // 章节标题卡：黑屏全屏章节名（成熟视觉小说标配，点击继续）
+  out.push(`; ---- 章节标题卡 ----`);
+  out.push(`intro:第 ${chapter.chapter + 1} 章 · ${esc(chapter.title)} -fontColor=rgba(255,255,255,1) -fontSize=large -hold;`);
+
   // 舞台立绘管理：同时最多 2 个角色（左/右插槽），新角色出现时按最近说话顺序驱逐
   const stageSlot = new Map<string, "left" | "right">();
   const stageOrder: string[] = [];
   const lastFigureFile = new Map<string, string>();
   let entranceIdx = 0;
+  // BGM 状态：WebGAL 的 changeScene 不自动清舞台，跨场景/跨章节残留的音乐需显式停止
+  let lastBgm: string | null = null;
+  const bgmUnlocked = new Set<string>();
+
+  // 单句渲染（主流程与分支选择共用），idx 为台词在场景内的配音键序号
+  const renderLine = (line: Line, idx: number, scene: SceneJSON): void => {
+    if (line.type === "dialogue") {
+      const char = opts.characters.find((c) => c.id === line.characterId);
+      const figureFile = opts.assets.figure[line.characterId];
+      // 立绘优先级：台词指定动作 → 对应动作立绘；否则表情差分立绘；否则默认立绘
+      let displayFile = figureFile;
+      if (line.action) {
+        const actionFile = opts.assets.figure[`${line.characterId}_act_${sanitizeId(line.action)}`];
+        if (actionFile) displayFile = actionFile;
+      } else if (opts.figureEmotions !== false && line.emotion && line.emotion !== "normal") {
+        displayFile = opts.assets.figure[`${line.characterId}_${line.emotion}`] ?? figureFile;
+      }
+      // 舞台管理 + 人物动作：最多 2 个角色同台（左/右），新角色入场 / 表情切换 / 情绪动作
+      let slot = stageSlot.get(line.characterId);
+      const appearing = !!displayFile && !slot;
+      if (displayFile) {
+        if (appearing) {
+          // 分配插槽；左右满员则驱逐最久没说话的角色
+          const used = new Set(stageSlot.values());
+          if (!used.has("left")) {
+            slot = "left";
+          } else if (!used.has("right")) {
+            slot = "right";
+          } else {
+            const victim = stageOrder[stageOrder.length - 1];
+            const victimSlot = stageSlot.get(victim)!;
+            out.push(`changeFigure:none -${victimSlot}${useActions ? " -exit=exit" : ""} -next;`);
+            stageSlot.delete(victim);
+            stageOrder.splice(stageOrder.indexOf(victim), 1);
+            lastFigureFile.delete(victim);
+            slot = victimSlot;
+          }
+          stageSlot.set(line.characterId, slot);
+          if (useActions) {
+            const entrance = ENTRANCES[entranceIdx++ % ENTRANCES.length];
+            out.push(`changeFigure:${getBaseName(displayFile)} -${slot} -enter=${entrance} -next;`);
+          } else {
+            out.push(`changeFigure:${getBaseName(displayFile)} -${slot} -next;`);
+          }
+        } else if (displayFile !== lastFigureFile.get(line.characterId)) {
+          out.push(`changeFigure:${getBaseName(displayFile)} -${slot} -next;`);
+        }
+        lastFigureFile.set(line.characterId, displayFile);
+      }
+      // 情绪动作：说话时的震动/弹出/跳动（入场那一句跳过，避免与入场动画叠加）
+      if (useActions && displayFile && !appearing && slot && line.emotion && line.emotion !== "normal") {
+        const motion = motionFor(line.emotion);
+        if (motion) out.push(`setTempAnimation:${motion} -target=fig-${slot} -next;`);
+      }
+      // 更新最近说话顺序（用于驱逐）
+      const oi = stageOrder.indexOf(line.characterId);
+      if (oi >= 0) stageOrder.splice(oi, 1);
+      stageOrder.unshift(line.characterId);
+      // 首次登场资料演出：立绘 + 文本框资料卡（旁白形式，立绘保持可见）
+      if (opts.introCard !== false && char && !opts.seenCharacters?.has(line.characterId)) {
+        opts.seenCharacters?.add(line.characterId);
+        const parts = [`【${esc(char.name)}】`];
+        if (char.appearance) parts.push(esc(char.appearance));
+        if (char.personality) parts.push(esc(char.personality));
+        out.push(`:${parts.join(" ")};`);
+      }
+      const name = esc(char?.name || line.characterId || "???");
+      const vocalKey = sceneVocalKey(chapter.chapter, scene.id, idx);
+      const vocalFile = opts.assets.vocal[vocalKey];
+      const vocalArg = vocalFile ? ` -${getBaseName(vocalFile)}` : "";
+      out.push(`${name}:${esc(line.text)}${vocalArg};`);
+    } else if (line.monologue) {
+      if (useActions && isDramatic(line.text)) {
+        out.push(`setAnimation:shake -target=bg-main -next;`);
+      }
+      out.push(`intro:${esc(line.text)} -hold;`);
+    } else {
+      if (useActions && isDramatic(line.text)) {
+        out.push(`setAnimation:shake -target=bg-main -next;`);
+      }
+      out.push(`:${esc(line.text)};`);
+    }
+  };
 
   for (const scene of chapter.scenes) {
     out.push("");
     out.push(`; ---- 场景：${comment(scene.location)}（${comment(scene.atmosphere)} ${comment(scene.time)}）----`);
 
-    // BGM：匹配到的音乐文件则播放（无则跳过，不影响流程）
+    // BGM：匹配到的音乐文件则播放（并解锁鉴赏）；无匹配则淡出停止，避免串场
     const bgmFile = opts.assets.bgm?.[scene.id];
     if (bgmFile) {
-      out.push(`bgm:${getBaseName(bgmFile)};`);
+      out.push(`bgm:${getBaseName(bgmFile)} -next;`);
+      if (!bgmUnlocked.has(bgmFile)) {
+        bgmUnlocked.add(bgmFile);
+        const bgmName = getBaseName(bgmFile).replace(/\.(mp3|ogg|wav|m4a|opus)$/i, "");
+        out.push(`unlockBgm:${getBaseName(bgmFile)} -name=${esc(bgmName)};`);
+      }
+      lastBgm = bgmFile;
+    } else if (lastBgm) {
+      out.push(`bgm:none -enter=600 -next;`);
+      lastBgm = null;
     }
 
     const bgFile = opts.assets.bg[scene.id];
@@ -164,88 +265,30 @@ export function renderChapter(
       if (evIdx !== undefined) {
         out.push(...renderItemEvent(scene, evIdx, opts));
       }
-
-      if (line.type === "dialogue") {
-        const char = opts.characters.find((c) => c.id === line.characterId);
-        const figureFile = opts.assets.figure[line.characterId];
-        // 立绘优先级：台词指定动作 → 对应动作立绘；否则表情差分立绘；否则默认立绘
-        let displayFile = figureFile;
-        if (line.action) {
-          const actionFile = opts.assets.figure[`${line.characterId}_act_${sanitizeId(line.action)}`];
-          if (actionFile) displayFile = actionFile;
-        } else if (opts.figureEmotions !== false && line.emotion && line.emotion !== "normal") {
-          displayFile = opts.assets.figure[`${line.characterId}_${line.emotion}`] ?? figureFile;
-        }
-        // 舞台管理 + 人物动作：最多 2 个角色同台（左/右），新角色入场 / 表情切换 / 情绪动作
-        let slot = stageSlot.get(line.characterId);
-        const appearing = !!displayFile && !slot;
-        if (displayFile) {
-          if (appearing) {
-            // 分配插槽；左右满员则驱逐最久没说话的角色
-            const used = new Set(stageSlot.values());
-            if (!used.has("left")) {
-              slot = "left";
-            } else if (!used.has("right")) {
-              slot = "right";
-            } else {
-              const victim = stageOrder[stageOrder.length - 1];
-              const victimSlot = stageSlot.get(victim)!;
-              out.push(`changeFigure:none -${victimSlot}${useActions ? " -exit=exit" : ""} -next;`);
-              stageSlot.delete(victim);
-              stageOrder.splice(stageOrder.indexOf(victim), 1);
-              lastFigureFile.delete(victim);
-              slot = victimSlot;
-            }
-            stageSlot.set(line.characterId, slot);
-            if (useActions) {
-              const entrance = ENTRANCES[entranceIdx++ % ENTRANCES.length];
-              out.push(`changeFigure:${getBaseName(displayFile)} -${slot} -enter=${entrance} -next;`);
-            } else {
-              out.push(`changeFigure:${getBaseName(displayFile)} -${slot} -next;`);
-            }
-          } else if (displayFile !== lastFigureFile.get(line.characterId)) {
-            out.push(`changeFigure:${getBaseName(displayFile)} -${slot} -next;`);
-          }
-          lastFigureFile.set(line.characterId, displayFile);
-        }
-        // 情绪动作：说话时的震动/弹出/跳动（入场那一句跳过，避免与入场动画叠加）
-        if (useActions && displayFile && !appearing && slot && line.emotion && line.emotion !== "normal") {
-          const motion = motionFor(line.emotion);
-          if (motion) out.push(`setTempAnimation:${motion} -target=fig-${slot} -next;`);
-        }
-        // 更新最近说话顺序（用于驱逐）
-        const oi = stageOrder.indexOf(line.characterId);
-        if (oi >= 0) stageOrder.splice(oi, 1);
-        stageOrder.unshift(line.characterId);
-        // 首次登场资料演出：立绘 + 文本框资料卡（旁白形式，立绘保持可见）
-        if (opts.introCard !== false && char && !opts.seenCharacters?.has(line.characterId)) {
-          opts.seenCharacters?.add(line.characterId);
-          const parts = [`【${esc(char.name)}】`];
-          if (char.appearance) parts.push(esc(char.appearance));
-          if (char.personality) parts.push(esc(char.personality));
-          out.push(`:${parts.join(" ")};`);
-        }
-        const name = esc(char?.name || line.characterId || "???");
-        const vocalKey = `ch${chapter.chapter}_${sanitizeId(scene.id)}_${i}`;
-        const vocalFile = opts.assets.vocal[vocalKey];
-        const vocalArg = vocalFile ? ` -${getBaseName(vocalFile)}` : "";
-        out.push(`${name}:${esc(line.text)}${vocalArg};`);
-      } else if (line.monologue) {
-        if (useActions && isDramatic(line.text)) {
-          out.push(`setAnimation:shake -target=stage-main -next;`);
-        }
-        out.push(`intro:${esc(line.text)} -hold;`);
-      } else {
-        if (useActions && isDramatic(line.text)) {
-          out.push(`setAnimation:shake -target=stage-main -next;`);
-        }
-        out.push(`:${esc(line.text)};`);
-      }
+      renderLine(line, i, scene);
     });
 
     const lastEvIdx = eventIdxByTrigger.get(scene.lines.length);
     if (lastEvIdx !== undefined) {
       out.push(...renderItemEvent(scene, lastEvIdx, opts));
+    }
+
+    // 分支选择：场景末尾弹出选项，各分支为独立 label 块，结束后跳回合并点继续
+    if (scene.choices && scene.choices.length) {
+      const prefix = `ch${chapter.chapter + 1}_${sanitizeId(scene.id)}`;
+      const joinLabel = `${prefix}_join`;
+      const args = scene.choices
+        .map((c, ci) => `${esc((c.prompt || "继续").replace(/\|/g, "｜"))}:${prefix}_c${ci + 1}`)
+        .join("|");
+      out.push("");
+      out.push(`; ---- 分支选择 ----`);
+      out.push(`choose:${args};`);
+      scene.choices.forEach((c, ci) => {
+        out.push(`label:${prefix}_c${ci + 1};`);
+        c.lines.forEach((line, j) => renderLine(line, scene.lines.length + 1000 * (ci + 1) + j, scene));
+        out.push(`jumpLabel:${joinLabel};`);
+      });
+      out.push(`label:${joinLabel};`);
     }
   }
 
@@ -278,8 +321,14 @@ function cleanConfigValue(text: string): string {
 
 export type WebgalLanguage = "zh_CN" | "zh_TW" | "en" | "ja";
 
-export function renderConfig(title: string, gameKey: string, language: WebgalLanguage = "zh_CN"): string {
-  return [
+export function renderConfig(
+  title: string,
+  gameKey: string,
+  language: WebgalLanguage = "zh_CN",
+  titleImg?: string,
+  titleBgm?: string,
+): string {
+  const lines = [
     `Game_name:${cleanConfigValue(title)};`,
     `Game_key:${cleanConfigValue(gameKey)};`,
     `Enable_Appreciation:true;`,
@@ -287,6 +336,11 @@ export function renderConfig(title: string, gameKey: string, language: WebgalLan
     `Enable_flowchart:true;`,
     `Show_panic:true;`,
     `Default_Language:${language};`,
-  ].join("\n");
+  ];
+  if (titleImg) lines.push(`Title_img:${cleanConfigValue(titleImg)};`);
+  if (titleBgm) lines.push(`Title_bgm:${cleanConfigValue(titleBgm)};`);
+  return lines.join("\n");
 }
+
+
 

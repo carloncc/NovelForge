@@ -1,4 +1,4 @@
-import { generateImages } from "../src/core/images";
+﻿import { generateImages } from "../src/core/images";
 import { demoExtract } from "../src/core/extract";
 import { demoScriptAll } from "../src/core/script";
 import { splitChapters } from "../src/core/chapters";
@@ -14,7 +14,7 @@ async function main() {
   const scripts = demoScriptAll(chapters, cards);
 
   // 造 2 个假素材（1 角色 + 1 物品）
-  const png = await readFile("/root/my_project/novel2vn/src-tauri/icons/32x32.png");
+  const png = await readFile(`${import.meta.dirname.replace(/\\/g, "/")}/../src/assets/logo.png`);
   await tauri.mkdirAll(`${work}/mats`);
   const charPath = `${work}/mats/林澈-角色参考.png`;
   const itemPath = `${work}/mats/星陨剑-物品图.png`;

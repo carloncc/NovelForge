@@ -20,7 +20,7 @@ export interface LintReport {
   };
 }
 
-const CMD_RE = /^(changeBg|changeFigure|intro|bgm|playEffect|end|changeScene|unlockCg|label|miniAvatar|playVideo|setAnimation|setTempAnimation|setTransform|setTransition|setComplexAnimation):.*;$/;
+const CMD_RE = /^(changeBg|changeFigure|intro|bgm|playEffect|end|changeScene|unlockCg|unlockBgm|label|jumpLabel|choose|miniAvatar|playVideo|setAnimation|setTempAnimation|setTransform|setTransition|setComplexAnimation):.*;$/;
 const END_RE = /^end;$/;
 const LINE_RE = /^(?:[^:;\\]|\\[:;,\.`\\])*:(.*);$/;
 

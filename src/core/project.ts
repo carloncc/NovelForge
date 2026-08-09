@@ -116,9 +116,13 @@ export async function assembleProject(input: AssembleInput): Promise<{ gameDir: 
     );
   }
 
+  // 标题画面：用第一章的 CG 或首张背景作标题图，BGM 匹配一首宁静的作标题曲（无则省略）
+  const titleImg = pickTitleImage(input.assets);
+  const titleBgm = pickTitleBgm(bgmMap);
+
   await tauri.writeTextFile(
     joinPath(normalizedOutputDir, "game/config.txt"),
-    renderConfig(title, gameKey, input.language ?? "zh_CN"),
+    renderConfig(title, gameKey, input.language ?? "zh_CN", titleImg, titleBgm),
   );
 
   input.log("复制素材…");
@@ -155,6 +159,22 @@ export async function assembleProject(input: AssembleInput): Promise<{ gameDir: 
   log.info("project", "项目组装完成", { outputDir: normalizedOutputDir, meta });
 
   return { gameDir: normalizedOutputDir, meta };
+}
+
+/** 标题画面图：优先取第一章首张 CG（名场面最适合做标题视觉），否则取首张背景图 */
+function pickTitleImage(assets: RenderAssets): string | undefined {
+  const cg = Object.values(assets.cg)[0];
+  if (cg) return basename(cg);
+  const bg = Object.values(assets.bg)[0];
+  return bg ? basename(bg) : undefined;
+}
+
+/** 标题背景音乐：优先宁静/舒缓氛围的 BGM，否则取第一首 */
+function pickTitleBgm(bgmMap: Record<string, string>): string | undefined {
+  const calm = Object.values(bgmMap).find((p) => /calm|peace|piano|ambient|静|平|安|舒缓/i.test(basename(p)));
+  const first = Object.values(bgmMap)[0];
+  const picked = calm ?? first;
+  return picked ? basename(picked) : undefined;
 }
 
 async function copyAssets(assets: RenderAssets, outputDir: string): Promise<void> {

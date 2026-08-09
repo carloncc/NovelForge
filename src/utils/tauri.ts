@@ -190,6 +190,38 @@ export const tauri = {
       await fs.cp(src, dst, { recursive: true });
     });
   }),
+  replacePath: wrap("replacePath", (src: string, dst: string): Promise<void> => {
+    if (isTauri()) return invoke("replace_path", { src, dst });
+    if (web.isWeb()) return web.webReplacePath(src, dst);
+    return import("node:fs/promises").then(async (fs) => {
+      const backup = `${dst}.replace-backup`;
+      await fs.rm(backup, { recursive: true, force: true });
+      const destinationExists = await fs.access(dst).then(() => true).catch(() => false);
+      if (destinationExists) await fs.rename(dst, backup);
+      try {
+        await fs.rename(src, dst);
+      } catch (error) {
+        if (destinationExists) {
+          try {
+            await fs.rename(backup, dst);
+          } catch (rollbackError) {
+            const replaceMessage = error instanceof Error ? error.message : String(error);
+            const rollbackMessage = rollbackError instanceof Error ? rollbackError.message : String(rollbackError);
+            throw new Error(`Path replacement failed (${replaceMessage}); rollback also failed (${rollbackMessage})`);
+          }
+        }
+        throw error;
+      }
+      try {
+        await fs.rm(backup, { recursive: true, force: true });
+      } catch (error) {
+        log.warn("tauri", "Path replacement backup cleanup failed", {
+          backup,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    });
+  }),
   removePath: wrap("removePath", (path: string): Promise<void> => {
     if (isTauri()) return invoke("remove_path", { path });
     if (web.isWeb()) return web.webRemovePath(path);
@@ -246,10 +278,11 @@ export const tauri = {
     if (web.isWeb()) return Promise.resolve("/app/exports");
     return Promise.resolve("/root/my_project/game");
   }),
-  cutoutImage: wrap("cutoutImage", (dataB64: string, threshold?: number): Promise<string> => {
-    if (isTauri()) return invoke("cutout_image", { dataB64, threshold: threshold ?? 40 });
-    if (web.isWeb()) return web.webCutoutImage(dataB64, threshold);
-    return Promise.resolve(dataB64);
+  cutoutImage: wrap("cutoutImage", (dataB64: string, threshold?: number): Promise<{ dataB64: string; method: string }> => {
+    if (isTauri())
+      return invoke("cutout_image", { dataB64, threshold: threshold ?? 40 }).then((r) => r as { dataB64: string; method: string });
+    if (web.isWeb()) return web.webCutoutImage(dataB64, threshold).then((dataB64) => ({ dataB64, method: "chroma" }));
+    return Promise.resolve({ dataB64, method: "chroma" });
   }),
   hasTransparency: wrap("hasTransparency", (dataB64: string): Promise<boolean> => {
     if (isTauri()) return invoke("has_transparency", { dataB64 });

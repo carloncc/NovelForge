@@ -37,7 +37,8 @@ export async function recognizeStyle(
 ): Promise<string> {
   const reply = await chatVision(cfg, STYLE_SYSTEM, "请识别这张图的画风。", imageB64, { maxTokens: 300, onUsage });
   const clean = (reply || "").trim().replace(/^画风[:：]?\s*/i, "");
-  return clean || "unified anime style, consistent art direction";
+  if (!clean) throw new Error("图片识别 API 未返回画风描述");
+  return clean;
 }
 
 /** 用多模态模型根据角色参考图识别角色设定（外貌/服装/性格/立绘与三视图提示词） */

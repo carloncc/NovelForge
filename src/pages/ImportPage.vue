@@ -3,7 +3,7 @@ import { onMounted, ref } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
 import { projectState, addMaterial, removeMaterial, restoreProject } from "../stores/project";
 import { configState, addRecentOutputDir, removeRecentOutputDir } from "../stores/config";
-import { importNovelFile } from "../core/chapters";
+import { importNovelFile, importNovelFiles } from "../core/chapters";
 import { tauri, isTauri } from "../utils/tauri";
 import { vfsWriteTextFile, vfsWriteFileBase64 } from "../utils/vfsWeb";
 import { DEMO_NOVEL } from "../core/demoNovel";
@@ -31,14 +31,16 @@ async function pickNovel(): Promise<void> {
   error.value = "";
   importing.value = true;
   try {
-    const path = await open({
-      multiple: false,
+    const picked = await open({
+      multiple: true,
       filters: [{ name: "文本文件", extensions: ["txt", "TXT"] }],
     });
-    if (!path || typeof path !== "string") return;
-    const doc = await importNovelFile(path);
+    if (!picked) return;
+    const paths = (Array.isArray(picked) ? picked : [picked]).filter((p): p is string => typeof p === "string");
+    if (!paths.length) return;
+    const doc = paths.length > 1 ? await importNovelFiles(paths) : await importNovelFile(paths[0]);
     projectState.novel = doc;
-    log.info("page", "导入小说成功", { path, chapters: doc.chapters.length, charCount: doc.fullText.length });
+    log.info("page", "导入小说成功", { fileCount: paths.length, chapters: doc.chapters.length, charCount: doc.fullText.length });
   } catch (e) {
     log.error("page", "导入小说失败", { error: errMsg(e) });
     error.value = errMsg(e);
@@ -49,16 +51,20 @@ async function pickNovel(): Promise<void> {
 
 async function onNovelFile(e: Event): Promise<void> {
   const input = e.target as HTMLInputElement;
-  const file = input.files?.[0];
+  const files = input.files ? [...input.files] : [];
   input.value = "";
-  if (!file) return;
+  if (!files.length) return;
   error.value = "";
   importing.value = true;
   try {
-    const text = await file.text();
-    const vPath = `/app/novel/${file.name}`;
-    await vfsWriteTextFile(vPath, text);
-    projectState.novel = await importNovelFile(vPath);
+    const vPaths: string[] = [];
+    for (const file of files) {
+      const text = await file.text();
+      const vPath = `/app/novel/${file.name}`;
+      await vfsWriteTextFile(vPath, text);
+      vPaths.push(vPath);
+    }
+    projectState.novel = vPaths.length > 1 ? await importNovelFiles(vPaths) : await importNovelFile(vPaths[0]);
   } catch (err) {
     error.value = (err as Error).message;
   } finally {
@@ -177,15 +183,15 @@ function loadRecentTitles(dir: string): string {
     <div class="page-head">
       <div>
         <div class="page-title">导入小说</div>
-        <p class="page-sub">选择 txt 小说文件，自动识别编码并按章节切分；可导入自定义素材（AI 优先使用）</p>
+        <p class="page-sub">选择 txt 小说文件（可多选，自动合并；导入时不分章，生成时由 AI 分章）；可导入自定义素材（AI 优先使用）</p>
       </div>
       <div class="page-actions">
         <button class="btn secondary" @click="loadDemo">加载示例</button>
         <button class="btn" :disabled="importing" @click="pickNovel">
           <span v-if="importing" class="spinner" />
-          {{ importing ? "读取中…" : "选择小说 txt" }}
+          {{ importing ? "读取中…" : "选择小说 txt（可多选）" }}
         </button>
-        <input v-if="!isTauri()" ref="novelInput" type="file" accept=".txt,text/plain" style="display: none" @change="onNovelFile" />
+        <input v-if="!isTauri()" ref="novelInput" type="file" accept=".txt,text/plain" multiple style="display: none" @change="onNovelFile" />
       </div>
     </div>
 
@@ -206,7 +212,7 @@ function loadRecentTitles(dir: string): string {
 
     <div class="card" v-if="projectState.novel">
       <div class="card-head">
-        <h3>章节（可勾选参与生成、修改标题）</h3>
+        <h3>章节（导入时不切章；生成时由 AI 分章，可在生成页查看/勾选重跑）</h3>
       </div>
       <div class="tbl-wrap">
         <table class="tbl">

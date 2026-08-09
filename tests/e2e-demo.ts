@@ -35,7 +35,7 @@ async function main(): Promise<void> {
     outputDir: out,
     title: cards.title,
     gameKey: gameKeyFor(cards.title),
-    templateDir: "/root/my_project/novel2vn/src-tauri/templates/webgal",
+    templateDir: `${import.meta.dirname.replace(/\\/g, "/")}/../src-tauri/templates/webgal`,
     chapters: scripts,
     cards,
     assets,

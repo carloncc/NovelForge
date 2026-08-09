@@ -214,6 +214,47 @@ export async function vfsCopyDirAll(src: string, dst: string): Promise<void> {
   }
 }
 
+export async function vfsReplacePath(src: string, dst: string): Promise<void> {
+  const source = normalizePath(src);
+  const destination = normalizePath(dst);
+  const db = await openDb();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(STORE, "readwrite");
+    const store = tx.objectStore(STORE);
+    const keysRequest = store.getAllKeys();
+    const nodesRequest = store.getAll();
+    let keys: string[] | undefined;
+    let nodes: VfsNode[] | undefined;
+    const applyReplacement = (): void => {
+      if (!keys || !nodes) return;
+      const sourceEntries = keys
+        .map((key, index) => ({ key, node: nodes![index] }))
+        .filter(({ key }) => key === source || key.startsWith(source + "/"));
+      if (!sourceEntries.length) {
+        tx.abort();
+        return;
+      }
+      for (const key of keys) {
+        if (key === destination || key.startsWith(destination + "/") || key === source || key.startsWith(source + "/")) store.delete(key);
+      }
+      for (const entry of sourceEntries) {
+        store.put(entry.node, destination + entry.key.slice(source.length));
+      }
+    };
+    keysRequest.onsuccess = () => {
+      keys = keysRequest.result as string[];
+      applyReplacement();
+    };
+    nodesRequest.onsuccess = () => {
+      nodes = nodesRequest.result as VfsNode[];
+      applyReplacement();
+    };
+    tx.oncomplete = () => resolve();
+    tx.onabort = () => reject(new Error(`替换失败：源路径不存在 ${src}`));
+    tx.onerror = () => reject(tx.error ?? new Error("IndexedDB 替换失败"));
+  });
+}
+
 /** 递归收集路径下所有文件（用于打包 zip / 预览上传） */
 export async function vfsCollectFiles(
   root: string,

@@ -189,6 +189,10 @@ export async function webCopyDirAll(src: string, dst: string): Promise<void> {
   await vfs.vfsCopyDirAll(src, dst);
 }
 
+export async function webReplacePath(src: string, dst: string): Promise<void> {
+  await vfs.vfsReplacePath(src, dst);
+}
+
 export async function webMkdirAll(path: string): Promise<void> {
   await vfs.vfsMkdirAll(path);
 }
@@ -364,6 +368,19 @@ export async function webCutoutImage(dataB64: string, threshold = 40): Promise<s
       if (x < w - 1) stack.push(idx + 1);
       if (y > 0) stack.push(idx - w);
       if (y < h - 1) stack.push(idx + w);
+    }
+    // 去绿边/绿晕：对边缘与半透明像素，绿色明显高于红/蓝时压制绿色（与 Rust 版一致）
+    for (let i = 0; i < px.length; i += 4) {
+      const r = px[i];
+      const g = px[i + 1];
+      const b = px[i + 2];
+      const a = px[i + 3];
+      const maxRB = Math.max(r, b);
+      const spill = g - maxRB;
+      if (spill > 6 && a < 250) {
+        const strength = a < 200 ? 1 : 0.85;
+        px[i + 1] = Math.round(Math.max(0, g - spill * strength));
+      }
     }
     let removed = 0;
     for (let i = 3; i < px.length; i += 4) if (px[i] < 250) removed++;

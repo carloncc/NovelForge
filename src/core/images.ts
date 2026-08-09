@@ -3,14 +3,18 @@
   CharacterCard,
   ExtractionResult,
   FailedTask,
+  ImageReference,
   ImageTask,
   ItemCard,
   MaterialAsset,
   PipelineEvent,
   SceneJSON,
+  ProjectVisualBible,
+  VisualBibleCacheBinding,
 } from "./types";
 import type { ApiConfig } from "./types";
-import { generateImage } from "../api/openaiCompatible";
+import { generateImage, ReferenceImageError, VisionApiError } from "../api/openaiCompatible";
+import { resolveImageModelCapabilities } from "../api/providers";
 import { verifyImage } from "./selfcheck";
 import { tauri } from "../utils/tauri";
 import { errMsg } from "../utils/errors";
@@ -49,9 +53,35 @@ const DEFAULT_STYLE =
   "unified Japanese anime style, cel shading, clean line art, consistent character design and proportions, cohesive color palette, high quality illustration";
 const STYLE_HINT = "consistent art direction, same visual style, no dimension change";
 
+// 统一负面提示词：避免低质量/畸形/水印等破坏画风与观感的元素
+const DEFAULT_NEGATIVE =
+  "lowres, bad anatomy, bad hands, extra fingers, mutated hands, deformed, disfigured, missing fingers, extra digit, watermark, signature, text, logo, jpeg artifacts, blurry, noise, low quality, worst quality";
+
+// 风格锚点：一张纯场景/无人物的画风基准图，后续所有背景/CG 以它做参考图，强制全项目同一画风
+const ANCHOR_PROMPT =
+  "anime background scenery, a serene countryside valley at golden hour with distant mountains and a small village, soft lighting, cinematic wide shot, no people, no text";
+
 /** 图生图一致性提示：要求与参考图保持同一角色/服装/配色/画风/维度 */
 const REF_HINT =
   ", exactly match the reference image: same character, same hair and eye color, same clothing and colors, same art style, same proportions, front-facing full body";
+
+/** 三视图基于角色参考图生成：以参考图为基准，输出正/侧/背三视图设定图 */
+const THREEVIEW_REF_HINT =
+  ", based on the reference image: keep the exact same character (hair, eyes, clothing, colors, proportions, art style), generate a clean three-view character sheet (front view / side view / back view), neutral standing pose, calm expression, full body visible, plain white background";
+
+/** 背景/CG 风格锚定提示：参考图为画风基准，内容必须全新 */
+const STYLE_ANCHOR_HINT =
+  ", same exact art style, line rendering, color palette, lighting and texture quality as the reference image, but an entirely different scene with different content";
+
+function inlineIdentityReference(rawImage: string): ImageReference {
+  const match = /^data:(image\/[a-z0-9.+-]+);base64,(.+)$/is.exec(rawImage.trim());
+  return {
+    role: "identity",
+    dataB64: rawImage,
+    mime: match?.[1] ?? "image/png",
+    required: true,
+  };
+}
 
 function styleSuffix(style?: string): string {
   const s = (style ?? "").trim();
@@ -80,6 +110,10 @@ export interface BuildImageTaskOptions {
   threeView?: boolean;
   /** 基于三视图生成角色动作立绘 */
   actions?: boolean;
+  /** 确定性种子基数：为每个任务分配 baseSeed+i 的固定种子（同一项目重跑结果稳定） */
+  baseSeed?: number;
+  /** 风格锚点：先生成画风基准图，背景/CG 以其为参考图统一画风 */
+  styleAnchor?: boolean;
 }
 
 export function buildImageTasks(
@@ -96,14 +130,34 @@ export function buildImageTasks(
   const withActions = opts.actions !== false;
   const baseStyle = styleSuffix(opts.style);
   const style = opts.feedback ? `${baseStyle}, ${opts.feedback.trim().replace(/[。.]$/, "")}` : baseStyle;
+  const useAnchor = opts.styleAnchor !== false;
+
+  // ① 全项目画风锚点：一张无人物场景基准图，作为所有背景/CG 的画风参考
+  if (useAnchor) {
+    tasks.push({
+      kind: "anchor",
+      id: "__anchor__",
+      prompt: ANCHOR_PROMPT + style,
+      fileName: "anchor_style.png",
+      width: 1024,
+      height: 576,
+      usage: "风格锚点（画风基准）",
+    });
+  }
 
   for (const char of cards.characters) {
-    // ① 三视图参考图（正/侧/背），作为该角色所有图像的图生图基准
+    // ① 三视图参考图（正/侧/背），作为该角色所有图像的图生图基准；
+    //    若用户为角色设置了参考图，则以参考图为基准生成三视图（保持人物一致）
     if (threeView) {
       tasks.push({
         kind: "threeview",
         id: `${char.id}_threeview`,
-        prompt: (char.threeViewPrompt || threeViewFallback(char.imagePrompt)) + style,
+        characterId: char.id,
+        prompt:
+          (char.threeViewPrompt || threeViewFallback(char.imagePrompt)) +
+          style +
+          (char.referenceImage ? THREEVIEW_REF_HINT : ""),
+        ...(char.referenceImage ? { references: [inlineIdentityReference(char.referenceImage)] } : {}),
         fileName: `threeview_${sanitizeId(char.id)}.png`,
         width: 1024,
         height: 1024,
@@ -117,9 +171,9 @@ export function buildImageTasks(
       tasks.push({
         kind: "figure",
         id: isNormal ? char.id : `${char.id}_${emo}`,
+        characterId: char.id,
         emotion: emo,
         prompt: char.imagePrompt + (EMOTION_PROMPT_SUFFIX[emo] ?? "") + REF_HINT + style + FIGURE_BG_SUFFIX,
-        referenceImage: isNormal ? char.referenceImage : undefined,
         refFromTask: isNormal ? (threeView ? `${char.id}_threeview` : undefined) : char.id,
         fileName: `figure_${sanitizeId(char.id)}_${emo}.png`,
         width: 1024,
@@ -133,6 +187,7 @@ export function buildImageTasks(
         tasks.push({
           kind: "action",
           id: `${char.id}_act_${a.id}`,
+          characterId: char.id,
           actionId: a.id,
           prompt: a.prompt + REF_HINT + style + FIGURE_BG_SUFFIX,
           refFromTask: `${char.id}_threeview`,
@@ -164,7 +219,7 @@ export function buildImageTasks(
       tasks.push({
         kind: "background",
         id: scene.id,
-        prompt: (scene.bgPrompt || `${scene.location} ${scene.atmosphere}, anime background, no people`) + style,
+        prompt: (scene.bgPrompt || `${scene.location} ${scene.atmosphere}, anime background, no people`) + style + (useAnchor ? STYLE_ANCHOR_HINT : ""),
         fileName: `bg_${sanitizeId(scene.id)}.png`,
         width: 1024,
         height: 576,
@@ -179,7 +234,7 @@ export function buildImageTasks(
         tasks.push({
           kind: "cg",
           id: `${chapter.chapter}_${scene.id}`,
-          prompt: scene.cgEvent.imagePrompt + style,
+          prompt: scene.cgEvent.imagePrompt + style + (useAnchor ? STYLE_ANCHOR_HINT : ""),
           fileName: `cg_${chapter.chapter}_${sanitizeId(scene.id)}.png`,
           width: 1024,
           height: 576,
@@ -190,15 +245,25 @@ export function buildImageTasks(
     }
   }
 
+  // 确定性种子：baseSeed 已指定时，按任务顺序分配固定种子（锚点=baseSeed，其余依次 +1）
+  if (opts.baseSeed !== undefined) {
+    tasks.forEach((t, i) => {
+      t.seed = opts.baseSeed! + i;
+    });
+  }
+
   return tasks;
 }
 
-async function tryCopyMaterial(mat: MaterialAsset, targetPath: string): Promise<boolean> {
+async function copyMaterial(mat: MaterialAsset, targetPath: string): Promise<void> {
+  if (!(await tauri.pathExists(mat.path).catch(() => false))) {
+    throw new ReferenceImageError(`Declared material is missing: ${mat.path}`, "REFERENCE_MISSING");
+  }
   try {
     await tauri.copyFile(mat.path, targetPath);
-    return true;
-  } catch {
-    return false;
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new ReferenceImageError(`Declared material could not be copied: ${mat.path} (${reason})`, "REFERENCE_MISSING");
   }
 }
 
@@ -210,13 +275,15 @@ async function ensureCutout(
   try {
     const b64 = await tauri.readFileBase64(path);
     if (await tauri.hasTransparency(b64)) return path;
-    const out = await tauri.cutoutImage(b64, 40);
+    const res = await tauri.cutoutImage(b64, 40);
+    const out = res.dataB64;
     const pngPath = path.replace(/\.(jpg|jpeg)$/i, ".png");
     await tauri.writeFileBase64(pngPath, out);
     if (pngPath !== path) {
       await tauri.removePath(path).catch(() => {});
     }
-    log({ step: "图像", message: `无背景立绘：${task.usage}`, level: "info", at: Date.now() });
+    const method = res.method === "ai" ? "AI 抠图" : "色度键抠图";
+    log({ step: "图像", message: `无背景立绘（${method}）：${task.usage}`, level: "info", at: Date.now() });
     return pngPath;
   } catch (e) {
     log({
@@ -235,8 +302,104 @@ export interface ImageRunOptions {
   force?: boolean;
   /** 表情差分参考图：normal 立绘路径（单素材重生成时传入） */
   figureBase?: Record<string, string>;
+  /** Approved project references. File reads are resolved immediately before an API request. */
+  visualBible?: ProjectVisualBible;
+  outputDir?: string;
   /** 多模态模型自检：生成后核对图片是否符合描述，不合格自动重生成 1 次 */
   verifyCfg?: ApiConfig;
+  /** 风格锚点图路径：背景/CG 以其为参考图统一画风（仅当任务无其它参考图时生效） */
+  styleAnchorPath?: string;
+  /** 负面提示词（走适配器模板 $negativePrompt，模板未映射则忽略） */
+  negativePrompt?: string;
+}
+
+export interface ImageReferenceResolutionContext {
+  outputDir: string;
+  visualBible?: ProjectVisualBible;
+  figureBase?: Record<string, string>;
+  styleAnchorPath?: string;
+}
+
+function imageMimeForPath(path: string): string {
+  const lower = path.toLowerCase();
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
+  if (lower.endsWith(".webp")) return "image/webp";
+  return "image/png";
+}
+
+async function fileReference(
+  path: string,
+  role: ImageReference["role"],
+  label: string,
+  required = true,
+): Promise<ImageReference> {
+  if (!(await tauri.pathExists(path).catch(() => false))) {
+    throw new ReferenceImageError(`${label} is missing: ${path}`, "REFERENCE_MISSING");
+  }
+  try {
+    const dataB64 = await tauri.readFileBase64(path);
+    if (!dataB64.trim()) throw new Error("empty file");
+    return { role, dataB64, mime: imageMimeForPath(path), sourcePath: path, required };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new ReferenceImageError(`${label} could not be read: ${path} (${message})`, "REFERENCE_MISSING");
+  }
+}
+
+function visualBibleArtifactPath(outputDir: string, storedPath: string): string {
+  return `${outputDir.replace(/[\\/]$/, "").replace(/\\/g, "/")}/.novel2vn/visual-bible/${storedPath}`;
+}
+
+export async function resolveImageTaskReferences(
+  task: ImageTask,
+  context: ImageReferenceResolutionContext,
+): Promise<ImageReference[]> {
+  const references = [...(task.references ?? [])];
+  const bible = context.visualBible?.status === "approved" ? context.visualBible : undefined;
+  const bibleCharacter = task.characterId ? bible?.characters[task.characterId] : undefined;
+  const characterDerivative = task.kind === "figure" || task.kind === "action";
+
+  if (task.refFromTask) {
+    const generatedPath = context.figureBase?.[task.refFromTask];
+    if (generatedPath) {
+      references.unshift(await fileReference(generatedPath, "identity", `Generated identity for ${task.id}`));
+    } else if (bibleCharacter) {
+      const storedPath = bibleCharacter.threeViewPath;
+      references.unshift(await fileReference(
+        visualBibleArtifactPath(context.outputDir, storedPath),
+        "identity",
+        `Approved identity for ${task.characterId}`,
+      ));
+    } else {
+      throw new ReferenceImageError(`Required generated reference ${task.refFromTask} is unavailable for ${task.id}`, "REFERENCE_MISSING");
+    }
+  } else if (characterDerivative && bibleCharacter) {
+    references.unshift(await fileReference(
+      visualBibleArtifactPath(context.outputDir, bibleCharacter.threeViewPath),
+      "identity",
+      `Approved identity for ${task.characterId}`,
+    ));
+  } else if (task.kind === "threeview" && bibleCharacter && !references.some((reference) => reference.role === "identity")) {
+    const storedPath = bibleCharacter.sourceReferencePath ?? bibleCharacter.threeViewPath;
+    references.unshift(await fileReference(
+      visualBibleArtifactPath(context.outputDir, storedPath),
+      "identity",
+      `Character source for ${task.characterId}`,
+    ));
+  }
+
+  if (bible) {
+    const styleRequired = !references.some((reference) => reference.role === "identity");
+    references.push(await fileReference(
+      visualBibleArtifactPath(context.outputDir, bible.styleReferencePath),
+      "style",
+      "Approved global style reference",
+      styleRequired,
+    ));
+  } else if ((task.kind === "background" || task.kind === "cg") && context.styleAnchorPath) {
+    references.push(await fileReference(context.styleAnchorPath, "style", "Legacy style anchor"));
+  }
+  return references;
 }
 
 /** 执行单个图像任务（管线批处理与单素材重生成共用） */
@@ -249,19 +412,10 @@ export async function runImageTask(
 ): Promise<string | null> {
   const cacheDir = cacheDirFor(cacheRoot, "images");
   await tauri.mkdirAll(cacheDir);
-  // 表情差分任务：用已生成的 normal 立绘作为参考图（图生图保持一致）
-  if (task.refFromTask && !task.referenceImage) {
-    const basePath = opts.figureBase?.[task.refFromTask];
-    if (basePath) {
-      try {
-        task.referenceImage = await tauri.readFileBase64(basePath);
-      } catch {
-        /* 读取失败则降级文生图 */
-      }
-    }
-  }
   let path: string | null = null;
   let source = "";
+  let resolvedReferences: ImageReference[] = [];
+  let materialReference: ImageReference | undefined;
 
   const cached = opts.force ? null : await cacheHit(cacheDir, task.fileName);
   if (cached) {
@@ -271,8 +425,15 @@ export async function runImageTask(
   } else {
     const mat = findMaterial(opts.materials ?? [], task);
     if (mat) {
-      const ok = await tryCopyMaterial(mat, `${cacheDir}/${task.fileName}`);
-      if (ok) {
+      const useAsItemReference = !!cfg && task.kind === "item" && opts.visualBible?.status === "approved";
+      if (useAsItemReference) {
+        const resolvedMaterial = await fileReference(mat.path, "identity", `Item material for ${task.id}`);
+        materialReference = {
+          ...resolvedMaterial,
+          mime: mat.mime.startsWith("image/") ? mat.mime : resolvedMaterial.mime,
+        };
+      } else {
+        await copyMaterial(mat, `${cacheDir}/${task.fileName}`);
         path = `${cacheDir}/${task.fileName}`;
         source = `用户素材 ${mat.name}`;
       }
@@ -288,25 +449,32 @@ export async function runImageTask(
         });
         return null;
       }
-      let img: { dataB64: string; mime: string };
-      try {
-        img = await generateImage(cfg, task.prompt, {
-          referenceImageB64: task.referenceImage,
-          size: `${task.width}x${task.height}`,
+      const generationTask = materialReference
+        ? { ...task, references: [materialReference, ...(task.references ?? [])] }
+        : task;
+      resolvedReferences = await resolveImageTaskReferences(generationTask, {
+        outputDir: opts.outputDir ?? cacheRoot.replace(/[\\/]\.novel2vn[\\/]cache[\\/]?$/, ""),
+        visualBible: opts.visualBible,
+        figureBase: opts.figureBase,
+        styleAnchorPath: opts.styleAnchorPath,
+      });
+      const capabilities = resolveImageModelCapabilities(cfg);
+      if (capabilities.maxReferenceImages === 1
+        && resolvedReferences.some((reference) => reference.role === "identity")
+        && resolvedReferences.some((reference) => reference.role === "style" && reference.required === false)) {
+        log({
+          step: "图像",
+          message: `模型仅支持单参考图：${task.usage} 使用已批准的人物身份图，画风由已批准的风格文字约束`,
+          level: "info",
+          at: Date.now(),
         });
-      } catch (e) {
-        if (task.referenceImage) {
-          log({
-            step: "图像",
-            message: `参考图失败，降级文生图：${task.usage}（${errMsg(e).slice(0, 120)}）`,
-            level: "warn",
-            at: Date.now(),
-          });
-          img = await generateImage(cfg, task.prompt, { size: `${task.width}x${task.height}` });
-        } else {
-          throw e;
-        }
       }
+      const img = await generateImage(cfg, task.prompt, {
+        references: resolvedReferences,
+        size: `${task.width}x${task.height}`,
+        seed: task.seed,
+        negativePrompt: opts.negativePrompt,
+      });
       const ext = img.mime.includes("jpeg") ? "jpg" : "png";
       const file = task.fileName.replace(/\.png$/, `.${ext}`);
       path = `${cacheDir}/${file}`;
@@ -320,11 +488,16 @@ export async function runImageTask(
     path = await ensureCutout(path, task, log);
   }
 
-  // 多模态自检：核对图片是否符合描述，不合格自动重生成 1 次
+  // 多模态自检：核对图片是否符合描述，不合格自动重生成 1 次（有参考图时一并核对角色/画风一致性）
   if (path && opts.verifyCfg && source === "AI 生成") {
     try {
       const b64 = await tauri.readFileBase64(path);
-      const { ok, reason } = await verifyImage(opts.verifyCfg, b64, `${task.usage}；${task.prompt}`);
+      const { ok, reason } = await verifyImage(
+        opts.verifyCfg,
+        b64,
+        `${task.usage}；${task.prompt}`,
+        { references: resolvedReferences },
+      );
       if (!ok) {
         log({ step: "图像", message: `自检未通过（自动重生成 1 次）：${task.usage}（${reason}）`, level: "warn", at: Date.now() });
         const fixed = await runImageTask(cfg, { ...task, prompt: `${task.prompt}, IMPORTANT FIX: ${reason}` }, cacheRoot, log, {
@@ -340,6 +513,7 @@ export async function runImageTask(
         }
       }
     } catch (e) {
+      if (e instanceof VisionApiError) throw e;
       log({ step: "图像", message: `自检过程出错（保留原图）：${task.usage}（${errMsg(e).slice(0, 120)}）`, level: "warn", at: Date.now() });
     }
   }
@@ -367,23 +541,45 @@ export async function generateImages(
   threeView = true,
   withActions = true,
   verifyCfg?: ApiConfig,
+  baseSeed?: number,
+  styleAnchor = true,
+  isAborted?: () => boolean,
+  visualBible?: ProjectVisualBible,
 ): Promise<{ images: ImageResultMap; failed: FailedTask[] }> {
   const result: ImageResultMap = { bg: {}, cg: {}, figure: {}, item: {} };
   const failed: FailedTask[] = [];
+  const approvedBible = visualBible?.status === "approved" ? visualBible : undefined;
+  const projectOutputDir = cacheRoot.replace(/[\\/]\.novel2vn[\\/]cache[\\/]?$/, "");
   const tasks = buildImageTasks(chapters, cards, {
     figurePerCharacter: 1,
     cgPerChapter: 3,
     maxPerChapter: 12,
     figureEmotions,
-    style,
+    style: approvedBible?.styleDescription ?? style,
     feedback,
     threeView,
     actions: withActions,
+    baseSeed,
+    styleAnchor: approvedBible ? false : styleAnchor,
   });
 
   await tauri.mkdirAll(cacheDirFor(cacheRoot, "images"));
+  const visualBibleCacheMarker = `${cacheDirFor(cacheRoot, "images")}/.visual-bible-fingerprint`;
+  const approvedCacheBinding = approvedBible ? cacheBindingForBible(approvedBible) : undefined;
+  const storedCacheBinding = approvedBible
+    ? await readCacheBinding(visualBibleCacheMarker, approvedBible, approvedCacheBinding!)
+    : undefined;
+  const globalCacheCurrent = !approvedBible
+    || storedCacheBinding?.globalFingerprint === approvedCacheBinding?.globalFingerprint;
+  const imageForceFor = (task: ImageTask): boolean => {
+    if (force || !globalCacheCurrent) return true;
+    if (!task.characterId || !approvedCacheBinding) return false;
+    return storedCacheBinding?.characterRevisions[task.characterId]
+      !== approvedCacheBinding.characterRevisions[task.characterId];
+  };
   logger.info("images", "开始生成图像素材", {
     totalTasks: tasks.length,
+    anchor: tasks.filter((t) => t.kind === "anchor").length,
     threeview: tasks.filter((t) => t.kind === "threeview").length,
     action: tasks.filter((t) => t.kind === "action").length,
     bg: tasks.filter((t) => t.kind === "background").length,
@@ -394,15 +590,35 @@ export async function generateImages(
     figureEmotions,
     threeView,
     force,
+    baseSeed,
+    styleAnchor,
     hasFeedback: !!feedback,
     style: style ? style.slice(0, 80) : "(默认)",
     concurrency,
   });
 
-  // 四阶段执行（链式图生图保证形象一致）：
-  // 三视图 → 默认立绘+背景/CG/物品 → 表情差分（以默认立绘为参考）→ 动作（以三视图为参考）
-  const threeViewPass = tasks.filter((t) => t.kind === "threeview");
-  const firstPass = tasks.filter((t) => (t.kind === "figure" && !t.emotion) || t.kind === "background" || t.kind === "cg" || t.kind === "item");
+  // 实时进度：total 为任务总数，done 为已完成（含缓存/失败）；每个任务完成后发一条进度事件
+  const total = tasks.length;
+  let done = 0;
+  const emitProgress = (task: ImageTask, extra = ""): void => {
+    done++;
+    const label = (task.usage ?? task.fileName) + extra;
+    log({
+      step: "图像",
+      message: `进度 ${done}/${total}：${label}`,
+      level: "info",
+      at: Date.now(),
+      progress: { done, total, label },
+    });
+  };
+
+  // 五阶段执行（链式图生图保证形象/画风一致）：
+  // 风格锚点 → 三视图 → 默认立绘+背景/CG/物品（背景/CG 以锚点为参考）→ 表情差分（以默认立绘为参考）→ 动作（以三视图为参考）
+  const leadingPass = tasks.filter((t) => t.kind === "threeview");
+  // 默认立绘的 emotion 为 "normal"，必须归入首轮，否则表情差分没有参考图（曾导致角色形象漂移）
+  const firstPass = tasks.filter(
+    (t) => (t.kind === "figure" && (!t.emotion || t.emotion === "normal")) || t.kind === "background" || t.kind === "cg" || t.kind === "item",
+  );
   const emotionPass = tasks.filter((t) => t.kind === "figure" && t.emotion && t.emotion !== "normal");
   const actionPass = tasks.filter((t) => t.kind === "action");
 
@@ -414,23 +630,32 @@ export async function generateImages(
       case "threeview": result.figure[task.id] = path; break;
       case "action": result.figure[task.id] = path; break;
       case "item": result.item[task.id] = path; break;
+      case "anchor": break;
     }
   };
 
-  const runPass = async (pass: ImageTask[]) => {
+  const runPass = async (pass: ImageTask[], anchorPath?: string) => {
     let idx = 0;
     const worker = async () => {
       while (idx < pass.length) {
+        if (isAborted?.()) return;
         const task = pass[idx++];
         try {
           const p = await runImageTask(cfg, task, cacheRoot, log, {
             materials,
-            force,
+            force: imageForceFor(task),
             figureBase: result.figure,
+            visualBible: approvedBible,
+            outputDir: projectOutputDir,
             verifyCfg,
+            styleAnchorPath: anchorPath,
+            negativePrompt: DEFAULT_NEGATIVE,
           });
+          emitProgress(task);
           if (p) record(task, p);
         } catch (e) {
+          if (e instanceof VisionApiError) throw e;
+          emitProgress(task, "（失败）");
           // 单任务失败不阻断整章：记录并继续
           failed.push({
             id: task.id,
@@ -453,10 +678,30 @@ export async function generateImages(
     await Promise.all(Array.from({ length: concurrency }, () => worker()));
   };
 
-  await runPass(threeViewPass);
-  await runPass(firstPass);
-  await runPass(emotionPass);
-  await runPass(actionPass);
+  // 风格锚点先生成，供背景/CG 引用
+  let anchorPath: string | undefined;
+  const anchorTask = tasks.find((t) => t.kind === "anchor");
+  if (anchorTask) {
+    const p = await runImageTask(cfg, anchorTask, cacheRoot, log, {
+      materials,
+      force: imageForceFor(anchorTask),
+      figureBase: result.figure,
+      visualBible: approvedBible,
+      outputDir: projectOutputDir,
+      verifyCfg,
+      negativePrompt: DEFAULT_NEGATIVE,
+    });
+    emitProgress(anchorTask);
+    if (p) anchorPath = p;
+  }
+  if (isAborted?.()) {
+    log({ step: "图像", message: "已中止（后续图片任务不再继续，已生成的保留）", level: "warn", at: Date.now() });
+  } else {
+    await runPass(leadingPass, anchorPath);
+    await runPass(firstPass, anchorPath);
+    await runPass(emotionPass, anchorPath);
+    await runPass(actionPass, anchorPath);
+  }
 
   for (const chapter of chapters) {
     for (const scene of chapter.scenes) {
@@ -476,7 +721,54 @@ export async function generateImages(
     failed: failed.length,
   });
 
+  if (approvedBible && cfg && failed.length === 0 && !isAborted?.()) {
+    await tauri.writeTextFile(visualBibleCacheMarker, JSON.stringify(approvedCacheBinding));
+  }
+
   return { images: result, failed };
+}
+
+function cacheBindingForBible(bible: ProjectVisualBible): VisualBibleCacheBinding {
+  const characterRevisions = Object.fromEntries(
+    Object.entries(bible.characters).map(([characterId, character]) => [characterId, character.revision]),
+  );
+  const existingBinding = bible.cacheBinding;
+  if (existingBinding
+    && Object.keys(characterRevisions).every((characterId) => Number.isInteger(existingBinding.characterRevisions[characterId]))) {
+    return existingBinding;
+  }
+  return {
+    globalFingerprint: existingBinding?.globalFingerprint ?? bible.inputFingerprint,
+    characterRevisions,
+  };
+}
+
+async function readCacheBinding(
+  markerPath: string,
+  bible: ProjectVisualBible,
+  currentBinding: VisualBibleCacheBinding,
+): Promise<VisualBibleCacheBinding | undefined> {
+  try {
+    const marker = (await tauri.readTextFile(markerPath)).text.trim();
+    if (marker === bible.inputFingerprint || marker === currentBinding.globalFingerprint) {
+      return {
+        globalFingerprint: currentBinding.globalFingerprint,
+        characterRevisions: { ...currentBinding.characterRevisions },
+      };
+    }
+    const parsed = JSON.parse(marker) as Partial<VisualBibleCacheBinding>;
+    if (typeof parsed.globalFingerprint !== "string"
+      || !parsed.characterRevisions
+      || typeof parsed.characterRevisions !== "object") return undefined;
+    return {
+      globalFingerprint: parsed.globalFingerprint,
+      characterRevisions: Object.fromEntries(
+        Object.entries(parsed.characterRevisions).filter(([, revision]) => Number.isInteger(revision) && revision >= 0),
+      ) as Record<string, number>,
+    };
+  } catch {
+    return undefined;
+  }
 }
 
 function findMaterial(materials: MaterialAsset[], task: ImageTask): MaterialAsset | undefined {

@@ -16,6 +16,14 @@ export interface LogEntry {
 const HISTORY_LIMIT = 5000;
 const history: LogEntry[] = [];
 
+/** 可插拔的日志文件写入器（由应用启动时注册，写入磁盘，便于离线诊断） */
+export type LogFileSink = (entry: LogEntry) => void;
+let logFileSink: LogFileSink | null = null;
+
+export function setLogFileSink(sink: LogFileSink | null): void {
+  logFileSink = sink;
+}
+
 const DEV =
   typeof import.meta !== "undefined" &&
   !!(import.meta as { env?: { DEV?: boolean } }).env?.DEV;
@@ -52,6 +60,7 @@ function push(level: LogLevel, scope: string, message: string, data?: unknown): 
   const entry: LogEntry = { at: Date.now(), level, scope, message, data };
   if (history.length >= HISTORY_LIMIT) history.shift();
   history.push(entry);
+  logFileSink?.(entry);
 
   if (!DEV) return;
   const time = new Date(entry.at).toISOString();

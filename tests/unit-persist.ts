@@ -1,9 +1,11 @@
 import { saveProjectState, restoreProjectState } from "../src/utils/persist";
+import { computeProjectVisualBibleFingerprint } from "../src/core/visualBible";
 import { tauri } from "../src/utils/tauri";
-import type { MaterialAsset } from "../src/core/types";
+import type { MaterialAsset, ProjectVisualBible } from "../src/core/types";
 import { writeFile } from "node:fs/promises";
 
-const DIR = "/tmp/novelforge-persist-test";
+const DIR = `${process.cwd().replace(/\\/g, "/")}/tests/.tmp-persist`;
+const PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z8Z8AAAAASUVORK5CYII=";
 
 function assert(cond: boolean, msg: string): void {
   if (!cond) throw new Error(msg);
@@ -36,7 +38,64 @@ async function main(): Promise<void> {
     characterIntroCard: true,
   };
 
-  await saveProjectState({ novel, materials, outputDir: DIR, options, lastResult: null });
+  const visualBible: ProjectVisualBible = {
+    version: 1,
+    status: "draft",
+    styleSource: "novel_analysis",
+    styleDescription: "painted animation, cool palette",
+    styleReferencePath: "style-sample.png",
+    characters: {
+      alice: {
+        threeViewPath: "threeview_alice.png",
+        prompt: "alice turnaround",
+        approved: false,
+        revision: 1,
+      },
+    },
+    inputFingerprint: "v1-test",
+  };
+  await tauri.writeFileBase64(`${DIR}/.novel2vn/visual-bible/style-sample.png`, PNG_B64);
+  await tauri.writeFileBase64(`${DIR}/.novel2vn/visual-bible/threeview_alice.png`, PNG_B64);
+
+  const lastResult = {
+    meta: {
+      title: "Book",
+      gameKey: "book",
+      chapterCount: 2,
+      charCount: 1,
+      sceneCount: 0,
+      lineCount: 0,
+      outputDir: DIR,
+      webgalVersion: "test",
+      generatedAt: "2026-08-08T00:00:00.000Z",
+    },
+    cards: {
+      title: "Book",
+      characters: [{
+        id: "alice",
+        name: "Alice",
+        appearance: "silver hair",
+        clothing: "black coat",
+        personality: "calm",
+        voiceDesc: "soft",
+        imagePrompt: "alice, silver hair",
+        referenceImage: `data:image/png;base64,${PNG_B64}`,
+        color: "#fff",
+      }],
+      scenes: [],
+      items: [],
+    },
+    cost: {
+      llmTokens: 0,
+      imageCount: 0,
+      ttsChars: 0,
+      llmCostYuan: 0,
+      imageCostYuan: 0,
+      ttsCostYuan: 0,
+    },
+  };
+
+  await saveProjectState({ novel, materials, outputDir: DIR, options, lastResult, visualBible });
 
   // 模拟重新启动：重新读文件并恢复
   const restored = await restoreProjectState(DIR);
@@ -49,9 +108,75 @@ async function main(): Promise<void> {
   assert(restored.options?.videoPointsPerChapter === 2, "新增选项应保留");
 
   // 源文件不存在时安全返回空
-  const gone = await restoreProjectState("/tmp/novelforge-persist-missing");
+  assert(restored.visualBible?.styleDescription === visualBible.styleDescription, "visual bible should restore from its canonical manifest");
+  const projectJson = (await tauri.readTextFile(`${DIR}/.novel2vn/project_state.json`)).text;
+  assert(!projectJson.includes(PNG_B64) && !projectJson.includes("visualBible"), "project JSON should not duplicate the visual-bible manifest or image data");
+  assert(
+    /^character-reference_alice\.rev-[A-Za-z0-9-]+\.png$/.test(restored.lastResult?.cards.characters[0].referenceImagePath ?? ""),
+    "legacy character references should restore as revisioned project-local paths",
+  );
+
+  assert(restored.visualBible && restored.novel && restored.lastResult, "restored project should contain the inputs needed to approve its visual bible");
+  restored.visualBible.status = "approved";
+  restored.visualBible.approvedAt = "2026-08-08T00:00:00.000Z";
+  restored.visualBible.characters.alice.approved = true;
+  restored.visualBible.characters.alice.sheetSourceRevision = restored.visualBible.characters.alice.sourceRevision;
+  restored.visualBible.inputFingerprint = await computeProjectVisualBibleFingerprint(
+    DIR,
+    restored.visualBible,
+    restored.novel,
+    restored.lastResult.cards.characters,
+  );
+  await saveProjectState({
+    novel: restored.novel,
+    materials: restored.materials,
+    outputDir: DIR,
+    options: restored.options!,
+    lastResult: restored.lastResult,
+    visualBible: restored.visualBible,
+  });
+  await writeFile(novelPath, "changed chapter body after visual-bible approval", "utf-8");
+  const staleRestore = await restoreProjectState(DIR);
+  assert(staleRestore.visualBible?.status === "stale", "restoring changed chapter bodies should stale an approved visual bible");
+  const persistedBible = JSON.parse((await tauri.readTextFile(`${DIR}/.novel2vn/visual-bible/visual-bible.json`)).text) as ProjectVisualBible;
+  assert(persistedBible.status === "stale" && !persistedBible.approvedAt, "restore-time fingerprint refresh should persist the stale state");
+
+  const originalWriteTextFile = tauri.writeTextFile;
+  tauri.writeTextFile = async (path, content) => {
+    if (path.endsWith("/.novel2vn/project_state.json")) throw new Error("injected project-state write failure");
+    return originalWriteTextFile(path, content);
+  };
+  try {
+    let saveFailed = false;
+    try {
+      await saveProjectState({ novel, materials, outputDir: DIR, options, lastResult, visualBible });
+    } catch (error) {
+      saveFailed = error instanceof Error && error.message.includes("project-state write failure");
+    }
+    assert(saveFailed, "project-state persistence should surface write failures");
+  } finally {
+    tauri.writeTextFile = originalWriteTextFile;
+  }
+
+  (globalThis as unknown as { window: { setTimeout: () => number } }).window = { setTimeout: () => 1 };
+  const { persistCurrentProjectState, projectState } = await import("../src/stores/project");
+  projectState.outputDir = DIR;
+  tauri.writeTextFile = async (path, content) => {
+    if (path.endsWith("/.novel2vn/project_state.json")) throw new Error("visible project-state failure");
+    return originalWriteTextFile(path, content);
+  };
+  try {
+    const saved = await persistCurrentProjectState();
+    assert(!saved, "project-state wrapper should report save failure");
+    assert(projectState.saveError?.includes("visible project-state failure") === true, "project state should expose the save error");
+  } finally {
+    tauri.writeTextFile = originalWriteTextFile;
+  }
+
+  const gone = await restoreProjectState(`${DIR}-missing`);
   assert(gone.novel === null && gone.materials.length === 0, "无状态目录应返回空");
 
+  await tauri.removePath(DIR);
   console.log("=== 状态持久化测试通过 ===");
 }
 main().catch((e) => {

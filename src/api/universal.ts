@@ -1,5 +1,7 @@
-import type { ApiConfig } from "../core/types";
+import type { ApiConfig, ImageReference } from "../core/types";
+import { rawReferenceBase64, ReferenceImageError, referenceDataUrl } from "./providers";
 import { tauri } from "../utils/tauri";
+import { log } from "../utils/logger";
 
 /* ============ 统一能力模型 ============ */
 
@@ -58,7 +60,8 @@ export interface UnifiedImageInput {
   negativePrompt?: string;
   width?: number;
   height?: number;
-  referenceImageB64?: string;
+  references?: ImageReference[];
+  referenceEncoding?: "raw-base64" | "data-url";
   count?: number;
   seed?: number;
   format?: string;
@@ -331,6 +334,19 @@ function isRetryable(status: number, text: string): boolean {
   return /timeout|timed out|network|socket|connect|ECONN|ETIMEDOUT|fetch failed/i.test(text);
 }
 
+function referenceErrorFromResponse(raw: string): ReferenceImageError | undefined {
+  const match = /\b(REFERENCE_UNSUPPORTED|REFERENCE_MISSING)\b/i.exec(raw);
+  if (!match) return undefined;
+  const code = match[1].toUpperCase() as "REFERENCE_UNSUPPORTED" | "REFERENCE_MISSING";
+  let message = raw.slice(0, 300);
+  try {
+    message = smartErrorText(JSON.parse(raw)) ?? message;
+  } catch {
+    // Plain-text local adapters use the same typed code prefix.
+  }
+  return new ReferenceImageError(message, code);
+}
+
 const RETRY_DELAYS = [800, 2500];
 
 /** 构造 multipart/form-data 字符串（跨 Tauri/浏览器统一，无需真实 FormData） */
@@ -386,6 +402,16 @@ async function postJson(
         timeoutSecs: 300,
       });
       const raw = utf8FromB64(res.bodyBase64);
+      if (res.status >= 400) {
+        log.error("api", "适配器请求失败", {
+          url,
+          status: res.status,
+          templateId: template.id,
+          raw: raw.slice(0, 500),
+        });
+        const referenceError = referenceErrorFromResponse(raw);
+        if (referenceError) throw referenceError;
+      }
       if (res.status >= 500 || res.status === 429) {
         throw { status: res.status, message: `HTTP ${res.status}` };
       }
@@ -498,9 +524,12 @@ export async function callUnified(ctx: CallContext): Promise<UnifiedResult> {
         timeoutSecs: 300,
       });
       if (res.status >= 400) {
-        let errText = utf8FromB64(res.bodyBase64).slice(0, 300);
+        const raw = utf8FromB64(res.bodyBase64);
+        const referenceError = referenceErrorFromResponse(raw);
+        if (referenceError) throw referenceError;
+        let errText = raw.slice(0, 300);
         try {
-          const smart = smartErrorText(JSON.parse(utf8FromB64(res.bodyBase64)));
+          const smart = smartErrorText(JSON.parse(raw));
           if (smart) errText = smart;
         } catch {
           /* 非 JSON */
@@ -514,13 +543,18 @@ export async function callUnified(ctx: CallContext): Promise<UnifiedResult> {
     }
     const { json } = await postJson(cfg, url, body, template);
     const raw = getByPath(json, template.response.path ?? "");
-    if (raw === undefined || raw === null || raw === "") {
+    if (raw !== undefined && raw !== null && raw !== "") {
+      return decodeResult(raw, template, cfg);
+    }
+    // 配置路径未命中时，尝试深度智能提取（兼容 image_urls / inlineData 等变体响应）
+    try {
+      return await decodeResult(json, template, cfg);
+    } catch (e) {
       const errMsg = smartErrorText(json);
       throw new Error(
         errMsg ? `API 错误：${errMsg}` : `响应中未找到结果字段「${template.response.path}」：${JSON.stringify(json).slice(0, 300)}`,
       );
     }
-    return decodeResult(raw, template, cfg);
   }
 
   // async：提交 → 轮询 → 取结果
@@ -592,6 +626,10 @@ export async function unifiedImage(
   template: AdapterTemplate,
   input: UnifiedImageInput,
 ): Promise<UnifiedResult> {
+  const references = input.references ?? [];
+  const rawReferences = references.map(rawReferenceBase64);
+  const dataUrlReferences = references.map(referenceDataUrl);
+  const encodedReferences = input.referenceEncoding === "data-url" ? dataUrlReferences : rawReferences;
   return callUnified({
     cfg,
     template,
@@ -599,7 +637,15 @@ export async function unifiedImage(
       prompt: input.prompt,
       negativePrompt: input.negativePrompt,
       model: cfg.model,
-      refImage: input.referenceImageB64,
+      refImage: encodedReferences[0],
+      refImage2: encodedReferences[1],
+      refImage3: encodedReferences[2],
+      refImageRaw: rawReferences[0],
+      refImage2Raw: rawReferences[1],
+      refImage3Raw: rawReferences[2],
+      refImageDataUrl: dataUrlReferences[0],
+      refImage2DataUrl: dataUrlReferences[1],
+      refImage3DataUrl: dataUrlReferences[2],
       count: input.count ?? 1,
       seed: input.seed,
       width: input.width,

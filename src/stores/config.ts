@@ -1,14 +1,14 @@
-import { reactive, watch } from "vue";
+import { reactive, ref, watch } from "vue";
 import type { ApiConfig, ApiPreset, ChannelKey } from "../core/types";
 import { tauri } from "../utils/tauri";
 import { getTemplate } from "../api/templates";
-
-interface ConfigFile {
-  presets: ApiPreset[];
-  activePresetId: string;
-  outputDir?: string;
-  recentOutputDirs?: string[];
-}
+import {
+  CONFIG_SCHEMA_VERSION,
+  loadConfigFile,
+  UnsupportedConfigVersionError,
+  type ConfigFile,
+} from "./configMigration";
+import { log } from "../utils/logger";
 
 export function addRecentOutputDir(dir: string): void {
   if (!dir) return;
@@ -46,17 +46,22 @@ export const DEFAULT_VOICE_LIBRARY = [
 export function defaultApiConfig(kind: ChannelKey): ApiConfig {
   const defaults: Partial<Record<ChannelKey, { baseUrl: string; model: string }>> = {
     llm: { baseUrl: "https://api.deepseek.com", model: "deepseek-chat" },
-    image: { baseUrl: "https://api.siliconflow.cn/v1", model: "black-forest-labs/FLUX.1-schnell" },
+    vision: { baseUrl: "https://api.siliconflow.cn/v1", model: "zai-org/GLM-4.6V" },
+    image: { baseUrl: "https://api.siliconflow.cn/v1", model: "Qwen/Qwen-Image-Edit-2509" },
     tts: { baseUrl: "https://api.siliconflow.cn/v1", model: "FunAudioLLM/CosyVoice2-0.5B" },
   };
   const d = defaults[kind]!;
   return {
     id: makeId(),
-    name: kind === "llm" ? "文本模型" : kind === "image" ? "图像模型" : "语音模型",
+    name: kind === "llm" ? "文本模型" : kind === "vision" ? "图片识别模型" : kind === "image" ? "图像模型" : "语音模型",
     baseUrl: d.baseUrl,
     apiKey: "",
     model: d.model,
-    extra: kind === "tts" ? { voiceLibrary: [...DEFAULT_VOICE_LIBRARY] } : {},
+    extra: kind === "tts"
+      ? { voiceLibrary: [...DEFAULT_VOICE_LIBRARY] }
+      : kind === "image"
+        ? { provider: "siliconflow", protocol: "siliconflow-image" }
+        : {},
   };
 }
 
@@ -91,55 +96,127 @@ export function applyTemplate(cfg: ApiConfig, templateId: string): void {
   }
 }
 
-export const configState = reactive<ConfigFile>({
-  presets: [{
+export function createApiPreset(name: string): ApiPreset {
+  const llm = defaultApiConfig("llm");
+  const vision = defaultApiConfig("vision");
+  const image = defaultApiConfig("image");
+  const tts = defaultApiConfig("tts");
+  return {
     id: makeId(),
-    name: "默认配置",
-    channels: {
-      llm: [defaultApiConfig("llm")],
-      image: [defaultApiConfig("image")],
-      tts: [defaultApiConfig("tts")],
-    },
-    active: { llm: "", image: "", tts: "" },
-  }],
-  activePresetId: "",
+    name,
+    channels: { llm: [llm], vision: [vision], image: [image], tts: [tts] },
+    active: { llm: llm.id, vision: vision.id, image: image.id, tts: tts.id },
+  };
+}
+
+const initialPreset = createApiPreset("默认配置");
+
+export const configState = reactive<ConfigFile>({
+  configSchemaVersion: CONFIG_SCHEMA_VERSION,
+  presets: [initialPreset],
+  activePresetId: initialPreset.id,
   outputDir: "",
   recentOutputDirs: [],
 });
+let configPersistenceBlocked = false;
+let lastPersistedContent = "";
+let pendingMigrationContent = "";
+let migrationRetryTimer: number | undefined;
+export const configPersistenceError = ref("");
 void loadPersisted();
 
 async function loadPersisted() {
   try {
     const raw = await tauri.readConfig();
     if (!raw || raw === "{}") return;
-    const parsed = JSON.parse(raw) as ConfigFile;
-    if (parsed?.presets?.length) {
+    const loaded = await loadConfigFile(raw, {
+      createId: makeId,
+      createVisionDefault: () => defaultApiConfig("vision"),
+      writeConfig: (content) => tauri.writeConfig(content),
+    });
+    const parsed = loaded.config;
+    if (loaded.migrationPending) {
+      configPersistenceBlocked = true;
+      pendingMigrationContent = JSON.stringify(parsed);
+      configPersistenceError.value = `旧配置已恢复，但迁移结果暂时无法保存：${loaded.migrationSaveError?.message ?? "未知错误"}`;
+      scheduleMigrationRetry();
+    } else {
+      lastPersistedContent = JSON.stringify(parsed);
+    }
+    if (parsed.presets.length) {
       configState.presets = parsed.presets;
       configState.activePresetId = parsed.activePresetId || parsed.presets[0].id;
     }
+    configState.configSchemaVersion = CONFIG_SCHEMA_VERSION;
     configState.outputDir = parsed.outputDir || "";
     configState.recentOutputDirs = parsed.recentOutputDirs ?? [];
-  } catch {
-    /* ignore */
+  } catch (error) {
+    if (error instanceof UnsupportedConfigVersionError) {
+      configPersistenceBlocked = true;
+      configPersistenceError.value = error.message;
+      log.error("config", "配置文件来自更高版本，已停止写入以保护原配置", { error: error.message });
+    }
   }
 }
 
 let saveTimer: number | undefined;
+
+function persistedConfigContent(): string {
+  return JSON.stringify({
+    configSchemaVersion: CONFIG_SCHEMA_VERSION,
+    presets: configState.presets,
+    activePresetId: configState.activePresetId,
+    outputDir: configState.outputDir,
+    recentOutputDirs: configState.recentOutputDirs,
+  });
+}
+
+function scheduleMigrationRetry(): void {
+  if (!pendingMigrationContent || migrationRetryTimer !== undefined) return;
+  migrationRetryTimer = window.setTimeout(() => {
+    migrationRetryTimer = undefined;
+    void retryMigrationPersistence();
+  }, 3000);
+}
+
+async function retryMigrationPersistence(): Promise<void> {
+  const migratedContent = pendingMigrationContent;
+  if (!migratedContent) return;
+  try {
+    await tauri.writeConfig(migratedContent);
+  } catch (error) {
+    configPersistenceError.value = `配置迁移仍无法保存：${error instanceof Error ? error.message : String(error)}`;
+    scheduleMigrationRetry();
+    return;
+  }
+
+  pendingMigrationContent = "";
+  lastPersistedContent = migratedContent;
+  configPersistenceBlocked = false;
+  configPersistenceError.value = "";
+  const currentContent = persistedConfigContent();
+  if (currentContent === lastPersistedContent) return;
+  try {
+    await tauri.writeConfig(currentContent);
+    lastPersistedContent = currentContent;
+  } catch (error) {
+    configPersistenceError.value = `配置自动保存失败：${error instanceof Error ? error.message : String(error)}`;
+  }
+}
+
 watch(
   () => JSON.stringify(configState),
   () => {
+    if (configPersistenceBlocked) return;
+    if (persistedConfigContent() === lastPersistedContent) return;
     if (saveTimer) return;
     saveTimer = window.setTimeout(() => {
       saveTimer = undefined;
+      const content = persistedConfigContent();
+      if (content === lastPersistedContent) return;
       void tauri
-        .writeConfig(
-          JSON.stringify({
-            presets: configState.presets,
-            activePresetId: configState.activePresetId,
-            outputDir: configState.outputDir,
-            recentOutputDirs: configState.recentOutputDirs,
-          }),
-        )
+        .writeConfig(content)
+        .then(() => { lastPersistedContent = content; })
         .catch(() => {});
     }, 500);
   },
@@ -180,16 +257,7 @@ export function removeConfig(kind: ChannelKey, id: string): void {
 }
 
 export function addPreset(): void {
-  const preset: ApiPreset = {
-    id: makeId(),
-    name: `配置组 ${configState.presets.length + 1}`,
-    channels: {
-      llm: [{ ...defaultApiConfig("llm") }],
-      image: [{ ...defaultApiConfig("image") }],
-      tts: [{ ...defaultApiConfig("tts") }],
-    },
-    active: { llm: "", image: "", tts: "" },
-  };
+  const preset = createApiPreset(`配置组 ${configState.presets.length + 1}`);
   configState.presets.push(preset);
   configState.activePresetId = preset.id;
 }
