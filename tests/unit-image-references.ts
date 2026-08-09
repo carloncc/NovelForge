@@ -900,7 +900,9 @@ async function testThreeViewRegenerationExecutesReferenceCascadeInOrder(): Promi
   assert(requests[1].image === `data:image/png;base64,${generatedPayloads[0]}`, "default figure should depend on the newly generated three-view");
   assert(requests.slice(2, 6).every((request) => request.image === `data:image/png;base64,${generatedPayloads[1]}`), "expressions should depend on the newly generated default figure");
   assert(requests[6].image === `data:image/png;base64,${generatedPayloads[0]}`, "actions should depend on the newly generated three-view");
-  assert(requests.every((request) => request.image2 === `data:image/png;base64,${styleB64}`), "every regenerated character image should include approved global style second");
+  // 角色图（三视图/立绘/动作）不再传全局风格参考图，避免 style_reference 参数的人物特征污染。
+  // 风格一致性改为由文字 styleDescription 合入提示词保证。
+  assert(requests.every((request) => !request.image2), "character images should not include global style reference to avoid subject contamination");
 }
 
 async function main(): Promise<void> {

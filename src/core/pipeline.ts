@@ -255,7 +255,7 @@ export class Pipeline {
       const imgDir = `${this.cacheRoot}/images`;
       const entries = await tauri.listDir(imgDir);
       for (const e of entries) {
-        if (!e.isDir && /^(figure_|item_)/.test(e.name)) {
+        if (!e.isDir && /^(figure_|item_|threeview_)/.test(e.name)) {
           await tauri.removePath(e.path).catch(() => {});
           images++;
         }
@@ -341,7 +341,7 @@ export class Pipeline {
     const cfg = this.input.llm!;
     const dir = `${this.input.outputDir}/.novel2vn/translate`;
     await tauri.mkdirAll(dir);
-    const force = this.input.forceStages?.includes("translate");
+    const force = this.input.forceStages?.includes("translate") || !!this.feedback.translate;
     const feedback = this.feedback.translate;
     const out: ChapterInfo[] = [];
     const total = chapters.length;
@@ -474,7 +474,8 @@ export class Pipeline {
         level: "success",
         at: Date.now(),
       });
-    } else {
+    } else if (!input.novel.chapters.length || (input.novel.chapters.length === 1 && input.novel.chapters[0].text === input.novel.fullText)) {
+      // 未勾选分章，且导入时是未切章状态（单章=全文）→ 需要从缓存恢复 AI 分章结果
       const cachedSplit = await this.loadSplitChapters();
       if (cachedSplit) {
         workingChapters = cachedSplit;
@@ -728,7 +729,7 @@ export class Pipeline {
           input.materials,
           this.cacheRoot,
           input.log,
-          2,
+          this.options.maxConcurrent,
           this.options.figureEmotions,
           this.options.imageStyle,
           imageFeedback,
@@ -740,6 +741,7 @@ export class Pipeline {
           this.options.styleAnchor !== false,
           () => this.aborted,
           input.visualBible,
+          input.vision,
         );
         this.failedTasks.push(...failed);
         this.cost.imageCount = Object.values(images.bg).length + Object.values(images.cg).length + Object.values(images.figure).length + Object.values(images.item).length;
@@ -772,7 +774,7 @@ export class Pipeline {
       if (this.options.useTts && input.tts?.apiKey) {
         log({ step: "配音", message: "开始生成配音…", level: "info", at: Date.now() });
         const voiceForce = !!this.feedback.voice || input.forceStages?.includes("voice");
-        const vocal = await generateVoice(input.tts, chapters, cards!.characters, this.cacheRoot, input.log, 2, voiceForce, () => this.aborted);
+        const vocal = await generateVoice(input.tts, chapters, cards!.characters, this.cacheRoot, input.log, this.options.maxConcurrent, voiceForce, () => this.aborted);
         this.cost.ttsChars = Object.keys(vocal).reduce((n, k) => n + (vocal[k] ? 1 : 0), 0) * 20;
         this.cost.ttsCostYuan = (this.cost.ttsChars / 1e6) * DEFAULT_PRICES.ttsYuanPer1mChars;
         assets.vocal = vocal;

@@ -4,6 +4,7 @@ import { sizeRatio, unifiedImage, unifiedTts, utf8FromB64 } from "./universal";
 import { resolveTemplate, getTemplate } from "./templates";
 import {
   configIsUsable,
+  knownImageModelCapabilities,
   parseModelList,
   protocolForConfig,
   providerIdForConfig,
@@ -962,16 +963,23 @@ export async function testImage(cfg: ApiConfig): Promise<{ imageOk: boolean; edi
   if (!r.dataB64 || r.dataB64.length < 500) {
     throw new Error("图像 API 返回数据异常");
   }
-  // 自动探测该模型是否支持参考图/图生图，并把结果写回配置，避免手动改配置
+  // 自动探测该模型是否支持参考图/图生图，并把结果写回配置，避免手动改配置。
+  // 合并而不是覆盖已知能力表，保留准确配置（如 Qwen 的 supportsSeed / data-url 编码）。
   const probe = await probeImageEditSupport(cfg);
-  const capabilities: ImageModelCapabilities = probe.ok
-    ? { maxReferenceImages: 3, supportsSeed: false, supportsImageEdit: true, referenceEncoding: "raw-base64" }
-    : { maxReferenceImages: 0, supportsSeed: false, supportsImageEdit: false, referenceEncoding: "raw-base64" };
+  const known = knownImageModelCapabilities(cfg.model);
+  const base = known ?? { maxReferenceImages: 0, supportsSeed: false, supportsImageEdit: false, referenceEncoding: "raw-base64" as const };
+  const capabilities: ImageModelCapabilities = {
+    ...base,
+    supportsImageEdit: probe.ok,
+    maxReferenceImages: probe.ok ? 3 : 0,
+  };
   cfg.extra ??= {};
   cfg.extra.imageCapabilities = capabilities;
   log.info("api", "图像模型能力自动探测完成", {
     model: cfg.model,
     supportsImageEdit: probe.ok,
+    supportsSeed: capabilities.supportsSeed,
+    referenceEncoding: capabilities.referenceEncoding,
     detail: probe.detail.slice(0, 120),
   });
   return { imageOk: true, editOk: probe.ok, detail: probe.detail };

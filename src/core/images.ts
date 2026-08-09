@@ -16,6 +16,7 @@ import type { ApiConfig } from "./types";
 import { generateImage, ReferenceImageError, VisionApiError } from "../api/openaiCompatible";
 import { resolveImageModelCapabilities } from "../api/providers";
 import { verifyImage } from "./selfcheck";
+import { describeReferenceImage } from "./recognize";
 import { tauri } from "../utils/tauri";
 import { errMsg } from "../utils/errors";
 import { cacheDirFor, cacheHit } from "./cache";
@@ -43,12 +44,7 @@ const EMOTION_PROMPT_SUFFIX: Record<string, string> = {
   surprised: ", shocked surprised expression, wide eyes",
 };
 
-// 立绘/物品强制纯色背景：AI 无法输出透明 PNG，统一生成纯绿底（绿幕），管线再色度键抠图（透明立绘）
-const FIGURE_BG_SUFFIX =
-  ", pure solid green chroma background (exact RGB 0,255,0), even flat green screen filling entire background, no shadow, no gradient, no pattern, no other objects, no text, full body visible, no legs cut off";
-const ITEM_BG_SUFFIX = ", pure solid green chroma background (exact RGB 0,255,0), even flat green screen, no shadow, no reflection, no text";
-
-// 统一画风：保证同一项目内所有立绘/背景/CG 视觉风格一致（同一个“维度”）
+// 统一画风：保证同一项目内所有立绘/背景/CG 视觉风格一致（同一个"维度"）
 const DEFAULT_STYLE =
   "unified Japanese anime style, cel shading, clean line art, consistent character design and proportions, cohesive color palette, high quality illustration";
 const STYLE_HINT = "consistent art direction, same visual style, no dimension change";
@@ -72,6 +68,15 @@ const THREEVIEW_REF_HINT =
 /** 背景/CG 风格锚定提示：参考图为画风基准，内容必须全新 */
 const STYLE_ANCHOR_HINT =
   ", same exact art style, line rendering, color palette, lighting and texture quality as the reference image, but an entirely different scene with different content";
+
+/** 对 style 参考图的描述做人物特征过滤：保留纯风格要素，去除人物相关词 */
+const STYLE_FILTER_WORDS =
+  /\b(hair|eyes|eye|face|skin|body|outfit|uniform|dress|skirt|shirt|coat|jacket|shoes|ribbon|bow\s*tie|girl|boy|woman|man|female|male|teen|character|person|people|student|blazer|blouse|stockings|socks)\b/gi;
+
+function filterStyleOnlyFromDescription(description: string): string {
+  const filtered = description.replace(STYLE_FILTER_WORDS, "").replace(/\s{2,}/g, " ").trim();
+  return filtered || description;
+}
 
 function inlineIdentityReference(rawImage: string): ImageReference {
   const match = /^data:(image\/[a-z0-9.+-]+);base64,(.+)$/is.exec(rawImage.trim());
@@ -173,7 +178,7 @@ export function buildImageTasks(
         id: isNormal ? char.id : `${char.id}_${emo}`,
         characterId: char.id,
         emotion: emo,
-        prompt: char.imagePrompt + (EMOTION_PROMPT_SUFFIX[emo] ?? "") + REF_HINT + style + FIGURE_BG_SUFFIX,
+        prompt: char.imagePrompt + (EMOTION_PROMPT_SUFFIX[emo] ?? "") + REF_HINT + style,
         refFromTask: isNormal ? (threeView ? `${char.id}_threeview` : undefined) : char.id,
         fileName: `figure_${sanitizeId(char.id)}_${emo}.png`,
         width: 1024,
@@ -189,7 +194,7 @@ export function buildImageTasks(
           id: `${char.id}_act_${a.id}`,
           characterId: char.id,
           actionId: a.id,
-          prompt: a.prompt + REF_HINT + style + FIGURE_BG_SUFFIX,
+          prompt: a.prompt + REF_HINT + style,
           refFromTask: `${char.id}_threeview`,
           fileName: `figure_${sanitizeId(char.id)}_act_${sanitizeId(a.id)}.png`,
           width: 1024,
@@ -204,7 +209,7 @@ export function buildImageTasks(
     tasks.push({
       kind: "item",
       id: item.id,
-      prompt: item.imagePrompt + style + ITEM_BG_SUFFIX,
+      prompt: item.imagePrompt + style,
       fileName: `item_${sanitizeId(item.id)}.png`,
       width: 1024,
       height: 1024,
@@ -272,26 +277,12 @@ async function ensureCutout(
   task: ImageTask,
   log: (ev: PipelineEvent) => void,
 ): Promise<string> {
+  // 不再强制色度键抠图（保留自然背景）。仅检测原图是否已有透明通道，有则保持，没有也不主动破坏原图。
   try {
     const b64 = await tauri.readFileBase64(path);
     if (await tauri.hasTransparency(b64)) return path;
-    const res = await tauri.cutoutImage(b64, 40);
-    const out = res.dataB64;
-    const pngPath = path.replace(/\.(jpg|jpeg)$/i, ".png");
-    await tauri.writeFileBase64(pngPath, out);
-    if (pngPath !== path) {
-      await tauri.removePath(path).catch(() => {});
-    }
-    const method = res.method === "ai" ? "AI 抠图" : "色度键抠图";
-    log({ step: "图像", message: `无背景立绘（${method}）：${task.usage}`, level: "info", at: Date.now() });
-    return pngPath;
-  } catch (e) {
-    log({
-      step: "图像",
-      message: `抠图失败，保留原图：${task.usage}（${errMsg(e).slice(0, 100)}）`,
-      level: "warn",
-      at: Date.now(),
-    });
+    return path;
+  } catch {
     return path;
   }
 }
@@ -307,6 +298,8 @@ export interface ImageRunOptions {
   outputDir?: string;
   /** 多模态模型自检：生成后核对图片是否符合描述，不合格自动重生成 1 次 */
   verifyCfg?: ApiConfig;
+  /** 多模态模型：生成前把参考图描述成文字合入提示词，使图生图更严格还原参考图（可选） */
+  visionCfg?: ApiConfig;
   /** 风格锚点图路径：背景/CG 以其为参考图统一画风（仅当任务无其它参考图时生效） */
   styleAnchorPath?: string;
   /** 负面提示词（走适配器模板 $negativePrompt，模板未映射则忽略） */
@@ -389,15 +382,19 @@ export async function resolveImageTaskReferences(
   }
 
   if (bible) {
-    const styleRequired = !references.some((reference) => reference.role === "identity");
-    references.push(await fileReference(
-      visualBibleArtifactPath(context.outputDir, bible.styleReferencePath),
-      "style",
-      "Approved global style reference",
-      styleRequired,
-    ));
+    // 全局风格参考图只用于 BG/CG，不用于角色图（三视图/立绘/动作已有 identity 参考链）。
+    // style_reference 参数的"人物特征污染"会导致角色偏离自身描述（如"男身体女头"）。
+    const isCharacterImage = task.kind === "threeview" || task.kind === "figure" || task.kind === "action";
+    if (!isCharacterImage) {
+      references.push(await fileReference(
+        visualBibleArtifactPath(context.outputDir, bible.styleReferencePath),
+        "style",
+        "Approved global style reference",
+        false,
+      ));
+    }
   } else if ((task.kind === "background" || task.kind === "cg") && context.styleAnchorPath) {
-    references.push(await fileReference(context.styleAnchorPath, "style", "Legacy style anchor"));
+    references.push(await fileReference(context.styleAnchorPath, "style", "Legacy style anchor", false));
   }
   return references;
 }
@@ -469,7 +466,53 @@ export async function runImageTask(
           at: Date.now(),
         });
       }
-      const img = await generateImage(cfg, task.prompt, {
+      // 参考图增强：有参考图且配置了多模态模型时，先把参考图描述成文字合入提示词。
+      // 只提取风格要素（色盘/线条/光影/笔触），不提取人物特征，避免风格参考图污染角色一致性。
+      // MiniMax image-01 限制 prompt < 1500 字符；最终截断到安全上限。
+      let finalPrompt = task.prompt;
+      const MAX_PROMPT_CHARS = 1400;
+      if (opts.visionCfg?.apiKey && resolvedReferences.length && finalPrompt) {
+        const referenceBlocks: string[] = [];
+        for (const reference of resolvedReferences) {
+          if (!reference.dataB64) continue;
+          const remainingBudget = MAX_PROMPT_CHARS - 300 - referenceBlocks.join(" ").length;
+          if (remainingBudget < 100) break;
+          try {
+            let description = await describeReferenceImage(opts.visionCfg, reference.dataB64);
+            if (description) {
+              // 对 style 参考图额外过滤人物相关词，只保留纯风格关键字
+              if (reference.role === "style") {
+                description = filterStyleOnlyFromDescription(description);
+              }
+              if (description.length > remainingBudget) description = description.slice(0, remainingBudget);
+              const roleLabel = reference.role === "style" ? "全局风格参考图" : reference.role === "identity" ? "人物身份参考图" : "参考图";
+              referenceBlocks.push(`[${roleLabel}] ${description}`);
+              log({
+                step: "图像",
+                message: `已按参考图描述增强提示词：${task.usage}（${roleLabel}）`,
+                level: "info",
+                at: Date.now(),
+              });
+            }
+          } catch (e) {
+            log({
+              step: "图像",
+              message: `参考图描述失败，按原提示词生成：${task.usage}（${errMsg(e).slice(0, 100)}）`,
+              level: "warn",
+              at: Date.now(),
+            });
+          }
+        }
+        if (referenceBlocks.length) {
+          finalPrompt = `Style reference for consistent art direction — ${referenceBlocks.join(" ")}. Subject description: ${finalPrompt}`;
+        }
+      }
+      // 兜底截断：所有路径都确保不超过 MiniMax 1500 字符限制
+      if (finalPrompt.length > MAX_PROMPT_CHARS) {
+        log({ step: "图像", message: `提示词超长（${finalPrompt.length}→${MAX_PROMPT_CHARS}），已截断：${task.usage}`, level: "warn", at: Date.now() });
+        finalPrompt = finalPrompt.slice(0, MAX_PROMPT_CHARS);
+      }
+      const img = await generateImage(cfg, finalPrompt, {
         references: resolvedReferences,
         size: `${task.width}x${task.height}`,
         seed: task.seed,
@@ -533,7 +576,7 @@ export async function generateImages(
   materials: MaterialAsset[],
   cacheRoot: string,
   log: (ev: PipelineEvent) => void,
-  concurrency = 2,
+  concurrency = 30,
   figureEmotions = true,
   style?: string,
   feedback?: string,
@@ -545,6 +588,7 @@ export async function generateImages(
   styleAnchor = true,
   isAborted?: () => boolean,
   visualBible?: ProjectVisualBible,
+  visionCfg?: ApiConfig,
 ): Promise<{ images: ImageResultMap; failed: FailedTask[] }> {
   const result: ImageResultMap = { bg: {}, cg: {}, figure: {}, item: {} };
   const failed: FailedTask[] = [];
@@ -648,6 +692,7 @@ export async function generateImages(
             visualBible: approvedBible,
             outputDir: projectOutputDir,
             verifyCfg,
+            visionCfg,
             styleAnchorPath: anchorPath,
             negativePrompt: DEFAULT_NEGATIVE,
           });

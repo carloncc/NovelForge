@@ -64,24 +64,25 @@ export interface ChapterAdjust {
 export async function importNovelFile(path: string): Promise<NovelDoc> {
   const done = log.time("chapters", `导入小说 ${path}`);
   const { text, encoding } = await tauri.readTextFile(path);
+  const cleaned = text.replace(/^\uFEFF/, "");
   const fileName = basename(path);
   const baseTitle = basenameWithoutExt(path);
-  const chapters = splitChapters(text, baseTitle);
+  const chapters = splitChapters(cleaned, baseTitle);
   log.info("chapters", "小说导入完成", {
     path,
     fileName,
     encoding,
-    charCount: text.length,
+    charCount: cleaned.length,
     chapterCount: chapters.length,
     chapterTitles: chapters.map((c) => c.title),
   });
-  done(`章节=${chapters.length} 字数=${text.length}`);
+  done(`章节=${chapters.length} 字数=${cleaned.length}`);
   return {
     fileName,
     sourcePath: path,
     sourcePaths: [path],
     encoding,
-    fullText: text,
+    fullText: cleaned,
     chapters,
   };
 }
@@ -91,20 +92,26 @@ export async function importNovelFile(path: string): Promise<NovelDoc> {
  * 章节划分留到「分章」阶段（运行管线时由 AI 完成）。
  */
 export async function importNovelFiles(paths: string[]): Promise<NovelDoc> {
-  const done = log.time("chapters", `合并导入 ${paths.length} 个文件`);
+  // 去重：同一文件选两次不重复拼接
+  const uniquePaths = [...new Set(paths)].filter((p) => p);
+  const done = log.time("chapters", `合并导入 ${uniquePaths.length} 个文件`);
   const parts: { path: string; fileName: string; text: string; encoding: string }[] = [];
   let totalChars = 0;
-  for (const p of paths) {
+  for (const p of uniquePaths) {
     const { text, encoding } = await tauri.readTextFile(p);
     parts.push({ path: p, fileName: basename(p), text, encoding });
     totalChars += text.length;
   }
-  const fullText = parts
-    .map((p) => p.text.replace(/\r/g, "").replace(/\n{3,}/g, "\n\n").trim())
+  const nonEmpty = parts.filter((p) => p.text.trim());
+  if (nonEmpty.length === 0) {
+    throw new Error("所选文件均为空，无法导入");
+  }
+  const fullText = nonEmpty
+    .map((p) => p.text.replace(/^\uFEFF/, "").replace(/\r/g, "").replace(/\n{3,}/g, "\n\n").trim())
     .filter(Boolean)
     .join("\n\n\n");
   const fileName = parts.length === 1 ? parts[0].fileName : `${parts.length} 个文件合并`;
-  const baseTitle = basenameWithoutExt(parts[0].path);
+  const baseTitle = basenameWithoutExt(nonEmpty[0].path);
   // 合并导入不切章：仅作为单一章节占位，运行时分章阶段会替换
   const chapters: ChapterInfo[] = [
     { index: 0, title: baseTitle || "全文", text: fullText, charCount: fullText.length },
@@ -115,13 +122,14 @@ export async function importNovelFiles(paths: string[]): Promise<NovelDoc> {
     encoding: parts.map((p) => p.encoding),
     charCount: totalChars,
     mergedCharCount: fullText.length,
+    skippedEmpty: parts.length - nonEmpty.length,
   });
   done(`文件=${parts.length} 字数=${fullText.length}`);
   return {
     fileName,
-    sourcePath: parts[0].path,
-    sourcePaths: paths,
-    encoding: parts[0].encoding,
+    sourcePath: nonEmpty[0].path,
+    sourcePaths: uniquePaths,
+    encoding: nonEmpty[0].encoding,
     fullText,
     chapters,
   };

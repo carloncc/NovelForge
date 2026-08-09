@@ -19,6 +19,30 @@ const CHAR_SYSTEM = `你是角色设定师。根据用户给出的角色参考�
   "threeViewPrompt": "生成该角色三视图（正面/侧面/背面）参考图的英文 prompt：同一角色、站姿自然、表情平静、全身可见、纯绿背景"
 }`;
 
+const REFERENCE_DESC_SYSTEM = `你是视觉小说风格分析助手。根据用户给出的参考图，输出严格 JSON（不要 markdown 代码块，不要其他文字）：
+{
+  "prompt": "一段英文提示词片段，用于在后续 AI 绘图中约束画风一致性。只提取风格要素，禁止输出人物特征。"
+}
+
+风格要素（必须提取）：
+- 画风类型（anime cel shading / watercolor / thick paint / semi-realistic 等）
+- 色盘（3-5 个主导色调及 hex 或英文名，如 navy blue #1a1a4e, warm pink, cream）
+- 线条风格（clean crisp / sketchy loose / thick heavy / soft diffused）
+- 光影（方向、软硬、对比度，如 backlit rim lighting, soft ambient, dramatic chiaroscuro）
+- 笔触质感（smooth gradient / visible brush strokes / texture grain）
+- 氛围/色调（warm or cool, melancholy, bright, cinematic）
+
+禁止输出的内容（任何情况下都不要描述）：
+- 人物外貌：头发颜色、发型、眼睛颜色、肤色、体型、性别
+- 人物服装：校服、连衣裙、颜色、款式、配饰
+- 人物特征：表情、姿势、动作
+- 具体场景内容：教室、走廊、医院（只说光影/色调，不说地点）
+
+输出示例：
+{
+  "prompt": "cel-shaded anime style, cool navy-and-violet palette, clean crisp linework, soft backlit rim lighting, dramatic moody atmosphere"
+}`;
+
 export interface RecognizedCharacter {
   name?: string;
   appearance?: string;
@@ -61,4 +85,21 @@ export async function recognizeCharacter(
     imagePrompt: typeof data?.imagePrompt === "string" ? data.imagePrompt : "",
     threeViewPrompt: typeof data?.threeViewPrompt === "string" ? data.threeViewPrompt : "",
   };
+}
+
+/** 用多模态模型把参考图描述成英文提示词片段（供后续图生图严格还原参考图）。失败返回空串。 */
+export async function describeReferenceImage(
+  cfg: ApiConfig,
+  imageB64: string,
+  onUsage?: (pt: number, ct: number) => void,
+): Promise<string> {
+  const reply = await chatVision(cfg, REFERENCE_DESC_SYSTEM, "请描述这张参考图。", imageB64, {
+    maxTokens: 800,
+    temperature: 0.1,
+    onUsage,
+  });
+  const data = extractJson(reply) as { prompt?: unknown };
+  const prompt = typeof data?.prompt === "string" ? data.prompt.trim() : "";
+  if (!prompt) throw new Error("图片识别 API 未返回参考图描述");
+  return prompt;
 }

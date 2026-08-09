@@ -131,7 +131,19 @@ export async function aiSplitChapters(
 ): Promise<ChapterInfo[]> {
   const blocks = splitBlocks(fullText);
   if (blocks.length <= 1) {
+    // 单块仍超长（如全文无空行）→ 按句子硬切分，避免超长章撑爆剧本阶段上下文
+    if (fullText.length > maxChapterChars) {
+      return hardSplitBySentences(fullText, maxChapterChars);
+    }
     return [{ index: 0, title: "第一章", text: fullText, charCount: fullText.length }];
+  }
+
+  // 单个块自身超长 → 递归前先按句子硬切，保证最终章节都不超限
+  for (let i = 0; i < blocks.length; i++) {
+    if (blocks[i].length > maxChapterChars) {
+      const sub = hardSplitBySentences(blocks[i], maxChapterChars);
+      blocks.splice(i, 1, ...sub.map((s) => s.text));
+    }
   }
 
   // 分批并行识别章节标题块 + 杂项丢弃块
@@ -210,7 +222,7 @@ export async function aiSplitChapters(
   const result: ChapterInfo[] = [];
   for (const ch of chapters) {
     if (ch.text.length > maxChapterChars) {
-      const sub = await aiSplitChapters(cfg, ch.text, onUsage, maxChapterChars);
+      const sub = await aiSplitChapters(cfg, ch.text, onUsage, maxChapterChars, feedback);
       result.push(...sub.map((s, i) => ({ ...s, index: result.length + i, title: `${ch.title} ${i + 1}` })));
     } else {
       result.push(ch);
@@ -218,6 +230,26 @@ export async function aiSplitChapters(
   }
   result.forEach((c, i) => (c.index = i));
   return result;
+}
+
+/** 回退分章：按近似字数把全文切分成若干章 */
+function hardSplitBySentences(text: string, maxChars: number): ChapterInfo[] {
+  const sentences = text.split(/(?<=[。！？!?；;\n])/).filter((s) => s.trim());
+  const chapters: ChapterInfo[] = [];
+  let current = "";
+  for (const sentence of sentences) {
+    if (current && current.length + sentence.length > maxChars) {
+      if (current.trim()) {
+        chapters.push({ index: chapters.length, title: `第${chapters.length + 1}部分`, text: current.trim(), charCount: current.trim().length });
+      }
+      current = "";
+    }
+    current += sentence;
+  }
+  if (current.trim()) {
+    chapters.push({ index: chapters.length, title: `第${chapters.length + 1}部分`, text: current.trim(), charCount: current.trim().length });
+  }
+  return chapters.length ? chapters : [{ index: 0, title: "第一章", text, charCount: text.length }];
 }
 
 /** 回退分章：按近似字数把全文切分成若干章 */

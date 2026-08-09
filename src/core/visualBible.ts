@@ -17,7 +17,7 @@ import type {
 } from "./types";
 
 const VISUAL_BIBLE_VERSION = 1 as const;
-const NOVEL_CHUNK_LIMIT = 30_000;
+const NOVEL_CHUNK_LIMIT = 12_000;
 const SUMMARY_BATCH_LIMIT = 12_000;
 const MAX_IMAGE_BASE64_LENGTH = 48_000_000;
 const DEFAULT_ASSET_MAP: AssetMap = { bg: {}, cg: {}, figure: {}, item: {}, vocal: {} };

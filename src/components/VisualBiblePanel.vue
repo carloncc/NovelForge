@@ -468,6 +468,37 @@ async function regenerateCharacter(characterId: string): Promise<void> {
   }
 }
 
+/** 全局重新生成：按顺序逐个重新生成所有角色三视图 */
+async function regenerateAllCharacters(): Promise<void> {
+  const imageCfg = activeConfig("image");
+  if (!imageCfg?.apiKey) {
+    approvalError.value = "全局重新生成需要配置图像生成 API";
+    return;
+  }
+  busyKey.value = "regenerate-all";
+  approvalError.value = "";
+  let ok = 0;
+  const failures: string[] = [];
+  for (const character of characters.value) {
+    try {
+      await regenerateCharacterSheet(outputDir.value!, bible.value!, { character, imageCfg });
+      ok++;
+    } catch (e) {
+      failures.push(`${character.name}：${visualBibleErrorMessage(e, { imageModel: imageCfg.model, visionModel: activeConfig("vision")?.model })}`);
+    }
+  }
+  await refreshApprovalValidation();
+  await afterMutation();
+  pushLog({
+    step: "视觉圣经",
+    message: `全局重新生成完成：成功 ${ok} 个${failures.length ? `，失败 ${failures.length} 个` : ""}`,
+    level: failures.length ? "warn" : "success",
+    at: Date.now(),
+  });
+  if (failures.length) approvalError.value = failures.join("；");
+  busyKey.value = "";
+}
+
 async function acceptCharacter(characterId: string): Promise<void> {
   const current = bible.value;
   if (!current || !outputDir.value) return;
@@ -615,16 +646,15 @@ function characterNeedsRegeneration(characterId: string): boolean {
                   @click="regenerateSample"
                 >重新生成示例</button>
               </div>
-              <div class="vb-upload-row" v-if="bible.styleSource !== 'novel_analysis' || pendingStyleImage">
+              <div class="vb-upload-row">
                 <button class="btn ghost small" :disabled="!!busyKey" @click="pickStyleFile">
-                  {{ pendingStyleImage ? "更换已选图片" : "替换参考图" }}
+                  {{ pendingStyleImage ? "更换已选图片" : "上传参考图（替换全局风格）" }}
                 </button>
                 <button v-if="pendingStyleImage" class="btn small" :disabled="!!busyKey" @click="replaceStyleFromUpload">
                   应用替换
                 </button>
               </div>
               <input
-                v-if="bible.styleSource !== 'novel_analysis' || pendingStyleImage"
                 ref="styleFileInput"
                 type="file"
                 accept="image/png,image/jpeg,image/webp"
@@ -640,6 +670,12 @@ function characterNeedsRegeneration(characterId: string): boolean {
           <div class="vb-section-title">
             角色三视图
             <span class="vb-section-hint">{{ characters.length }} 个主角色</span>
+            <span class="vb-section-actions">
+              <button class="btn small" :disabled="!!busyKey" @click="regenerateAllCharacters">
+                <span v-if="busyKey === 'regenerate-all'" class="spinner" />
+                全局重新生成
+              </button>
+            </span>
           </div>
           <div v-for="row in characters" :key="row.id" class="vb-character-row">
             <div class="vb-character-head">

@@ -356,6 +356,7 @@ export function buildMultipartBody(
   const boundary = `novelforge-${Math.random().toString(36).slice(2, 12)}`;
   const parts: string[] = [];
   for (const [name, value] of Object.entries(fields)) {
+    if (value === undefined || value === null) continue;
     parts.push(
       `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${String(value)}\r\n`,
     );
@@ -488,9 +489,13 @@ export function joinUrl(base: string, endpoint: string): string {
   if (/^https?:\/\//i.test(endpoint)) return endpoint;
   let b = (base || "").trim().replace(/\/+$/, "");
   let e = endpoint;
-  // base 已含 /v1 时去掉 endpoint 的 /v1 前缀（避免 /v1/v1/...）
-  if (/\/v\d+$/i.test(b) && e.startsWith("/v1/")) {
-    e = e.replace(/^\/v1/, "");
+  // base 已含 /v1（或 /v1beta 等带后缀版本）时去掉 endpoint 的同名版本前缀（避免 /v1/v1/...）
+  const versionMatch = /\/v\d+(?:alpha|beta|p\d+)?$/i.exec(b);
+  if (versionMatch) {
+    const versionPrefix = versionMatch[0].replace(/^\//, ""); // 如 v1 / v1beta
+    if (e.startsWith(`/${versionPrefix}/`)) {
+      e = e.replace(new RegExp(`^/${versionPrefix}`, "i"), "");
+    }
   }
   return `${b}${e}`;
 }
@@ -575,7 +580,7 @@ export async function callUnified(ctx: CallContext): Promise<UnifiedResult> {
     await new Promise((r) => setTimeout(r, poll.intervalMs));
     let statusJson: unknown;
     if (poll.method === "POST") {
-      const pollBody = (poll.requestBody ?? {}) as Record<string, unknown>;
+      const pollBody = { ...(poll.requestBody ?? {}) } as Record<string, unknown>;
       if (poll.requestBody) {
         for (const [k, v] of Object.entries(poll.requestBody)) {
           if (v === "{taskId}") pollBody[k] = taskId;

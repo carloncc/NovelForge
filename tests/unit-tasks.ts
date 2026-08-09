@@ -83,8 +83,10 @@ if (!actionTask || actionTask.refFromTask !== "linche_threeview") throw new Erro
   const figure = tasks.find((t) => t.kind === "figure");
   const item = tasks.find((t) => t.kind === "item");
   const bg = tasks.find((t) => t.kind === "background");
-  check(figure!.prompt.includes("green chroma background"), "立绘 prompt 缺少纯绿背景约束");
-  check(item!.prompt.includes("green chroma background"), "物品 prompt 缺少纯绿背景约束");
-  console.log("  ✓ 立绘/物品 prompt 含纯绿背景约束，背景/CG 不含");
+  // 不再强制纯绿背景（保留自然背景）；确认 figure/item 有立绘一致性提示、bg/cg 为场景画风
+  check(!figure!.prompt.includes("green chroma background"), "立绘 prompt 不应强制纯绿背景（保留自然背景）");
+  check(!item!.prompt.includes("green chroma background"), "物品 prompt 不应强制纯绿背景（保留自然背景）");
+  check(figure!.prompt.includes("reference"), "立绘 prompt 应含参考图一致性提示");
+  console.log("  ✓ 立绘/物品保留自然背景，不再强制绿幕");
 }
 console.log("=== 图像任务构建验证通过 ===");

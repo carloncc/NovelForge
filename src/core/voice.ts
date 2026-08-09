@@ -118,7 +118,7 @@ export async function generateVoice(
   characters: CharacterCard[],
   cacheRoot: string,
   log: (ev: PipelineEvent) => void,
-  concurrency = 2,
+  concurrency = 30,
   force = false,
   isAborted?: () => boolean,
 ): Promise<Record<string, string>> {

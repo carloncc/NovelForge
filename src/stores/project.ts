@@ -41,7 +41,7 @@ export const projectState = reactive<ProjectState>({
     imageBudgetPerChapter: 12,
     cgPerChapter: 3,
     skipCache: false,
-    maxConcurrent: 2,
+    maxConcurrent: 30,
     videoPointsPerChapter: 2,
     characterIntroCard: true,
     budgetYuan: 0,

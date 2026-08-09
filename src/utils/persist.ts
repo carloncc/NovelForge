@@ -17,6 +17,11 @@ interface PersistedState {
     fileName: string;
     encoding: string;
     chapters: { index: number; title: string; enabled?: boolean }[];
+    /** AI 分章快照：仅当分章结果无法从源文件重建时保存（正文 + 源文件全文指纹）。恢复时指纹匹配才使用 */
+    splitChapters?: {
+      fp: string;
+      chapters: { index: number; title: string; text: string; enabled?: boolean }[];
+    };
   };
   materials: MaterialAsset[];
   outputDir: string;
@@ -57,6 +62,19 @@ export async function saveProjectState(state: {
       encoding: state.novel.encoding,
       chapters: state.novel.chapters.map((c) => ({ index: c.index, title: c.title, enabled: c.enabled })),
     };
+    // AI 分章快照：当分章结果无法用正则从源文件重建时保存（如 AI 分章丢弃了杂项、边界与正则不同）。
+    // 附带源文件全文指纹，恢复时指纹匹配才使用，保证源文件改动后视觉圣经仍能正确降级。
+    if (shouldPersistSplitChapters(state.novel)) {
+      persistedState.novel.splitChapters = {
+        fp: splitSnapshotFingerprint(state.novel),
+        chapters: state.novel.chapters.map((c) => ({
+          index: c.index,
+          title: c.title,
+          text: c.text,
+          enabled: c.enabled,
+        })),
+      };
+    }
   }
   if (state.lastResult) {
     persistedState.lastResult = {
@@ -104,19 +122,30 @@ export async function restoreProjectState(outputDir: string): Promise<{
         : [];
     const existingPaths = sourcePaths.filter((p) => p);
     if (existingPaths.length && (await Promise.all(existingPaths.map((p) => tauri.pathExists(p)))).every(Boolean)) {
-      const fresh =
-        existingPaths.length > 1
-          ? await importNovelFiles(existingPaths)
-          : await importNovelFile(existingPaths[0]);
-      const saved = new Map(persistedState.novel!.chapters.map((c) => [c.index, c]));
-      fresh.chapters = fresh.chapters.map((ch, i) => {
-        const s = saved.get(ch.index);
-        if (s) {
-          ch.title = s.title || ch.title;
-          ch.enabled = s.enabled;
-        }
-        return ch;
-      });
+      const fresh = existingPaths.length > 1
+        ? await importNovelFiles(existingPaths)
+        : await importNovelFile(existingPaths[0]);
+      const snapshot = persistedState.novel?.splitChapters;
+      // 快照指纹匹配 → 使用 AI 分章快照恢复（源文件未变化）；否则重新正则切分 + 应用保存的标题/启用
+      if (snapshot && snapshot.chapters?.length && snapshot.fp === splitSnapshotFingerprint(fresh)) {
+        fresh.chapters = snapshot.chapters.map((c) => ({
+          index: c.index,
+          title: c.title,
+          text: c.text,
+          charCount: c.text.length,
+          enabled: c.enabled,
+        }));
+      } else {
+        const saved = new Map(persistedState.novel!.chapters.map((c) => [c.index, c]));
+        fresh.chapters = fresh.chapters.map((ch, i) => {
+          const s = saved.get(ch.index);
+          if (s) {
+            ch.title = s.title || ch.title;
+            ch.enabled = s.enabled;
+          }
+          return ch;
+        });
+      }
       fresh.fileName = persistedState.novel!.fileName || fresh.fileName;
       fresh.encoding = persistedState.novel!.encoding || fresh.encoding;
       novel = fresh;
@@ -172,4 +201,29 @@ export function splitChaptersForRestore(text: string, title: string): ChapterInf
     chapters[0].title = title;
   }
   return chapters;
+}
+
+/** 是否应持久化 AI 分章快照：非占位单章，且章节正文与正则切分结果不同（说明是 AI 分章） */
+function shouldPersistSplitChapters(novel: NovelDoc): boolean {
+  const { chapters, fullText } = novel;
+  const isPlaceholder = chapters.length === 1 && chapters[0].title === "全文";
+  if (chapters.length <= 1 || isPlaceholder) return false;
+  // 与正则切分对比正文：正文结构不同 → AI 分章（丢弃杂项/自定义边界），无法重建
+  try {
+    const regexSplit = splitChaptersForFallback(fullText);
+    if (regexSplit.length !== chapters.length) return true;
+    return regexSplit.some((c, i) => c.text !== chapters[i]?.text);
+  } catch {
+    return true;
+  }
+}
+
+/** 源文件全文指纹：用于校验分章快照是否仍与当前源文件一致 */
+function splitSnapshotFingerprint(novel: NovelDoc): string {
+  let h = 5381;
+  const fullText = novel.fullText;
+  for (const ch of fullText) {
+    h = ((h * 33) ^ ch.codePointAt(0)!) >>> 0;
+  }
+  return `${fullText.length}:${h.toString(36)}`;
 }

@@ -493,7 +493,8 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
       const split = result.splitChapters;
       const wasMerged = projectState.novel.chapters.length <= 1 && projectState.novel.chapters[0]?.title === "全文";
       if (wasMerged || split.length > 1) {
-        projectState.novel.chapters = split.map((c) => ({ ...c, enabled: projectState.novel!.chapters[0]?.enabled }));
+        // 新分章默认全部启用（不继承旧章节的 enabled，避免旧第 0 章被停用时所有新章全被停用）
+        projectState.novel.chapters = split.map((c) => ({ ...c, enabled: c.enabled !== false }));
         logger.info("page", "分章结果已写入项目", { chapterCount: split.length, titles: split.map((c) => c.title).slice(0, 8) });
       }
     }
@@ -676,7 +677,9 @@ async function regenCtx(): Promise<RegenContext | null> {
     threeView: projectState.options.characterPoses !== false,
     actions: projectState.options.characterPoses !== false,
     verifyCfg: projectState.options.imageSelfCheck ? visionCfg : undefined,
+    visionCfg: configIsUsable(visionCfg, "vision") ? visionCfg : undefined,
     imageSeed: projectState.options.imageSeed || undefined,
+    concurrency: projectState.options.maxConcurrent,
     styleAnchor: projectState.options.styleAnchor,
     visualBible: projectState.visualBible?.status === "approved" ? projectState.visualBible : undefined,
   };
@@ -1185,6 +1188,10 @@ function fileExistsLabel(file: string | undefined): string {
           <label class="field">
             <span>预算上限（¥，0 = 不限）</span>
             <input type="number" v-model.number="projectState.options.budgetYuan" min="0" step="0.5" />
+          </label>
+          <label class="field" :title="'同时生成图片/配音的任务数。调大可显著提速，但会同时消耗多张额度；建议 2-6'">
+            <span>图像/配音并发数</span>
+            <input type="number" v-model.number="projectState.options.maxConcurrent" min="1" max="100" />
           </label>
           <label class="field" :title="'固定所有图片生成的随机种子：同一种子下背景/CG/立绘的画风与角色更稳定一致。0 = 按小说标题自动派生'">
             <span>固定种子（0 = 按标题自动派生）</span>

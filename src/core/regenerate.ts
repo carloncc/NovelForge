@@ -33,11 +33,15 @@ export interface RegenContext {
   actions?: boolean;
   /** 多模态模型自检（重生成时同样生效） */
   verifyCfg?: ApiConfig;
+  /** 多模态模型：生成前把参考图描述成文字合入提示词（重生成时同样生效） */
+  visionCfg?: ApiConfig;
   /** 固定种子（跟随生成页设置，保持与管线一致） */
   imageSeed?: number;
   /** 是否启用风格锚点（跟随生成页设置） */
   styleAnchor?: boolean;
   visualBible?: ProjectVisualBible;
+  /** 图像并发数（跟随生成页设置，默认 30） */
+  concurrency?: number;
 }
 
 export interface RegenImageResult {
@@ -134,7 +138,27 @@ export async function regenerateImages(
   const total = tasks.length;
   let done = 0;
   const results: RegenImageResult[] = [];
+  const concurrency = Math.max(1, ctx.concurrency ?? 30);
+  // 图生图参考链：threeview → 默认立绘(normal) → 表情(emotion) → 动作(action)。
+  // refFromTask 依赖必须先完成，故按依赖分层批处理：同一层内并发，层间串行。
+  const layerOf = (task: ImageTask): number => {
+    if (task.kind === "threeview") return 0;
+    if (task.kind === "figure") return task.emotion === "normal" ? 1 : 2;
+    if (task.kind === "action") return 3;
+    if (task.kind === "item") return 4;
+    if (task.kind === "background") return 5;
+    if (task.kind === "cg") return 6;
+    return 7;
+  };
+  const byLayer = new Map<number, ImageTask[]>();
   for (const task of tasks) {
+    const layer = layerOf(task);
+    const arr = byLayer.get(layer) ?? [];
+    arr.push(task);
+    byLayer.set(layer, arr);
+  }
+  const layers = [...byLayer.keys()].sort((a, b) => a - b);
+  for (const layer of layers) {
     if (signal?.aborted()) {
       ctx.log({
         step: "素材",
@@ -144,21 +168,31 @@ export async function regenerateImages(
       });
       break;
     }
-    const path = await runImageTask(ctx.cfg, task, cacheRoot, ctx.log, {
-      materials: ctx.materials,
-      force: true,
-      figureBase,
-      visualBible: approvedBible,
-      outputDir: ctx.outputDir,
-      verifyCfg: ctx.verifyCfg,
-      styleAnchorPath: anchorPath,
-    });
-    done++;
-    onProgress?.(done, total, task.usage ?? task.fileName);
-    if (path) {
-      results.push({ task, path });
-      figureBase[task.id] = path;
-    }
+    const layerTasks = byLayer.get(layer)!;
+    let idx = 0;
+    const worker = async (): Promise<void> => {
+      while (idx < layerTasks.length) {
+        if (signal?.aborted()) return;
+        const task = layerTasks[idx++];
+        const path = await runImageTask(ctx.cfg, task, cacheRoot, ctx.log, {
+          materials: ctx.materials,
+          force: true,
+          figureBase,
+          visualBible: approvedBible,
+          outputDir: ctx.outputDir,
+          verifyCfg: ctx.verifyCfg,
+          visionCfg: ctx.visionCfg,
+          styleAnchorPath: anchorPath,
+        });
+        done++;
+        onProgress?.(done, total, task.usage ?? task.fileName);
+        if (path) {
+          results.push({ task, path });
+          figureBase[task.id] = path;
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(concurrency, layerTasks.length) }, () => worker()));
   }
   await mergeAssetMap(ctx.outputDir, results);
   return results;
@@ -316,7 +350,7 @@ export async function regenerateVoiceLine(ctx: RegenContext, key: string): Promi
   return path;
 }
 
-/** 重新生成某个角色的全部配音 */
+/** 重新生成某个角色的全部配音（并发执行，无依赖） */
 export async function regenerateCharacterVoice(
   ctx: RegenContext,
   charId: string,
@@ -327,17 +361,23 @@ export async function regenerateCharacterVoice(
   if (!tts) return 0;
   const jobs = buildVoiceJobs(tts, ctx.chapters, ctx.cards.characters).filter((j) => j.charId === charId);
   const total = jobs.length;
+  const concurrency = Math.max(1, ctx.concurrency ?? 30);
   let done = 0;
   let count = 0;
-  for (const job of jobs) {
-    if (signal?.aborted()) break;
-    const path = await runVoiceJob(tts, job, cacheRootFor(ctx.outputDir), ctx.log, true);
-    done++;
-    onProgress?.(done, total, `${job.voice}「${job.text.slice(0, 12)}…」`);
-    if (path) {
-      await mergeVocal(ctx.outputDir, job.key, path);
-      count++;
+  let idx = 0;
+  const worker = async (): Promise<void> => {
+    while (idx < jobs.length) {
+      if (signal?.aborted()) return;
+      const job = jobs[idx++];
+      const path = await runVoiceJob(tts, job, cacheRootFor(ctx.outputDir), ctx.log, true);
+      done++;
+      onProgress?.(done, total, `${job.voice}「${job.text.slice(0, 12)}…」`);
+      if (path) {
+        await mergeVocal(ctx.outputDir, job.key, path);
+        count++;
+      }
     }
-  }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, jobs.length) }, () => worker()));
   return count;
 }
