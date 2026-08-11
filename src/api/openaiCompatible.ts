@@ -2,6 +2,7 @@ import { tauri } from "../utils/tauri";
 import type { ApiConfig, ChannelKey, ImageModelCapabilities, ImageReference } from "../core/types";
 import { sizeRatio, unifiedImage, unifiedTts, utf8FromB64 } from "./universal";
 import { resolveTemplate, getTemplate } from "./templates";
+import { ConcurrencyLimiter } from "../utils/performance";
 import {
   configIsUsable,
   knownImageModelCapabilities,
@@ -21,10 +22,16 @@ import { zlibSync } from "fflate";
 import { log } from "../utils/logger";
 
 /**
+ * 全局图像请求并发上限：任务层并发再高（如 30），实际同时发往图片 API 的请求数也受此限制。
+ * 许多图片服务（如 api2cn）并发上限很低，30 并发会触发大量 429；
+ * 用信号量把实际并发压到 3，配合单请求退避即可稳定跑满而不再打爆服务端。
+ */
+const IMAGE_CONCURRENCY = new ConcurrencyLimiter(3);
+
+/**
  * 通过 OpenAI 兼容的 GET /models 拉取模型列表，并按通道能力过滤。
  * 无 apiKey 或请求失败时抛出可读错误；返回的列表可存入 config.extra.discoveredModels。
- */
-export async function fetchModelsForChannel(cfg: ApiConfig, kind: ChannelKey): Promise<DiscoveredModel[]> {
+ */export async function fetchModelsForChannel(cfg: ApiConfig, kind: ChannelKey): Promise<DiscoveredModel[]> {
   if (!cfg.baseUrl?.trim()) throw new Error("请先填写 Base URL 再刷新模型");
   const base = normalizeBaseUrl(cfg.baseUrl, cfg.extra?.pathPrefix as string | undefined);
   const url = `${base}/models`;
@@ -768,7 +775,9 @@ export async function generateImage(
     promptHead: prompt.slice(0, 120),
   });
   try {
-    const r = await unifiedImage(cfg, tpl, {
+    // 全局图像请求限流：任务并发再高，实际同时发往图片 API 的请求数也受此限制，
+    // 避免 30 个 worker 同时打爆服务端并发上限（429 Too Many Requests）。
+    const r = await IMAGE_CONCURRENCY.run(() => unifiedImage(cfg, tpl, {
       prompt,
       width: w,
       height: h,
@@ -776,7 +785,7 @@ export async function generateImage(
       referenceEncoding: capabilities.referenceEncoding,
       seed: capabilities.supportsSeed ? opts.seed : undefined,
       negativePrompt: opts.negativePrompt,
-    });
+    }));
     done(`b64len=${r.dataB64.length}`);
     log.debug("api", "generateImage 成功", { dataB64Len: r.dataB64.length, mime: r.mime });
     return r;

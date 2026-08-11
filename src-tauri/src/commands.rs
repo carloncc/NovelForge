@@ -396,14 +396,25 @@ pub struct CutoutResult {
     pub method: String,
 }
 
-/// 抠图：优先 AI 分割（isnet-anime，首次自动下载模型约 40MB），
-/// 模型不可用/下载失败/推理失败时自动回退到改进版色度键抠图。
+/// 抠图：优先色度键（纯算法、0 下载，适合纯色背景），
+/// 色度键失败（背景不够纯/无法采样）时才尝试 AI 分割（isnet-anime，首次自动下载模型约 40MB）。
+/// 这样纯色背景立绘可零下载直接抠图；复杂背景才需要 AI 模型。
 #[tauri::command]
 pub async fn cutout_image(
     app: tauri::AppHandle,
     data_b64: String,
     threshold: f32,
 ) -> Result<CutoutResult, String> {
+    // ① 先试色度键：立绘背景多为纯色（提示词强制 solid background），色度键即可干净抠出
+    let chroma = crate::cutout::cutout(&data_b64, threshold);
+    if let Ok(out) = &chroma {
+        return Ok(CutoutResult {
+            data_b64: out.clone(),
+            method: "chroma".to_string(),
+        });
+    }
+
+    // ② 色度键失败 → 尝试 AI 分割（模型未下载时首次自动下载）
     let app2 = app.clone();
     let data = data_b64.clone();
     let ai = tauri::async_runtime::spawn_blocking(move || {
@@ -417,11 +428,9 @@ pub async fn cutout_image(
     if let Some((data_b64, method)) = ai {
         return Ok(CutoutResult { data_b64, method });
     }
-    let data_b64 = crate::cutout::cutout(&data_b64, threshold)?;
-    Ok(CutoutResult {
-        data_b64,
-        method: "chroma".to_string(),
-    })
+
+    // ③ 都失败 → 返回色度键的错误信息（供前端提示）
+    Err(chroma.err().unwrap_or_else(|| "抠图失败".to_string()))
 }
 
 #[tauri::command]

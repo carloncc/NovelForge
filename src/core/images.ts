@@ -1,4 +1,5 @@
 ﻿import type {
+  AssetMap,
   ChapterScript,
   CharacterCard,
   ExtractionResult,
@@ -46,12 +47,18 @@ const EMOTION_PROMPT_SUFFIX: Record<string, string> = {
 
 // 统一画风：保证同一项目内所有立绘/背景/CG 视觉风格一致（同一个"维度"）
 const DEFAULT_STYLE =
-  "unified Japanese anime style, cel shading, clean line art, consistent character design and proportions, cohesive color palette, high quality illustration";
+  "unified Japanese anime style, cel shading, clean line art, cohesive color palette, high quality illustration, no text, no writing, no signs, no letters";
 const STYLE_HINT = "consistent art direction, same visual style, no dimension change";
 
 // 统一负面提示词：避免低质量/畸形/水印等破坏画风与观感的元素
 const DEFAULT_NEGATIVE =
   "lowres, bad anatomy, bad hands, extra fingers, mutated hands, deformed, disfigured, missing fingers, extra digit, watermark, signature, text, logo, jpeg artifacts, blurry, noise, low quality, worst quality";
+
+// 立绘/物品强制纯色背景：生成纯色底，色度键可稳定抠出透明底（统一使用亮绿色 chroma key green）
+const FIGURE_BG_SUFFIX =
+  ", solid chroma key green background (pure #00FF00 green filling the entire background, no gradient, no pattern, no objects, no other people, no text, no shadow, no green elements on the character), full body visible, no legs cut off";
+const ITEM_BG_SUFFIX =
+  ", one solid flat color background (a single uniform color filling the entire background, no gradient, no pattern, no reflection, no text)";
 
 // 风格锚点：一张纯场景/无人物的画风基准图，后续所有背景/CG 以它做参考图，强制全项目同一画风
 const ANCHOR_PROMPT =
@@ -63,7 +70,7 @@ const REF_HINT =
 
 /** 三视图基于角色参考图生成：以参考图为基准，输出正/侧/背三视图设定图 */
 const THREEVIEW_REF_HINT =
-  ", based on the reference image: keep the exact same character (hair, eyes, clothing, colors, proportions, art style), generate a clean three-view character sheet (front view / side view / back view), neutral standing pose, calm expression, full body visible, plain white background";
+  ", based on the reference image: keep the exact same character (hair, eyes, clothing, colors, proportions, art style), generate a clean three-view character sheet (front view / side view / back view), neutral standing pose, calm expression, full body visible, solid chroma key green background (pure #00FF00 green)";
 
 /** 背景/CG 风格锚定提示：参考图为画风基准，内容必须全新 */
 const STYLE_ANCHOR_HINT =
@@ -101,7 +108,7 @@ function threeViewFallback(imagePrompt: string): string {
     .replace(/plain white background[^,]*/gi, "")
     .replace(/clean illustration[^,]*/gi, "")
     .replace(/[,，\s]+$/, "");
-  return `${clean}, three-view character reference sheet, front view / side view / back view, neutral standing pose, calm expression, full body visible, plain white background`;
+  return `${clean}, three-view character reference sheet, front view / side view / back view, neutral standing pose, calm expression, full body visible, solid chroma key green background (pure #00FF00 green)`;
 }
 
 export interface BuildImageTaskOptions {
@@ -178,7 +185,7 @@ export function buildImageTasks(
         id: isNormal ? char.id : `${char.id}_${emo}`,
         characterId: char.id,
         emotion: emo,
-        prompt: char.imagePrompt + (EMOTION_PROMPT_SUFFIX[emo] ?? "") + REF_HINT + style,
+        prompt: char.imagePrompt + (EMOTION_PROMPT_SUFFIX[emo] ?? "") + REF_HINT + style + FIGURE_BG_SUFFIX,
         refFromTask: isNormal ? (threeView ? `${char.id}_threeview` : undefined) : char.id,
         fileName: `figure_${sanitizeId(char.id)}_${emo}.png`,
         width: 1024,
@@ -194,7 +201,7 @@ export function buildImageTasks(
           id: `${char.id}_act_${a.id}`,
           characterId: char.id,
           actionId: a.id,
-          prompt: a.prompt + REF_HINT + style,
+          prompt: a.prompt + REF_HINT + style + FIGURE_BG_SUFFIX,
           refFromTask: `${char.id}_threeview`,
           fileName: `figure_${sanitizeId(char.id)}_act_${sanitizeId(a.id)}.png`,
           width: 1024,
@@ -209,7 +216,7 @@ export function buildImageTasks(
     tasks.push({
       kind: "item",
       id: item.id,
-      prompt: item.imagePrompt + style,
+      prompt: item.imagePrompt + style + ITEM_BG_SUFFIX,
       fileName: `item_${sanitizeId(item.id)}.png`,
       width: 1024,
       height: 1024,
@@ -226,8 +233,8 @@ export function buildImageTasks(
         id: scene.id,
         prompt: (scene.bgPrompt || `${scene.location} ${scene.atmosphere}, anime background, no people`) + style + (useAnchor ? STYLE_ANCHOR_HINT : ""),
         fileName: `bg_${sanitizeId(scene.id)}.png`,
-        width: 1024,
-        height: 576,
+        width: 1536,
+        height: 1024,
         usage: `背景-${scene.location}`,
       });
       count++;
@@ -241,8 +248,8 @@ export function buildImageTasks(
           id: `${chapter.chapter}_${scene.id}`,
           prompt: scene.cgEvent.imagePrompt + style + (useAnchor ? STYLE_ANCHOR_HINT : ""),
           fileName: `cg_${chapter.chapter}_${sanitizeId(scene.id)}.png`,
-          width: 1024,
-          height: 576,
+          width: 1536,
+          height: 1024,
           usage: `CG-${scene.cgEvent.title}`,
         });
         cgCount++;
@@ -272,17 +279,45 @@ async function copyMaterial(mat: MaterialAsset, targetPath: string): Promise<voi
   }
 }
 
-async function ensureCutout(
+/** 生成失败是否可重试：网络/5xx/429/超时/参考图类/服务端临时错误可重试；参数/鉴权/格式类不可重试 */
+function isRetryableImageError(e: unknown): boolean {
+  const message = e instanceof Error ? e.message : String(e);
+  const text = message.toLowerCase();
+  // 明确不可重试：参数错误/提示词限制/鉴权/资源不存在/格式不支持
+  if (/invalid params?|invalid_?request|bad request|400|prompt length|prompt.*(too|must)|does not exist|not found|invalid api key|unauthorized|401|403|permission|not supported|unsupported|not supported|must be|require|missing required|refused by|empty result|结果对象|响应中未找到/.test(text)) {
+    return false;
+  }
+  // 可重试：5xx/429/网络/超时/服务端不可用/参考图类/自检类
+  return /5\d\d|429|timeout|timed ?out|network|socket|connect|ec?onn|etimedout|fetch failed|econnrefused|econnreset|broken pipe|server error|unavailable|overloaded|busy|internal|too many|rate limit|reference|retry|temporary/i.test(text);
+}
+
+export async function ensureCutout(
   path: string,
   task: ImageTask,
   log: (ev: PipelineEvent) => void,
 ): Promise<string> {
-  // 不再强制色度键抠图（保留自然背景）。仅检测原图是否已有透明通道，有则保持，没有也不主动破坏原图。
+  // 立绘/动作/物品抠出无背景透明底（优先 AI 抠图，可识别任意背景；失败降级保留原图）。
+  // 三视图/背景/CG 不在此处调用（保持自然背景）。
   try {
     const b64 = await tauri.readFileBase64(path);
     if (await tauri.hasTransparency(b64)) return path;
-    return path;
-  } catch {
+    const res = await tauri.cutoutImage(b64, 40);
+    const out = res.dataB64;
+    const pngPath = path.replace(/\.(jpg|jpeg)$/i, ".png");
+    await tauri.writeFileBase64(pngPath, out);
+    if (pngPath !== path) {
+      await tauri.removePath(path).catch(() => {});
+    }
+    const method = res.method === "ai" ? "AI 抠图" : "色度键抠图";
+    log({ step: "图像", message: `无背景立绘（${method}）：${task.usage}`, level: "info", at: Date.now() });
+    return pngPath;
+  } catch (e) {
+    log({
+      step: "图像",
+      message: `抠图失败，保留原图：${task.usage}（${errMsg(e).slice(0, 100)}）`,
+      level: "warn",
+      at: Date.now(),
+    });
     return path;
   }
 }
@@ -304,6 +339,10 @@ export interface ImageRunOptions {
   styleAnchorPath?: string;
   /** 负面提示词（走适配器模板 $negativePrompt，模板未映射则忽略） */
   negativePrompt?: string;
+  /** 生成失败重试次数（默认 3 次，含首次；网络/临时错误自动重试） */
+  retryCount?: number;
+  /** 重试间隔毫秒（默认 3000，每次翻倍） */
+  retryDelayMs?: number;
 }
 
 export interface ImageReferenceResolutionContext {
@@ -416,9 +455,22 @@ export async function runImageTask(
 
   const cached = opts.force ? null : await cacheHit(cacheDir, task.fileName);
   if (cached) {
-    path = cached;
-    source = "缓存";
-    logger.debug("images", "图像命中缓存", { id: task.id, fileName: task.fileName });
+    // 尺寸校验：缓存图尺寸与任务要求不一致（如旧竖屏背景）→ 视为缓存失效重新生成
+    if (task.width > 0 && task.height > 0) {
+      const sizeOk = await tauri.imageSizeMatches(cached, task.width, task.height).catch(() => true);
+      if (!sizeOk) {
+        logger.info("images", "缓存图尺寸与要求不符，重新生成", { id: task.id, fileName: task.fileName, want: `${task.width}x${task.height}` });
+        await tauri.removePath(cached).catch(() => {});
+      } else {
+        path = cached;
+        source = "缓存";
+        logger.debug("images", "图像命中缓存", { id: task.id, fileName: task.fileName });
+      }
+    } else {
+      path = cached;
+      source = "缓存";
+      logger.debug("images", "图像命中缓存", { id: task.id, fileName: task.fileName });
+    }
   } else {
     const mat = findMaterial(opts.materials ?? [], task);
     if (mat) {
@@ -512,12 +564,46 @@ export async function runImageTask(
         log({ step: "图像", message: `提示词超长（${finalPrompt.length}→${MAX_PROMPT_CHARS}），已截断：${task.usage}`, level: "warn", at: Date.now() });
         finalPrompt = finalPrompt.slice(0, MAX_PROMPT_CHARS);
       }
-      const img = await generateImage(cfg, finalPrompt, {
-        references: resolvedReferences,
-        size: `${task.width}x${task.height}`,
-        seed: task.seed,
-        negativePrompt: opts.negativePrompt,
-      });
+      // 生成失败自动重试（网络/5xx/超时等临时错误；参数类错误不重试避免浪费）
+      const retryCount = Math.max(0, opts.retryCount ?? 3) - 1;
+      const baseDelay = opts.retryDelayMs ?? 3000;
+      let img: { dataB64: string; mime: string };
+      let lastErr: unknown;
+      for (let attempt = 0; ; attempt++) {
+        try {
+          img = await generateImage(cfg, finalPrompt, {
+            references: resolvedReferences,
+            size: `${task.width}x${task.height}`,
+            seed: task.seed,
+            negativePrompt: opts.negativePrompt,
+          });
+          break;
+        } catch (e) {
+          lastErr = e;
+          const retryable = isRetryableImageError(e);
+          if (!retryable || attempt >= retryCount) {
+            log({
+              step: "图像",
+              message: `生成失败（${retryable ? "已重试耗尽" : "不可重试"}）：${task.usage}（${errMsg(e).slice(0, 120)}）`,
+              level: "error",
+              at: Date.now(),
+            });
+            throw e;
+          }
+          const isRateLimit = /429|too many|rate limit/i.test(errMsg(e));
+          // 429/速率限制退避更长（5s→10s→20s），避免连续打爆 API
+          const delay = isRateLimit
+            ? 5000 * 2 ** attempt
+            : baseDelay * 2 ** attempt;
+          log({
+            step: "图像",
+            message: `生成失败，${delay / 1000}s 后重试（${attempt + 1}/${retryCount}）：${task.usage}（${errMsg(e).slice(0, 100)}）`,
+            level: "warn",
+            at: Date.now(),
+          });
+          await new Promise((r) => setTimeout(r, delay));
+        }
+      }
       const ext = img.mime.includes("jpeg") ? "jpg" : "png";
       const file = task.fileName.replace(/\.png$/, `.${ext}`);
       path = `${cacheDir}/${file}`;
@@ -576,7 +662,7 @@ export async function generateImages(
   materials: MaterialAsset[],
   cacheRoot: string,
   log: (ev: PipelineEvent) => void,
-  concurrency = 30,
+  concurrency = 3,
   figureEmotions = true,
   style?: string,
   feedback?: string,
@@ -678,6 +764,41 @@ export async function generateImages(
     }
   };
 
+  // 每生成一张立即增量写入 assets.json：即使中途失败/中止，已生成的图也已落盘，
+  // 下次只需重跑缺失项，不必整体重新生成。
+  let assetsPersistInFlight: Promise<void> | null = null;
+  const persistIncremental = (): void => {
+    const write = async (): Promise<void> => {
+      const assetsFile = `${projectOutputDir}/.novel2vn/assets.json`;
+      let existing: AssetMap | null = null;
+      try {
+        const { text } = await tauri.readTextFile(assetsFile);
+        existing = JSON.parse(text) as AssetMap;
+      } catch {
+        existing = null;
+      }
+      const next: AssetMap = {
+        bg: { ...(existing?.bg ?? {}), ...result.bg },
+        cg: { ...(existing?.cg ?? {}), ...result.cg },
+        figure: { ...(existing?.figure ?? {}), ...result.figure },
+        item: { ...(existing?.item ?? {}), ...result.item },
+        vocal: existing?.vocal ?? {},
+      };
+      try {
+        await tauri.writeTextFile(assetsFile, JSON.stringify(next, null, 2));
+      } catch {
+        /* 增量落盘失败不阻断生成 */
+      }
+    };
+    if (assetsPersistInFlight) {
+      assetsPersistInFlight = assetsPersistInFlight.then(write, write);
+    } else {
+      assetsPersistInFlight = write().finally(() => {
+        assetsPersistInFlight = null;
+      });
+    }
+  };
+
   const runPass = async (pass: ImageTask[], anchorPath?: string) => {
     let idx = 0;
     const worker = async () => {
@@ -697,7 +818,10 @@ export async function generateImages(
             negativePrompt: DEFAULT_NEGATIVE,
           });
           emitProgress(task);
-          if (p) record(task, p);
+          if (p) {
+            record(task, p);
+            persistIncremental();
+          }
         } catch (e) {
           if (e instanceof VisionApiError) throw e;
           emitProgress(task, "（失败）");
@@ -833,4 +957,48 @@ function findMaterial(materials: MaterialAsset[], task: ImageTask): MaterialAsse
   }
   const kind = task.kind === "figure" ? "character" : task.kind === "item" ? "item" : "background";
   return materials.find((m) => m.kind === kind && nameContains(m.name, keywords));
+}
+
+/** 对单张素材重新抠图：读取图片 → 抠出透明底 → 更新 assets.json 映射。
+ * 用于素材页「抠图」按钮，出问题时单独重抠而无需重新生成整张图。
+ * 返回抠图后的新文件路径；若已透明/无需抠图则返回原路径。
+ */
+export async function reCutoutAsset(
+  outputDir: string,
+  assetMapKey: "bg" | "cg" | "figure" | "item",
+  assetKey: string,
+  filePath: string,
+  log: (ev: PipelineEvent) => void,
+): Promise<string | null> {
+  const metaDir = `${outputDir}/.novel2vn`;
+  const task: ImageTask = {
+    kind: assetMapKey === "bg" ? "background" : assetMapKey === "cg" ? "cg" : assetMapKey === "item" ? "item" : "figure",
+    id: assetKey,
+    fileName: filePath.split(/[\\/]/).pop() || "asset.png",
+    prompt: "",
+    width: 0,
+    height: 0,
+  };
+  try {
+    const newPath = await ensureCutout(filePath, task, log);
+    // 更新 assets.json 中该 key 的映射
+    const assetsFile = `${metaDir}/assets.json`;
+    let map: AssetMap = { bg: {}, cg: {}, figure: {}, item: {}, vocal: {} };
+    try {
+      const { text } = await tauri.readTextFile(assetsFile);
+      map = JSON.parse(text) as AssetMap;
+    } catch {
+      /* 无旧映射 */
+    }
+    map[assetMapKey][assetKey] = newPath;
+    try {
+      await tauri.writeTextFile(assetsFile, JSON.stringify(map, null, 2));
+    } catch {
+      /* 忽略 */
+    }
+    return newPath;
+  } catch (e) {
+    log({ step: "图像", message: `重新抠图失败：${assetKey}（${errMsg(e).slice(0, 120)}）`, level: "error", at: Date.now() });
+    return null;
+  }
 }

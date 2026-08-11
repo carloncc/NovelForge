@@ -2,6 +2,7 @@ import { chatCompletion, chatVision, generateImage, ReferenceImageError } from "
 import { tauri } from "../utils/tauri";
 import { extname, normalizePath, safeFilename } from "../utils/path";
 import { buildImageTasks } from "./images";
+import { DEFAULT_CONCURRENCY } from "../stores/configMigration";
 import type {
   ApiConfig,
   AssetMap,
@@ -92,6 +93,8 @@ interface VisualBibleDraftBase {
   cards: ExtractionResult;
   imageCfg: ApiConfig;
   characterReferences?: Record<string, VisualBibleImageInput>;
+  /** 角色三视图并发生成数；默认 3（与全局并发数可独立配置） */
+  concurrency?: number;
 }
 
 export type CreateVisualBibleDraftInput = VisualBibleDraftBase & (
@@ -376,19 +379,25 @@ export async function analyzeNovelStyle(
   llmCfg: ApiConfig,
   novel: NovelDoc,
   dependencies: VisualBibleServiceDependencies = DEFAULT_DEPENDENCIES,
+  concurrency: number = DEFAULT_CONCURRENCY,
 ): Promise<string> {
   const chunks = chunkNovelForStyleAnalysis(novel);
   if (!chunks.length) throw new Error("The novel has no enabled chapter text to analyze");
-  const summaries: string[] = [];
-  for (let index = 0; index < chunks.length; index++) {
-    const summary = await dependencies.chatText(
-      llmCfg,
-      "You extract visual direction from fiction for a production art bible. Do not summarize plot.",
-      `Analyze excerpt ${index + 1}/${chunks.length}. Extract only era, genre, mood, recurring palette, medium, linework, color treatment, lighting, texture, and camera traits. Be terse.\n\nNOVEL EXCERPT\n${chunks[index]}`,
-      { maxTokens: 1200, temperature: 0.1 },
-    );
-    summaries.push(requireNonEmptyStyle(summary, `Novel style analysis chunk ${index + 1}`).slice(0, 800));
-  }
+  const summaries: string[] = new Array(chunks.length);
+  let idx = 0;
+  const worker = async (): Promise<void> => {
+    while (idx < chunks.length) {
+      const index = idx++;
+      const summary = await dependencies.chatText(
+        llmCfg,
+        "You extract visual direction from fiction for a production art bible. Do not summarize plot.",
+        `Analyze excerpt ${index + 1}/${chunks.length}. Extract only era, genre, mood, recurring palette, medium, linework, color treatment, lighting, texture, and camera traits. Be terse.\n\nNOVEL EXCERPT\n${chunks[index]}`,
+        { maxTokens: 1200, temperature: 0.1 },
+      );
+      summaries[index] = requireNonEmptyStyle(summary, `Novel style analysis chunk ${index + 1}`).slice(0, 800);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, chunks.length) }, () => worker()));
   const reducedSummaries = await reduceStyleSummaries(llmCfg, summaries, dependencies);
   const synthesisInput = reducedSummaries.map((summary, index) => `${index + 1}. ${summary}`).join("\n");
   const finalStyle = await dependencies.chatText(
@@ -548,7 +557,7 @@ async function createDraftStyle(
     return { description, referencePath, sourceReferenceB64: resolved.dataB64 };
   }
 
-  const description = await analyzeNovelStyle(input.llmCfg, input.novel, dependencies);
+  const description = await analyzeNovelStyle(input.llmCfg, input.novel, dependencies, input.concurrency);
   const referencePath = revisionedArtifactPath("style-sample.png", artifactRevision);
   const sample = await dependencies.generateImage(
     input.imageCfg,
@@ -569,6 +578,12 @@ async function createDraftCharacters(
 ): Promise<Record<string, VisualBibleCharacter>> {
   const characters: Record<string, VisualBibleCharacter> = {};
   const canonicalIds = new Set<string>();
+  for (const card of input.cards.characters) {
+    if (characters[card.id]) throw new Error(`Duplicate character ID in visual bible draft: ${card.id}`);
+    const canonicalId = sanitizeVisualBibleId(card.id);
+    if (canonicalIds.has(canonicalId)) throw new Error(`Character IDs collide in canonical storage: ${card.id}`);
+    canonicalIds.add(canonicalId);
+  }
   const styleArtifactPath = visualBibleArtifactPath(artifactDir, styleReferencePath);
   const styleArtifact = await readReferenceFile(styleArtifactPath, "Global style reference");
   const styleReference: ImageReference = {
@@ -576,42 +591,45 @@ async function createDraftCharacters(
     ...styleArtifact,
     sourcePath: styleArtifactPath,
   };
-  for (const card of input.cards.characters) {
-    if (characters[card.id]) throw new Error(`Duplicate character ID in visual bible draft: ${card.id}`);
-    const canonicalId = sanitizeVisualBibleId(card.id);
-    if (canonicalIds.has(canonicalId)) throw new Error(`Character IDs collide in canonical storage: ${card.id}`);
-    canonicalIds.add(canonicalId);
-    const reference = await resolveCharacterReference(input, card, artifactDir, artifactRevision);
-    const prompt = normalizeStyleDescription(card.threeViewPrompt || card.imagePrompt);
-    const references: ImageReference[] = [
-      ...(reference.dataB64 ? [{
-        role: "identity" as const,
-        dataB64: reference.dataB64,
-        mime: reference.mime ?? "image/png",
-        sourcePath: reference.relativePath,
-        required: true,
-      }] : []),
-      { ...styleReference, required: !reference.dataB64 },
-    ];
-    const generated = await dependencies.generateImage(input.imageCfg, characterThreeViewPrompt(prompt, styleDescription), {
-      references,
-      size: "1024x1024",
-    });
-    const threeViewPath = revisionedArtifactPath(canonicalThreeViewPath(card.id), artifactRevision);
-    await writeGeneratedImage(visualBibleArtifactPath(artifactDir, threeViewPath), generated);
-    const sourceRevision = reference.relativePath ? 1 : 0;
-    const actionIds = productionActionIds(card);
-    characters[card.id] = {
-      ...(reference.relativePath ? { sourceReferencePath: reference.relativePath } : {}),
-      threeViewPath,
-      prompt,
-      ...(actionIds.length ? { actionIds } : {}),
-      approved: false,
-      revision: 1,
-      sourceRevision,
-      sheetSourceRevision: sourceRevision,
-    };
-  }
+  const concurrency = Math.max(1, input.concurrency ?? DEFAULT_CONCURRENCY);
+  const cards = input.cards.characters;
+  let idx = 0;
+  const worker = async (): Promise<void> => {
+    while (idx < cards.length) {
+      const card = cards[idx++];
+      const reference = await resolveCharacterReference(input, card, artifactDir, artifactRevision);
+      const prompt = normalizeStyleDescription(card.threeViewPrompt || card.imagePrompt);
+      const references: ImageReference[] = [
+        ...(reference.dataB64 ? [{
+          role: "identity" as const,
+          dataB64: reference.dataB64,
+          mime: reference.mime ?? "image/png",
+          sourcePath: reference.relativePath,
+          required: true,
+        }] : []),
+        { ...styleReference, required: !reference.dataB64 },
+      ];
+      const generated = await dependencies.generateImage(input.imageCfg, characterThreeViewPrompt(prompt, styleDescription), {
+        references,
+        size: "1024x1024",
+      });
+      const threeViewPath = revisionedArtifactPath(canonicalThreeViewPath(card.id), artifactRevision);
+      await writeGeneratedImage(visualBibleArtifactPath(artifactDir, threeViewPath), generated);
+      const sourceRevision = reference.relativePath ? 1 : 0;
+      const actionIds = productionActionIds(card);
+      characters[card.id] = {
+        ...(reference.relativePath ? { sourceReferencePath: reference.relativePath } : {}),
+        threeViewPath,
+        prompt,
+        ...(actionIds.length ? { actionIds } : {}),
+        approved: false,
+        revision: 1,
+        sourceRevision,
+        sheetSourceRevision: sourceRevision,
+      };
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, cards.length) }, () => worker()));
   return characters;
 }
 
@@ -1359,12 +1377,12 @@ async function readCharacterReferencePayloads(
   characters: Record<string, VisualBibleCharacter>,
 ): Promise<Record<string, string>> {
   const payloads: Record<string, string> = {};
-  for (const [characterId, character] of Object.entries(characters)) {
-    if (!character.sourceReferencePath) continue;
+  const withReferences = Object.entries(characters).filter(([, character]) => character.sourceReferencePath);
+  await Promise.all(withReferences.map(async ([characterId, character]) => {
     payloads[characterId] = await tauri.readFileBase64(
-      visualBibleArtifactPath(artifactDir, character.sourceReferencePath),
+      visualBibleArtifactPath(artifactDir, character.sourceReferencePath!),
     );
-  }
+  }));
   return payloads;
 }
 

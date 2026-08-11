@@ -116,7 +116,7 @@ async function detectBatch(
 }
 
 const BATCH = 40; // 每批候选块数量
-const CONCURRENT = 3; // 并发批数
+const CONCURRENT = 30; // 并发批数
 
 /**
  * AI 分章：输入未切章全文，输出章节列表。

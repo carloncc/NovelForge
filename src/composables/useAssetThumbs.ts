@@ -66,6 +66,19 @@ export function useAssetThumbs() {
   return { thumbCache: cache, loadAssetDataUrl, mimeOf };
 }
 
+/** 清除指定路径的缓存（或全部）：素材被重新生成/覆盖同名文件后调用，强制 UI 重新读取新图 */
+export function clearThumbCache(paths?: string[]): void {
+  if (paths && paths.length) {
+    for (const p of paths) {
+      delete cache.value[p];
+      failed.delete(p);
+    }
+  } else {
+    for (const key of Object.keys(cache.value)) delete cache.value[key];
+    failed.clear();
+  }
+}
+
 /** 等待加载完成（用于试听等需要拿到结果的场景）；失败或超时返回空字符串 */
 export function ensureAssetLoaded(p: string): Promise<string> {
   if (!p) return Promise.resolve("");

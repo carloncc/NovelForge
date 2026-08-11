@@ -26,9 +26,10 @@ import {
   regenerateImages,
   type RegenContext,
 } from "../core/regenerate";
+import { reCutoutAsset } from "../core/images";
 import { recognizeStyle } from "../core/recognize";
 import { configIsUsable } from "../api/providers";
-import { useAssetThumbs, ensureAssetLoaded } from "../composables/useAssetThumbs";
+import { useAssetThumbs, ensureAssetLoaded, clearThumbCache } from "../composables/useAssetThumbs";
 import LazyThumb from "../components/LazyThumb.vue";
 import AssetPreview from "../components/AssetPreview.vue";
 import VisualBiblePanel from "../components/VisualBiblePanel.vue";
@@ -218,6 +219,13 @@ function resetRegenState(): void {
   regenProgress.value = null;
 }
 
+// 全局并发：优先使用系统配置页的「全局并发数」；未配置时回退到项目级设置（默认 30）
+const effectiveConcurrency = computed(() => {
+  const system = configState.concurrency;
+  if (typeof system === "number" && system >= 1) return system;
+  return Math.max(1, projectState.options.maxConcurrent || 30);
+});
+
 const regenPct = computed(() => {
   const p = regenProgress.value;
   if (!p || p.total <= 0) return 0;
@@ -290,6 +298,26 @@ async function regenSelected(): Promise<void> {
 const FIGURE_EMOTIONS = ["normal", "happy", "sad", "angry", "surprised"];
 const EMOTION_LABELS: Record<string, string> = { normal: "默认", happy: "开心", sad: "悲伤", angry: "愤怒", surprised: "惊讶" };
 
+/** 单张素材重新抠图：不动原图，只重跑抠图出透明底；完成后刷新素材映射 */
+async function reCutout(mapKey: "figure" | "item" | "bg" | "cg", assetKey: string, filePath: string): Promise<void> {
+  if (!filePath || !projectState.outputDir) return;
+  if (assetBusy.value) return;
+  assetBusy.value = `cutout:${assetKey}`;
+  try {
+    const newPath = await reCutoutAsset(projectState.outputDir, mapKey, assetKey, filePath, (ev) => pushLog(ev));
+    if (newPath && newPath !== filePath) {
+      pushLog({ step: "素材", message: `抠图完成：${assetKey} → 透明底 PNG`, level: "success", at: Date.now() });
+    } else if (newPath === filePath) {
+      pushLog({ step: "素材", message: `${assetKey} 无需抠图（已透明或背景无法识别）`, level: "info", at: Date.now() });
+    }
+    await loadAssetMapNow();
+  } catch (e) {
+    pushLog({ step: "素材", message: `抠图失败：${assetKey}（${errMsg(e)}）`, level: "error", at: Date.now() });
+  } finally {
+    assetBusy.value = "";
+  }
+}
+
 // 素材预览/试听：读成 base64 data-URL（桌面/网页通用），失败不重试、并发受限，避免卡死
 const { loadAssetDataUrl, mimeOf } = useAssetThumbs();
 
@@ -300,9 +328,39 @@ async function loadAssetMapNow(): Promise<void> {
       return;
     }
     const { text } = await tauri.readTextFile(`${projectState.outputDir}/.novel2vn/assets.json`);
-    assetMap.value = JSON.parse(text) as AssetMap;
+    const next = JSON.parse(text) as AssetMap;
+    // 素材映射重载（重生成/管线完成后）时，同一路径的文件可能已被覆盖为新的图片，
+    // 必须清掉缩略图缓存，否则 UI 仍显示旧图。
+    clearThumbCache();
+    assetMap.value = next;
   } catch {
     assetMap.value = null;
+  }
+}
+
+// 生成期间实时刷新素材：每张图生成后会增量写入 assets.json，这里每 2s 轮询一次，
+// 新图一到就插入界面，无需等整批生成完。
+let assetLiveTimer: number | undefined;
+let assetLiveFingerprint = "";
+function startAssetLiveRefresh(): void {
+  assetLiveFingerprint = "";
+  if (assetLiveTimer !== undefined) return;
+  assetLiveTimer = window.setInterval(() => {
+    if (!projectState.outputDir) return;
+    void tauri
+      .readTextFile(`${projectState.outputDir}/.novel2vn/assets.json`)
+      .then(({ text }) => {
+        if (text === assetLiveFingerprint) return;
+        assetLiveFingerprint = text;
+        void loadAssetMapNow();
+      })
+      .catch(() => {});
+  }, 2000);
+}
+function stopAssetLiveRefresh(): void {
+  if (assetLiveTimer !== undefined) {
+    window.clearInterval(assetLiveTimer);
+    assetLiveTimer = undefined;
   }
 }
 
@@ -471,6 +529,7 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
       templateDir,
       options: {
         ...projectState.options,
+        maxConcurrent: effectiveConcurrency.value,
         rerunChapters: opts.rerunChapters !== undefined ? opts.rerunChapters ?? undefined : rerunChapters.value ?? undefined,
       },
       stages: opts.stages,
@@ -486,7 +545,10 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
       level: "info",
       at: Date.now(),
     });
+    startAssetLiveRefresh();
     const result = await pipeline.run();
+    stopAssetLiveRefresh();
+    await loadAssetMapNow();
     projectState.lastResult = result;
     addRecentOutputDir(result.meta.outputDir);
     if (result.splitChapters?.length && projectState.novel) {
@@ -508,6 +570,8 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
   } catch (e) {
     const msg = errMsg(e);
     logger.error("page", "生成失败", { message: msg });
+    // 中途失败也刷新素材：已增量落盘的图片保留并显示，重跑时只补缺失项
+    void loadAssetMapNow();
     if (msg === "已中止") {
       logger.warn("page", "生成被用户中止");
       log({ step: "中止", message: "已停止生成，进度已保存（缓存命中部分不会重复计费）", level: "warn", at: Date.now() });
@@ -517,6 +581,7 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
     }
     return false;
   } finally {
+    stopAssetLiveRefresh();
     busy.value = false;
     projectState.running = false;
     pipelineRef.value = null;
@@ -679,7 +744,7 @@ async function regenCtx(): Promise<RegenContext | null> {
     verifyCfg: projectState.options.imageSelfCheck ? visionCfg : undefined,
     visionCfg: configIsUsable(visionCfg, "vision") ? visionCfg : undefined,
     imageSeed: projectState.options.imageSeed || undefined,
-    concurrency: projectState.options.maxConcurrent,
+    concurrency: effectiveConcurrency.value,
     styleAnchor: projectState.options.styleAnchor,
     visualBible: projectState.visualBible?.status === "approved" ? projectState.visualBible : undefined,
   };
@@ -1189,7 +1254,7 @@ function fileExistsLabel(file: string | undefined): string {
             <span>预算上限（¥，0 = 不限）</span>
             <input type="number" v-model.number="projectState.options.budgetYuan" min="0" step="0.5" />
           </label>
-          <label class="field" :title="'同时生成图片/配音的任务数。调大可显著提速，但会同时消耗多张额度；建议 2-6'">
+          <label class="field" :title="'同时生成图片/配音的任务数。调大可显著提速，但会同时消耗多张额度；默认 30，可到系统配置页统一调整'">
             <span>图像/配音并发数</span>
             <input type="number" v-model.number="projectState.options.maxConcurrent" min="1" max="100" />
           </label>
@@ -1426,12 +1491,14 @@ function fileExistsLabel(file: string | undefined): string {
                   <label class="asset-sel" @click.stop><input type="checkbox" :checked="selected.has(`threeview:${row.id}`)" @change="toggleSelect(`threeview:${row.id}`)" /></label>
                   <LazyThumb :path="row.threeView" alt="三视图" />
                   <span class="thumb-label">三视图</span>
+                  <button class="btn ghost small" :disabled="!!assetBusy" @click.stop="reCutout('figure', `${row.id}_threeview`, row.threeView)">抠图</button>
                 </div>
                 <div v-for="e in row.emotions" :key="e.emo" class="asset-thumb" :class="{ missing: !e.file }" :title="`${EMOTION_LABELS[e.emo]}（点击放大）`" @click="e.file && openPreview(e.file, `${row.name} · ${EMOTION_LABELS[e.emo]}`)">
                   <label class="asset-sel" @click.stop><input type="checkbox" :checked="selected.has(`figure:${row.id}:${e.emo}`)" @change="toggleSelect(`figure:${row.id}:${e.emo}`)" /></label>
                   <LazyThumb v-if="e.file" :path="e.file" :alt="EMOTION_LABELS[e.emo]" />
                   <span class="thumb-label">{{ EMOTION_LABELS[e.emo] }}</span>
                   <button class="btn ghost small" :disabled="!!assetBusy" @click.stop="regenFigureEmotion(row.id, e.emo)">重生成</button>
+                  <button v-if="e.file" class="btn ghost small" :disabled="!!assetBusy" @click.stop="reCutout('figure', e.emo === 'normal' ? row.id : `${row.id}_${e.emo}`, e.file)">抠图</button>
                 </div>
               </div>
               <div v-if="row.actions.length" style="border-top: 1px dashed var(--border); margin-top: 8px; padding-top: 8px">
@@ -1441,6 +1508,7 @@ function fileExistsLabel(file: string | undefined): string {
                     <LazyThumb v-if="a.file" :path="a.file" :alt="a.name" />
                     <span class="thumb-label">{{ a.name }}</span>
                     <button class="btn ghost small" :disabled="!!assetBusy" @click.stop="regenAction(row.id, a.id, a.name)">重生成</button>
+                    <button v-if="a.file" class="btn ghost small" :disabled="!!assetBusy" @click.stop="reCutout('figure', `${row.id}_act_${a.id}`, a.file)">抠图</button>
                   </div>
                 </div>
               </div>
@@ -1464,6 +1532,7 @@ function fileExistsLabel(file: string | undefined): string {
                 <div class="asset-thumb" :title="'点击放大'" @click="row.file && openPreview(row.file, `${row.name} · 物品图`)">
                   <LazyThumb v-if="row.file" :path="row.file" :alt="row.name" />
                   <span class="thumb-label">物品图</span>
+                  <button v-if="row.file" class="btn ghost small" :disabled="!!assetBusy" @click.stop="reCutout('item', row.id, row.file)">抠图</button>
                 </div>
               </div>
             </div>
@@ -1487,6 +1556,7 @@ function fileExistsLabel(file: string | undefined): string {
                 <div class="asset-thumb" :title="'点击放大'" @click="row.file && openPreview(row.file, `背景 · ${row.location}`)">
                   <LazyThumb v-if="row.file" :path="row.file" :alt="row.location" />
                   <span class="thumb-label">背景图</span>
+                  <button v-if="row.file" class="btn ghost small" :disabled="!!assetBusy" @click.stop="reCutout('bg', row.sceneId, row.file)">抠图</button>
                 </div>
               </div>
             </div>
@@ -1510,6 +1580,7 @@ function fileExistsLabel(file: string | undefined): string {
                 <div class="asset-thumb" :title="'点击放大'" @click="row.file && openPreview(row.file, `CG · ${row.title}`)">
                   <LazyThumb v-if="row.file" :path="row.file" :alt="row.title" />
                   <span class="thumb-label">CG</span>
+                  <button v-if="row.file" class="btn ghost small" :disabled="!!assetBusy" @click.stop="reCutout('cg', `${row.chapter - 1}_${row.sceneId}`, row.file)">抠图</button>
                 </div>
               </div>
             </div>

@@ -356,47 +356,56 @@ export class Pipeline {
         progress: { done, total, label: title },
       });
     };
-    for (const ch of chapters) {
-      this.checkAbort();
-      const cacheFile = this.translateCacheFile(lang, ch);
-      let cached: { title: string; text: string } | null = null;
-      if (!force) {
-        cached = await this.readCachedJson<{ title: string; text: string }>(cacheFile);
-      }
-      if (cached) {
+    const concurrency = Math.max(1, this.options.maxConcurrent ?? 30);
+    const results: (ChapterInfo | null)[] = new Array(total);
+    let idx = 0;
+    const worker = async (): Promise<void> => {
+      while (idx < chapters.length) {
+        const pos = idx++;
+        const ch = chapters[pos];
+        this.checkAbort();
+        const cacheFile = this.translateCacheFile(lang, ch);
+        let cached: { title: string; text: string } | null = null;
+        if (!force) {
+          cached = await this.readCachedJson<{ title: string; text: string }>(cacheFile);
+        }
+        if (cached) {
+          this.input.log({
+            step: "翻译",
+            message: `[缓存] 第 ${ch.index + 1} 章译文：${cached.title}`,
+            level: "info",
+            at: Date.now(),
+          });
+          emitProgress(cached.title);
+          results[pos] = { ...ch, title: cached.title, text: cached.text };
+          continue;
+        }
         this.input.log({
           step: "翻译",
-          message: `[缓存] 第 ${ch.index + 1} 章译文：${cached.title}`,
+          message: `翻译第 ${ch.index + 1} 章：${ch.title}`,
           level: "info",
           at: Date.now(),
         });
-        emitProgress(cached.title);
-        out.push({ ...ch, title: cached.title, text: cached.text });
-        continue;
+        try {
+          const tr = await translateChapter(cfg, ch, lang, this.onUsageCb, feedback);
+          await tauri.writeTextFile(cacheFile, JSON.stringify(tr, null, 2));
+          emitProgress(tr.title);
+          results[pos] = { ...ch, title: tr.title, text: tr.text };
+          this.checkBudget();
+        } catch (e) {
+          this.recordFailure({
+            id: `translate_${ch.index + 1}`,
+            kind: "llm",
+            step: "翻译",
+            message: `第 ${ch.index + 1} 章：${errMsg(e)}`,
+            at: Date.now(),
+          });
+          throw e;
+        }
       }
-      this.input.log({
-        step: "翻译",
-        message: `翻译第 ${ch.index + 1} 章：${ch.title}`,
-        level: "info",
-        at: Date.now(),
-      });
-      try {
-        const tr = await translateChapter(cfg, ch, lang, this.onUsageCb, feedback);
-        await tauri.writeTextFile(cacheFile, JSON.stringify(tr, null, 2));
-        emitProgress(tr.title);
-        out.push({ ...ch, title: tr.title, text: tr.text });
-        this.checkBudget();
-      } catch (e) {
-        this.recordFailure({
-          id: `translate_${ch.index + 1}`,
-          kind: "llm",
-          step: "翻译",
-          message: `第 ${ch.index + 1} 章：${errMsg(e)}`,
-          at: Date.now(),
-        });
-        throw e;
-      }
-    }
+    };
+    await Promise.all(Array.from({ length: Math.min(concurrency, total) }, () => worker()));
+    for (const item of results) if (item) out.push(item);
     this.input.log({
       step: "翻译",
       message: `翻译完成：${out.length} 章 → ${languageName(lang)}`,
@@ -609,74 +618,83 @@ export class Pipeline {
           progress: { done: scriptDone, total: scriptTotal, label: title },
         });
       };
-      for (const chapter of activeChapters) {
-        this.checkAbort();
-        const cacheFile = `${cacheDir}/${demo ? "script_demo" : "script"}_ch${chapter.index + 1}_${titleHash(chapter.title)}${styleFrag}.json`;
-        const hasFeedback = feedbackSet.has(chapter.index);
-        const selected = rerunSet.has(chapter.index);
-        let script: ChapterScript | null = null;
-        if (!selected && !hasFeedback) {
-          script = await this.readCachedJson<ChapterScript>(cacheFile);
-          if (script) {
-            log({ step: "剧本", message: `[缓存] 第 ${chapter.index + 1} 章（未勾选重跑，复用）：${chapter.title}`, level: "info", at: Date.now() });
-          } else {
-            log({
-              step: "剧本",
-              message: `第 ${chapter.index + 1} 章未勾选重跑且无缓存，跳过：${chapter.title}`,
-              level: "warn",
-              at: Date.now(),
-            });
-            continue;
-          }
-        } else {
-          if (!this.options.skipCache && !hasFeedback && !scriptForce) {
+      const scriptConcurrency = Math.max(1, this.options.maxConcurrent ?? 30);
+      const scriptResults: (ChapterScript | null)[] = new Array(activeChapters.length);
+      let scriptIdx = 0;
+      const scriptWorker = async (): Promise<void> => {
+        while (scriptIdx < activeChapters.length) {
+          const pos = scriptIdx++;
+          const chapter = activeChapters[pos];
+          this.checkAbort();
+          const cacheFile = `${cacheDir}/${demo ? "script_demo" : "script"}_ch${chapter.index + 1}_${titleHash(chapter.title)}${styleFrag}.json`;
+          const hasFeedback = feedbackSet.has(chapter.index);
+          const selected = rerunSet.has(chapter.index);
+          let script: ChapterScript | null = null;
+          if (!selected && !hasFeedback) {
             script = await this.readCachedJson<ChapterScript>(cacheFile);
-          }
-          if (!script) {
-            log({
-              step: "剧本",
-              message: `生成第 ${chapter.index + 1} 章剧本：${chapter.title}${hasFeedback ? "（按你的意见重写）" : ""}`,
-              level: "info",
-              at: Date.now(),
-            });
-            try {
-              script = demo
-                ? demoScriptAll([chapter], cards!)[0]
-                : await scriptChapter(input.llm!, chapter, cards!, onUsage, {
-                    style: style || undefined,
-                    feedback: this.feedback.script?.[chapter.index],
-                  });
-            } catch (e) {
-              this.recordFailure({
-                id: `chapter_${chapter.index + 1}`,
-                kind: "script",
+            if (script) {
+              log({ step: "剧本", message: `[缓存] 第 ${chapter.index + 1} 章（未勾选重跑，复用）：${chapter.title}`, level: "info", at: Date.now() });
+            } else {
+              log({
                 step: "剧本",
-                message: `第 ${chapter.index + 1} 章：${errMsg(e)}`,
+                message: `第 ${chapter.index + 1} 章未勾选重跑且无缓存，跳过：${chapter.title}`,
+                level: "warn",
                 at: Date.now(),
               });
-              throw e;
+              continue;
             }
-            await tauri.writeTextFile(cacheFile, JSON.stringify(script, null, 2));
-            this.checkBudget();
           } else {
-            log({
-              step: "剧本",
-              message: `[缓存] 第 ${chapter.index + 1} 章：${chapter.title}`,
-              level: "info",
-              at: Date.now(),
-            });
+            if (!this.options.skipCache && !hasFeedback && !scriptForce) {
+              script = await this.readCachedJson<ChapterScript>(cacheFile);
+            }
+            if (!script) {
+              log({
+                step: "剧本",
+                message: `生成第 ${chapter.index + 1} 章剧本：${chapter.title}${hasFeedback ? "（按你的意见重写）" : ""}`,
+                level: "info",
+                at: Date.now(),
+              });
+              try {
+                script = demo
+                  ? demoScriptAll([chapter], cards!)[0]
+                  : await scriptChapter(input.llm!, chapter, cards!, onUsage, {
+                      style: style || undefined,
+                      feedback: this.feedback.script?.[chapter.index],
+                    });
+              } catch (e) {
+                this.recordFailure({
+                  id: `chapter_${chapter.index + 1}`,
+                  kind: "script",
+                  step: "剧本",
+                  message: `第 ${chapter.index + 1} 章：${errMsg(e)}`,
+                  at: Date.now(),
+                });
+                throw e;
+              }
+              await tauri.writeTextFile(cacheFile, JSON.stringify(script, null, 2));
+              this.checkBudget();
+            } else {
+              log({
+                step: "剧本",
+                message: `[缓存] 第 ${chapter.index + 1} 章：${chapter.title}`,
+                level: "info",
+                at: Date.now(),
+              });
+            }
           }
+          this.applyVideoOptions(script);
+          ensureUniqueSceneIds(script);
+          scriptResults[pos] = script;
+          emitScriptProgress(chapter.title);
+          logger.debug("pipeline", `第 ${chapter.index + 1} 章剧本就绪`, {
+            title: chapter.title,
+            scenes: script.scenes.length,
+            lines: script.scenes.reduce((n, s) => n + s.lines.length, 0),
+          });
         }
-        this.applyVideoOptions(script);
-        ensureUniqueSceneIds(script);
-        chapters.push(script);
-        emitScriptProgress(chapter.title);
-        logger.debug("pipeline", `第 ${chapter.index + 1} 章剧本就绪`, {
-          title: chapter.title,
-          scenes: script.scenes.length,
-          lines: script.scenes.reduce((n, s) => n + s.lines.length, 0),
-        });
-      }
+      };
+      await Promise.all(Array.from({ length: Math.min(scriptConcurrency, activeChapters.length) }, () => scriptWorker()));
+      for (const script of scriptResults) if (script) chapters.push(script);
     } else {
       const cachedChapters = await this.loadChapters();
       if (cachedChapters.length) {

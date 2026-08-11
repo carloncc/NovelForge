@@ -160,7 +160,7 @@ pub fn ai_cutout(data_b64: &str, model_path: &str) -> Result<String, String> {
 
     // 源是绿幕，AI 遮罩会把绿边颜色留在边缘 → 统一去绿
     let alpha: Vec<f32> = out_rgba.pixels().map(|p| p[3] as f32 / 255.0).collect();
-    crate::cutout::despill(&mut out_rgba, &alpha);
+    crate::cutout::despill(&mut out_rgba, &alpha, false);
 
     let mut out_buf = std::io::Cursor::new(Vec::new());
     out_rgba

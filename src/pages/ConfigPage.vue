@@ -38,6 +38,13 @@ const templatesByChannel = computed(() => ({
   tts: templatesForCapability("tts"),
 }));
 
+const concurrencyInput = computed<number>({
+  get: () => configState.concurrency ?? 30,
+  set: (value: number) => {
+    configState.concurrency = Math.max(1, Math.min(100, Number(value) || 30));
+  },
+});
+
 function onTemplateChange(kind: ChannelKey, cfg: ApiConfig, templateId: string): void {
   if (!templateId) {
     cfg.adapter = undefined;
@@ -243,6 +250,22 @@ watch(
         </button>
       </div>
       <button v-if="configState.presets.length > 1" class="btn danger small" style="margin-left: auto" @click="removePreset(configState.activePresetId)">删除该组</button>
+    </div>
+
+    <div class="card" style="margin-top: var(--space-4)">
+      <div class="card-head">
+        <h3>全局并发数</h3>
+        <div class="card-actions"></div>
+      </div>
+      <div style="display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap">
+        <label class="field" style="max-width: 220px" :title="'所有批量生成任务（图像/配音/分章/视觉圣经/多选重生成）同时执行的任务数。调大可显著提速，但会同时消耗更多 API 额度；默认 30'">
+          <span>批量生成并发数（默认 30）</span>
+          <input type="number" v-model.number="concurrencyInput" min="1" max="100" />
+        </label>
+        <div class="hint" style="font-size: 12px; color: var(--text-dim); padding-bottom: 8px">
+          作用于图像、配音、分章、视觉圣经及素材多选批量重生成；项目级设置（生成页）可单独覆盖。
+        </div>
+      </div>
     </div>
 
     <div class="cfg-grid">

@@ -2,12 +2,16 @@ import type { ApiConfig, ApiPreset, ChannelKey } from "../core/types";
 
 export const CONFIG_SCHEMA_VERSION = 2 as const;
 
+export const DEFAULT_CONCURRENCY = 30 as const;
+
 export interface ConfigFile {
   configSchemaVersion: typeof CONFIG_SCHEMA_VERSION;
   presets: ApiPreset[];
   activePresetId: string;
   outputDir?: string;
   recentOutputDirs?: string[];
+  /** 全局并发数：图像/配音/分章/视觉圣经等所有批量生成任务的并发上限，默认 30 */
+  concurrency?: number;
 }
 
 export interface ConfigMigrationResult {
@@ -153,6 +157,7 @@ export function migrateConfigFile(
       recentOutputDirs: Array.isArray(root.recentOutputDirs)
         ? root.recentOutputDirs.filter((dir): dir is string => typeof dir === "string")
         : [],
+      concurrency: typeof root.concurrency === "number" && root.concurrency >= 1 ? root.concurrency : DEFAULT_CONCURRENCY,
     },
   };
 }

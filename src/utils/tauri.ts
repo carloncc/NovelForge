@@ -19,6 +19,62 @@ export function isTauri(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
+function base64ToBuffer(b64: string): Uint8Array {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+/** 从文件头识别图片尺寸（支持 PNG / JPEG / WebP / GIF） */
+function detectImageSize(buf: Uint8Array): { width: number; height: number } | null {
+  // PNG: 8 字节签名 + 4 长度 + "IHDR" + 宽(4) 高(4)
+  if (buf.length >= 24 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
+    const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+    return { width: dv.getUint32(16), height: dv.getUint32(20) };
+  }
+  // JPEG: FF D8 ... FF C0/C1/C2 段
+  if (buf.length >= 4 && buf[0] === 0xff && buf[1] === 0xd8) {
+    let offset = 2;
+    while (offset + 9 < buf.length) {
+      if (buf[offset] !== 0xff) { offset++; continue; }
+      const marker = buf[offset + 1];
+      if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+        return { width: (buf[offset + 7] << 8) | buf[offset + 8], height: (buf[offset + 5] << 8) | buf[offset + 6] };
+      }
+      const len = (buf[offset + 2] << 8) | buf[offset + 3];
+      offset += 2 + len;
+    }
+    return null;
+  }
+  // WebP: RIFF....WEBP + VP8/VP8L/VP8X
+  if (buf.length >= 30 && buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46) {
+    const isWebp = buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50;
+    if (isWebp) {
+      const chunk = String.fromCharCode(buf[12], buf[13], buf[14], buf[15]);
+      if (chunk === "VP8X") {
+        const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+        return { width: 1 + (dv.getUint32(24, true) & 0xffffff), height: 1 + (dv.getUint32(27, true) & 0xffffff) };
+      }
+      if (chunk === "VP8L") {
+        const b = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+        const bits = b.getUint32(21, true);
+        return { width: (bits & 0x3fff) + 1, height: ((bits >> 14) & 0x3fff) + 1 };
+      }
+      if (chunk === "VP8 ") {
+        const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+        return { width: dv.getUint16(26, true) & 0x3fff, height: dv.getUint16(28, true) & 0x3fff };
+      }
+    }
+    return null;
+  }
+  // GIF: GIF8 宽(2) 高(2)
+  if (buf.length >= 10 && buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46) {
+    return { width: buf[6] | (buf[7] << 8), height: buf[8] | (buf[9] << 8) };
+  }
+  return null;
+}
+
 function b64encode(data: Uint8Array): string {
   if (typeof Buffer !== "undefined") {
     return Buffer.from(data).toString("base64");
@@ -302,5 +358,17 @@ export const tauri = {
     if (isTauri()) return invoke("build_zip", { sourceDir, zipPath, exclude });
     if (web.isWeb()) return web.webBuildZip(sourceDir, zipPath, exclude);
     return Promise.reject(new Error("Web 环境不支持打包"));
+  }),
+  /** 判断图片文件尺寸是否匹配目标宽高（读 PNG/JPEG 文件头，纯前端实现） */
+  imageSizeMatches: wrap("imageSizeMatches", async (path: string, targetWidth: number, targetHeight: number): Promise<boolean> => {
+    try {
+      const b64 = await tauri.readFileBase64(path);
+      const buf = base64ToBuffer(b64);
+      const size = detectImageSize(buf);
+      if (!size) return true; // 无法识别 → 不阻断（保守放行）
+      return size.width === targetWidth && size.height === targetHeight;
+    } catch {
+      return true; // 读取失败 → 放行（后续生成/缓存逻辑兜底）
+    }
   }),
 };

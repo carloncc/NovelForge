@@ -2,7 +2,7 @@
 import { computed, ref, watch } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
 import { projectState, pushLog, scheduleSave } from "../stores/project";
-import { activeConfig } from "../stores/config";
+import { activeConfig, configState } from "../stores/config";
 import { tauri, isTauri } from "../utils/tauri";
 import { errMsg } from "../utils/errors";
 import { configIsUsable } from "../api/providers";
@@ -265,6 +265,7 @@ async function createDraft(): Promise<void> {
     cards,
     imageCfg,
     characterReferences,
+    concurrency: configState.concurrency ?? 30,
   };
 
   creating.value = true;

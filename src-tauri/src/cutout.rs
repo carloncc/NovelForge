@@ -1,6 +1,26 @@
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use image::{ImageFormat, Rgba, RgbaImage};
 
+/// 判断采样到的背景色是否亮绿色幕：G 通道高且显著高于 R/B（饱和的绿）
+fn is_green_screen(bg: [f32; 3]) -> bool {
+    bg[1] > 100.0 && (bg[1] - bg[0].max(bg[2])) > 40.0
+}
+
+/// 色度加权欧氏距离：对绿色背景降低亮度(G)权重，让深绿/浅绿渐变与背景色距离变小
+/// （RGB 欧氏距离在亮度变化下会放大，导致 AI 生成的有渐变的绿底抠不干净）
+fn distance(rgba: &RgbaImage, x: u32, y: u32, bg: [f32; 3], green: bool) -> f32 {
+    let p = rgba.get_pixel(x, y);
+    let dr = p[0] as f32 - bg[0];
+    let dg = p[1] as f32 - bg[1];
+    let db = p[2] as f32 - bg[2];
+    if green {
+        // G 权重 0.25：把"亮度差"对距离的贡献压低，色度(R/B 差)主导 → 渐变绿底仍判定为背景
+        (dr * dr + db * db + dg * dg * 0.25).sqrt()
+    } else {
+        (dr * dr + dg * dg + db * db).sqrt()
+    }
+}
+
 /// 采样图像边缘一圈的背景色（取各通道中位数，抗前景人物/噪点干扰）
 fn sample_bg_color(img: &RgbaImage) -> Option<[f32; 3]> {
     let (w, h) = img.dimensions();
@@ -74,7 +94,9 @@ fn alpha_median3x3(alpha: &[f32], w: u32, h: u32) -> Vec<f32> {
 
 /// 把背景绿色溢出（绿边/绿晕）从前景边缘去除：对半透明羽化带按透明度强度去绿，
 /// 对与透明像素相邻的不透明边界像素做一次轻量去绿（主体本身非绿色时干净利落）。
-pub(crate) fn despill(rgba: &mut RgbaImage, alpha: &[f32]) {
+/// `aggressive=true` 用于亮绿色背景：触发阈值更低（>2 而非 >6），边界带去绿强度更强（0.95 而非 0.85），
+/// 防止 AI 生成的有渐变绿底在人物边缘残留绿边/绿晕。
+pub(crate) fn despill(rgba: &mut RgbaImage, alpha: &[f32], aggressive: bool) {
     let (w, h) = rgba.dimensions();
     let n = (w * h) as usize;
     // 标记前景边界像素（4 邻域存在半透明/透明的像素）
@@ -100,6 +122,8 @@ pub(crate) fn despill(rgba: &mut RgbaImage, alpha: &[f32]) {
             }
         }
     }
+    let spill_th = if aggressive { 2.0 } else { 6.0 };
+    let fringe_strength = if aggressive { 0.95 } else { 0.85 };
     for i in 0..n {
         if !is_fringe[i] {
             continue;
@@ -110,10 +134,10 @@ pub(crate) fn despill(rgba: &mut RgbaImage, alpha: &[f32]) {
         let b = p[2] as f32;
         let max_rb = r.max(b);
         let spill = (g - max_rb).max(0.0);
-        if spill > 6.0 {
+        if spill > spill_th {
             // 半透明带：按透明度强度彻底去绿（趋向 max(r,b)）；边界带：只去大部分，避免灰边
             let a = alpha[i];
-            let strength = if a < 0.98 { 1.0 } else { 0.85 };
+            let strength = if a < 0.98 { 1.0 } else { fringe_strength };
             let out_g = g - spill * strength;
             p[1] = out_g.round().clamp(0.0, 255.0) as u8;
         }
@@ -125,6 +149,7 @@ pub(crate) fn despill(rgba: &mut RgbaImage, alpha: &[f32]) {
 /// - thr..thr_edge 之间羽化（平滑过渡到不透明）；超过 thr_edge 视为前景边界，不扩散
 /// - 前景内部与背景色相近的孤立像素（如脸部高光、浅色头发内侧）因“不连通”而不会被误删
 /// - 最后做 despill（去除绿幕常见的绿边/绿晕）与 alpha 3x3 中值平滑（去噪点/空洞）
+/// - 对亮绿色背景自动切换为色度加权距离（降亮度权重）+ 更大容差，把有渐变/光照的绿底也抠干净
 pub fn cutout(data_b64: &str, threshold: f32) -> Result<String, String> {
     let bytes = B64
         .decode(data_b64)
@@ -134,17 +159,15 @@ pub fn cutout(data_b64: &str, threshold: f32) -> Result<String, String> {
     let (w, h) = rgba.dimensions();
     let bg = sample_bg_color(&rgba).ok_or("无法采样背景色（图像过小或边缘全透明）")?;
 
-    let thr = threshold.max(4.0);
-    let thr_edge = thr + 40.0;
+    // 检测亮绿背景：绿底常见 AI 生成会有明暗渐变/压缩噪点，
+    // RGB 欧氏距离会因亮度差放大导致洪水填充提前终止 → 残留绿块。
+    // 色度加权 + 更大容差可彻底抠掉。
+    let green = is_green_screen(bg);
+    let thr = if green { threshold.max(70.0) } else { threshold.max(4.0) };
+    let thr_edge = if green { thr + 70.0 } else { thr + 40.0 };
 
     let idx = |x: u32, y: u32| -> usize { (y * w + x) as usize };
-    let dist_at = |x: u32, y: u32| -> f32 {
-        let p = rgba.get_pixel(x, y);
-        let dr = p[0] as f32 - bg[0];
-        let dg = p[1] as f32 - bg[1];
-        let db = p[2] as f32 - bg[2];
-        (dr * dr + dg * dg + db * db).sqrt()
-    };
+    let dist_at = |x: u32, y: u32| -> f32 { distance(&rgba, x, y, bg, green) };
 
     // 初始 alpha 全 1（默认保留），仅对“与边缘连通的背景区域”做透明化
     let mut alpha_out = vec![1f32; (w * h) as usize];
@@ -206,7 +229,7 @@ pub fn cutout(data_b64: &str, threshold: f32) -> Result<String, String> {
     }
 
     // 去绿边/绿晕（在应用 alpha 前处理颜色，避免绿边留在前景上）
-    despill(&mut rgba, &alpha_out);
+    despill(&mut rgba, &alpha_out, green);
 
     let mut writes: Vec<(u32, u32, [u8; 4])> = Vec::with_capacity((w * h) as usize / 8);
     for (x, y, base) in rgba.enumerate_pixels() {
@@ -293,6 +316,53 @@ mod tests {
         let mut buf = std::io::Cursor::new(Vec::new());
         img.write_to(&mut buf, ImageFormat::Png).unwrap();
         B64.encode(buf.into_inner())
+    }
+
+    /// 模拟 AI 生成的有渐变的亮绿背景（抠图没抠干净的根因）：
+    /// 边缘是纯绿 (0,255,0)，向中心逐渐变暗绿（如 (40,180,40)）。
+    /// RGB 欧氏距离下，深绿与背景色距离 ≈ 91 > 旧阈值 80 → 洪水填充被挡住 → 残留绿块。
+    fn make_gradient_green_bg_art() -> String {
+        let mut img = RgbaImage::new(64, 64);
+        for y in 0..64 {
+            for x in 0..64 {
+                let dx = (x as i32 - 32).unsigned_abs() as f32 / 32.0;
+                let dy = (y as i32 - 32).unsigned_abs() as f32 / 32.0;
+                let t = (dx + dy) * 0.5;
+                let r = (0.0 + t * 40.0) as u8;
+                let g = (255.0 - t * 75.0) as u8;
+                let b = (0.0 + t * 40.0) as u8;
+                img.put_pixel(x, y, Rgba([r, g, b, 255]));
+            }
+        }
+        for y in 20..44 {
+            for x in 20..44 {
+                img.put_pixel(x, y, Rgba([200, 40, 40, 255]));
+            }
+        }
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, ImageFormat::Png).unwrap();
+        B64.encode(buf.into_inner())
+    }
+
+    #[test]
+    fn cutout_gradient_green_bg_clean() {
+        // 渐变绿底应被完全抠掉（旧算法在深绿处残留）
+        let b64 = make_gradient_green_bg_art();
+        let out = cutout(&b64, 40.0).expect("抠图应成功");
+        let out_img = image::load_from_memory(&B64.decode(&out).unwrap()).unwrap().to_rgba8();
+        // 四角应透明
+        for (x, y) in [(0, 0), (63, 0), (0, 63), (63, 63)] {
+            assert!(out_img.get_pixel(x, y)[3] < 16, "角落应透明: {x},{y}");
+        }
+        // 中间靠近中心的深绿背景区域也应透明（关键：旧算法这里会残留绿块）
+        // 前景是 20..44 的方块，背景区域取前景外但在中央附近的深绿点
+        for (x, y) in [(2, 32), (32, 2), (61, 32), (32, 61), (15, 15)] {
+            let p = out_img.get_pixel(x, y);
+            assert!(p[3] < 16, "渐变绿底中央附近应透明: ({x},{y}) a={}", p[3]);
+        }
+        // 中心红色前景应保留
+        assert!(out_img.get_pixel(32, 32)[3] > 200, "中心前景应保留");
+        assert!(out_img.get_pixel(32, 32)[0] > 150, "中心应接近红色");
     }
 
     #[test]
