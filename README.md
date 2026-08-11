@@ -10,6 +10,8 @@ Import a novel (txt), and NovelForge automatically converts it into a playable v
 
 Tauri 2 + Vue 3 + WebGAL · Lightweight & fast · Bring-your-own API
 
+**English** · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [한국어](README.ko-KR.md)
+
 </div>
 
 ---
