@@ -1,7 +1,7 @@
 import { chatCompletion, chatVision, generateImage, ReferenceImageError } from "../api/openaiCompatible";
 import { tauri } from "../utils/tauri";
 import { extname, normalizePath, safeFilename } from "../utils/path";
-import { buildImageTasks } from "./images";
+import { buildImageTasks, stripBackground } from "./images";
 import { DEFAULT_CONCURRENCY } from "../stores/configMigration";
 import type {
   ApiConfig,
@@ -455,8 +455,8 @@ async function resolveCharacterReference(
 }
 
 function characterThreeViewPrompt(identityPrompt: string, styleDescription: string): string {
-  const identity = normalizeStyleDescription(identityPrompt);
-  return `${identity}. ${styleDescription}. Character turnaround sheet showing exactly the same person in front, side, and back orthographic full-body views, neutral pose, consistent proportions and clothing, plain light background, no extra figures, no text.`;
+  const identity = stripBackground(normalizeStyleDescription(identityPrompt));
+  return `${identity}. ${styleDescription}. Character turnaround sheet showing exactly the same person in front, side, and back orthographic full-body views, neutral pose, consistent proportions and clothing, solid chroma key green background (pure #00FF00 green filling the entire background, no gradient, no pattern, no text), no extra figures, no text.`;
 }
 
 function characterImageTasks(character: CharacterCard) {
@@ -857,6 +857,105 @@ export async function replaceCharacterReference(
     nextCharacter.sourceRevision = characterSourceRevision(storedCharacter) + 1;
     nextCharacter.sheetSourceRevision = characterSheetSourceRevision(storedCharacter);
     return { bible: next, cards: [characterCard], afterPublish: () => invalidateCharacterCaches(outputDir, invalidationCharacter) };
+  }, bible);
+  return bible;
+}
+
+/**
+ * 用 LLM 重新生成角色描述（imagePrompt + threeViewPrompt），强制绿幕背景。
+ * 解决问题：之前 LLM 提取时把背景写死成 `plain solid <色> background`，与绿幕后缀冲突，
+ * 导致 AI 按旧色画底色。重新生成会强制把背景统一为纯绿幕（pure #00FF00 green）。
+ *
+ * 纯函数：仅调 LLM，不写盘。返回 { imagePrompt, threeViewPrompt }，由调用方决定持久化。
+ */
+export async function regenerateCharacterDescription(
+  cfg: ApiConfig,
+  character: CharacterCard,
+  dependencies: VisualBibleServiceDependencies = DEFAULT_DEPENDENCIES,
+): Promise<{ imagePrompt: string; threeViewPrompt: string }> {
+  const systemPrompt = `你是角色设定师。请基于给定的角色设定（外貌/服装/性格），重新生成两段严格的英文 AI 绘图 prompt。
+
+严格要求：
+1. 必须输出严格的 JSON，不要 markdown 代码块，不要任何其他文字
+2. 背景必须是纯绿色 chroma key green（pure #00FF00 green filling the entire background, no gradient, no pattern, no text, no shadow），禁止使用任何其他底色
+3. 描述该角色的发型/瞳色/服装/体型/气质，不要凭空添加小说里没有的元素
+4. 全身可见（full body visible），站姿自然，动漫风格
+
+输出 JSON 字段：
+{
+  "imagePrompt": "立绘的完整英文 prompt（包含人物外观/服装/绿幕背景）",
+  "threeViewPrompt": "三视图的完整英文 prompt（同一角色、站姿自然、表情平静、全身可见、绿幕背景）"
+}`;
+
+  const userPrompt = `ROLE NAME
+${character.name || character.id}
+
+APPEARANCE
+${character.appearance || "(none)"}
+
+CLOTHING
+${character.clothing || "(none)"}
+
+PERSONALITY
+${character.personality || "(none)"}
+
+CURRENT imagePrompt (raw, may contain old background colors)
+${character.imagePrompt || "(none)"}
+
+请基于以上信息重新生成严格的 JSON imagePrompt 和 threeViewPrompt：`;
+
+  const reply = await dependencies.chatText(
+    cfg,
+    systemPrompt,
+    userPrompt,
+    { maxTokens: 1400, temperature: 0.2 },
+  );
+
+  const cleaned = reply.replace(/```json|```/g, "").trim();
+  let data: { imagePrompt?: string; threeViewPrompt?: string };
+  try {
+    const jsonStart = cleaned.indexOf("{");
+    const jsonEnd = cleaned.lastIndexOf("}");
+    if (jsonStart < 0 || jsonEnd < 0) throw new Error("no JSON object");
+    data = JSON.parse(cleaned.slice(jsonStart, jsonEnd + 1));
+  } catch (e) {
+    throw new Error(`角色描述重新生成失败：返回内容不是合法 JSON（${(e as Error).message}）`);
+  }
+
+  const newImagePrompt = stripBackground(data.imagePrompt || "").trim();
+  const newThreeViewPrompt = stripBackground(data.threeViewPrompt || "").trim();
+  if (!newImagePrompt || !newThreeViewPrompt) {
+    throw new Error("角色描述重新生成失败：LLM 返回内容缺少 imagePrompt / threeViewPrompt");
+  }
+  return { imagePrompt: newImagePrompt, threeViewPrompt: newThreeViewPrompt };
+}
+
+/**
+ * 把重新生成的角色描述持久化到 visual bible + 同步卡片 + 失效缓存。
+ * 必须在 regenerateCharacterDescription 拿到 imagePrompt/threeViewPrompt 之后调用。
+ */
+export async function persistRegeneratedCharacterDescription(
+  outputDir: string,
+  bible: ProjectVisualBible,
+  characterId: string,
+  characterCard: CharacterCard,
+  imagePrompt: string,
+  threeViewPrompt: string,
+): Promise<ProjectVisualBible> {
+  const storedCharacter = bible.characters[characterId];
+  if (!storedCharacter) throw new Error(`Character is missing from visual bible: ${characterId}`);
+  const invalidationCharacter = characterWithHistoricalActions(bible, characterCard);
+  await mutateAndPublishVisualBible(outputDir, async () => {
+    const next = cloneVisualBible(bible);
+    const nextCharacter = next.characters[characterId];
+    markCharacterBibleChanged(next, characterId);
+    nextCharacter.prompt = imagePrompt;
+    nextCharacter.approved = false;
+    return {
+      bible: next,
+      cards: [{ ...characterCard, imagePrompt, threeViewPrompt }],
+      afterPublish: () => invalidateCharacterCaches(outputDir, invalidationCharacter),
+    };
   }, bible);
   return bible;
 }

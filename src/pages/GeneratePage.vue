@@ -300,8 +300,8 @@ async function regenSelected(): Promise<void> {
 const FIGURE_EMOTIONS = ["normal", "happy", "sad", "angry", "surprised"];
 const EMOTION_LABELS: Record<string, string> = { normal: t("默认"), happy: t("开心"), sad: t("悲伤"), angry: t("愤怒"), surprised: t("惊讶") };
 
-/** 单张素材重新抠图：不动原图，只重跑抠图出透明底；完成后刷新素材映射 */
-async function reCutout(mapKey: "figure" | "item" | "bg" | "cg", assetKey: string, filePath: string): Promise<void> {
+/** 单张素材重新抠图：不动原图，只重跑抠图出透明底；完成后刷新素材映射（仅立绘/物品，背景/CG 不抠） */
+async function reCutout(mapKey: "figure" | "item", assetKey: string, filePath: string): Promise<void> {
   if (!filePath || !projectState.outputDir) return;
   if (assetBusy.value) return;
   assetBusy.value = `cutout:${assetKey}`;
@@ -1558,7 +1558,6 @@ function fileExistsLabel(file: string | undefined): string {
                 <div class="asset-thumb" :title="t('点击放大')" @click="row.file && openPreview(row.file, `背景 · ${row.location}`)">
                   <LazyThumb v-if="row.file" :path="row.file" :alt="row.location" />
                   <span class="thumb-label">{{ t("背景图") }}</span>
-                  <button v-if="row.file" class="btn ghost small" :disabled="!!assetBusy" @click.stop="reCutout('bg', row.sceneId, row.file)">{{ t("抠图") }}</button>
                 </div>
               </div>
             </div>
@@ -1582,7 +1581,6 @@ function fileExistsLabel(file: string | undefined): string {
                 <div class="asset-thumb" :title="t('点击放大')" @click="row.file && openPreview(row.file, `CG · ${row.title}`)">
                   <LazyThumb v-if="row.file" :path="row.file" :alt="row.title" />
                   <span class="thumb-label">CG</span>
-                  <button v-if="row.file" class="btn ghost small" :disabled="!!assetBusy" @click.stop="reCutout('cg', `${row.chapter - 1}_${row.sceneId}`, row.file)">抠图</button>
                 </div>
               </div>
             </div>

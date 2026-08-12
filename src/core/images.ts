@@ -14,7 +14,7 @@
   VisualBibleCacheBinding,
 } from "./types";
 import type { ApiConfig } from "./types";
-import { generateImage, ReferenceImageError, VisionApiError } from "../api/openaiCompatible";
+import { generateImage, ReferenceImageError, VisionApiError, setImageConcurrency } from "../api/openaiCompatible";
 import { resolveImageModelCapabilities } from "../api/providers";
 import { verifyImage } from "./selfcheck";
 import { describeReferenceImage } from "./recognize";
@@ -58,7 +58,7 @@ const DEFAULT_NEGATIVE =
 const FIGURE_BG_SUFFIX =
   ", solid chroma key green background (pure #00FF00 green filling the entire background, no gradient, no pattern, no objects, no other people, no text, no shadow, no green elements on the character), full body visible, no legs cut off";
 const ITEM_BG_SUFFIX =
-  ", one solid flat color background (a single uniform color filling the entire background, no gradient, no pattern, no reflection, no text)";
+  ", solid chroma key green background (pure #00FF00 green filling the entire background, no gradient, no pattern, no reflection, no text, no shadow)";
 
 // 风格锚点：一张纯场景/无人物的画风基准图，后续所有背景/CG 以它做参考图，强制全项目同一画风
 const ANCHOR_PROMPT =
@@ -103,12 +103,28 @@ function styleSuffix(style?: string): string {
 
 /** 从立绘 prompt 兜底推导三视图 prompt（无 threeViewPrompt 时用） */
 function threeViewFallback(imagePrompt: string): string {
-  const clean = (imagePrompt || "")
+  const clean = stripBackground(imagePrompt)
     .replace(/standing pose[^,]*/gi, "")
-    .replace(/plain white background[^,]*/gi, "")
     .replace(/clean illustration[^,]*/gi, "")
     .replace(/[,，\s]+$/, "");
   return `${clean}, three-view character reference sheet, front view / side view / back view, neutral standing pose, calm expression, full body visible, solid chroma key green background (pure #00FF00 green)`;
+}
+
+/**
+ * 剥掉 prompt 里所有"背景/底色"短句，避免 LLM 之前生成的 `plain solid <色> background` /
+ * `plain white background` 等与绿幕后缀打架，导致 AI 按旧色画底色。
+ * 覆盖中英文常见写法（"plain * background"、"solid * background"、"纯色背景" 等）。
+ * 只去掉含 "background" / "底色" / "背景" 的子句，不动人物描述。
+ */
+export function stripBackground(prompt: string): string {
+  if (!prompt) return "";
+  return prompt
+    .replace(/[,，;；]\s*(?:plain|solid|uniform|clean|simple|empty|white|black|grey|gray|light|dark|deep|pale|bright|vibrant|soft|warm|cool|saturated|muted|pastel|chrome|chroma\s*key|studio|gradient)\s+[^,，;；]*?\b(background|backdrop|wallpaper|scene|setting)\b[^,，;；]*/gi, "")
+    .replace(/[,，;；]\s*[^,，;；]*?(plain\s+solid\s+\w+\s+background|plain\s+white\s+background|plain\s+light\s+background|plain\s+dark\s+background|solid\s+color\s+background|solid\s+chroma\s+key\s+green\s+background|clean\s+light\s+gray\s+background|clean\s+white\s+background|empty\s+background|gradient\s+background)[^,，;；]*/gi, "")
+    .replace(/[,，;；]\s*[^,，;；]*?(纯色背景|纯绿背景|纯白背景|纯灰背景|单一背景|平面背景|干净背景)[^,，;；]*/gi, "")
+    .replace(/background\s+with[^,，;；]*/gi, "")
+    .replace(/[,，;；\s]+$/, "")
+    .trim();
 }
 
 export interface BuildImageTaskOptions {
@@ -166,7 +182,7 @@ export function buildImageTasks(
         id: `${char.id}_threeview`,
         characterId: char.id,
         prompt:
-          (char.threeViewPrompt || threeViewFallback(char.imagePrompt)) +
+          stripBackground(char.threeViewPrompt || threeViewFallback(char.imagePrompt)) +
           style +
           (char.referenceImage ? THREEVIEW_REF_HINT : ""),
         ...(char.referenceImage ? { references: [inlineIdentityReference(char.referenceImage)] } : {}),
@@ -185,7 +201,7 @@ export function buildImageTasks(
         id: isNormal ? char.id : `${char.id}_${emo}`,
         characterId: char.id,
         emotion: emo,
-        prompt: char.imagePrompt + (EMOTION_PROMPT_SUFFIX[emo] ?? "") + REF_HINT + style + FIGURE_BG_SUFFIX,
+        prompt: stripBackground(char.imagePrompt) + (EMOTION_PROMPT_SUFFIX[emo] ?? "") + REF_HINT + style + FIGURE_BG_SUFFIX,
         refFromTask: isNormal ? (threeView ? `${char.id}_threeview` : undefined) : char.id,
         fileName: `figure_${sanitizeId(char.id)}_${emo}.png`,
         width: 1024,
@@ -201,7 +217,7 @@ export function buildImageTasks(
           id: `${char.id}_act_${a.id}`,
           characterId: char.id,
           actionId: a.id,
-          prompt: a.prompt + REF_HINT + style + FIGURE_BG_SUFFIX,
+          prompt: stripBackground(a.prompt) + REF_HINT + style + FIGURE_BG_SUFFIX,
           refFromTask: `${char.id}_threeview`,
           fileName: `figure_${sanitizeId(char.id)}_act_${sanitizeId(a.id)}.png`,
           width: 1024,
@@ -216,7 +232,7 @@ export function buildImageTasks(
     tasks.push({
       kind: "item",
       id: item.id,
-      prompt: item.imagePrompt + style + ITEM_BG_SUFFIX,
+      prompt: stripBackground(item.imagePrompt) + style + ITEM_BG_SUFFIX,
       fileName: `item_${sanitizeId(item.id)}.png`,
       width: 1024,
       height: 1024,
@@ -678,6 +694,8 @@ export async function generateImages(
 ): Promise<{ images: ImageResultMap; failed: FailedTask[] }> {
   const result: ImageResultMap = { bg: {}, cg: {}, figure: {}, item: {} };
   const failed: FailedTask[] = [];
+  // 图片请求全局限流跟随用户并发设置：任务 worker 数与 API 实际并发一致，不再被默认 3 卡死
+  setImageConcurrency(concurrency);
   const approvedBible = visualBible?.status === "approved" ? visualBible : undefined;
   const projectOutputDir = cacheRoot.replace(/[\\/]\.novel2vn[\\/]cache[\\/]?$/, "");
   const tasks = buildImageTasks(chapters, cards, {
@@ -962,17 +980,18 @@ function findMaterial(materials: MaterialAsset[], task: ImageTask): MaterialAsse
 /** 对单张素材重新抠图：读取图片 → 抠出透明底 → 更新 assets.json 映射。
  * 用于素材页「抠图」按钮，出问题时单独重抠而无需重新生成整张图。
  * 返回抠图后的新文件路径；若已透明/无需抠图则返回原路径。
+ * 注意：背景/CG 属于场景图，不抠图（仅立绘/物品可抠透明底）。
  */
 export async function reCutoutAsset(
   outputDir: string,
-  assetMapKey: "bg" | "cg" | "figure" | "item",
+  assetMapKey: "figure" | "item",
   assetKey: string,
   filePath: string,
   log: (ev: PipelineEvent) => void,
 ): Promise<string | null> {
   const metaDir = `${outputDir}/.novel2vn`;
   const task: ImageTask = {
-    kind: assetMapKey === "bg" ? "background" : assetMapKey === "cg" ? "cg" : assetMapKey === "item" ? "item" : "figure",
+    kind: assetMapKey === "item" ? "item" : "figure",
     id: assetKey,
     fileName: filePath.split(/[\\/]/).pop() || "asset.png",
     prompt: "",

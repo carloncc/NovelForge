@@ -25,8 +25,15 @@ import { log } from "../utils/logger";
  * 全局图像请求并发上限：任务层并发再高（如 30），实际同时发往图片 API 的请求数也受此限制。
  * 许多图片服务（如 api2cn）并发上限很低，30 并发会触发大量 429；
  * 用信号量把实际并发压到 3，配合单请求退避即可稳定跑满而不再打爆服务端。
+ * 上限会跟随用户设置的「图像/配音并发数」动态调整（setImageConcurrency），
+ * 默认 3 仅是兜底，避免未设置时打爆服务端。
  */
 const IMAGE_CONCURRENCY = new ConcurrencyLimiter(3);
+
+/** 跟随用户并发设置动态调整图片请求上限（由生成/重生成入口调用） */
+export function setImageConcurrency(n: number): void {
+  IMAGE_CONCURRENCY.setMaxConcurrent(n);
+}
 
 /**
  * 通过 OpenAI 兼容的 GET /models 拉取模型列表，并按通道能力过滤。
@@ -189,10 +196,10 @@ function extractProviderBaseError(data: unknown): string | null {
 
 export function isRetryable(status: number, text: string): boolean {
   if (status >= 500 || status === 429) return true;
-  return /timeout|timed out|network|socket|connect|ECONN|ETIMEDOUT|fetch failed/i.test(text);
+  return /timeout|timed out|network|socket|connect|ECONN|ETIMEDOUT|fetch failed|error sending request|请求失败|dns|resolve|refused/i.test(text);
 }
 
-export const RETRY_DELAYS = [800, 2500];
+export const RETRY_DELAYS = [800, 2500, 6000];
 
 export async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
   let lastErr: unknown;

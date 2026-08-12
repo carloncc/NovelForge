@@ -17,7 +17,9 @@ import {
   approveVisualBible,
   computeProjectVisualBibleFingerprint,
   createVisualBibleDraft,
+  persistRegeneratedCharacterDescription,
   refreshVisualBibleFingerprint,
+  regenerateCharacterDescription,
   regenerateCharacterSheet,
   regenerateStyleSample,
   replaceCharacterReference,
@@ -470,6 +472,50 @@ async function regenerateCharacter(characterId: string): Promise<void> {
   }
 }
 
+/**
+ * 重新生成角色描述（imagePrompt / threeViewPrompt），强制绿幕背景。
+ * 适用：旧版 LLM 提取时把背景写死成"plain solid <色> background"，与绿幕后缀冲突，
+ *       AI 按旧色画底色，导致抠图困难。点击后会让 LLM 重新生成描述，并提示
+ *       「需重新生成三视图/立绘」以让图像按新绿幕 prompt 出来。
+ */
+async function regenerateCharacterDesc(characterId: string): Promise<void> {
+  const current = bible.value;
+  const character = characters.value.find((candidate) => candidate.id === characterId);
+  if (!current || !outputDir.value || !character) return;
+  const visionCfg = activeConfig("vision") ?? activeConfig("llm");
+  if (!visionCfg?.apiKey) {
+    charErrors.value[characterId] = t("重新生成角色描述需要配置视觉或文本 API");
+    return;
+  }
+  busyKey.value = `char-desc:${characterId}`;
+  charErrors.value[characterId] = "";
+  try {
+    const { imagePrompt, threeViewPrompt } = await regenerateCharacterDescription(visionCfg, character);
+    await persistRegeneratedCharacterDescription(
+      outputDir.value,
+      current,
+      characterId,
+      character,
+      imagePrompt,
+      threeViewPrompt,
+    );
+    await refreshApprovalValidation();
+    await afterMutation();
+    pushLog({
+      step: "视觉圣经",
+      message: `角色「${character.name}」描述已重新生成（强制绿幕），需重新生成三视图`,
+      level: "success",
+      at: Date.now(),
+    });
+  } catch (e) {
+    charErrors.value[characterId] = visualBibleErrorMessage(e, {
+      visionModel: visionCfg.model,
+    });
+  } finally {
+    busyKey.value = "";
+  }
+}
+
 /** 全局重新生成：按顺序逐个重新生成所有角色三视图 */
 async function regenerateAllCharacters(): Promise<void> {
   const imageCfg = activeConfig("image");
@@ -690,6 +736,15 @@ function characterNeedsRegeneration(characterId: string): boolean {
                 <span v-if="characterNeedsRegeneration(row.id)" class="tag err">{{ t("需重新生成") }}</span>
               </div>
               <div class="vb-character-actions">
+                <button
+                  class="btn ghost small"
+                  :disabled="!!busyKey"
+                  :title="t('旧版 LLM 提取时把背景写死成其他颜色时使用，会强制改成纯绿幕')"
+                  @click="regenerateCharacterDesc(row.id)"
+                >
+                  <span v-if="busyKey === `char-desc:${row.id}`" class="spinner" />
+                  {{ t("重新生成描述") }}
+                </button>
                 <button class="btn small" :disabled="!!busyKey" @click="regenerateCharacter(row.id)">
                   <span v-if="busyKey === `char-sheet:${row.id}`" class="spinner" />
                   {{ t("重新生成三视图") }}

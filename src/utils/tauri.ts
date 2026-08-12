@@ -173,9 +173,13 @@ function wrap<A extends unknown[], R>(name: string, fn: (...args: A) => R): (...
             return v;
           },
           (e: unknown) => {
-            log.error("tauri", `调用 ${name} 失败`, {
+            const errText = e instanceof Error ? e.message : String(e);
+            // 预期内失败不刷 ERROR：文件不存在（首次生成前无 assets.json）、
+            // 网络瞬时失败（调用方有重试）都降级为 warn/debug，避免日志噪音掩盖真实错误。
+            const level = failureLogLevel(name, errText);
+            log[level]("tauri", `调用 ${name} 失败`, {
               args: truncate(args.length === 1 ? args[0] : args),
-              error: e instanceof Error ? e.message : String(e),
+              error: errText,
             });
             throw e;
           },
@@ -184,13 +188,26 @@ function wrap<A extends unknown[], R>(name: string, fn: (...args: A) => R): (...
       log.debug("tauri", `调用 ${name} → 成功`, truncate(r));
       return r;
     } catch (e) {
-      log.error("tauri", `调用 ${name} 失败`, {
+      const errText = e instanceof Error ? e.message : String(e);
+      const level = failureLogLevel(name, errText);
+      log[level]("tauri", `调用 ${name} 失败`, {
         args: truncate(args.length === 1 ? args[0] : args),
-        error: e instanceof Error ? e.message : String(e),
+        error: errText,
       });
       throw e;
     }
   };
+}
+
+/** 决定 tauri 调用失败的日志级别：文件不存在/网络瞬时失败为低级别，其余为 ERROR */
+function failureLogLevel(name: string, errText: string): "error" | "warn" | "debug" {
+  if (name === "readTextFile" && /ENOENT|os error 2|No such file|找不到指定的文件|不存在/i.test(errText)) {
+    return "debug";
+  }
+  if (name === "http" && /error sending request|请求失败|timed? out|ECONN|ETIMEDOUT|fetch failed|Could not connect/i.test(errText)) {
+    return "warn";
+  }
+  return "error";
 }
 
 export const tauri = {

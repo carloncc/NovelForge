@@ -42,7 +42,10 @@ fn distance(rgba: &RgbaImage, x: u32, y: u32, bg: [f32; 3], green: bool) -> f32 
     }
 }
 
-/// 采样图像边缘一圈的背景色（取各通道中位数，抗前景人物/噪点干扰）
+/// 采样图像边缘一圈的背景色（取各通道中位数，抗前景人物/噪点干扰）。
+/// 关键：先剔除"明显是前景"的暗像素（亮度 < 60），避免人物贴边的黑色头发/黑色衣服把背景色拉成黑，
+/// 解决"边缘有黑色前景时算法把黑色当背景一起抠掉"的回归。
+/// 候选样本不足时退回全量采样以保证最差情况仍能抠图。
 fn sample_bg_color(img: &RgbaImage) -> Option<[f32; 3]> {
     let (w, h) = img.dimensions();
     if w < 8 || h < 8 {
@@ -52,34 +55,55 @@ fn sample_bg_color(img: &RgbaImage) -> Option<[f32; 3]> {
     let mut rs = Vec::new();
     let mut gs = Vec::new();
     let mut bs = Vec::new();
-    let mut push = |x: u32, y: u32| {
+    let mut rs_bright = Vec::new();
+    let mut gs_bright = Vec::new();
+    let mut bs_bright = Vec::new();
+    let mut push = |x: u32, y: u32,
+                    rs: &mut Vec<u8>,
+                    gs: &mut Vec<u8>,
+                    bs: &mut Vec<u8>| {
         let p = img.get_pixel(x.min(w - 1), y.min(h - 1));
         if p[3] > 240 {
             rs.push(p[0]);
             gs.push(p[1]);
             bs.push(p[2]);
+            // 暗像素（max channel < 60）大概率是前景黑色，过滤掉避免把背景色拉成黑
+            if p[0].max(p[1]).max(p[2]) >= 60 {
+                rs_bright.push(p[0]);
+                gs_bright.push(p[1]);
+                bs_bright.push(p[2]);
+            }
         }
     };
     for x in 0..w {
         for y in 0..ring {
-            push(x, y);
-            push(x, h - 1 - y);
+            push(x, y, &mut rs, &mut gs, &mut bs);
+            push(x, h - 1 - y, &mut rs, &mut gs, &mut bs);
         }
     }
     for y in 0..h {
         for x in 0..ring {
-            push(x, y);
-            push(w - 1 - x, y);
+            push(x, y, &mut rs, &mut gs, &mut bs);
+            push(w - 1 - x, y, &mut rs, &mut gs, &mut bs);
         }
     }
-    if rs.len() < 8 {
+    if rs.is_empty() {
         return None;
     }
     let median = |mut v: Vec<u8>| -> u8 {
         v.sort_unstable();
         v[v.len() / 2]
     };
-    Some([median(rs) as f32, median(gs) as f32, median(bs) as f32])
+    // 优先用亮像素样本；若太少（说明这个图本身就是暗色背景），退回全量样本
+    if rs_bright.len() >= 8 {
+        Some([
+            median(rs_bright) as f32,
+            median(gs_bright) as f32,
+            median(bs_bright) as f32,
+        ])
+    } else {
+        Some([median(rs) as f32, median(gs) as f32, median(bs) as f32])
+    }
 }
 
 /// 3x3 中值滤波（仅 alpha），去除抠图后的孤立噪点与 1px 空洞

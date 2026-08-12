@@ -312,10 +312,12 @@ watch(
           </div>
 
           <div class="cfg-row">
-            <label class="field grow-2">
+            <label class="field">
               <span>Base URL</span>
               <input type="text" v-model="cfg.baseUrl" placeholder="https://api.deepseek.com" />
             </label>
+          </div>
+          <div class="cfg-row">
             <label class="field cfg-model-field">
               <span>Model<span v-if="modelFetching === cfg.id" class="cfg-model-loading"> {{ t("获取模型中…") }}</span></span>
               <div class="cfg-model-row">

@@ -1,5 +1,5 @@
 mod commands;
-mod cutout;
+pub mod cutout;
 mod matte;
 mod server;
 

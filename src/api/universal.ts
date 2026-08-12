@@ -331,7 +331,7 @@ async function decodeResult(
 
 function isRetryable(status: number, text: string): boolean {
   if (status >= 500 || status === 429) return true;
-  return /timeout|timed out|network|socket|connect|ECONN|ETIMEDOUT|fetch failed/i.test(text);
+  return /timeout|timed out|network|socket|connect|ECONN|ETIMEDOUT|fetch failed|error sending request|请求失败|dns|resolve|refused/i.test(text);
 }
 
 function referenceErrorFromResponse(raw: string): ReferenceImageError | undefined {
@@ -347,7 +347,7 @@ function referenceErrorFromResponse(raw: string): ReferenceImageError | undefine
   return new ReferenceImageError(message, code);
 }
 
-const RETRY_DELAYS = [800, 2500];
+const RETRY_DELAYS = [800, 2500, 6000];
 
 /** 构造 multipart/form-data 字符串（跨 Tauri/浏览器统一，无需真实 FormData） */
 export function buildMultipartBody(

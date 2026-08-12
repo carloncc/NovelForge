@@ -9,6 +9,7 @@ import type {
   ProjectVisualBible,
 } from "./types";
 import { buildImageTasks, runImageTask } from "./images";
+import { setImageConcurrency } from "../api/openaiCompatible";
 import { buildVoiceJobs, runVoiceJob } from "./voice";
 import { tauri } from "../utils/tauri";
 
@@ -139,6 +140,8 @@ export async function regenerateImages(
   let done = 0;
   const results: RegenImageResult[] = [];
   const concurrency = Math.max(1, ctx.concurrency ?? 30);
+  // 图片请求全局限流跟随并发设置（与生成管线一致），避免被默认 3 卡死
+  setImageConcurrency(concurrency);
   // 图生图参考链：threeview → 默认立绘(normal) → 表情(emotion) → 动作(action)。
   // refFromTask 依赖必须先完成，故按依赖分层批处理：同一层内并发，层间串行。
   const layerOf = (task: ImageTask): number => {
