@@ -259,6 +259,16 @@ cd src-tauri && cargo test
 
 Show off the visual novels you generate — that's the whole point of this tool.
 
+## Disclaimer
+
+This software is provided "as is" without warranty of any kind. By using NovelForge, you acknowledge and agree that:
+
+- **You are solely responsible** for all AI-generated content (images, voice-over, script) produced with this tool, and for how you use, publish, or distribute it. The authors have no control over model outputs and accept no liability for them.
+- **Only use content you have the right to use.** Feed in novels you own or are authorized to adapt. Generated output may be subject to the terms and conditions of the AI service providers whose APIs you configure.
+- **Third-party API costs and terms are your responsibility** — NovelForge calls the providers you configure with your own keys. Monitor your own usage and billing.
+- **Do not generate unlawful or infringing content** — including copyrighted characters, real people's likenesses, or hateful and harmful material. You are responsible for compliance with all applicable laws and platform policies.
+- **Keep required attributions**: works published with NovelForge must retain the WebGAL copyright notice (see [LICENSE](./LICENSE)).
+
 ## Credits & License
 
 - [WebGAL](https://github.com/OpenWebGAL/WebGAL) — visual novel engine (MPL-2.0); see [THIRD_PARTY_NOTICE](./THIRD_PARTY_NOTICE)
