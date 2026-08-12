@@ -14,16 +14,17 @@ import { testLlm, testVision, testTts, testImage, fetchModelsForChannel } from "
 import { templatesForCapability } from "../api/templates";
 import { errMsg } from "../utils/errors";
 import { log } from "../utils/logger";
+import { t } from "../i18n";
 import { knownImageModelCapabilities } from "../api/providers";
 import type { ApiConfig, ChannelKey, ImageModelCapabilities } from "../core/types";
 import type { DiscoveredModel } from "../api/providers";
 
-const channels: { key: ChannelKey; label: string; desc: string; icon: string }[] = [
-  { key: "llm", label: "文本 LLM", desc: "角色/场景/物品提取与剧本生成", icon: "M12 5v14M5 12h14" },
-  { key: "vision", label: "图片识别 API", desc: "参考图分析、角色识别与生成图自检", icon: "M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z M12 9a3 3 0 1 1 0 6 3 3 0 0 1 0-6Z" },
-  { key: "image", label: "图像 API", desc: "立绘 / 背景 / CG / 物品图生成", icon: "M4 17L9 12L13 16L17 12L20 15M4 5H20V19H4V5Z" },
-  { key: "tts", label: "TTS 配音", desc: "逐句配音（可选），音色可控", icon: "M12 6V18M8 9V15M16 9V15M5 11V13M19 11V13" },
-];
+const channels = computed<{ key: ChannelKey; label: string; desc: string; icon: string }[]>(() => [
+  { key: "llm", label: t("文本 LLM"), desc: t("角色/场景/物品提取与剧本生成"), icon: "M12 5v14M5 12h14" },
+  { key: "vision", label: t("图片识别 API"), desc: t("参考图分析、角色识别与生成图自检"), icon: "M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z M12 9a3 3 0 1 1 0 6 3 3 0 0 1 0-6Z" },
+  { key: "image", label: t("图像 API"), desc: t("立绘 / 背景 / CG / 物品图生成"), icon: "M4 17L9 12L13 16L17 12L20 15M4 5H20V19H4V5Z" },
+  { key: "tts", label: t("TTS 配音"), desc: t("逐句配音（可选），音色可控"), icon: "M12 6V18M8 9V15M16 9V15M5 11V13M19 11V13" },
+]);
 
 const testing = ref<{ key: ChannelKey; id: string } | null>(null);
 const testResult = ref<{ key: ChannelKey; id: string; ok: boolean; msg: string } | null>(null);
@@ -51,7 +52,7 @@ function toggleCustom(key: string): void {
 }
 
 function showTemplateError(): void {
-  globalThis.alert("模板 JSON 格式错误");
+  globalThis.alert(t("模板 JSON 格式错误"));
 }
 
 async function runTest(kind: ChannelKey, cfg: ApiConfig): Promise<void> {
@@ -67,11 +68,11 @@ async function runTest(kind: ChannelKey, cfg: ApiConfig): Promise<void> {
       testResult.value = { key: kind, id: cfg.id, ok: true, msg: `视觉识别正常：${description.slice(0, 60)}` };
     } else if (kind === "tts") {
       await testTts(cfg);
-      testResult.value = { key: kind, id: cfg.id, ok: true, msg: "正常，语音合成可用" };
+      testResult.value = { key: kind, id: cfg.id, ok: true, msg: t("正常，语音合成可用") };
     } else {
       const result = await testImage(cfg);
       const editMsg = result.editOk
-        ? "正常（已消耗 1 张额度）；已自动探测：支持参考图/图生图"
+        ? t("正常（已消耗 1 张额度）；已自动探测：支持参考图/图生图")
         : `正常（已消耗 1 张额度）；已自动探测：不支持参考图${result.detail ? `（${result.detail.slice(0, 80)}）` : ""}`;
       testResult.value = { key: kind, id: cfg.id, ok: true, msg: editMsg };
     }
@@ -216,20 +217,20 @@ watch(
 <template>
   <div class="inner">
     <div v-if="configPersistenceError" class="notice danger" style="margin-bottom: var(--space-4)">
-      {{ configPersistenceError }}。为保护原配置，问题解决前不会自动覆盖配置文件。
+      {{ configPersistenceError }}。{{ t("为保护原配置，问题解决前不会自动覆盖配置文件。") }}
     </div>
     <div class="page-head">
       <div>
-        <div class="page-title">API 配置</div>
-        <p class="page-sub">文本、图片识别、图片生成、语音四通道独立配置，可保存多套配置切换</p>
+        <div class="page-title">{{ t("API 配置") }}</div>
+        <p class="page-sub">{{ t("文本、图片识别、图片生成、语音四通道独立配置，可保存多套配置切换") }}</p>
       </div>
       <div class="page-actions">
-        <button class="btn secondary" @click="addPreset">＋ 新建配置组</button>
+        <button class="btn secondary" @click="addPreset">{{ t("＋ 新建配置组") }}</button>
       </div>
     </div>
 
     <div class="card preset-bar">
-      <span class="preset-bar-label">配置组</span>
+      <span class="preset-bar-label">{{ t("配置组") }}</span>
       <div class="preset-pills">
         <button
           v-for="p in configState.presets"
@@ -242,7 +243,7 @@ watch(
           {{ p.name }}
         </button>
       </div>
-      <button v-if="configState.presets.length > 1" class="btn danger small" style="margin-left: auto" @click="removePreset(configState.activePresetId)">删除该组</button>
+      <button v-if="configState.presets.length > 1" class="btn danger small" style="margin-left: auto" @click="removePreset(configState.activePresetId)">{{ t("删除该组") }}</button>
     </div>
 
     <div class="cfg-grid">
@@ -257,33 +258,33 @@ watch(
               <div class="cfg-channel-desc">{{ ch.desc }}</div>
             </div>
           </div>
-          <button class="btn secondary small" @click="addConfig(ch.key)">＋ 添加</button>
+          <button class="btn secondary small" @click="addConfig(ch.key)">{{ t("＋ 添加") }}</button>
         </div>
 
         <div v-for="cfg in activePreset().channels[ch.key]" :key="cfg.id" class="cfg-entry">
           <div class="cfg-entry-head">
-            <input type="text" v-model="cfg.name" class="cfg-entry-name" placeholder="配置名" />
+            <input type="text" v-model="cfg.name" class="cfg-entry-name" :placeholder="t('配置名')" />
             <button class="btn small cfg-active" :class="cfgActive(ch.key, cfg.id) ? 'is-active' : ''" @click="setActive(ch.key, cfg.id)">
               <svg v-if="cfgActive(ch.key, cfg.id)" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12" /></svg>
-              {{ cfgActive(ch.key, cfg.id) ? "使用中" : "设为当前" }}
+              {{ cfgActive(ch.key, cfg.id) ? t("使用中") : t("设为当前") }}
             </button>
-            <button class="btn ghost small cfg-del" @click="removeConfig(ch.key, cfg.id)">删除</button>
+            <button class="btn ghost small cfg-del" @click="removeConfig(ch.key, cfg.id)">{{ t("删除") }}</button>
           </div>
 
           <div v-if="ch.key === 'image' || ch.key === 'tts'" class="cfg-row">
             <label class="field" style="flex: 1; margin-bottom: 0">
-              <span>服务商模板（通用适配器，可选）</span>
+              <span>{{ t("服务商模板（通用适配器，可选）") }}</span>
               <select
                 :value="cfg.adapter ?? ''"
                 @change="(e: any) => onTemplateChange(ch.key, cfg, (e.target as HTMLSelectElement).value)"
               >
-                <option value="">（手动配置 / OpenAI 兼容）</option>
+                <option value="">{{ t("（手动配置 / OpenAI 兼容）") }}</option>
                 <option v-for="t in templatesByChannel[ch.key]" :key="t.id" :value="t.id">{{ t.name }}</option>
-                <option value="__custom__" disabled>── 自定义模板见下方高级选项 ──</option>
+                <option value="__custom__" disabled>{{ t("── 自定义模板见下方高级选项 ──") }}</option>
               </select>
             </label>
             <button class="btn ghost small" style="align-self: flex-end" @click="toggleCustom(ch.key + ':' + cfg.id)">
-              {{ customOpen[ch.key + ':' + cfg.id] ? "收起高级" : "高级" }}
+              {{ customOpen[ch.key + ':' + cfg.id] ? t("收起高级") : t("高级") }}
             </button>
           </div>
 
@@ -293,16 +294,16 @@ watch(
               <input type="text" v-model="cfg.baseUrl" placeholder="https://api.deepseek.com" />
             </label>
             <label class="field cfg-model-field">
-              <span>Model<span v-if="modelFetching === cfg.id" class="cfg-model-loading"> 获取模型中…</span></span>
+              <span>Model<span v-if="modelFetching === cfg.id" class="cfg-model-loading"> {{ t("获取模型中…") }}</span></span>
               <div class="cfg-model-row">
                 <select :value="modelValueFor(cfg)" @change="onModelSelect(ch.key, cfg, $event)">
-                  <option v-if="!cfg.model" value="" disabled>填写 Base URL 后自动加载模型…</option>
-                  <option v-if="cfg.model && !modelOptionsFor(ch.key, cfg).includes(cfg.model)" :value="cfg.model">{{ cfg.model }}（当前）</option>
+                  <option v-if="!cfg.model" value="" disabled>{{ t("填写 Base URL 后自动加载模型…") }}</option>
+                  <option v-if="cfg.model && !modelOptionsFor(ch.key, cfg).includes(cfg.model)" :value="cfg.model">{{ cfg.model }}{{ t("（当前）") }}</option>
                   <option v-for="m in modelOptionsFor(ch.key, cfg)" :key="m" :value="m">{{ m }}</option>
-                  <option value="__custom__">✏️ 自定义…</option>
+                  <option value="__custom__">{{ t("✏️ 自定义…") }}</option>
                 </select>
               </div>
-              <input v-if="customModelOpen[cfg.id]" type="text" v-model="cfg.model" placeholder="输入模型名，例如 deepseek-chat" />
+              <input v-if="customModelOpen[cfg.id]" type="text" v-model="cfg.model" :placeholder="t('输入模型名，例如 deepseek-chat')" />
               <span v-if="modelFetchError[cfg.id]" class="cfg-model-error">{{ modelFetchError[cfg.id] }}</span>
             </label>
           </div>
@@ -312,8 +313,8 @@ watch(
               <input type="password" v-model="cfg.apiKey" placeholder="sk-…" />
             </label>
             <label class="field">
-              <span>路径前缀（可选）</span>
-              <input type="text" v-model="cfg.extra!.pathPrefix" placeholder="留空自动 /v1" />
+              <span>{{ t("路径前缀（可选）") }}</span>
+              <input type="text" v-model="cfg.extra!.pathPrefix" :placeholder="t('留空自动 /v1')" />
             </label>
           </div>
 
@@ -321,7 +322,7 @@ watch(
             <button class="btn small cfg-test-btn" :class="testing?.key === ch.key && testing?.id === cfg.id ? 'is-loading' : 'ghost'" :disabled="!!testing" @click="runTest(ch.key, cfg)">
               <span v-if="testing?.key === ch.key && testing?.id === cfg.id" class="spinner" />
               <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4" /><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" /></svg>
-              {{ testing?.key === ch.key && testing?.id === cfg.id ? "测试中" : "测试连接" }}
+              {{ testing?.key === ch.key && testing?.id === cfg.id ? t("测试中") : t("测试连接") }}
             </button>
             <span
               v-if="testResult && testResult.key === ch.key && testResult.id === cfg.id"
@@ -333,9 +334,9 @@ watch(
           </div>
 
           <details v-if="ch.key === 'tts'" class="cfg-details">
-            <summary>音色列表</summary>
+            <summary>{{ t("音色列表") }}</summary>
             <label class="field" style="margin-top: 8px">
-              <span>可用音色（每行一个；AI 提取时从中挑选，失败自动回退第一个）</span>
+              <span>{{ t("可用音色（每行一个；AI 提取时从中挑选，失败自动回退第一个）") }}</span>
               <textarea
                 :value="(cfg.extra!.voiceLibrary as string[] | undefined)?.join('\n') ?? ''"
                 rows="4"
@@ -350,13 +351,13 @@ watch(
             </label>
           </details>
           <details v-if="ch.key === 'image'" class="cfg-details">
-            <summary>图片模型能力</summary>
+            <summary>{{ t("图片模型能力") }}</summary>
             <div v-if="knownImageModelCapabilities(cfg.model)" class="notice" style="margin-top: 8px">
-              已知模型能力：最多 {{ knownImageModelCapabilities(cfg.model)!.maxReferenceImages }} 张参考图，编码 {{ knownImageModelCapabilities(cfg.model)!.referenceEncoding }}
+              {{ t("已知模型能力：最多") }} {{ knownImageModelCapabilities(cfg.model)!.maxReferenceImages }} {{ t("张参考图，编码") }} {{ knownImageModelCapabilities(cfg.model)!.referenceEncoding }}
             </div>
             <div v-else class="cfg-row" style="margin-top: 8px">
               <label class="field">
-                <span>参考图数量（0–3）</span>
+                <span>{{ t("参考图数量（0–3）") }}</span>
                 <input
                   type="number"
                   min="0"
@@ -366,7 +367,7 @@ watch(
                 />
               </label>
               <label class="field">
-                <span>参考图编码</span>
+                <span>{{ t("参考图编码") }}</span>
                 <select
                   :value="editableImageCapabilities(cfg).referenceEncoding"
                   @change="(e: any) => setImageCapability(cfg, 'referenceEncoding', (e.target as HTMLSelectElement).value as ImageModelCapabilities['referenceEncoding'])"
@@ -377,17 +378,17 @@ watch(
               </label>
             </div>
             <div v-if="!knownImageModelCapabilities(cfg.model)" class="cfg-row">
-              <label class="check"><input type="checkbox" :checked="editableImageCapabilities(cfg).supportsImageEdit" @change="(e: any) => setImageCapability(cfg, 'supportsImageEdit', (e.target as HTMLInputElement).checked)" /> 图生图</label>
-              <label class="check"><input type="checkbox" :checked="editableImageCapabilities(cfg).supportsSeed" @change="(e: any) => setImageCapability(cfg, 'supportsSeed', (e.target as HTMLInputElement).checked)" /> 固定 seed</label>
+              <label class="check"><input type="checkbox" :checked="editableImageCapabilities(cfg).supportsImageEdit" @change="(e: any) => setImageCapability(cfg, 'supportsImageEdit', (e.target as HTMLInputElement).checked)" /> {{ t("图生图") }}</label>
+              <label class="check"><input type="checkbox" :checked="editableImageCapabilities(cfg).supportsSeed" @change="(e: any) => setImageCapability(cfg, 'supportsSeed', (e.target as HTMLInputElement).checked)" /> {{ t("固定 seed") }}</label>
             </div>
             <div v-if="!knownImageModelCapabilities(cfg.model) && imageCapabilityConflict(cfg)" class="notice danger">
-              参考图数量大于 0 时必须启用图生图。
+              {{ t("参考图数量大于 0 时必须启用图生图。") }}
             </div>
           </details>
           <details v-if="customOpen[ch.key + ':' + cfg.id]" class="cfg-details">
-            <summary>自定义适配器模板（JSON，优先级高于服务商模板）</summary>
+            <summary>{{ t("自定义适配器模板（JSON，优先级高于服务商模板）") }}</summary>
             <label class="field" style="margin-top: 8px">
-              <span>适配器模板（字段：id/name/capability/mode/endpoint/requestMap/response/poll/voices/rawResponse，见项目文档）</span>
+              <span>{{ t("适配器模板（字段：id/name/capability/mode/endpoint/requestMap/response/poll/voices/rawResponse，见项目文档）") }}</span>
               <textarea
                 :value="(cfg.extra!.customTemplate as string | undefined) ?? ''"
                 rows="10"
@@ -415,7 +416,7 @@ watch(
         </div>
 
         <div v-if="!activePreset().channels[ch.key].length" class="empty" style="padding: var(--space-4) 0">
-          <p>暂无 {{ ch.label }} 配置，点击右上角「＋ 添加」</p>
+          <p>{{ t("暂无") }} {{ ch.label }} {{ t("配置，点击右上角「＋ 添加」") }}</p>
         </div>
       </div>
     </div>

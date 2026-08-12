@@ -203,6 +203,19 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.sidebar .sidebar-footer .lang-select {
+  font-size: 11px;
+  color: var(--text-dim);
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px 4px;
+  cursor: pointer;
+  max-width: 110px;
 }
 
 .sidebar .sidebar-footer .version {

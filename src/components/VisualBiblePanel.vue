@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
+import { t } from "../i18n";
 import { open } from "@tauri-apps/plugin-dialog";
 import { projectState, pushLog, scheduleSave } from "../stores/project";
 import { activeConfig } from "../stores/config";
@@ -81,15 +82,15 @@ const canApprove = computed(() => {
 });
 
 const bibleStatusLabel = computed(() => {
-  if (!bible.value) return "未创建";
-  if (bible.value.status === "approved") return "已批准";
-  if (bible.value.status === "stale") return "已失效，需重新确认";
-  return "草稿";
+  if (!bible.value) return t("未创建");
+  if (bible.value.status === "approved") return t("已批准");
+  if (bible.value.status === "stale") return t("已失效，需重新确认");
+  return t("草稿");
 });
 
 const resumeHint = computed(() => {
   if (!bible.value || bible.value.status === "approved") return "";
-  return "批准后将续跑已勾选的图像及后续阶段";
+  return t("批准后将续跑已勾选的图像及后续阶段");
 });
 
 function openPreview(path: string, label: string): void {
@@ -128,7 +129,7 @@ async function pickStyleFile(): Promise<void> {
   }
   const picked = await open({
     multiple: false,
-    filters: [{ name: "参考图", extensions: ["png", "jpg", "jpeg", "webp"] }],
+    filters: [{ name: t("参考图"), extensions: ["png", "jpg", "jpeg", "webp"] }],
   });
   if (!picked || typeof picked !== "string") return;
   try {
@@ -160,7 +161,7 @@ async function pickCharacterFile(characterId: string): Promise<void> {
   }
   const picked = await open({
     multiple: false,
-    filters: [{ name: "角色参考图", extensions: ["png", "jpg", "jpeg", "webp"] }],
+    filters: [{ name: t("角色参考图"), extensions: ["png", "jpg", "jpeg", "webp"] }],
   });
   if (!picked || typeof picked !== "string") return;
   try {
@@ -234,24 +235,24 @@ async function createDraft(): Promise<void> {
   const cards = projectState.lastResult?.cards;
   const novel = projectState.novel;
   if (!cards || !novel || !outputDir.value) {
-    createError.value = "请先运行文本阶段，生成角色卡片";
+    createError.value = t("请先运行文本阶段，生成角色卡片");
     return;
   }
   const imageCfg = activeConfig("image");
   if (!imageCfg?.apiKey) {
-    createError.value = "尚未配置图像生成 API，无法生成视觉圣经参考图";
+    createError.value = t("尚未配置图像生成 API，无法生成视觉圣经参考图");
     return;
   }
   if (styleSource.value === "reference_image" && !pendingStyleImage.value) {
-    createError.value = "请先选择一张风格参考图";
+    createError.value = t("请先选择一张风格参考图");
     return;
   }
   if (styleSource.value === "novel_analysis" && !activeConfig("llm")?.apiKey) {
-    createError.value = "整本小说风格分析需要配置文本 LLM API";
+    createError.value = t("整本小说风格分析需要配置文本 LLM API");
     return;
   }
   if (styleSource.value === "reference_image" && !configIsUsable(activeConfig("vision"), "vision")) {
-    createError.value = "参考图模式需要配置可用的图片识别（vision）API";
+    createError.value = t("参考图模式需要配置可用的图片识别（vision）API");
     return;
   }
 
@@ -286,7 +287,7 @@ async function createDraft(): Promise<void> {
     pendingCharImages.value = {};
     await refreshApprovalValidation();
     await afterMutation();
-    pushLog({ step: "视觉圣经", message: "视觉圣经草稿已生成，请逐项确认后批准", level: "success", at: Date.now() });
+    pushLog({ step: "视觉圣经", message: t("视觉圣经草稿已生成，请逐项确认后批准"), level: "success", at: Date.now() });
   } catch (e) {
     createError.value = visualBibleErrorMessage(e, {
       imageModel: activeConfig("image")?.model,
@@ -302,7 +303,7 @@ async function saveStyleDescription(): Promise<void> {
   const description = styleDescriptionText.value.trim();
   if (!current || !outputDir.value) return;
   if (!description) {
-    styleError.value = "风格描述不能为空";
+    styleError.value = t("风格描述不能为空");
     return;
   }
   busyKey.value = "style-save";
@@ -312,7 +313,7 @@ async function saveStyleDescription(): Promise<void> {
     await refreshFingerprint();
     await refreshApprovalValidation();
     await afterMutation();
-    pushLog({ step: "视觉圣经", message: "风格描述已更新，角色需重新确认", level: "info", at: Date.now() });
+    pushLog({ step: "视觉圣经", message: t("风格描述已更新，角色需重新确认"), level: "info", at: Date.now() });
   } catch (e) {
     styleError.value = visualBibleErrorMessage(e, {
       imageModel: activeConfig("image")?.model,
@@ -328,7 +329,7 @@ async function rewriteStyle(): Promise<void> {
   const llmCfg = activeConfig("llm");
   if (!current || !outputDir.value) return;
   if (!llmCfg?.apiKey) {
-    styleError.value = "AI 重写风格需要配置文本 LLM API";
+    styleError.value = t("AI 重写风格需要配置文本 LLM API");
     return;
   }
   busyKey.value = "style-rewrite";
@@ -342,7 +343,7 @@ async function rewriteStyle(): Promise<void> {
     await refreshFingerprint();
     await refreshApprovalValidation();
     await afterMutation();
-    pushLog({ step: "视觉圣经", message: "风格描述已由 AI 重写", level: "success", at: Date.now() });
+    pushLog({ step: "视觉圣经", message: t("风格描述已由 AI 重写"), level: "success", at: Date.now() });
   } catch (e) {
     styleError.value = visualBibleErrorMessage(e, {
       imageModel: activeConfig("image")?.model,
@@ -358,11 +359,11 @@ async function regenerateSample(): Promise<void> {
   const imageCfg = activeConfig("image");
   if (!current || !outputDir.value) return;
   if (current.styleSource !== "novel_analysis") {
-    styleError.value = "上传参考图模式不能重新生成示例图，请替换参考图";
+    styleError.value = t("上传参考图模式不能重新生成示例图，请替换参考图");
     return;
   }
   if (!imageCfg?.apiKey) {
-    styleError.value = "重新生成风格示例需要配置图像生成 API";
+    styleError.value = t("重新生成风格示例需要配置图像生成 API");
     return;
   }
   busyKey.value = "style-sample";
@@ -371,7 +372,7 @@ async function regenerateSample(): Promise<void> {
     await regenerateStyleSample(outputDir.value, current, imageCfg);
     await refreshApprovalValidation();
     await afterMutation();
-    pushLog({ step: "视觉圣经", message: "风格示例图已重新生成，需重新确认角色", level: "success", at: Date.now() });
+    pushLog({ step: "视觉圣经", message: t("风格示例图已重新生成，需重新确认角色"), level: "success", at: Date.now() });
   } catch (e) {
     styleError.value = visualBibleErrorMessage(e, {
       imageModel: imageCfg.model,
@@ -387,7 +388,7 @@ async function replaceStyleFromUpload(): Promise<void> {
   const visionCfg = activeConfig("vision");
   if (!current || !outputDir.value || !pendingStyleImage.value) return;
   if (!configIsUsable(visionCfg, "vision")) {
-    styleError.value = "替换参考图需要配置可用的图片识别（vision）API";
+    styleError.value = t("替换参考图需要配置可用的图片识别（vision）API");
     return;
   }
   busyKey.value = "style-replace";
@@ -402,7 +403,7 @@ async function replaceStyleFromUpload(): Promise<void> {
     await refreshFingerprint();
     await refreshApprovalValidation();
     await afterMutation();
-    pushLog({ step: "视觉圣经", message: "全局风格参考图已替换，需重新确认", level: "success", at: Date.now() });
+    pushLog({ step: "视觉圣经", message: t("全局风格参考图已替换，需重新确认"), level: "success", at: Date.now() });
   } catch (e) {
     styleError.value = visualBibleErrorMessage(e, {
       imageModel: activeConfig("image")?.model,
@@ -448,7 +449,7 @@ async function regenerateCharacter(characterId: string): Promise<void> {
   const character = characters.value.find((candidate) => candidate.id === characterId);
   if (!current || !outputDir.value || !character) return;
   if (!imageCfg?.apiKey) {
-    charErrors.value[characterId] = "重新生成三视图需要配置图像生成 API";
+    charErrors.value[characterId] = t("重新生成三视图需要配置图像生成 API");
     return;
   }
   busyKey.value = `char-sheet:${characterId}`;
@@ -472,7 +473,7 @@ async function regenerateCharacter(characterId: string): Promise<void> {
 async function regenerateAllCharacters(): Promise<void> {
   const imageCfg = activeConfig("image");
   if (!imageCfg?.apiKey) {
-    approvalError.value = "全局重新生成需要配置图像生成 API";
+    approvalError.value = t("全局重新生成需要配置图像生成 API");
     return;
   }
   busyKey.value = "regenerate-all";
@@ -532,7 +533,7 @@ async function approve(): Promise<void> {
     });
     await refreshApprovalValidation();
     await afterMutation();
-    pushLog({ step: "视觉圣经", message: "视觉圣经已批准，开始续跑剩余阶段", level: "success", at: Date.now() });
+    pushLog({ step: "视觉圣经", message: t("视觉圣经已批准，开始续跑剩余阶段"), level: "success", at: Date.now() });
     emit("approve");
   } catch (e) {
     approvalError.value = visualBibleErrorMessage(e, {
@@ -566,42 +567,42 @@ function characterNeedsRegeneration(characterId: string): boolean {
     <div class="card">
       <div class="card-head">
         <div>
-          <h3>视觉圣经确认</h3>
-          <p class="vb-sub">图像生成前的统一风格与角色三视图门禁。</p>
+          <h3>{{ t("视觉圣经确认") }}</h3>
+          <p class="vb-sub">{{ t("图像生成前的统一风格与角色三视图门禁。") }}</p>
         </div>
         <div class="row" style="justify-content: flex-end">
           <span class="tag" :class="bible?.status === 'approved' ? 'ok' : bible?.status === 'stale' ? 'err' : 'warn'">{{ bibleStatusLabel }}</span>
-          <span v-if="bibleNeedsReview" class="tag warn">待确认</span>
+          <span v-if="bibleNeedsReview" class="tag warn">{{ t("待确认") }}</span>
         </div>
       </div>
 
       <div v-if="!hasCards" class="vb-empty">
-        <p>还没有角色卡片。请先运行文本阶段，生成角色/场景/物品卡。</p>
-        <button class="btn" :disabled="creating" @click="emit('prepare')">运行文本阶段</button>
+        <p>{{ t("还没有角色卡片。请先运行文本阶段，生成角色/场景/物品卡。") }}</p>
+        <button class="btn" :disabled="creating" @click="emit('prepare')">{{ t("运行文本阶段") }}</button>
       </div>
 
       <template v-else-if="!bible">
         <div class="vb-section">
-          <div class="vb-section-title">选择风格来源</div>
+          <div class="vb-section-title">{{ t("选择风格来源") }}</div>
           <div class="vb-source-grid">
             <label class="vb-source-option" :class="{ active: styleSource === 'reference_image' }">
               <input type="radio" v-model="styleSource" value="reference_image" />
-              <span class="vb-source-name">上传参考图</span>
-              <span class="vb-source-desc">由图片识别分析，并直接作为全局风格参考</span>
+              <span class="vb-source-name">{{ t("上传参考图") }}</span>
+              <span class="vb-source-desc">{{ t("由图片识别分析，并直接作为全局风格参考") }}</span>
             </label>
             <label class="vb-source-option" :class="{ active: styleSource === 'novel_analysis' }">
               <input type="radio" v-model="styleSource" value="novel_analysis" />
-              <span class="vb-source-name">整本小说分析</span>
-              <span class="vb-source-desc">文本 LLM 分析全书，再生成无角色风格示例图</span>
+              <span class="vb-source-name">{{ t("整本小说分析") }}</span>
+              <span class="vb-source-desc">{{ t("文本 LLM 分析全书，再生成无角色风格示例图") }}</span>
             </label>
           </div>
 
           <div v-if="styleSource === 'reference_image'" class="vb-upload-row">
             <button class="btn secondary small" :disabled="creating" @click="pickStyleFile">
-              {{ pendingStyleImage ? "更换参考图" : "选择风格参考图" }}
+              {{ pendingStyleImage ? t("更换参考图") : t("选择风格参考图") }}
             </button>
-            <span v-if="pendingStyleImage" class="tag ok">已选择</span>
-            <img v-if="pendingStyleImage" :src="pendingStyleImage.dataUrl" alt="风格参考图" class="vb-preview-img" />
+            <span v-if="pendingStyleImage" class="tag ok">{{ t("已选择") }}</span>
+            <img v-if="pendingStyleImage" :src="pendingStyleImage.dataUrl" :alt="t('风格参考图')" class="vb-preview-img" />
             <input ref="styleFileInput" type="file" accept="image/png,image/jpeg,image/webp" style="display: none" @change="onStyleFileChange" />
           </div>
 
@@ -609,7 +610,7 @@ function characterNeedsRegeneration(characterId: string): boolean {
           <div class="vb-actions">
             <button class="btn" :disabled="!canCreateDraft" @click="createDraft">
               <span v-if="creating" class="spinner" />
-              {{ creating ? "生成草稿中…" : "创建视觉圣经草稿" }}
+              {{ creating ? t("生成草稿中…") : t("创建视觉圣经草稿") }}
             </button>
           </div>
         </div>
@@ -618,40 +619,40 @@ function characterNeedsRegeneration(characterId: string): boolean {
       <template v-else>
         <div class="vb-section">
           <div class="vb-section-title">
-            全局风格
-            <span class="tag">{{ bible.styleSource === "reference_image" ? "上传参考图" : "整本小说分析" }}</span>
+            {{ t("全局风格") }}
+            <span class="tag">{{ bible.styleSource === "reference_image" ? t("上传参考图") : t("整本小说分析") }}</span>
           </div>
           <div class="vb-style-grid">
               <div class="vb-preview-block">
-                <div class="vb-preview-label">风格参考 / 示例</div>
-                <div class="vb-thumb" :class="{ missing: !stylePreviewSrc }" @click="stylePreviewSrc && openPreview(stylePreviewSrc, '风格参考')">
-                  <img v-if="pendingStyleImage" :src="pendingStyleImage.dataUrl" alt="待替换参考" />
-                  <LazyThumb v-else-if="stylePreviewSrc" :path="stylePreviewSrc" alt="风格参考" />
-                  <span v-else>未生成</span>
-                  <span class="thumb-label">点击放大</span>
+                <div class="vb-preview-label">{{ t("风格参考 / 示例") }}</div>
+                <div class="vb-thumb" :class="{ missing: !stylePreviewSrc }" @click="stylePreviewSrc && openPreview(stylePreviewSrc, t('风格参考'))">
+                  <img v-if="pendingStyleImage" :src="pendingStyleImage.dataUrl" :alt="t('待替换参考')" />
+                  <LazyThumb v-else-if="stylePreviewSrc" :path="stylePreviewSrc" :alt="t('风格参考')" />
+                  <span v-else>{{ t("未生成") }}</span>
+                  <span class="thumb-label">{{ t("点击放大") }}</span>
                 </div>
               </div>
             <div class="vb-style-form">
               <label class="field">
-                <span>风格描述（可编辑）</span>
-                <textarea v-model="styleDescriptionText" rows="4" placeholder="英文风格 prompt 后缀" />
+                <span>{{ t("风格描述（可编辑）") }}</span>
+                <textarea v-model="styleDescriptionText" rows="4" :placeholder="t('英文风格 prompt 后缀')" />
               </label>
               <div class="row">
-                <button class="btn small" :disabled="!!busyKey" @click="saveStyleDescription">保存风格</button>
-                <button class="btn secondary small" :disabled="!!busyKey" @click="rewriteStyle">AI 重写</button>
+                <button class="btn small" :disabled="!!busyKey" @click="saveStyleDescription">{{ t("保存风格") }}</button>
+                <button class="btn secondary small" :disabled="!!busyKey" @click="rewriteStyle">{{ t("AI 重写") }}</button>
                 <button
                   v-if="bible.styleSource === 'novel_analysis'"
                   class="btn secondary small"
                   :disabled="!!busyKey"
                   @click="regenerateSample"
-                >重新生成示例</button>
+                >{{ t("重新生成示例") }}</button>
               </div>
               <div class="vb-upload-row">
                 <button class="btn ghost small" :disabled="!!busyKey" @click="pickStyleFile">
-                  {{ pendingStyleImage ? "更换已选图片" : "上传参考图（替换全局风格）" }}
+                  {{ pendingStyleImage ? t("更换已选图片") : t("上传参考图（替换全局风格）") }}
                 </button>
                 <button v-if="pendingStyleImage" class="btn small" :disabled="!!busyKey" @click="replaceStyleFromUpload">
-                  应用替换
+                  {{ t("应用替换") }}
                 </button>
               </div>
               <input
@@ -668,12 +669,12 @@ function characterNeedsRegeneration(characterId: string): boolean {
 
         <div class="vb-section">
           <div class="vb-section-title">
-            角色三视图
-            <span class="vb-section-hint">{{ characters.length }} 个主角色</span>
+            {{ t("角色三视图") }}
+            <span class="vb-section-hint">{{ characters.length }} {{ t("个主角色") }}</span>
             <span class="vb-section-actions">
               <button class="btn small" :disabled="!!busyKey" @click="regenerateAllCharacters">
                 <span v-if="busyKey === 'regenerate-all'" class="spinner" />
-                全局重新生成
+                {{ t("全局重新生成") }}
               </button>
             </span>
           </div>
@@ -682,52 +683,52 @@ function characterNeedsRegeneration(characterId: string): boolean {
               <div>
                 <span class="asset-name">{{ row.name }}</span>
                 <span class="tag" :class="bible.characters[row.id]?.approved ? 'ok' : 'warn'">
-                  {{ bible.characters[row.id]?.approved ? "已确认" : "待确认" }}
+                  {{ bible.characters[row.id]?.approved ? t("已确认") : t("待确认") }}
                 </span>
-                <span v-if="bible.characters[row.id]?.sourceReferencePath" class="tag ok">有参考图</span>
-                <span v-if="characterNeedsRegeneration(row.id)" class="tag err">需重新生成</span>
+                <span v-if="bible.characters[row.id]?.sourceReferencePath" class="tag ok">{{ t("有参考图") }}</span>
+                <span v-if="characterNeedsRegeneration(row.id)" class="tag err">{{ t("需重新生成") }}</span>
               </div>
               <div class="vb-character-actions">
                 <button class="btn small" :disabled="!!busyKey" @click="regenerateCharacter(row.id)">
                   <span v-if="busyKey === `char-sheet:${row.id}`" class="spinner" />
-                  重新生成三视图
+                  {{ t("重新生成三视图") }}
                 </button>
                 <button
                   class="btn secondary small"
                   :disabled="!!busyKey || characterNeedsRegeneration(row.id)"
                   @click="acceptCharacter(row.id)"
-                >确认此角色</button>
+                >{{ t("确认此角色") }}</button>
               </div>
             </div>
             <div class="vb-character-body">
               <div class="vb-preview-block">
-                <div class="vb-preview-label">上传参考</div>
+                <div class="vb-preview-label">{{ t("上传参考") }}</div>
                 <div class="vb-thumb" :class="{ missing: !characterSourcePath(row.id) && !pendingCharImages[row.id] }">
-                  <img v-if="pendingCharImages[row.id]" :src="pendingCharImages[row.id].dataUrl" alt="待替换参考" />
-                  <LazyThumb v-else-if="characterSourcePath(row.id)" :path="characterSourcePath(row.id)" alt="角色参考" />
-                  <span v-else>未上传</span>
+                  <img v-if="pendingCharImages[row.id]" :src="pendingCharImages[row.id].dataUrl" :alt="t('待替换参考')" />
+                  <LazyThumb v-else-if="characterSourcePath(row.id)" :path="characterSourcePath(row.id)" :alt="t('角色参考')" />
+                  <span v-else>{{ t("未上传") }}</span>
                 </div>
                 <button class="btn ghost small" :disabled="!!busyKey" @click="pickCharacterFile(row.id)">
-                  {{ pendingCharImages[row.id] ? "更换已选" : "上传 / 替换" }}
+                  {{ pendingCharImages[row.id] ? t("更换已选") : t("上传 / 替换") }}
                 </button>
                 <button
                   v-if="pendingCharImages[row.id]"
                   class="btn small"
                   :disabled="!!busyKey"
                   @click="replaceCharacterFromUpload(row.id)"
-                >应用参考图</button>
+                >{{ t("应用参考图") }}</button>
               </div>
               <div class="vb-preview-block">
-                <div class="vb-preview-label">三视图</div>
+                <div class="vb-preview-label">{{ t("三视图") }}</div>
                 <div class="vb-thumb" :class="{ missing: !characterSheetPath(row.id) }" @click="characterSheetPath(row.id) && openPreview(characterSheetPath(row.id), `${row.name} · 三视图`)">
-                  <LazyThumb v-if="characterSheetPath(row.id)" :path="characterSheetPath(row.id)" alt="三视图" />
-                  <span v-else>未生成</span>
-                  <span class="thumb-label">点击放大</span>
+                  <LazyThumb v-if="characterSheetPath(row.id)" :path="characterSheetPath(row.id)" :alt="t('三视图')" />
+                  <span v-else>{{ t("未生成") }}</span>
+                  <span class="thumb-label">{{ t("点击放大") }}</span>
                 </div>
               </div>
               <div class="vb-character-prompt">
-                <span class="vb-preview-label">三视图提示词</span>
-                <code>{{ bible.characters[row.id]?.prompt || "暂无" }}</code>
+                <span class="vb-preview-label">{{ t("三视图提示词") }}</span>
+                <code>{{ bible.characters[row.id]?.prompt || t("暂无") }}</code>
               </div>
             </div>
             <p v-if="charErrors[row.id]" class="vb-error">{{ charErrors[row.id] }}</p>
@@ -744,7 +745,7 @@ function characterNeedsRegeneration(characterId: string): boolean {
           </div>
           <button class="btn" :disabled="!canApprove" @click="approve">
             <span v-if="busyKey === 'approve'" class="spinner" />
-            {{ busyKey === "approve" ? "正在批准…" : "批准并续跑生成" }}
+            {{ busyKey === "approve" ? t("正在批准…") : t("批准并续跑生成") }}
           </button>
         </div>
       </template>

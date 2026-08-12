@@ -135,6 +135,7 @@ Artifacts land in `src-tauri/target/release/bundle/` (Windows exe / macOS dmg / 
 | 🎬 **Video slots** | AI marks cinematic moments and writes video prompts; drop in videos (e.g. from Jimeng/Kling) with the prescribed filename to enable them (zero API cost) |
 | 🎙️ **Voice-over with selectable voices** | Sentence-level TTS, configurable voice library, AI picks a fitting voice per character, graceful degradation on failure |
 | 🎵 **BGM** | Music files auto-matched to atmosphere keywords; cross-fade stop on scene/chapter change, BGM gallery unlock |
+| 🌐 **UI in 5 languages** | Interface language auto-detects your system (zh-CN / zh-TW / en / ja / ko), switchable anytime — novels and exported games translate separately. |
 | 🔌 **Fully configurable APIs** | Four independent channels (LLM / vision / image / TTS), each with its own base_url + api_key + model (OpenAI-compatible protocol), multiple presets with test buttons; image channel exposes capabilities (reference-image count, img2img, seed) with automatic model capability detection |
 | 🗂️ **Material-first** | Import character/item/background images with manual mapping; the pipeline prefers your assets and only generates what is missing |
 | ♻️ **Cost control** | Full disk caching, resume from breakpoints, chapter-level reruns, abort button, token/cost stats, pre-generation budget limits (auto-abort), failed-task list with targeted retry, on-disk logs |

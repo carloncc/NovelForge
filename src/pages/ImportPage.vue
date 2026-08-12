@@ -11,6 +11,7 @@ import type { MaterialAsset, NovelDoc } from "../core/types";
 import { splitChapters } from "../core/chapters";
 import { errMsg } from "../utils/errors";
 import { log } from "../utils/logger";
+import { t } from "../i18n";
 
 const error = ref("");
 const importing = ref(false);
@@ -132,7 +133,7 @@ function fileToBase64(file: File): Promise<string> {
       const result = String(reader.result ?? "");
       resolve(result.includes(",") ? result.split(",")[1] : result);
     };
-    reader.onerror = () => reject(new Error("文件读取失败"));
+    reader.onerror = () => reject(new Error(t("文件读取失败")));
     reader.readAsDataURL(file);
   });
 }
@@ -182,14 +183,14 @@ function loadRecentTitles(dir: string): string {
   <div class="inner">
     <div class="page-head">
       <div>
-        <div class="page-title">导入小说</div>
-        <p class="page-sub">选择 txt 小说文件（可多选，自动合并；导入时不分章，生成时由 AI 分章）；可导入自定义素材（AI 优先使用）</p>
+        <div class="page-title">{{ t("导入小说") }}</div>
+        <p class="page-sub">{{ t("选择 txt 小说文件（可多选，自动合并；导入时不分章，生成时由 AI 分章）；可导入自定义素材（AI 优先使用）") }}</p>
       </div>
       <div class="page-actions">
-        <button class="btn secondary" @click="loadDemo">加载示例</button>
+        <button class="btn secondary" @click="loadDemo">{{ t("加载示例") }}</button>
         <button class="btn" :disabled="importing" @click="pickNovel">
           <span v-if="importing" class="spinner" />
-          {{ importing ? "读取中…" : "选择小说 txt（可多选）" }}
+          {{ importing ? t("读取中…") : t("选择小说 txt（可多选）") }}
         </button>
         <input v-if="!isTauri()" ref="novelInput" type="file" accept=".txt,text/plain" multiple style="display: none" @change="onNovelFile" />
       </div>
@@ -197,31 +198,31 @@ function loadRecentTitles(dir: string): string {
 
     <div class="card">
       <div class="card-head">
-        <h3>小说文件</h3>
+        <h3>{{ t("小说文件") }}</h3>
         <div class="card-actions">
-          <button v-if="projectState.novel" class="btn secondary small" @click="pickNovel">重新导入</button>
+          <button v-if="projectState.novel" class="btn secondary small" @click="pickNovel">{{ t("重新导入") }}</button>
         </div>
       </div>
       <p v-if="error" style="color: var(--err); margin-top: 10px">{{ error }}</p>
       <p v-if="projectState.novel" style="color: var(--text-dim)">
-        {{ projectState.novel.fileName }} · 编码 {{ projectState.novel.encoding }} · 共
-        {{ projectState.novel.fullText.length.toLocaleString() }} 字
+        {{ projectState.novel.fileName }} · {{ t("编码") }} {{ projectState.novel.encoding }} · {{ t("共") }}
+        {{ projectState.novel.fullText.length.toLocaleString() }} {{ t("字") }}
       </p>
-      <p v-else style="color: var(--text-faint)">尚未导入小说</p>
+      <p v-else style="color: var(--text-faint)">{{ t("尚未导入小说") }}</p>
     </div>
 
     <div class="card" v-if="projectState.novel">
       <div class="card-head">
-        <h3>章节（导入时不切章；生成时由 AI 分章，可在生成页查看/勾选重跑）</h3>
+        <h3>{{ t("章节（导入时不切章；生成时由 AI 分章，可在生成页查看/勾选重跑）") }}</h3>
       </div>
       <div class="tbl-wrap">
         <table class="tbl">
           <thead>
             <tr>
-              <th style="width: 50px">启用</th>
-              <th>标题</th>
-              <th style="width: 90px">字数</th>
-              <th style="width: 90px">段落数</th>
+              <th style="width: 50px">{{ t("启用") }}</th>
+              <th>{{ t("标题") }}</th>
+              <th style="width: 90px">{{ t("字数") }}</th>
+              <th style="width: 90px">{{ t("段落数") }}</th>
             </tr>
           </thead>
           <tbody>
@@ -247,15 +248,15 @@ function loadRecentTitles(dir: string): string {
 
     <div class="card">
       <div class="card-head">
-        <h3>自定义素材库（可选）</h3>
+        <h3>{{ t("自定义素材库（可选）") }}</h3>
         <div class="card-actions">
-          <button class="btn secondary small" @click="pickMaterials">＋ 导入图片素材</button>
+          <button class="btn secondary small" @click="pickMaterials">{{ t("＋ 导入图片素材") }}</button>
           <input v-if="!isTauri()" ref="materialInput" type="file" accept="image/*" multiple style="display: none" @change="onMaterialFiles" />
         </div>
       </div>
       <p style="color: var(--text-dim); font-size: 12.5px; margin-bottom: var(--space-4)">
-        人物参考图 / 物品图 / 背景图。文件名含「人/角色/char」归人物、「物/item/剑」归物品、其余归背景。
-        管线优先使用你的素材，缺失才由 AI 生成；可在下方手动改类型与映射。
+        {{ t("人物参考图 / 物品图 / 背景图。文件名含「人/角色/char」归人物、「物/item/剑」归物品、其余归背景。") }}
+        {{ t("管线优先使用你的素材，缺失才由 AI 生成；可在下方手动改类型与映射。") }}
       </p>
       <div v-if="projectState.materials.length" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: var(--space-3)">
         <div
@@ -265,19 +266,19 @@ function loadRecentTitles(dir: string): string {
         >
           <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px">
             <span style="font-size: 12.5px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap">{{ m.name }}</span>
-            <button class="btn danger small" @click="removeMaterial(m.path)">移除</button>
+            <button class="btn danger small" @click="removeMaterial(m.path)">{{ t("移除") }}</button>
           </div>
           <div style="display: flex; gap: 8px; margin-top: 8px">
             <select :value="m.kind" @change="(e: any) => (m.kind = (e.target as HTMLSelectElement).value as any)" style="padding: 4px 8px; font-size: 12px; flex: 1">
-              <option value="character">人物</option>
-              <option value="item">物品</option>
-              <option value="background">背景</option>
+              <option value="character">{{ t("人物") }}</option>
+              <option value="item">{{ t("物品") }}</option>
+              <option value="background">{{ t("背景") }}</option>
             </select>
             <input
               type="text"
               :value="m.extra?.mapTo ?? ''"
               style="padding: 4px 8px; font-size: 12px; flex: 1.4"
-              placeholder="映射到（角色/物品 id）"
+              :placeholder="t('映射到（角色/物品 id）')"
               @change="
                 (e: any) => {
                   if (!m.extra) m.extra = {};
@@ -288,15 +289,15 @@ function loadRecentTitles(dir: string): string {
           </div>
         </div>
       </div>
-      <p v-else style="color: var(--text-faint); font-size: 12.5px">暂无素材</p>
+      <p v-else style="color: var(--text-faint); font-size: 12.5px">{{ t("暂无素材") }}</p>
       <p v-if="projectState.lastResult" style="color: var(--text-dim); font-size: 12px; margin-top: var(--space-3)">
-        可映射 id：角色 {{ projectState.lastResult.cards.characters.map((c) => c.id).join("、") }} · 物品 {{ projectState.lastResult.cards.items.map((c) => c.id).join("、") }}
+        {{ t("可映射 id：角色") }} {{ projectState.lastResult.cards.characters.map((c) => c.id).join("、") }} · {{ t("物品") }} {{ projectState.lastResult.cards.items.map((c) => c.id).join("、") }}
       </p>
     </div>
 
     <div class="card" v-if="configState.recentOutputDirs?.length">
       <div class="card-head">
-        <h3>最近项目</h3>
+        <h3>{{ t("最近项目") }}</h3>
       </div>
       <div style="display: flex; flex-direction: column; gap: 6px">
         <div
@@ -310,8 +311,8 @@ function loadRecentTitles(dir: string): string {
             <span style="font-weight: 600; color: var(--primary)">{{ loadRecentTitles(dir) }}</span>
             <span style="color: var(--text-faint); margin-left: 8px">{{ dir }}</span>
           </span>
-          <button class="btn secondary small" @click="openRecent(dir)">打开</button>
-          <button class="btn ghost small" @click="removeRecentOutputDir(dir)">移除</button>
+          <button class="btn secondary small" @click="openRecent(dir)">{{ t("打开") }}</button>
+          <button class="btn ghost small" @click="removeRecentOutputDir(dir)">{{ t("移除") }}</button>
         </div>
       </div>
     </div>
