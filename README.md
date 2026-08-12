@@ -4,9 +4,9 @@
 
 # NovelForge
 
-**AI-powered Novel → Visual Novel Converter**
+**One click from novel to visual novel.**
 
-Import a novel (txt), and NovelForge automatically converts it into a playable visual novel — exportable as PC (exe), Android (APK), or web (zip).
+Text walls are hard to read. One click turns your novel into a playable visual novel — sprites, expressions, CGs, voice-over, BGM and branching choices, all generated automatically. Preview it, package it (exe / APK / web), and share it.
 
 Tauri 2 + Vue 3 + WebGAL · Lightweight & fast · Bring-your-own API
 
@@ -16,12 +16,29 @@ Tauri 2 + Vue 3 + WebGAL · Lightweight & fast · Bring-your-own API
 
 ---
 
+## Why NovelForge?
+
+| | Why |
+|---|---|
+| 🪄 **One click, zero manual work** | Hand-crafting a visual novel means painting every sprite, staging every scene and recording every line — passion-fueled labor. NovelForge is the lazy way: import the novel, press generate, and get a finished, playable game you can distribute. |
+| 🎬 **Watch the story, don't read it** | You came for the story, not the text blocks. Characters with expressions, scene CGs, voice-over and BGM deliver the immersion plain text can't — no need to build the visuals step by step. |
+| 🔥 **For the novels nobody else adapts** | Popular works get adaptations and translations. Niche novels don't even get translated — that's exactly where NovelForge shines: your niche story becomes a shareable visual novel in one click, with built-in multi-language translation (zh / en / ja / ko). |
+
+## One Click, Done
+
+```
+novel.txt ─▶ one click ─▶ sprites · expressions · CGs · backgrounds ─▶ voice-over · BGM ─▶ playable visual novel
+    AI pipeline: split → translate → extract → script → images → voice → assemble          └─▶ preview / exe / APK / web zip
+```
+
+> Bring your own API key (no key? demo mode runs the full pipeline with a built-in sample novel). When images are enabled, one style confirmation step (Visual Bible) is required before batch generation.
+
 ## Features
 
 | | Description |
 |---|---|
-| 📖 **Fully automated pipeline** | ① Split chapters (AI) → ② Translate (optional, multi-language) → ③ Extract character / scene / item cards → ④ Write the script (auto CG staging, item close-ups, debut intro cards, video slots) → ⑤ Generate character / background / CG / item images → ⑥ TTS voice-over → ⑦ Assemble a standard WebGAL project |
-| 🎨 **Background-free sprites** | AI segmentation (isnet-anime; model auto-downloaded and cached on first use) with an improved chroma-key fallback (connected flood-fill + green-fringe removal + edge feathering) when offline or on failure |
+| 📖 **All-in-one pipeline** | Chapter split → multi-language translation → card extraction → script (auto CG staging, item close-ups, debut intro cards, video slots) → images → TTS → standard WebGAL assembly |
+| 🎨 **Background-free sprites** | Auto cutout (AI segmentation, model auto-downloaded and cached; offline-safe chroma-key fallback with connected flood-fill + edge feathering) |
 | 🎨 **Style consistency** | Project-wide style anchor image + fixed seed + shared negative prompt + chain image-to-image (three-view → sprite → expressions/actions), with multimodal self-checks that verify character consistency against reference images |
 | 📖 **Visual Bible gate** | Before batch image generation, a "Visual Bible" must be approved: pick a style source (uploaded reference analyzed by the vision model, or a style sample generated from a full-novel analysis) plus three-view sheets (front/side/back) for every protagonist. Re-generating one character's three-view does not affect others. Any change invalidates approval |
 | 😊 **Expression variants** | 5 expressions per character (normal sprite used as reference for consistency); dialogue auto-switches by emotion |
