@@ -13,14 +13,39 @@
   <a href="https://github.com/carloncc/NovelForge/releases"><img alt="Release" src="https://img.shields.io/github/v/release/carloncc/NovelForge"></a>
   <a href="https://github.com/carloncc/NovelForge/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/carloncc/NovelForge"></a>
   <a href="https://github.com/carloncc/NovelForge/issues"><img alt="Issues" src="https://img.shields.io/github/issues/carloncc/NovelForge"></a>
+  <a href="https://www.forgepeaknow.com/"><img alt="Website" src="https://img.shields.io/badge/Website-forgepeaknow.com-64748b"></a>
 </p>
 Tauri 2 + Vue 3 + WebGAL · 가볍고 빠름 · API 완전 커스터마이즈
 
-[English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · **한국어**
+[English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · **한국어** · [공식 사이트](https://www.forgepeaknow.com/) · [변경 로그](https://github.com/carloncc/NovelForge/releases)
 
 </div>
 
 ---
+
+<details>
+<summary><kbd>📑 목차</kbd></summary>
+
+- [왜 NovelForge인가?](#왜-novelforge인가)
+- [원클릭, 완료](#원클릭-완료)
+- [빠른 시작](#빠른-시작)
+- [NovelForge를 쓰면 안 되는 경우](#novelforge를-쓰면-안-되는-경우)
+- [기능](#기능)
+- [스크린샷](#스크린샷)
+- [API 설정 예시](#api-설정-예시)
+- [비주얼 바이블(이미지 생성 게이트)](#비주얼-바이블이미지-생성-게이트)
+- [웹 모드(브라우저에서 직접 실행, 빌드 불필요)](#웹-모드브라우저에서-직접-실행-빌드-불필요)
+- [유니버설 어댑터(이미지 / TTS)](#유니버설-어댑터이미지--tts)
+- [출력 구조(표준 WebGAL 프로젝트)](#출력-구조표준-webgal-프로젝트)
+- [개발 및 테스트](#개발-및-테스트)
+- [아키텍처](#아키텍처)
+- [커뮤니티](#커뮤니티)
+- [기여](#기여)
+- [면책 조항](#면책-조항)
+- [크레딧 및 라이선스](#크레딧-및-라이선스)
+- [Roadmap](#roadmap)
+
+</details>
 
 ## 왜 NovelForge인가?
 
@@ -47,6 +72,7 @@ Tauri 2 + Vue 3 + WebGAL · 가볍고 빠름 · API 완전 커스터마이즈
 |---|---|
 | Windows / macOS / Linux | [최신 릴리스](https://github.com/carloncc/NovelForge/releases)(Rust/Node 설치 불필요) |
 | 모든 플랫폼(브라우저) | Web 데모——설치 없이 브라우저에서 바로 실행(아래 참조) |
+| 공식 사이트 | [https://www.forgepeaknow.com/](https://www.forgepeaknow.com/) —— 웹 데모 및 최신 소식 |
 
 > API 키 없이도 체험 가능: 자동으로 데모 모드(샘플 소설 내장)로 진입해 전체 과정이 동작합니다——설정 전에 먼저 시도해 보세요.
 
@@ -251,11 +277,24 @@ cd src-tauri && cargo test
 
 ## 커뮤니티
 
+- [공식 사이트](' + SITE + ') —— 웹 데모 및 최신 소식
 - [Issues & 기능 요청](https://github.com/carloncc/NovelForge/issues) —— 버그 제보, 아이디어, 피드백
 - [Discussions](https://github.com/carloncc/NovelForge/discussions) —— 만든 게임 자랑하기, 질문하기
 - [WebGAL](https://github.com/OpenWebGAL/WebGAL) —— 엔진 본체. WebGAL 커뮤니티가 씬 스크립트에 정통합니다
 
+[![Star History](https://api.star-history.com/svg?repos=carloncc/NovelForge&type=Date)](https://star-history.com/#carloncc/NovelForge&Date)
+
 만든 비주얼 노벨을 공개하세요——그것이 이 도구의 존재 이유입니다.
+
+## 기여
+
+버그 제보, 기능 제안, 번역, 코드 등 모든 형태의 기여를 환영합니다.
+
+- 버그 제보·기능 요청: [Issues](https://github.com/carloncc/NovelForge/issues)
+- 토론: [Discussions](https://github.com/carloncc/NovelForge/discussions)
+- 코드 변경 시 PR 전에 테스트를 실행하세요([개발 및 테스트](#개발-및-테스트) 참조)
+
+**주요 관리자:** [@carloncc](https://github.com/carloncc)
 
 ## 면책 조항
 

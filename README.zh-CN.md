@@ -13,14 +13,39 @@
   <a href="https://github.com/carloncc/NovelForge/releases"><img alt="Release" src="https://img.shields.io/github/v/release/carloncc/NovelForge"></a>
   <a href="https://github.com/carloncc/NovelForge/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/carloncc/NovelForge"></a>
   <a href="https://github.com/carloncc/NovelForge/issues"><img alt="Issues" src="https://img.shields.io/github/issues/carloncc/NovelForge"></a>
+  <a href="https://www.forgepeaknow.com/"><img alt="Website" src="https://img.shields.io/badge/Website-forgepeaknow.com-64748b"></a>
 </p>
 Tauri 2 + Vue 3 + WebGAL · 轻量快速 · API 全自定义
 
-[English](README.md) · **简体中文** · [日本語](README.ja-JP.md) · [한국어](README.ko-KR.md)
+[English](README.md) · **简体中文** · [日本語](README.ja-JP.md) · [한국어](README.ko-KR.md) · [官网](https://www.forgepeaknow.com/) · [更新日志](https://github.com/carloncc/NovelForge/releases)
 
 </div>
 
 ---
+
+<details>
+<summary><kbd>📑 目录</kbd></summary>
+
+- [为什么要用 NovelForge？](#为什么要用-novelforge)
+- [一个按钮，一步到位](#一个按钮一步到位)
+- [快速开始](#快速开始)
+- [什么时候不适合用 NovelForge](#什么时候不适合用-novelforge)
+- [特性](#特性)
+- [截图](#截图)
+- [API 配置示例](#api-配置示例)
+- [视觉圣经（图像生成门禁）](#视觉圣经图像生成门禁)
+- [Web 版（浏览器直接运行，无需打包）](#web-版浏览器直接运行无需打包)
+- [通用适配器（图像 / TTS）](#通用适配器图像--tts)
+- [输出项目结构（标准 WebGAL 项目）](#输出项目结构标准-webgal-项目)
+- [开发与测试](#开发与测试)
+- [技术架构](#技术架构)
+- [社区](#社区)
+- [贡献](#贡献)
+- [免责声明](#免责声明)
+- [致谢与许可](#致谢与许可)
+- [Roadmap](#roadmap)
+
+</details>
 
 ## 为什么要用 NovelForge？
 
@@ -47,6 +72,7 @@ Tauri 2 + Vue 3 + WebGAL · 轻量快速 · API 全自定义
 |---|---|
 | Windows / macOS / Linux | [最新 Release](https://github.com/carloncc/NovelForge/releases)（无需安装 Rust/Node） |
 | 任意平台（浏览器） | Web 演示版——免安装，浏览器直接运行（见下） |
+| 官网 | [https://www.forgepeaknow.com/](https://www.forgepeaknow.com/) —— Web 演示与最新动态 |
 
 > 没有 API key 也能体验：自动进入演示模式（内置示例小说），完整跑通全流程——先试再配。
 
@@ -249,11 +275,24 @@ cd src-tauri && cargo test
 
 ## 社区
 
+- [官网](' + SITE + ') —— Web 演示与最新动态
 - [Issues & 功能建议](https://github.com/carloncc/NovelForge/issues) —— 报 bug、提想法、给反馈
 - [Discussions](https://github.com/carloncc/NovelForge/discussions) —— 晒出你做出来的游戏、提问交流
 - [WebGAL](https://github.com/OpenWebGAL/WebGAL) —— 引擎本体，它的社区熟悉 WebGAL 场景脚本
 
+[![Star History](https://api.star-history.com/svg?repos=carloncc/NovelForge&type=Date)](https://star-history.com/#carloncc/NovelForge&Date)
+
 把你生成的视觉小说晒出来——这正是这个工具存在的意义。
+
+## 贡献
+
+欢迎一切形式的贡献——bug 报告、功能建议、翻译、代码。
+
+- 报 bug / 提需求：[Issues](https://github.com/carloncc/NovelForge/issues)
+- 交流讨论：[Discussions](https://github.com/carloncc/NovelForge/discussions)
+- 提交代码前请先跑测试（见[开发与测试](#开发与测试)）
+
+**主要维护者：** [@carloncc](https://github.com/carloncc)
 
 ## 免责声明
 
