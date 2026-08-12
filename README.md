@@ -8,6 +8,15 @@
 
 Text walls are hard to read. One click turns your novel into a playable visual novel — sprites, expressions, CGs, voice-over, BGM and branching choices, all generated automatically. Preview it, package it (exe / APK / web), and share it.
 
+<p>
+  <a href="https://github.com/carloncc/NovelForge/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/carloncc/NovelForge?color=blue"></a>
+  <a href="https://github.com/carloncc/NovelForge/releases"><img alt="Release" src="https://img.shields.io/github/v/release/carloncc/NovelForge"></a>
+  <a href="https://github.com/carloncc/NovelForge/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/carloncc/NovelForge"></a>
+  <a href="https://github.com/carloncc/NovelForge/issues"><img alt="Issues" src="https://img.shields.io/github/issues/carloncc/NovelForge"></a>
+  <img alt="Web demo" src="https://img.shields.io/badge/web%20demo-npm%20run%20dev-64748b">
+  <img alt="Built with" src="https://img.shields.io/badge/Tauri%202%20%2B%20Vue%203-8b5cf6">
+</p>
+
 Tauri 2 + Vue 3 + WebGAL · Lightweight & fast · Bring-your-own API
 
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [한국어](README.ko-KR.md)
@@ -32,6 +41,57 @@ novel.txt ─▶ one click ─▶ sprites · expressions · CGs · backgrounds �
 ```
 
 > Bring your own API key (no key? demo mode runs the full pipeline with a built-in sample novel). When images are enabled, one style confirmation step (Visual Bible) is required before batch generation.
+
+## Quick Start
+
+### Download the app
+
+| Platform | Where to get it |
+|---|---|
+| Windows / macOS / Linux | [Latest release](https://github.com/carloncc/NovelForge/releases) (no Rust/Node needed) |
+| Any platform (browser) | Web demo — no install, runs in the browser (see below) |
+
+> No API key? The app drops into demo mode (built-in sample novel) and runs the full pipeline — try it before configuring anything.
+
+### Run the web demo (no install, no packaging)
+
+```bash
+git clone git@github.com:carloncc/NovelForge.git
+cd NovelForge
+pnpm install
+pnpm prepare:template   # download the WebGAL engine template (first run only, ~75MB, auto-pruned)
+npm run dev             # open http://localhost:5173 in your browser
+```
+
+### Run the desktop app in development
+
+```bash
+pnpm tauri dev
+```
+
+Requirements: Node.js 18+ · pnpm · Rust (https://rustup.rs) · Windows / macOS / Linux.
+
+### Build & package
+
+```bash
+pnpm tauri build
+```
+
+Artifacts land in `src-tauri/target/release/bundle/` (Windows exe / macOS dmg / Linux AppImage).
+
+### Usage flow
+
+1. **Import novel**: pick a txt (GBK/UTF-8 auto-detected), chapters auto-split; optionally import custom assets. Multiple files are supported, or let the LLM split chapters for you
+2. **Configure APIs**: fill in base_url + key + model for the text LLM (DeepSeek is the cheapest, ~$0.1–0.3/M tokens); image / TTS / vision channels can be added later but the image channel must be configured before generation
+3. **Generate**: toggle features (images / expressions / voice / video slots / BGM / intro cards) → run. The text stages run first; when images are enabled, the **Visual Bible approval** gate appears first (style source → three-view sheets → approve), then image / voice / assembly run with live progress logs and cost stats. Stage-based generation lets you rerun only the stages you need, with optional human feedback for chapter splitting
+4. **Preview**: play the game instantly in the embedded WebGAL engine
+5. **Export**: deploy the web zip directly; follow the generated `导出说明.txt` for exe / APK
+
+## When not to use NovelForge
+
+- You want pixel-perfect art by a specific artist: generated sprites are AI art — great for personal projects, not for commercial art-directable releases.
+- You only want a text reader (no visuals): this is a visual-novel pipeline, not an ebook reader.
+- You have zero tolerance for AI-cost: generation calls vendor APIs with your own keys (demo mode is free but produces the sample project only).
 
 ## Features
 
@@ -65,41 +125,6 @@ novel.txt ─▶ one click ─▶ sprites · expressions · CGs · backgrounds �
 | Export | Game title | Game story |
 |---|---|---|
 | ![Export](docs/screenshots/export.png) | ![Title](docs/screenshots/game-title.png) | ![Story](docs/screenshots/game-story.png) |
-
-## Quick Start
-
-### Requirements
-- Node.js 18+ · pnpm
-- Rust (development / packaging only): https://rustup.rs
-- Windows / macOS / Linux
-- Linux users: install CJK fonts for the Chinese UI: `sudo apt install fonts-noto-cjk`
-
-### Run in development
-
-```bash
-pnpm install
-pnpm prepare:template   # download the WebGAL engine template (first run only, ~75MB, auto-pruned)
-pnpm tauri dev
-```
-
-### Build & package
-
-```bash
-pnpm prepare:template   # if not run yet
-pnpm tauri build
-```
-
-Artifacts land in `src-tauri/target/release/bundle/` (Windows exe / macOS dmg / Linux AppImage).
-
-### Usage flow
-
-1. **Import novel**: pick a txt (GBK/UTF-8 auto-detected), chapters auto-split; optionally import custom assets. Multiple files are supported, or let the LLM split chapters for you
-2. **Configure APIs**: fill in base_url + key + model for the text LLM (DeepSeek is the cheapest, ~$0.1–0.3/M tokens); image / TTS / vision channels can be added later but the image channel must be configured before generation
-3. **Generate**: toggle features (images / expressions / voice / video slots / BGM / intro cards) → run. The text stages run first; when images are enabled, the **Visual Bible approval** gate appears first (style source → three-view sheets → approve), then image / voice / assembly run with live progress logs and cost stats. Stage-based generation lets you rerun only the stages you need, with optional human feedback for chapter splitting
-4. **Preview**: play the game instantly in the embedded WebGAL engine
-5. **Export**: deploy the web zip directly; follow the generated `导出说明.txt` for exe / APK
-
-> No API key? The app drops into demo mode (built-in sample novel) and runs the full pipeline.
 
 ## API Configuration Examples
 
@@ -225,6 +250,14 @@ cd src-tauri && cargo test
 │  APK (official tool)                       │
 └────────────────────────────────────────────┘
 ```
+
+## Community
+
+- [Issues & feature requests](https://github.com/carloncc/NovelForge/issues) — bugs, ideas, feedback
+- [Discussions](https://github.com/carloncc/NovelForge/discussions) — show off games you made, ask questions
+- [WebGAL](https://github.com/OpenWebGAL/WebGAL) — the engine powering the output; its community knows WebGAL scene scripting
+
+Show off the visual novels you generate — that's the whole point of this tool.
 
 ## Credits & License
 

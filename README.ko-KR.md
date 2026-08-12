@@ -8,6 +8,12 @@
 
 글로만 읽기엔 아쉽다, 그림이 있어야 몰입이 된다. 원클릭으로 소설을 플레이 가능한 비주얼 노벨로 변환——입화·표정·CG·음성·BGM·분기를 전부 자동 생성. 미리보기, 패키징(exe / APK / 웹), 배포까지 한 번에.
 
+<p>
+  <a href="https://github.com/carloncc/NovelForge/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/carloncc/NovelForge?color=blue"></a>
+  <a href="https://github.com/carloncc/NovelForge/releases"><img alt="Release" src="https://img.shields.io/github/v/release/carloncc/NovelForge"></a>
+  <a href="https://github.com/carloncc/NovelForge/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/carloncc/NovelForge"></a>
+  <a href="https://github.com/carloncc/NovelForge/issues"><img alt="Issues" src="https://img.shields.io/github/issues/carloncc/NovelForge"></a>
+</p>
 Tauri 2 + Vue 3 + WebGAL · 가볍고 빠름 · API 완전 커스터마이즈
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · **한국어**
@@ -32,6 +38,56 @@ Tauri 2 + Vue 3 + WebGAL · 가볍고 빠름 · API 완전 커스터마이즈
 ```
 
 > API 키는 직접 준비하세요(키가 없으면? 샘플 소설 내장 데모 모드로 전체 과정이 동작합니다). 이미지 활성 시 일괄 생성 전에 스타일 확인(비주얼 바이블)이 한 번 필요합니다.
+
+## 빠른 시작
+
+### 앱 다운로드
+
+| 플랫폼 | 받는 방법 |
+|---|---|
+| Windows / macOS / Linux | [최신 릴리스](https://github.com/carloncc/NovelForge/releases)(Rust/Node 설치 불필요) |
+| 모든 플랫폼(브라우저) | Web 데모——설치 없이 브라우저에서 바로 실행(아래 참조) |
+
+> API 키 없이도 체험 가능: 자동으로 데모 모드(샘플 소설 내장)로 진입해 전체 과정이 동작합니다——설정 전에 먼저 시도해 보세요.
+
+### Web 데모 실행(설치 불필요·빌드 불필요)
+
+```bash
+git clone git@github.com:carloncc/NovelForge.git
+cd NovelForge
+pnpm install
+pnpm prepare:template   # WebGAL 엔진 템플릿 다운로드(최초 1회, 약 75MB, 자동 정리)
+npm run dev             # 브라우저에서 http://localhost:5173 열기
+```
+
+### 데스크톱 개발 실행
+
+```bash
+pnpm tauri dev
+```
+
+요구 사항: Node.js 18+ · pnpm · Rust(https://rustup.rs) · Windows / macOS / Linux.
+
+### 빌드 및 패키징
+
+```bash
+pnpm tauri build
+```
+산출물은 `src-tauri/target/release/bundle/`(Windows exe / macOS dmg / Linux AppImage).
+
+### 사용 흐름
+
+1. **소설 가져오기**: txt 선택(GBK/UTF-8 자동 감지), 챕터 자동 분할. 여러 파일과 LLM 스마트 분할 지원. 커스텀 소재 임포트 가능
+2. **API 설정**: 텍스트 LLM의 base_url + key + model 입력(DeepSeek이 가장 저렴, 약 ¥1-2/백만 토큰). 이미지/TTS/비전은 나중에 추가 가능(이미지 생성 전에 이미지 채널 설정 필요)
+3. **생성**: 기능 토글(이미지/표정 차분/음성/영상 슬롯/BGM/소개 카드) → 시작 → 텍스트 단계가 먼저 진행. 이미지 활성 시 먼저 **비주얼 바이블 승인**(스타일 소스 선택 → 삼면도 생성/확인 → 승인) → 승인 후 이미지/음성/조립 진행 → 진행 로그 + 비용 통계. 단계별 재생성과 AI 챕터 분할 피드백 지원
+4. **미리보기**: 내장 WebGAL 엔진으로 즉시 플레이
+5. **내보내기**: 웹 zip은 직접 배포. exe/APK는 생성된 '导出说明.txt' 안내에 따름
+
+## NovelForge를 쓰면 안 되는 경우
+
+- 특정 작가의 픽셀 완벽한 아트가 필요한 경우: 생성 입화는 AI 아트——개인 프로젝트엔 좋지만 상업용 아트 디렉션엔 부적합합니다.
+- 텍스트 리더(화면 없음)만 원하는 경우: 이건 비주얼 노벨 파이프라인이지 전자책 리더가 아닙니다.
+- AI 비용을 전혀 감당할 수 없는 경우: 생성은 본인 키로 벤더 API를 호출합니다(데모 모드는 무료지만 샘플 프로젝트만 생성).
 
 ## 기능
 
@@ -65,40 +121,6 @@ Tauri 2 + Vue 3 + WebGAL · 가볍고 빠름 · API 완전 커스터마이즈
 | 내보내기 | 게임 타이틀 | 게임 스토리 |
 |---|---|---|
 | ![Export](docs/screenshots/export.png) | ![Title](docs/screenshots/game-title.png) | ![Story](docs/screenshots/game-story.png) |
-
-## 빠른 시작
-
-### 요구 사항
-- Node.js 18+ · pnpm
-- Rust(개발/빌드 시에만): https://rustup.rs
-- Windows / macOS / Linux
-- Linux 사용자: 한글 UI 표시를 위해 폰트 설치 권장: `sudo apt install fonts-noto-cjk`
-
-### 개발 실행
-
-```bash
-pnpm install
-pnpm prepare:template   # WebGAL 엔진 템플릿 다운로드(최초 1회, 약 75MB, 자동 정리)
-pnpm tauri dev
-```
-
-### 빌드 및 패키징
-
-```bash
-pnpm prepare:template   # 아직 실행하지 않았다면
-pnpm tauri build
-```
-산출물은 `src-tauri/target/release/bundle/`(Windows exe / macOS dmg / Linux AppImage).
-
-### 사용 흐름
-
-1. **소설 가져오기**: txt 선택(GBK/UTF-8 자동 감지), 챕터 자동 분할. 여러 파일과 LLM 스마트 분할 지원. 커스텀 소재 임포트 가능
-2. **API 설정**: 텍스트 LLM의 base_url + key + model 입력(DeepSeek이 가장 저렴, 약 ¥1-2/백만 토큰). 이미지/TTS/비전은 나중에 추가 가능(이미지 생성 전에 이미지 채널 설정 필요)
-3. **생성**: 기능 토글(이미지/표정 차분/음성/영상 슬롯/BGM/소개 카드) → 시작 → 텍스트 단계가 먼저 진행. 이미지 활성 시 먼저 **비주얼 바이블 승인**(스타일 소스 선택 → 삼면도 생성/확인 → 승인) → 승인 후 이미지/음성/조립 진행 → 진행 로그 + 비용 통계. 단계별 재생성과 AI 챕터 분할 피드백 지원
-4. **미리보기**: 내장 WebGAL 엔진으로 즉시 플레이
-5. **내보내기**: 웹 zip은 직접 배포. exe/APK는 생성된 '导出说明.txt' 안내에 따름
-
-> API 키 없이도 체험 가능: 자동으로 데모 모드(샘플 소설 내장)로 진입해 전체 과정이 동작합니다.
 
 ## API 설정 예시
 
@@ -226,6 +248,14 @@ cd src-tauri && cargo test
 │  APK(공식 도구)                            │
 └────────────────────────────────────────────┘
 ```
+
+## 커뮤니티
+
+- [Issues & 기능 요청](https://github.com/carloncc/NovelForge/issues) —— 버그 제보, 아이디어, 피드백
+- [Discussions](https://github.com/carloncc/NovelForge/discussions) —— 만든 게임 자랑하기, 질문하기
+- [WebGAL](https://github.com/OpenWebGAL/WebGAL) —— 엔진 본체. WebGAL 커뮤니티가 씬 스크립트에 정통합니다
+
+만든 비주얼 노벨을 공개하세요——그것이 이 도구의 존재 이유입니다.
 
 ## 크레딧 및 라이선스
 

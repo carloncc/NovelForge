@@ -8,6 +8,12 @@
 
 纯文字看不下去，画面才有代入感。一键把小说变成可游玩的视觉小说——立绘、表情、CG、配音、BGM、剧情分支全部自动生成；预览、打包（exe / APK / 网页版）、分发。
 
+<p>
+  <a href="https://github.com/carloncc/NovelForge/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/carloncc/NovelForge?color=blue"></a>
+  <a href="https://github.com/carloncc/NovelForge/releases"><img alt="Release" src="https://img.shields.io/github/v/release/carloncc/NovelForge"></a>
+  <a href="https://github.com/carloncc/NovelForge/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/carloncc/NovelForge"></a>
+  <a href="https://github.com/carloncc/NovelForge/issues"><img alt="Issues" src="https://img.shields.io/github/issues/carloncc/NovelForge"></a>
+</p>
 Tauri 2 + Vue 3 + WebGAL · 轻量快速 · API 全自定义
 
 [English](README.md) · **简体中文** · [日本語](README.ja-JP.md) · [한국어](README.ko-KR.md)
@@ -32,6 +38,56 @@ Tauri 2 + Vue 3 + WebGAL · 轻量快速 · API 全自定义
 ```
 
 > 需要自备 API key（没有 key？自动进入演示模式，内置示例小说跑通全流程）。启用图像时，批量生成前有一次风格确认（视觉圣经）。
+
+## 快速开始
+
+### 下载应用
+
+| 平台 | 获取方式 |
+|---|---|
+| Windows / macOS / Linux | [最新 Release](https://github.com/carloncc/NovelForge/releases)（无需安装 Rust/Node） |
+| 任意平台（浏览器） | Web 演示版——免安装，浏览器直接运行（见下） |
+
+> 没有 API key 也能体验：自动进入演示模式（内置示例小说），完整跑通全流程——先试再配。
+
+### 运行 Web 演示版（免安装、不打包）
+
+```bash
+git clone git@github.com:carloncc/NovelForge.git
+cd NovelForge
+pnpm install
+pnpm prepare:template   # 下载 WebGAL 引擎模板（仅首次，约 75MB，自动裁剪）
+npm run dev             # 浏览器打开 http://localhost:5173
+```
+
+### 桌面版开发运行
+
+```bash
+pnpm tauri dev
+```
+
+环境要求：Node.js 18+ · pnpm · Rust（https://rustup.rs）· Windows / macOS / Linux。
+
+### 打包发布
+
+```bash
+pnpm tauri build
+```
+产物在 `src-tauri/target/release/bundle/`（Windows exe / macOS dmg / Linux AppImage）。
+
+### 使用流程
+
+1. **导入小说**：选择 txt（自动识别 GBK/UTF-8），章节自动切分；支持多文件导入与 LLM 智能分章；可导入自定义素材
+2. **API 配置**：填文本 LLM 的 base_url + key + model（DeepSeek 最便宜，约 ¥1-2/百万 token）；图像/TTS/视觉识别可后补，生图前需先配置图像通道
+3. **生成项目**：开关（图像/表情差分/配音/视频位/BGM/登场资料卡）→ 开始生成 → 文本阶段先行；启用图像时先进入**视觉圣经确认**（选风格来源 → 生成/确认三视图 → 批准）→ 批准后续跑图像/配音/组装 → 进度日志 + 费用统计。支持分阶段生成（只重跑需要的阶段），AI 分章可提供人工意见反馈
+4. **预览**：内嵌 WebGAL 引擎实时试玩
+5. **导出**：网页版直接部署；exe/APK 按生成的「导出说明.txt」操作
+
+## 什么时候不适合用 NovelForge
+
+- 想要指定画师的像素级艺术：生成立绘是 AI 产物——适合个人项目，不适合商业美术精修交付。
+- 只想要纯文字阅读器（不要画面）：这是视觉小说管线，不是电子书阅读器。
+- 完全不能接受 AI 成本：生成需要用自己的 key 调用厂商 API（演示模式免费，但只产出示例项目）。
 
 ## 特性
 
@@ -65,40 +121,6 @@ Tauri 2 + Vue 3 + WebGAL · 轻量快速 · API 全自定义
 | 导出 | 游戏标题 | 游戏剧情 |
 |---|---|---|
 | ![导出](docs/screenshots/export.png) | ![标题](docs/screenshots/game-title.png) | ![剧情](docs/screenshots/game-story.png) |
-
-## 快速开始
-
-### 环境要求
-- Node.js 18+ · pnpm
-- Rust（仅开发/打包需要）：https://rustup.rs
-- Windows / macOS / Linux
-- Linux 用户建议安装中文字体（界面中文显示）：`sudo apt install fonts-noto-cjk`
-
-### 开发运行
-
-```bash
-pnpm install
-pnpm prepare:template   # 下载 WebGAL 引擎模板（仅首次，约 75MB，自动裁剪）
-pnpm tauri dev
-```
-
-### 打包发布
-
-```bash
-pnpm prepare:template   # 如未执行过
-pnpm tauri build
-```
-产物在 `src-tauri/target/release/bundle/`（Windows exe / macOS dmg / Linux AppImage）。
-
-### 使用流程
-
-1. **导入小说**：选择 txt（自动识别 GBK/UTF-8），章节自动切分；支持多文件导入与 LLM 智能分章；可导入自定义素材
-2. **API 配置**：填文本 LLM 的 base_url + key + model（DeepSeek 最便宜，约 ¥1-2/百万 token）；图像/TTS/视觉识别可后补，生图前需先配置图像通道
-3. **生成项目**：开关（图像/表情差分/配音/视频位/BGM/登场资料卡）→ 开始生成 → 文本阶段先行；启用图像时先进入**视觉圣经确认**（选风格来源 → 生成/确认三视图 → 批准）→ 批准后续跑图像/配音/组装 → 进度日志 + 费用统计。支持分阶段生成（只重跑需要的阶段），AI 分章可提供人工意见反馈
-4. **预览**：内嵌 WebGAL 引擎实时试玩
-5. **导出**：网页版直接部署；exe/APK 按生成的「导出说明.txt」操作
-
-> 没有 API key 也能体验：自动进入演示模式（内置示例小说），完整跑通全流程。
 
 ## API 配置示例
 
@@ -224,6 +246,14 @@ cd src-tauri && cargo test
 │  预览（内嵌）/ exe（Terre）/ APK（官方工具）  │
 └────────────────────────────────────────────┘
 ```
+
+## 社区
+
+- [Issues & 功能建议](https://github.com/carloncc/NovelForge/issues) —— 报 bug、提想法、给反馈
+- [Discussions](https://github.com/carloncc/NovelForge/discussions) —— 晒出你做出来的游戏、提问交流
+- [WebGAL](https://github.com/OpenWebGAL/WebGAL) —— 引擎本体，它的社区熟悉 WebGAL 场景脚本
+
+把你生成的视觉小说晒出来——这正是这个工具存在的意义。
 
 ## 致谢与许可
 
