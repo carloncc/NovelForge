@@ -10,6 +10,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { errMsg } from "../utils/errors";
 import { recognizeCharacter } from "../core/recognize";
 import { configIsUsable } from "../api/providers";
+import { t } from "../i18n";
 
 const props = defineProps<{ cards: ExtractionResult }>();
 const emit = defineEmits<{ saved: [cards: ExtractionResult] }>();
@@ -26,12 +27,12 @@ const charRecognizing = ref<string | null>(null);
 
 async function recognizeChar(c: CharacterCard): Promise<void> {
   if (!c.referenceImage) {
-    savedMsg.value = "请先为该角色设置参考图（从素材库选择或上传）";
+    savedMsg.value = t("请先为该角色设置参考图（从素材库选择或上传）");
     return;
   }
   const cfg = activeConfig("vision");
   if (!configIsUsable(cfg, "vision")) {
-    savedMsg.value = "图片识别 API 未配置或不可用，请先在「API 配置」页配置";
+    savedMsg.value = t("图片识别 API 未配置或不可用，请先在「API 配置」页配置");
     return;
   }
   charRecognizing.value = c.id;
@@ -110,7 +111,7 @@ function fileToBase64(file: File): Promise<string> {
       const result = String(reader.result ?? "");
       resolve(result.includes(",") ? result.split(",")[1] : result);
     };
-    reader.onerror = () => reject(new Error("文件读取失败"));
+    reader.onerror = () => reject(new Error(t("文件读取失败")));
     reader.readAsDataURL(file);
   });
 }
@@ -133,22 +134,22 @@ async function save(): Promise<void> {
 
 function reset(): void {
   local.value = JSON.parse(JSON.stringify(props.cards));
-  savedMsg.value = "已恢复为上次生成时的卡片";
+  savedMsg.value = t("已恢复为上次生成时的卡片");
 }
 </script>
 
 <template>
   <div class="card">
     <div class="row" style="justify-content: space-between; margin-bottom: 12px">
-      <h3 style="margin-bottom: 0">角色卡编辑（{{ local.characters.length }}）</h3>
+      <h3 style="margin-bottom: 0">{{ t("角色卡编辑（") }}{{ local.characters.length }}{{ t("）") }}</h3>
       <div class="row" style="flex: none">
-        <button class="btn small" :disabled="busy" @click="save">保存卡片</button>
-        <button class="btn secondary small" @click="reset">放弃修改</button>
+        <button class="btn small" :disabled="busy" @click="save">{{ t("保存卡片") }}</button>
+        <button class="btn secondary small" @click="reset">{{ t("放弃修改") }}</button>
       </div>
     </div>
     <p v-if="savedMsg" style="color: var(--ok); font-size: 12px; margin-bottom: 8px">{{ savedMsg }}</p>
     <p style="color: var(--text-dim); font-size: 12px; margin-bottom: 10px">
-      修改角色外貌/服装/音色后保存：剧本与立绘会在下次生成时自动重新生成；背景/CG 保留。
+      {{ t("修改角色外貌/服装/音色后保存：剧本与立绘会在下次生成时自动重新生成；背景/CG 保留。") }}
     </p>
 
     <div v-for="c in local.characters" :key="c.id" style="border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px; overflow: hidden">
@@ -165,19 +166,19 @@ function reset(): void {
       </div>
       <div v-if="openChar === c.id" style="padding: 12px 14px; border-top: 1px solid var(--border)">
         <div class="row">
-          <label class="field"><span>姓名</span><input type="text" v-model="c.name" /></label>
-          <label class="field"><span>主题色</span><input type="text" v-model="c.color" placeholder="#3b5bdb" /></label>
+          <label class="field"><span>{{ t("姓名") }}</span><input type="text" v-model="c.name" /></label>
+          <label class="field"><span>{{ t("主题色") }}</span><input type="text" v-model="c.color" placeholder="#3b5bdb" /></label>
         </div>
-        <label class="field"><span>外貌</span><input type="text" v-model="c.appearance" /></label>
-        <label class="field"><span>服装</span><input type="text" v-model="c.clothing" /></label>
-        <label class="field"><span>性格</span><input type="text" v-model="c.personality" /></label>
+        <label class="field"><span>{{ t("外貌") }}</span><input type="text" v-model="c.appearance" /></label>
+        <label class="field"><span>{{ t("服装") }}</span><input type="text" v-model="c.clothing" /></label>
+        <label class="field"><span>{{ t("性格") }}</span><input type="text" v-model="c.personality" /></label>
         <div class="row">
           <label class="field grow-2">
-            <span>音色描述</span>
+            <span>{{ t("音色描述") }}</span>
             <input type="text" v-model="c.voiceDesc" />
           </label>
           <label class="field">
-            <span>TTS 音色（可输入或选择）</span>
+            <span>{{ t("TTS 音色（可输入或选择）") }}</span>
             <input type="text" list="novelforge-voices" v-model="c.voiceName" />
             <datalist id="novelforge-voices">
               <option v-for="v in voices" :key="v" :value="v" />
@@ -185,34 +186,34 @@ function reset(): void {
           </label>
         </div>
         <label class="field">
-          <span>立绘提示词（imagePrompt）</span>
+          <span>{{ t("立绘提示词（imagePrompt）") }}</span>
           <textarea v-model="c.imagePrompt" rows="3" />
         </label>
         <label class="field">
-          <span>三视图提示词（threeViewPrompt，可选）</span>
-          <textarea v-model="c.threeViewPrompt" rows="3" placeholder="留空则由立绘提示词自动推导" />
+          <span>{{ t("三视图提示词（threeViewPrompt，可选）") }}</span>
+          <textarea v-model="c.threeViewPrompt" rows="3" :placeholder="t('留空则由立绘提示词自动推导')" />
         </label>
         <div class="row">
-          <span style="font-size: 12px; color: var(--text-dim)">参考图（图生图保持一致）：</span>
-          <span v-if="c.referenceImage" class="tag ok">已设置</span>
-          <span v-else class="tag">未设置</span>
-          <button class="btn secondary small" @click="pickReferenceImage(c)">从素材库选择…</button>
-          <button v-if="c.referenceImage" class="btn danger small" @click="c.referenceImage = undefined">清除</button>
+          <span style="font-size: 12px; color: var(--text-dim)">{{ t("参考图（图生图保持一致）：") }}</span>
+          <span v-if="c.referenceImage" class="tag ok">{{ t("已设置") }}</span>
+          <span v-else class="tag">{{ t("未设置") }}</span>
+          <button class="btn secondary small" @click="pickReferenceImage(c)">{{ t("从素材库选择…") }}</button>
+          <button v-if="c.referenceImage" class="btn danger small" @click="c.referenceImage = undefined">{{ t("清除") }}</button>
           <input v-if="!isTauri()" ref="refImgInput" type="file" accept="image/*" style="display: none" @change="onRefImgFile" />
         </div>
         <div class="row" style="margin-top: 8px">
           <button class="btn small" :disabled="charRecognizing === c.id || !c.referenceImage" @click="recognizeChar(c)">
             <span v-if="charRecognizing === c.id" class="spinner" />
-            {{ charRecognizing === c.id ? "AI 识别中…" : "用参考图 AI 识别角色（生成描述/提示词）" }}
+            {{ charRecognizing === c.id ? t("AI 识别中…") : t("用参考图 AI 识别角色（生成描述/提示词）") }}
           </button>
-          <span v-if="c.referenceImage" style="font-size: 11.5px; color: var(--text-faint)">AI 会按参考图生成外貌/服装/性格/立绘与三视图提示词，填入上方字段</span>
+          <span v-if="c.referenceImage" style="font-size: 11.5px; color: var(--text-faint)">{{ t("AI 会按参考图生成外貌/服装/性格/立绘与三视图提示词，填入上方字段") }}</span>
         </div>
       </div>
     </div>
   </div>
 
   <div class="card">
-    <h3 style="margin-bottom: 12px">物品卡编辑（{{ local.items.length }}）</h3>
+    <h3 style="margin-bottom: 12px">{{ t("物品卡编辑（") }}{{ local.items.length }}{{ t("）") }}</h3>
     <div v-for="it in local.items" :key="it.id" style="border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px; overflow: hidden">
       <div
         class="row"
@@ -226,11 +227,11 @@ function reset(): void {
         <span style="color: var(--text-dim); font-size: 12px">{{ openItem === it.id ? "▲" : "▼" }}</span>
       </div>
       <div v-if="openItem === it.id" style="padding: 12px 14px; border-top: 1px solid var(--border)">
-        <label class="field"><span>名称</span><input type="text" v-model="it.name" /></label>
-        <label class="field"><span>外观</span><input type="text" v-model="it.appearance" /></label>
-        <label class="field"><span>剧情意义</span><input type="text" v-model="it.note" /></label>
+        <label class="field"><span>{{ t("名称") }}</span><input type="text" v-model="it.name" /></label>
+        <label class="field"><span>{{ t("外观") }}</span><input type="text" v-model="it.appearance" /></label>
+        <label class="field"><span>{{ t("剧情意义") }}</span><input type="text" v-model="it.note" /></label>
         <label class="field">
-          <span>物品图提示词</span>
+          <span>{{ t("物品图提示词") }}</span>
           <textarea v-model="it.imagePrompt" rows="2" />
         </label>
       </div>
@@ -238,7 +239,7 @@ function reset(): void {
   </div>
 
   <div class="card">
-    <h3 style="margin-bottom: 12px">场景卡编辑（{{ local.scenes.length }}）</h3>
+    <h3 style="margin-bottom: 12px">{{ t("场景卡编辑（") }}{{ local.scenes.length }}{{ t("）") }}</h3>
     <div v-for="s in local.scenes" :key="s.id" style="border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px; overflow: hidden">
       <div
         class="row"
@@ -253,12 +254,12 @@ function reset(): void {
       </div>
       <div v-if="openScene === s.id" style="padding: 12px 14px; border-top: 1px solid var(--border)">
         <div class="row">
-          <label class="field"><span>地点</span><input type="text" v-model="s.location" /></label>
-          <label class="field"><span>氛围</span><input type="text" v-model="s.atmosphere" /></label>
-          <label class="field"><span>时间</span><input type="text" v-model="s.time" /></label>
+          <label class="field"><span>{{ t("地点") }}</span><input type="text" v-model="s.location" /></label>
+          <label class="field"><span>{{ t("氛围") }}</span><input type="text" v-model="s.atmosphere" /></label>
+          <label class="field"><span>{{ t("时间") }}</span><input type="text" v-model="s.time" /></label>
         </div>
         <label class="field">
-          <span>背景图提示词</span>
+          <span>{{ t("背景图提示词") }}</span>
           <textarea v-model="s.imagePrompt" rows="2" />
         </label>
       </div>

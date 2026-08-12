@@ -1,9 +1,30 @@
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use image::{ImageFormat, Rgba, RgbaImage};
 
-/// 判断采样到的背景色是否亮绿色幕：G 通道高且显著高于 R/B（饱和的绿）
+/// 判断采样到的背景色是否绿色幕（含亮绿、墨绿、青绿、teal）：
+/// - 亮绿/饱和绿：G 显著高于 R/B
+/// - 墨绿/深绿：G 高但 R/B 也不低，整体偏绿
+/// - teal（青绿）：G 高且 B 明显高于 R
 fn is_green_screen(bg: [f32; 3]) -> bool {
-    bg[1] > 100.0 && (bg[1] - bg[0].max(bg[2])) > 40.0
+    let r = bg[0];
+    let g = bg[1];
+    let b = bg[2];
+    if g < 60.0 {
+        return false;
+    }
+    // 饱和绿：G 显著高于 max(R,B)
+    if g - r.max(b) > 30.0 {
+        return true;
+    }
+    // teal/青绿：G 高且 B 明显高于 R（B≥R+15 且 G≥B-15，整体偏冷绿）
+    if b > r + 15.0 && g >= b - 15.0 {
+        return true;
+    }
+    // 偏绿（弱）：G > R 且 G > B，且 G 占主导
+    if g > r + 10.0 && g > b + 10.0 && g >= (r + b) * 0.55 {
+        return true;
+    }
+    false
 }
 
 /// 色度加权欧氏距离：对绿色背景降低亮度(G)权重，让深绿/浅绿渐变与背景色距离变小
@@ -92,14 +113,44 @@ fn alpha_median3x3(alpha: &[f32], w: u32, h: u32) -> Vec<f32> {
     out
 }
 
-/// 把背景绿色溢出（绿边/绿晕）从前景边缘去除：对半透明羽化带按透明度强度去绿，
-/// 对与透明像素相邻的不透明边界像素做一次轻量去绿（主体本身非绿色时干净利落）。
-/// `aggressive=true` 用于亮绿色背景：触发阈值更低（>2 而非 >6），边界带去绿强度更强（0.95 而非 0.85），
+/// 8 邻域二值膨胀：把 mask 中 true 的像素向外扩展 1 像素。
+fn dilate(mask: &[bool], w: u32, h: u32) -> Vec<bool> {
+    let mut out = mask.to_vec();
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y * w + x) as usize;
+            if !mask[i] {
+                continue;
+            }
+            for dy in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let xx = x as i32 + dx;
+                    let yy = y as i32 + dy;
+                    if xx < 0 || yy < 0 || xx >= w as i32 || yy >= h as i32 {
+                        continue;
+                    }
+                    out[(yy as u32 * w + xx as u32) as usize] = true;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 把背景绿色溢出（绿边/绿晕）从前景边缘去除：
+/// - 半透明羽化带（alpha < 0.98）按透明度强度去绿，避免灰边
+/// - 与透明像素相邻的不透明边界像素做一次轻量去绿
+/// - 迭代膨胀 fringe（最多 3 像素），把不透明但靠边、被绿晕污染的发丝内部像素也去绿
+/// - 主体内远离边界的非绿色像素完全不受影响
+/// `aggressive=true` 用于亮绿色背景：触发阈值更低、边界带去绿强度更强，
 /// 防止 AI 生成的有渐变绿底在人物边缘残留绿边/绿晕。
 pub(crate) fn despill(rgba: &mut RgbaImage, alpha: &[f32], aggressive: bool) {
     let (w, h) = rgba.dimensions();
     let n = (w * h) as usize;
-    // 标记前景边界像素（4 邻域存在半透明/透明的像素）
+    // 初始 fringe：半透明像素 + 4 邻域有半透明像素的不透明边界像素
     let mut is_fringe = vec![false; n];
     for y in 1..h.saturating_sub(1) {
         for x in 1..w.saturating_sub(1) {
@@ -124,6 +175,25 @@ pub(crate) fn despill(rgba: &mut RgbaImage, alpha: &[f32], aggressive: bool) {
     }
     let spill_th = if aggressive { 2.0 } else { 6.0 };
     let fringe_strength = if aggressive { 0.95 } else { 0.85 };
+    // 多次膨胀 + 去绿：把"靠边的不透明但偏绿"的发丝内部也处理掉
+    let max_passes = if aggressive { 3 } else { 2 };
+    for _ in 0..max_passes {
+        apply_despill(rgba, &is_fringe, alpha, spill_th, fringe_strength);
+        is_fringe = dilate(&is_fringe, w, h);
+    }
+    // 最后一轮：fringe 已膨胀到位，再跑一次完整去绿
+    apply_despill(rgba, &is_fringe, alpha, spill_th, fringe_strength);
+}
+
+fn apply_despill(
+    rgba: &mut RgbaImage,
+    is_fringe: &[bool],
+    alpha: &[f32],
+    spill_th: f32,
+    fringe_strength: f32,
+) {
+    let (w, _h) = rgba.dimensions();
+    let n = is_fringe.len();
     for i in 0..n {
         if !is_fringe[i] {
             continue;
@@ -134,13 +204,23 @@ pub(crate) fn despill(rgba: &mut RgbaImage, alpha: &[f32], aggressive: bool) {
         let b = p[2] as f32;
         let max_rb = r.max(b);
         let spill = (g - max_rb).max(0.0);
-        if spill > spill_th {
-            // 半透明带：按透明度强度彻底去绿（趋向 max(r,b)）；边界带：只去大部分，避免灰边
-            let a = alpha[i];
-            let strength = if a < 0.98 { 1.0 } else { fringe_strength };
-            let out_g = g - spill * strength;
-            p[1] = out_g.round().clamp(0.0, 255.0) as u8;
+        if spill <= spill_th {
+            continue;
         }
+        // 强度按像素透明度分档，避免把半透明发丝直接杀成灰：
+        // - 不透明像素（alpha ≥ 0.98）：用 fringe_strength，去大部分绿（避免灰边）
+        // - 半透明羽化带（alpha 0.5..0.98）：用 0.85，保留发丝色调
+        // - 高度半透明（alpha < 0.5）：用 1.0，几乎彻底去绿
+        let a = alpha[i];
+        let strength = if a >= 0.98 {
+            fringe_strength
+        } else if a >= 0.5 {
+            0.85
+        } else {
+            1.0
+        };
+        let out_g = g - spill * strength;
+        p[1] = out_g.round().clamp(0.0, 255.0) as u8;
     }
 }
 
@@ -163,8 +243,10 @@ pub fn cutout(data_b64: &str, threshold: f32) -> Result<String, String> {
     // RGB 欧氏距离会因亮度差放大导致洪水填充提前终止 → 残留绿块。
     // 色度加权 + 更大容差可彻底抠掉。
     let green = is_green_screen(bg);
-    let thr = if green { threshold.max(70.0) } else { threshold.max(4.0) };
-    let thr_edge = if green { thr + 70.0 } else { thr + 40.0 };
+    // 绿底用更大的容差：AI 生成的渐变/带噪点绿底距离中位色能到 80~120；
+    // thr_edge 给更宽的羽化带，让飘动的半透明发丝要么完全抠掉、要么完整保留（少出怪异半透色）。
+    let thr = if green { threshold.max(80.0) } else { threshold.max(4.0) };
+    let thr_edge = if green { thr + 90.0 } else { thr + 40.0 };
 
     let idx = |x: u32, y: u32| -> usize { (y * w + x) as usize };
     let dist_at = |x: u32, y: u32| -> f32 { distance(&rgba, x, y, bg, green) };
@@ -430,6 +512,120 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 模拟 AI 生成的"飘散发丝 + 亮绿背景"：绿色背景里悬浮几条不透明但偏绿的发丝，
+    /// 以及几条半透明（alpha=0.5 左右）的飘散发丝。抠图后：
+    /// - 背景应完全抠掉
+    /// - 不透明发丝保留但绿分量被压低
+    /// - 半透明飘散发丝要么完全抠掉、要么完整保留（不再有怪异半透绿）
+    fn make_wispy_hair_art() -> String {
+        let mut img = RgbaImage::new(96, 64);
+        // 亮绿底 + 一点噪点（AI 压缩特征）
+        for y in 0..64 {
+            for x in 0..96 {
+                let n = ((x * 13 + y * 7) % 11) as i32 - 5;
+                let g = (250 + n).clamp(180, 255) as u8;
+                img.put_pixel(x, y, Rgba([n.max(0) as u8, g, n.max(0) as u8, 255]));
+            }
+        }
+        // 主体：暖色头发块（防止被洪水填充误删）
+        for y in 22..42 {
+            for x in 24..72 {
+                img.put_pixel(x, y, Rgba([150, 90, 60, 255]));
+            }
+        }
+        // 不透明但偏绿的发丝（靠边）：模拟 AI 边缘处的绿晕
+        for x in 8..20 {
+            img.put_pixel(x, 28, Rgba([140, 200, 130, 255]));
+            img.put_pixel(x, 32, Rgba([120, 190, 110, 255]));
+            img.put_pixel(x, 36, Rgba([130, 210, 120, 255]));
+        }
+        // 半透明飘散发丝（alpha=0.5）：会与绿底混合成偏绿颜色
+        for x in 4..14 {
+            img.put_pixel(x, 12, Rgba([140, 220, 140, 128]));
+            img.put_pixel(x, 14, Rgba([130, 210, 130, 128]));
+        }
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, ImageFormat::Png).unwrap();
+        B64.encode(buf.into_inner())
+    }
+
+    #[test]
+    fn cutout_wispy_green_hair_no_residue() {
+        let b64 = make_wispy_hair_art();
+        let out = cutout(&b64, 40.0).expect("抠图应成功");
+        let out_img = image::load_from_memory(&B64.decode(&out).unwrap())
+            .unwrap()
+            .to_rgba8();
+
+        // 背景应完全抠掉
+        for (x, y) in [(0, 0), (95, 0), (0, 63), (95, 63), (50, 0), (50, 63)] {
+            assert!(out_img.get_pixel(x, y)[3] < 16, "背景应透明: ({x},{y})");
+        }
+        // 主体暖色头发应保留
+        assert!(out_img.get_pixel(48, 32)[3] > 200, "主体应保留");
+        // 主体内不应偏绿
+        let main = out_img.get_pixel(48, 32);
+        assert!(
+            main[1] as i32 <= main[0] as i32 + 30,
+            "主体残留绿色: rgb={:?}",
+            [main[0], main[1], main[2]]
+        );
+        // 不透明发丝（靠边偏绿）：要么被抠掉，要么绿分量被显著压低
+        for (x, y) in [(10, 28), (12, 32), (15, 36)] {
+            let p = out_img.get_pixel(x, y);
+            if p[3] > 80 {
+                assert!(
+                    p[1] as i32 <= (p[0] as i32).max(p[2] as i32) + 20,
+                    "发丝边缘残留绿: ({x},{y}) rgb={:?}",
+                    [p[0], p[1], p[2]]
+                );
+            }
+        }
+        // 半透明飘散发丝区域：要么完全透明（被抠掉），要么完整保留（不再有怪异半透绿）
+        for (x, y) in [(8, 12), (10, 14)] {
+            let p = out_img.get_pixel(x, y);
+            if p[3] > 32 {
+                // 完整保留的部分不应偏绿
+                assert!(
+                    p[1] as i32 <= (p[0] as i32).max(p[2] as i32) + 20,
+                    "飘散发丝残留绿: ({x},{y}) rgba={:?}",
+                    [p[0], p[1], p[2], p[3]]
+                );
+            }
+        }
+    }
+
+    /// 模拟 teal/青绿背景（也常见于 AI 生成的立绘，抠图旧算法会漏判非亮绿）
+    fn make_teal_bg_art() -> String {
+        let mut img = RgbaImage::new(64, 64);
+        for p in img.pixels_mut() {
+            *p = Rgba([40, 200, 160, 255]); // teal
+        }
+        for y in 20..44 {
+            for x in 20..44 {
+                img.put_pixel(x, y, Rgba([200, 40, 40, 255]));
+            }
+        }
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, ImageFormat::Png).unwrap();
+        B64.encode(buf.into_inner())
+    }
+
+    #[test]
+    fn cutout_teal_bg_recognized_as_green() {
+        let b64 = make_teal_bg_art();
+        let out = cutout(&b64, 40.0).expect("抠图应成功");
+        let out_img = image::load_from_memory(&B64.decode(&out).unwrap())
+            .unwrap()
+            .to_rgba8();
+        // 四角应透明（teal 也应被识别为绿底）
+        for (x, y) in [(0, 0), (63, 0), (0, 63), (63, 63)] {
+            assert!(out_img.get_pixel(x, y)[3] < 16, "teal 角落应透明: ({x},{y})");
+        }
+        // 中心前景应保留
+        assert!(out_img.get_pixel(32, 32)[3] > 200, "teal 中心前景应保留");
     }
 
     #[test]

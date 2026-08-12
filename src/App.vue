@@ -12,13 +12,14 @@ import { tauri } from "./utils/tauri";
 import { installLogFileSink } from "./utils/logFile";
 import { log } from "./utils/logger";
 import { version } from "../package.json";
+import { t, LANGS, currentLang, setLang } from "./i18n";
 
 const pages = [
-  { id: "import", label: "导入小说", comp: ImportPage },
-  { id: "config", label: "API 配置", comp: ConfigPage },
-  { id: "generate", label: "生成项目", comp: GeneratePage },
-  { id: "preview", label: "预览", comp: PreviewPage },
-  { id: "export", label: "导出", comp: ExportPage },
+  { id: "import", labelKey: "导入小说", comp: ImportPage },
+  { id: "config", labelKey: "API 配置", comp: ConfigPage },
+  { id: "generate", labelKey: "生成项目", comp: GeneratePage },
+  { id: "preview", labelKey: "预览", comp: PreviewPage },
+  { id: "export", labelKey: "导出", comp: ExportPage },
 ];
 const current = ref("import");
 const aboutOpen = ref(false);
@@ -32,6 +33,10 @@ const icons: Record<string, string> = {
 };
 
 const versionText = `v${version}`;
+
+function onLangChange(e: Event): void {
+  setLang((e.target as HTMLSelectElement).value as typeof currentLang.value);
+}
 
 onMounted(async () => {
   const logPath = await installLogFileSink();
@@ -52,10 +57,10 @@ onMounted(async () => {
       <img src="/src/assets/logo.png" alt="NovelForge" />
       <div class="name-wrap">
         <span class="name">NovelForge</span>
-        <span class="tagline">AI 视觉小说工坊</span>
+        <span class="tagline">{{ t("AI 视觉小说工坊") }}</span>
       </div>
     </div>
-    <div class="nav-group-label">导航</div>
+    <div class="nav-group-label">{{ t("导航") }}</div>
     <button
       v-for="p in pages"
       :key="p.id"
@@ -66,11 +71,14 @@ onMounted(async () => {
       <svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
         <path :d="icons[p.id]" />
       </svg>
-      <span>{{ p.label }}</span>
+      <span>{{ t(p.labelKey) }}</span>
     </button>
     <div class="sidebar-footer">
+      <select :value="currentLang" class="lang-select" @change="onLangChange">
+        <option v-for="l in LANGS" :key="l.code" :value="l.code">{{ l.label }}</option>
+      </select>
       <span class="version">{{ versionText }}</span>
-      <button class="about-btn" @click="aboutOpen = true">关于</button>
+      <button class="about-btn" @click="aboutOpen = true">{{ t("关于") }}</button>
     </div>
   </div>
   <div class="main">

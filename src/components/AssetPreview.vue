@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { ensureAssetLoaded } from "../composables/useAssetThumbs";
+import { t } from "../i18n";
 
 const props = defineProps<{
   path: string;
@@ -70,10 +71,10 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
     <div class="asset-preview-bar">
       <span class="asset-preview-label">{{ label }}</span>
       <div class="asset-preview-actions">
-        <button class="btn ghost small" title="放大" @click="scale = Math.min(8, scale * 1.25)">＋</button>
-        <button class="btn ghost small" title="缩小" @click="scale = Math.max(0.5, scale / 1.25)">－</button>
-        <button class="btn ghost small" title="重置（100%）" @click="reset">100%</button>
-        <button class="btn secondary small" @click="emit('close')">关闭</button>
+        <button class="btn ghost small" :title="t('放大')" @click="scale = Math.min(8, scale * 1.25)">＋</button>
+        <button class="btn ghost small" :title="t('缩小')" @click="scale = Math.max(0.5, scale / 1.25)">－</button>
+        <button class="btn ghost small" :title="t('重置（100%）')" @click="reset">100%</button>
+        <button class="btn secondary small" @click="emit('close')">{{ t("关闭") }}</button>
       </div>
     </div>
     <div class="asset-preview-stage" @wheel.prevent="onWheel">
@@ -87,7 +88,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
         @pointerdown="onPointerDown"
         @pointermove="onPointerMove"
       />
-      <div v-else class="asset-preview-loading">加载中…</div>
+      <div v-else class="asset-preview-loading">{{ t("加载中…") }}</div>
     </div>
   </div>
 </template>

@@ -1,5 +1,6 @@
 ﻿<script setup lang="ts">
 import { computed, nextTick, ref, watch } from "vue";
+import { t } from "../i18n";
 import { open } from "@tauri-apps/plugin-dialog";
 import { projectState, pushLog, clearLogs, scheduleSave, restoreProject } from "../stores/project";
 import { activeConfig, configState, addRecentOutputDir } from "../stores/config";
@@ -51,6 +52,7 @@ const copiedMsg = ref("");
 const logPanelRef = ref<HTMLElement | null>(null);
 
 const PIPELINE_STEPS = ["翻译", "提取", "剧本", "图像", "配音", "组装"];
+const pipelineSteps = computed(() => PIPELINE_STEPS.map((s) => t(s)));
 const currentStep = ref(-1);
 const failedSteps = ref<number[]>([]);
 
@@ -136,7 +138,7 @@ async function pickStyleRef(): Promise<void> {
   }
   const picked = await open({
     multiple: false,
-    filters: [{ name: "参考图", extensions: ["png", "jpg", "jpeg", "webp"] }],
+    filters: [{ name: t("参考图"), extensions: ["png", "jpg", "jpeg", "webp"] }],
   });
   if (!picked || typeof picked !== "string") return;
   try {
@@ -162,7 +164,7 @@ async function onStyleRefFile(e: Event): Promise<void> {
 async function recognizeStyleAndApply(b64: string): Promise<void> {
   const cfg = activeConfig("vision");
   if (!configIsUsable(cfg, "vision")) {
-    pushLog({ step: "画风", message: "图片识别 API 未配置或不可用，无法识别画风；请先在「API 配置」页配置", level: "warn", at: Date.now() });
+    pushLog({ step: "画风", message: t("图片识别 API 未配置或不可用，无法识别画风；请先在「API 配置」页配置"), level: "warn", at: Date.now() });
     return;
   }
   styleRecognizing.value = true;
@@ -296,7 +298,7 @@ async function regenSelected(): Promise<void> {
 }
 
 const FIGURE_EMOTIONS = ["normal", "happy", "sad", "angry", "surprised"];
-const EMOTION_LABELS: Record<string, string> = { normal: "默认", happy: "开心", sad: "悲伤", angry: "愤怒", surprised: "惊讶" };
+const EMOTION_LABELS: Record<string, string> = { normal: t("默认"), happy: t("开心"), sad: t("悲伤"), angry: t("愤怒"), surprised: t("惊讶") };
 
 /** 单张素材重新抠图：不动原图，只重跑抠图出透明底；完成后刷新素材映射 */
 async function reCutout(mapKey: "figure" | "item" | "bg" | "cg", assetKey: string, filePath: string): Promise<void> {
@@ -453,11 +455,11 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
   error.value = "";
   const novel = projectState.novel;
   if (!novel) {
-    error.value = "请先在「导入小说」页导入小说（或加载示例小说）";
+    error.value = t("请先在「导入小说」页导入小说（或加载示例小说）");
     return false;
   }
   if (!opts.stages.length) {
-    error.value = "请至少勾选一个要执行的阶段";
+    error.value = t("请至少勾选一个要执行的阶段");
     return false;
   }
   logger.info("page", "执行生成", {
@@ -478,7 +480,7 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
       });
       if (!prepared) return false;
     } else if (!projectState.lastResult) {
-      error.value = "请先运行文本阶段，生成角色卡片后再确认视觉圣经";
+      error.value = t("请先运行文本阶段，生成角色卡片后再确认视觉圣经");
       tab.value = "bible";
       return false;
     }
@@ -486,7 +488,7 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
     tab.value = "bible";
     pushLog({
       step: "视觉圣经",
-      message: "图像生成前需要确认视觉圣经；文本阶段已准备，请选择来源并创建/重新确认草稿",
+      message: t("图像生成前需要确认视觉圣经；文本阶段已准备，请选择来源并创建/重新确认草稿"),
       level: "info",
       at: Date.now(),
     });
@@ -499,7 +501,7 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
   if (!llm?.apiKey) {
     pushLog({
       step: "提示",
-      message: "未配置文本 LLM API Key，将以演示模式运行（可完整验证剧本/渲染/组装流程）",
+      message: t("未配置文本 LLM API Key，将以演示模式运行（可完整验证剧本/渲染/组装流程）"),
       level: "warn",
       at: Date.now(),
     });
@@ -574,7 +576,7 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
     void loadAssetMapNow();
     if (msg === "已中止") {
       logger.warn("page", "生成被用户中止");
-      log({ step: "中止", message: "已停止生成，进度已保存（缓存命中部分不会重复计费）", level: "warn", at: Date.now() });
+      log({ step: "中止", message: t("已停止生成，进度已保存（缓存命中部分不会重复计费）"), level: "warn", at: Date.now() });
     } else {
       error.value = msg;
       log({ step: "错误", message: msg, level: "error", at: Date.now() });
@@ -594,7 +596,7 @@ function start(): void {
 
 async function prepareVisualBible(): Promise<void> {
   if (!projectState.novel) {
-    error.value = "请先导入小说或加载示例小说";
+    error.value = t("请先导入小说或加载示例小说");
     return;
   }
   const selectedTextStages = selectedStagesList.value.filter((stage) =>
@@ -723,7 +725,7 @@ async function regenCtx(): Promise<RegenContext | null> {
   if (projectState.options.imageSelfCheck && !configIsUsable(visionCfg, "vision")) {
     pushLog({
       step: "图片识别",
-      message: "图像自检已启用，但图片识别 API 未配置或不可用；请先在「API 配置」页完成配置",
+      message: t("图像自检已启用，但图片识别 API 未配置或不可用；请先在「API 配置」页完成配置"),
       level: "error",
       at: Date.now(),
     });
@@ -906,7 +908,7 @@ async function playVoice(key: string, file: string): Promise<void> {
   }
   const src = await ensureAssetLoaded(file);
   if (!src) {
-    pushLog({ step: "素材", message: "读取配音文件失败", level: "warn", at: Date.now() });
+    pushLog({ step: "素材", message: t("读取配音文件失败"), level: "warn", at: Date.now() });
     return;
   }
   playingVoiceKey.value = key;
@@ -914,7 +916,7 @@ async function playVoice(key: string, file: string): Promise<void> {
   if (audioRef.value) {
     audioRef.value.src = src;
     void audioRef.value.play().catch(() => {
-      pushLog({ step: "素材", message: "试听播放失败（可能音频编码不支持）", level: "warn", at: Date.now() });
+      pushLog({ step: "素材", message: t("试听播放失败（可能音频编码不支持）"), level: "warn", at: Date.now() });
     });
   }
 }
@@ -969,7 +971,7 @@ async function browseOutputDir(): Promise<void> {
   if (!isTauri()) {
     projectState.outputDir = await tauri.getDefaultOutputDir();
     configState.outputDir = projectState.outputDir;
-    pushLog({ step: "项目", message: "Web 版输出目录固定为虚拟目录 /app/exports", level: "info", at: Date.now() });
+    pushLog({ step: "项目", message: t("Web 版输出目录固定为虚拟目录 /app/exports"), level: "info", at: Date.now() });
     return;
   }
   const dir = await open({ directory: true, multiple: false });
@@ -1030,7 +1032,7 @@ async function copyLogs(): Promise<void> {
     .map((l) => `[${new Date(l.at).toLocaleTimeString()}] [${l.step}] ${l.message}`)
     .join("\n");
   await navigator.clipboard.writeText(text);
-  copiedMsg.value = "日志已复制";
+  copiedMsg.value = t("日志已复制");
   setTimeout(() => (copiedMsg.value = ""), 2000);
 }
 
@@ -1071,9 +1073,9 @@ async function retryFailed(): Promise<void> {
   }
   if (chapterIds.size) {
     rerunChapters.value = Array.from(chapterIds);
-    copiedMsg.value = "已定位失败章节，点击「开始生成」重试（其余章节复用缓存）";
+    copiedMsg.value = t("已定位失败章节，点击「开始生成」重试（其余章节复用缓存）");
   } else {
-    copiedMsg.value = "无章节级失败；请勾选「跳过缓存」后重跑以重试图像任务";
+    copiedMsg.value = t("无章节级失败；请勾选「跳过缓存」后重跑以重试图像任务");
   }
   setTimeout(() => (copiedMsg.value = ""), 4000);
 }
@@ -1101,7 +1103,7 @@ function toggleChapterRerun(index: number, checked: boolean): void {
 function stop(): void {
   pipelineRef.value?.abort();
   error.value = "";
-  pushLog({ step: "中止", message: "用户请求中止，当前任务完成后将停止", level: "warn", at: Date.now() });
+  pushLog({ step: "中止", message: t("用户请求中止，当前任务完成后将停止"), level: "warn", at: Date.now() });
 }
 
 function onCardsSaved(cards: unknown): void {
@@ -1112,7 +1114,7 @@ function onCardsSaved(cards: unknown): void {
 }
 
 function fileExistsLabel(file: string | undefined): string {
-  return file ? "已生成" : "未生成";
+  return file ? t("已生成") : t("未生成");
 }
 </script>
 
@@ -1120,38 +1122,38 @@ function fileExistsLabel(file: string | undefined): string {
   <div class="inner">
     <div class="page-head">
       <div>
-        <div class="page-title">生成项目</div>
-        <p class="page-sub">AI 管线：提取 → 剧本 → 图像 → 配音 → 组装。可整体跑，也可分阶段单独执行与重生成。</p>
+        <div class="page-title">{{ t("生成项目") }}</div>
+        <p class="page-sub">{{ t("AI 管线：提取 → 剧本 → 图像 → 配音 → 组装。可整体跑，也可分阶段单独执行与重生成。") }}</p>
       </div>
       <div class="page-actions">
         <button class="btn" :disabled="busy" @click="start">
           <span v-if="busy" class="spinner" />
-          {{ busy ? "生成中…" : "开始生成" }}
+          {{ busy ? t("生成中…") : t("开始生成") }}
         </button>
-        <button v-if="busy" class="btn danger" @click="stop">停止</button>
+        <button v-if="busy" class="btn danger" @click="stop">{{ t("停止") }}</button>
       </div>
     </div>
 
     <div v-if="visualBibleReviewNeeded" class="vb-banner">
       <div>
-        <strong>图像生成前需要确认视觉圣经</strong>
-        <p>统一风格与角色三视图尚未批准，图像阶段会先停在这里。</p>
+        <strong>{{ t("图像生成前需要确认视觉圣经") }}</strong>
+        <p>{{ t("统一风格与角色三视图尚未批准，图像阶段会先停在这里。") }}</p>
       </div>
-      <button class="btn secondary small" @click="tab = 'bible'">去确认</button>
+      <button class="btn secondary small" @click="tab = 'bible'">{{ t("去确认") }}</button>
     </div>
 
     <div v-if="busy || currentStep >= 0" style="margin-bottom: var(--space-4)">
-      <StepIndicator :steps="PIPELINE_STEPS" :current="currentStep" :failed="failedSteps" />
+      <StepIndicator :steps="pipelineSteps" :current="currentStep" :failed="failedSteps" />
     </div>
 
     <div class="card" style="padding: var(--space-4)">
       <div style="display: flex; flex-wrap: wrap; gap: var(--space-3)">
         <label class="field" style="flex: 2 1 340px; margin-bottom: 0">
-          <span>输出目录</span>
+          <span>{{ t("输出目录") }}</span>
           <div class="row">
             <input type="text" v-model="projectState.outputDir" style="flex: 3" />
-            <button class="btn secondary small" @click="browseOutputDir">浏览…</button>
-            <button class="btn ghost small" @click="loadProjectState">加载该项目</button>
+            <button class="btn secondary small" @click="browseOutputDir">{{ t("浏览…") }}</button>
+            <button class="btn ghost small" @click="loadProjectState">{{ t("加载该项目") }}</button>
           </div>
         </label>
       </div>
@@ -1159,111 +1161,111 @@ function fileExistsLabel(file: string | undefined): string {
 
     <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(430px, 1fr)); gap: var(--space-4)">
       <div class="card" style="margin-bottom: 0">
-        <div class="card-head"><h3>生成内容</h3></div>
+        <div class="card-head"><h3>{{ t("生成内容") }}</h3></div>
         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px 18px">
           <label style="display: flex; align-items: center; gap: 8px; font-size: 13px">
-            <input type="checkbox" v-model="projectState.options.useImage" /> 图像（立绘/背景/CG/物品）
+            <input type="checkbox" v-model="projectState.options.useImage" /> {{ t("图像（立绘/背景/CG/物品）") }}
           </label>
           <label style="display: flex; align-items: center; gap: 8px; font-size: 13px">
-            <input type="checkbox" v-model="projectState.options.figureEmotions" /> 表情差分（5 表情/角色）
+            <input type="checkbox" v-model="projectState.options.figureEmotions" /> {{ t("表情差分（5 表情/角色）") }}
           </label>
           <label style="display: flex; align-items: center; gap: 8px; font-size: 13px">
-            <input type="checkbox" v-model="projectState.options.figureActions" /> 人物动作（入场/情绪动作/镜头震动）
+            <input type="checkbox" v-model="projectState.options.figureActions" /> {{ t("人物动作（入场/情绪动作/镜头震动）") }}
           </label>
           <label style="display: flex; align-items: center; gap: 8px; font-size: 13px">
-            <input type="checkbox" v-model="projectState.options.characterPoses" /> 角色三视图与动作立绘（图生图，形象更一致）
+            <input type="checkbox" v-model="projectState.options.characterPoses" /> {{ t("角色三视图与动作立绘（图生图，形象更一致）") }}
           </label>
-          <label style="display: flex; align-items: center; gap: 8px; font-size: 13px" :title="'先生成一张全项目画风基准图，背景/CG 以其为参考图，强制所有图片画风统一（推荐开启）'">
-            <input type="checkbox" v-model="projectState.options.styleAnchor" /> 风格锚点（背景/CG 统一画风）
+          <label style="display: flex; align-items: center; gap: 8px; font-size: 13px" :title="t('先生成一张全项目画风基准图，背景/CG 以其为参考图，强制所有图片画风统一（推荐开启）')">
+            <input type="checkbox" v-model="projectState.options.styleAnchor" /> {{ t("风格锚点（背景/CG 统一画风）") }}
           </label>
-          <label style="display: flex; align-items: center; gap: 8px; font-size: 13px" :title="'使用独立图片识别 API 核对生成图，不合格自动重生成 1 次（会增加费用与耗时）'">
-            <input type="checkbox" v-model="projectState.options.imageSelfCheck" /> 图像自检（多模态核对，不合格自动重生成）
-          </label>
-          <label style="display: flex; align-items: center; gap: 8px; font-size: 13px">
-            <input type="checkbox" v-model="projectState.options.useTts" /> 配音（TTS）
+          <label style="display: flex; align-items: center; gap: 8px; font-size: 13px" :title="t('使用独立图片识别 API 核对生成图，不合格自动重生成 1 次（会增加费用与耗时）')">
+            <input type="checkbox" v-model="projectState.options.imageSelfCheck" /> {{ t("图像自检（多模态核对，不合格自动重生成）") }}
           </label>
           <label style="display: flex; align-items: center; gap: 8px; font-size: 13px">
-            <input type="checkbox" v-model="projectState.options.useVideoPoints" /> 视频推荐位
+            <input type="checkbox" v-model="projectState.options.useTts" /> {{ t("配音（TTS）") }}
           </label>
           <label style="display: flex; align-items: center; gap: 8px; font-size: 13px">
-            <input type="checkbox" v-model="projectState.options.useBgm" /> BGM 匹配
+            <input type="checkbox" v-model="projectState.options.useVideoPoints" /> {{ t("视频推荐位") }}
           </label>
           <label style="display: flex; align-items: center; gap: 8px; font-size: 13px">
-            <input type="checkbox" v-model="projectState.options.characterIntroCard" /> 角色登场资料卡
+            <input type="checkbox" v-model="projectState.options.useBgm" /> {{ t("BGM 匹配") }}
+          </label>
+          <label style="display: flex; align-items: center; gap: 8px; font-size: 13px">
+            <input type="checkbox" v-model="projectState.options.characterIntroCard" /> {{ t("角色登场资料卡") }}
           </label>
         </div>
         <label class="field" style="margin-top: 12px">
-          <span>目标语言（先把小说翻译成该语言再生成，留空 = 用原文）</span>
+          <span>{{ t("目标语言（先把小说翻译成该语言再生成，留空 = 用原文）") }}</span>
           <select v-model="projectState.options.language">
-            <option value="">不翻译（使用原文）</option>
+            <option value="">{{ t("不翻译（使用原文）") }}</option>
             <option v-for="l in LANGUAGES" :key="l.code" :value="l.code">{{ l.label }}</option>
           </select>
         </label>
         <label class="field" style="margin-top: 12px">
-          <span>统一画风（留空用默认画风，所有立绘/背景/CG 保持一致）</span>
+          <span>{{ t("统一画风（留空用默认画风，所有立绘/背景/CG 保持一致）") }}</span>
           <input
             type="text"
             v-model="projectState.options.imageStyle"
-            placeholder="例：unified Japanese anime style, cel shading, clean line art"
+            :placeholder="t('例：unified Japanese anime style, cel shading, clean line art')"
           />
         </label>
         <div class="row" style="align-items: flex-end; margin-top: 10px">
           <div class="field" style="flex: 1; margin-bottom: 0">
-            <span>风格参考图（上传图片 → AI 识别画风并自动填入上方）</span>
+            <span>{{ t("风格参考图（上传图片 → AI 识别画风并自动填入上方）") }}</span>
             <div class="row">
               <button class="btn secondary small" :disabled="styleRecognizing" @click="pickStyleRef">
                 <span v-if="styleRecognizing" class="spinner" />
-                {{ styleRecognizing ? "AI 识别中…" : styleRefSrc ? "更换图片并重新识别" : "上传图片，AI 识别画风" }}
+                {{ styleRecognizing ? t("AI 识别中…") : styleRefSrc ? t("更换图片并重新识别") : t("上传图片，AI 识别画风") }}
               </button>
-              <span v-if="styleRefSrc" class="tag ok">已识别</span>
-              <button v-if="styleRefSrc" class="btn ghost small" @click="styleRefSrc = ''">清除</button>
+              <span v-if="styleRefSrc" class="tag ok">{{ t("已识别") }}</span>
+              <button v-if="styleRefSrc" class="btn ghost small" @click="styleRefSrc = ''">{{ t("清除") }}</button>
               <input ref="styleRefInput" type="file" accept="image/*" style="display: none" @change="onStyleRefFile" />
             </div>
           </div>
           <img
             v-if="styleRefSrc"
             :src="styleRefSrc"
-            alt="风格参考图"
+            :alt="t('风格参考图')"
             style="width: 72px; height: 72px; object-fit: cover; border-radius: 8px; border: 1px solid var(--border)"
           />
         </div>
         <label class="field" style="margin-top: 12px">
-          <span>剧本风格（按此风格重写台词与旁白，留空不调整。例：古风典雅 / 幽默风趣 / 冷峻克制）</span>
-          <input type="text" v-model="projectState.options.scriptStyle" placeholder="例：古风典雅，多用对仗与典雅意象" />
+          <span>{{ t("剧本风格（按此风格重写台词与旁白，留空不调整。例：古风典雅 / 幽默风趣 / 冷峻克制）") }}</span>
+          <input type="text" v-model="projectState.options.scriptStyle" :placeholder="t('例：古风典雅，多用对仗与典雅意象')" />
         </label>
       </div>
 
       <div class="card" style="margin-bottom: 0">
-        <div class="card-head"><h3>预算与范围</h3></div>
+        <div class="card-head"><h3>{{ t("预算与范围") }}</h3></div>
         <div class="row">
           <label class="field">
-            <span>每章 CG 数上限</span>
+            <span>{{ t("每章 CG 数上限") }}</span>
             <input type="number" v-model.number="projectState.options.cgPerChapter" min="0" max="10" />
           </label>
           <label class="field">
-            <span>每章图像数上限</span>
+            <span>{{ t("每章图像数上限") }}</span>
             <input type="number" v-model.number="projectState.options.imageBudgetPerChapter" min="0" max="50" />
           </label>
           <label class="field">
-            <span>视频推荐点数上限</span>
+            <span>{{ t("视频推荐点数上限") }}</span>
             <input type="number" v-model.number="projectState.options.videoPointsPerChapter" min="0" max="5" />
           </label>
         </div>
         <div class="row">
           <label class="field">
-            <span>预算上限（¥，0 = 不限）</span>
+            <span>{{ t("预算上限（¥，0 = 不限）") }}</span>
             <input type="number" v-model.number="projectState.options.budgetYuan" min="0" step="0.5" />
           </label>
-          <label class="field" :title="'同时生成图片/配音的任务数。调大可显著提速，但会同时消耗多张额度；默认 30，可到系统配置页统一调整'">
-            <span>图像/配音并发数</span>
+          <label class="field" :title="t('同时生成图片/配音的任务数。调大可显著提速，但会同时消耗多张额度；默认 30，可到系统配置页统一调整')">
+            <span>{{ t("图像/配音并发数") }}</span>
             <input type="number" v-model.number="projectState.options.maxConcurrent" min="1" max="100" />
           </label>
-          <label class="field" :title="'固定所有图片生成的随机种子：同一种子下背景/CG/立绘的画风与角色更稳定一致。0 = 按小说标题自动派生'">
-            <span>固定种子（0 = 按标题自动派生）</span>
+          <label class="field" :title="t('固定所有图片生成的随机种子：同一种子下背景/CG/立绘的画风与角色更稳定一致。0 = 按小说标题自动派生')">
+            <span>{{ t("固定种子（0 = 按标题自动派生）") }}</span>
             <input type="number" v-model.number="projectState.options.imageSeed" min="0" />
           </label>
           <label class="field">
-            <span>跳过缓存（全量重跑）</span>
+            <span>{{ t("跳过缓存（全量重跑）") }}</span>
             <div style="padding-top: 6px"><input type="checkbox" v-model="projectState.options.skipCache" /></div>
           </label>
         </div>
@@ -1272,39 +1274,39 @@ function fileExistsLabel(file: string | undefined): string {
 
     <div class="card" style="margin-top: var(--space-4)">
       <div class="card-head">
-        <h3>本次执行阶段</h3>
+        <h3>{{ t("本次执行阶段") }}</h3>
         <div class="card-actions">
-          <button class="btn ghost small" @click="selectedStages = { split: true, translate: true, extract: true, script: true, image: true, voice: true, assemble: true }">全选</button>
-          <button class="btn ghost small" @click="selectedStages = { split: false, translate: false, extract: false, script: false, image: false, voice: false, assemble: false }">全不选</button>
+          <button class="btn ghost small" @click="selectedStages = { split: true, translate: true, extract: true, script: true, image: true, voice: true, assemble: true }">{{ t("全选") }}</button>
+          <button class="btn ghost small" @click="selectedStages = { split: false, translate: false, extract: false, script: false, image: false, voice: false, assemble: false }">{{ t("全不选") }}</button>
         </div>
       </div>
       <div style="display: flex; flex-wrap: wrap; gap: 10px 22px">
         <label v-for="s in STAGE_ORDER" :key="s" style="display: flex; align-items: center; gap: 6px; font-size: 13px">
           <input type="checkbox" v-model="selectedStages[s]" />
-          {{ STAGE_LABELS[s] }}
-          <span v-if="s === 'split'" style="color: var(--text-faint); font-size: 11px">AI 识别章节边界（多文件合并/未切章时必开）</span>
-          <span v-else-if="s === 'translate'" style="color: var(--text-faint); font-size: 11px">小说→目标语言（需 LLM）</span>
-          <span v-else-if="s === 'extract'" style="color: var(--text-faint); font-size: 11px">角色/场景/物品卡</span>
-          <span v-else-if="s === 'script'" style="color: var(--text-faint); font-size: 11px">分章分镜</span>
-          <span v-else-if="s === 'image'" style="color: var(--text-faint); font-size: 11px">立绘/背景/CG/物品图</span>
-          <span v-else-if="s === 'voice'" style="color: var(--text-faint); font-size: 11px">逐句配音</span>
-          <span v-else style="color: var(--text-faint); font-size: 11px">写入游戏文件</span>
+          {{ t(STAGE_LABELS[s]) }}
+          <span v-if="s === 'split'" style="color: var(--text-faint); font-size: 11px">{{ t("AI 识别章节边界（多文件合并/未切章时必开）") }}</span>
+          <span v-else-if="s === 'translate'" style="color: var(--text-faint); font-size: 11px">{{ t("小说→目标语言（需 LLM）") }}</span>
+          <span v-else-if="s === 'extract'" style="color: var(--text-faint); font-size: 11px">{{ t("角色/场景/物品卡") }}</span>
+          <span v-else-if="s === 'script'" style="color: var(--text-faint); font-size: 11px">{{ t("分章分镜") }}</span>
+          <span v-else-if="s === 'image'" style="color: var(--text-faint); font-size: 11px">{{ t("立绘/背景/CG/物品图") }}</span>
+          <span v-else-if="s === 'voice'" style="color: var(--text-faint); font-size: 11px">{{ t("逐句配音") }}</span>
+          <span v-else style="color: var(--text-faint); font-size: 11px">{{ t("写入游戏文件") }}</span>
         </label>
       </div>
       <p style="color: var(--text-dim); font-size: 12px; margin-top: var(--space-2)">
-        未勾选的阶段会复用已有结果（卡片/剧本/素材），不会重新计费；若某阶段从未运行过则会提示需先运行。
+        {{ t("未勾选的阶段会复用已有结果（卡片/剧本/素材），不会重新计费；若某阶段从未运行过则会提示需先运行。") }}
       </p>
     </div>
 
     <div class="card" v-if="projectState.novel" style="margin-top: var(--space-4)">
       <div class="card-head">
-        <h3>本次重跑章节</h3>
+        <h3>{{ t("本次重跑章节") }}</h3>
         <div class="card-actions">
-          <button class="btn ghost small" @click="toggleAllRerun(true)">全选</button>
-          <button class="btn ghost small" @click="toggleAllRerun(false)">全不选</button>
+          <button class="btn ghost small" @click="toggleAllRerun(true)">{{ t("全选") }}</button>
+          <button class="btn ghost small" @click="toggleAllRerun(false)">{{ t("全不选") }}</button>
         </div>
       </div>
-      <p style="font-size: 12px; color: var(--text-dim); margin-bottom: var(--space-3)">未勾选章节复用已有缓存；无缓存则跳过</p>
+      <p style="font-size: 12px; color: var(--text-dim); margin-bottom: var(--space-3)">{{ t("未勾选章节复用已有缓存；无缓存则跳过") }}</p>
       <div style="display: flex; flex-wrap: wrap; gap: 6px 18px">
         <label v-for="(ch, i) in projectState.novel.chapters" :key="i" style="display: flex; align-items: center; gap: 5px; font-size: 12.5px">
           <input
@@ -1318,108 +1320,108 @@ function fileExistsLabel(file: string | undefined): string {
     </div>
 
     <div class="card" v-if="projectState.lastResult" style="margin-top: var(--space-4)">
-      <div class="card-head"><h3>分阶段操作（不满意可单独重生成）</h3></div>
+      <div class="card-head"><h3>{{ t("分阶段操作（不满意可单独重生成）") }}</h3></div>
       <div style="display: flex; flex-direction: column; gap: 10px">
         <div class="stage-row">
-          <div class="stage-row-label"><span class="stage-dot">①</span><b>分章</b></div>
-          <input type="text" v-model="stageFeedback.split" placeholder="意见（可选）：如「每章约 8000 字，按剧情自然切分」…" />
-          <button class="btn small" :disabled="busy" @click="runSplitRegen">重新分章（连后续）</button>
+          <div class="stage-row-label"><span class="stage-dot">①</span><b>{{ t("分章") }}</b></div>
+          <input type="text" v-model="stageFeedback.split" :placeholder="t('意见（可选）：如「每章约 8000 字，按剧情自然切分」…')" />
+          <button class="btn small" :disabled="busy" @click="runSplitRegen">{{ t("重新分章（连后续）") }}</button>
         </div>
         <div class="stage-row">
-          <div class="stage-row-label"><span class="stage-dot">②</span><b>翻译</b></div>
-          <input type="text" v-model="stageFeedback.translate" placeholder="意见（可选）：如「人名保持拼音，语气更自然」…" />
-          <button class="btn small" :disabled="busy" @click="runTranslateRegen">重新翻译（连后续）</button>
+          <div class="stage-row-label"><span class="stage-dot">②</span><b>{{ t("翻译") }}</b></div>
+          <input type="text" v-model="stageFeedback.translate" :placeholder="t('意见（可选）：如「人名保持拼音，语气更自然」…')" />
+          <button class="btn small" :disabled="busy" @click="runTranslateRegen">{{ t("重新翻译（连后续）") }}</button>
         </div>
         <div class="stage-row">
-          <div class="stage-row-label"><span class="stage-dot">③</span><b>提取卡片</b></div>
-          <input type="text" v-model="stageFeedback.extract" placeholder="意见（可选）：如「主角要有两个女性角色」…" />
-          <button class="btn small" :disabled="busy" @click="runExtractRegen">重新提取（连剧本/图像）</button>
+          <div class="stage-row-label"><span class="stage-dot">③</span><b>{{ t("提取卡片") }}</b></div>
+          <input type="text" v-model="stageFeedback.extract" :placeholder="t('意见（可选）：如「主角要有两个女性角色」…')" />
+          <button class="btn small" :disabled="busy" @click="runExtractRegen">{{ t("重新提取（连剧本/图像）") }}</button>
         </div>
         <div class="stage-row">
-          <div class="stage-row-label"><span class="stage-dot">④</span><b>剧本</b></div>
-          <input type="text" v-model="stageFeedback.script" placeholder="意见（可选）：如「对话更口语化，高潮更激烈」…" />
-          <button class="btn small" :disabled="busy" @click="runScriptRegen">重新剧本（全部章节）</button>
+          <div class="stage-row-label"><span class="stage-dot">④</span><b>{{ t("剧本") }}</b></div>
+          <input type="text" v-model="stageFeedback.script" :placeholder="t('意见（可选）：如「对话更口语化，高潮更激烈」…')" />
+          <button class="btn small" :disabled="busy" @click="runScriptRegen">{{ t("重新剧本（全部章节）") }}</button>
         </div>
         <div class="stage-row">
-          <div class="stage-row-label"><span class="stage-dot">⑤</span><b>图像</b></div>
-          <input type="text" v-model="stageFeedback.image" placeholder="意见（可选）：如「整体更有电影感，背景更精致」…" />
-          <button class="btn small" :disabled="busy" @click="runImageRegen">重新生成全部图像</button>
+          <div class="stage-row-label"><span class="stage-dot">⑤</span><b>{{ t("图像") }}</b></div>
+          <input type="text" v-model="stageFeedback.image" :placeholder="t('意见（可选）：如「整体更有电影感，背景更精致」…')" />
+          <button class="btn small" :disabled="busy" @click="runImageRegen">{{ t("重新生成全部图像") }}</button>
         </div>
         <div class="stage-row">
-          <div class="stage-row-label"><span class="stage-dot">⑥</span><b>配音</b></div>
-          <span style="color: var(--text-faint); font-size: 12px">TTS 不接收意见；如需重配请点击右侧按钮（全部重配）</span>
-          <button class="btn small" :disabled="busy" @click="runVoiceRegen">重新配音（全部）</button>
+          <div class="stage-row-label"><span class="stage-dot">⑥</span><b>{{ t("配音") }}</b></div>
+          <span style="color: var(--text-faint); font-size: 12px">{{ t("TTS 不接收意见；如需重配请点击右侧按钮（全部重配）") }}</span>
+          <button class="btn small" :disabled="busy" @click="runVoiceRegen">{{ t("重新配音（全部）") }}</button>
         </div>
         <div class="stage-row">
-          <div class="stage-row-label"><span class="stage-dot">⑦</span><b>组装</b></div>
-          <span style="color: var(--text-faint); font-size: 12px">把当前卡片/剧本/素材重新写入游戏目录</span>
-          <button class="btn small" :disabled="busy" @click="runAssemble">重新组装</button>
+          <div class="stage-row-label"><span class="stage-dot">⑦</span><b>{{ t("组装") }}</b></div>
+          <span style="color: var(--text-faint); font-size: 12px">{{ t("把当前卡片/剧本/素材重新写入游戏目录") }}</span>
+          <button class="btn small" :disabled="busy" @click="runAssemble">{{ t("重新组装") }}</button>
         </div>
       </div>
       <p style="color: var(--text-dim); font-size: 12px; margin-top: var(--space-2)">
-        单条立绘 / 单句配音的重生成请在下方「素材」页操作。
+        {{ t("单条立绘 / 单句配音的重生成请在下方「素材」页操作。") }}
       </p>
     </div>
 
     <p v-if="error" style="color: var(--err); margin: var(--space-3) 0">{{ error }}</p>
 
     <div class="tabs">
-      <button class="tab" :class="{ active: tab === 'run' }" @click="tab = 'run'">状态与费用</button>
-      <button class="tab" :class="{ active: tab === 'cards' }" @click="tab = 'cards'">卡片编辑</button>
-      <button class="tab" :class="{ active: tab === 'asset' }" @click="tab = 'asset'; loadAssetMapNow()">素材</button>
+      <button class="tab" :class="{ active: tab === 'run' }" @click="tab = 'run'">{{ t("状态与费用") }}</button>
+      <button class="tab" :class="{ active: tab === 'cards' }" @click="tab = 'cards'">{{ t("卡片编辑") }}</button>
+      <button class="tab" :class="{ active: tab === 'asset' }" @click="tab = 'asset'; loadAssetMapNow()">{{ t("素材") }}</button>
       <button class="tab" :class="{ active: tab === 'bible' }" @click="tab = 'bible'">
-        视觉圣经
-        <span v-if="visualBibleReviewNeeded" class="tab-badge">待确认</span>
+        {{ t("视觉圣经") }}
+        <span v-if="visualBibleReviewNeeded" class="tab-badge">{{ t("待确认") }}</span>
       </button>
-      <button class="tab" :class="{ active: tab === 'video' }" @click="tab = 'video'; checkVideos()">视频推荐位</button>
-      <button class="tab" :class="{ active: tab === 'script' }" @click="tab = 'script'; loadScripts()">剧本</button>
+      <button class="tab" :class="{ active: tab === 'video' }" @click="tab = 'video'; checkVideos()">{{ t("视频推荐位") }}</button>
+      <button class="tab" :class="{ active: tab === 'script' }" @click="tab = 'script'; loadScripts()">{{ t("剧本") }}</button>
       <button class="tab" :class="{ active: tab === 'failed' }" @click="tab = 'failed'">
-        失败项<template v-if="failedTasks.length">（{{ failedTasks.length }}）</template>
+        {{ t("失败项") }}<template v-if="failedTasks.length">（{{ failedTasks.length }}）</template>
       </button>
-      <button class="tab" :class="{ active: tab === 'log' }" @click="tab = 'log'">日志</button>
+      <button class="tab" :class="{ active: tab === 'log' }" @click="tab = 'log'">{{ t("日志") }}</button>
     </div>
 
     <div v-if="tab === 'run'">
       <div class="stat-grid">
         <div class="stat">
           <span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" /><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" /></svg></span>
-          <div class="stat-body"><div class="label">章节</div><div class="value">{{ projectState.novel?.chapters.filter((c) => c.enabled !== false).length ?? 0 }}</div></div>
+          <div class="stat-body"><div class="label">{{ t("章节") }}</div><div class="value">{{ projectState.novel?.chapters.filter((c) => c.enabled !== false).length ?? 0 }}</div></div>
         </div>
         <div class="stat">
           <span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><path d="M14 2v6h6" /></svg></span>
-          <div class="stat-body"><div class="label">总字数</div><div class="value">{{ (projectState.novel?.fullText.length ?? 0).toLocaleString() }}</div></div>
+          <div class="stat-body"><div class="label">{{ t("总字数") }}</div><div class="value">{{ (projectState.novel?.fullText.length ?? 0).toLocaleString() }}</div></div>
         </div>
         <div class="stat">
           <span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5" /></svg></span>
-          <div class="stat-body"><div class="label">素材</div><div class="value">{{ projectState.materials.length }}</div></div>
+          <div class="stat-body"><div class="label">{{ t("素材") }}</div><div class="value">{{ projectState.materials.length }}</div></div>
         </div>
         <div class="stat">
           <span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10" /><polyline points="12 6 12 12 16 14" /></svg></span>
           <div class="stat-body">
-            <div class="label">状态</div>
-            <div class="value" :style="busy ? 'color: var(--warn)' : projectState.lastResult ? 'color: var(--ok)' : ''">{{ busy ? "运行中" : projectState.lastResult ? "已完成" : "未开始" }}</div>
+            <div class="label">{{ t("状态") }}</div>
+            <div class="value" :style="busy ? 'color: var(--warn)' : projectState.lastResult ? 'color: var(--ok)' : ''">{{ busy ? t("运行中") : projectState.lastResult ? t("已完成") : t("未开始") }}</div>
           </div>
         </div>
       </div>
       <div class="card" v-if="liveProgress && busy" style="margin-top: var(--space-4)">
         <div class="card-head">
-          <h3>实时进度</h3>
+          <h3>{{ t("实时进度") }}</h3>
           <span style="color: var(--text-faint); font-size: 12px">{{ liveProgress.done }}/{{ liveProgress.total }} · {{ livePct }}%</span>
         </div>
         <div class="progress-bar"><div class="progress-fill" :style="{ width: livePct + '%' }"></div></div>
         <p style="color: var(--text-dim); font-size: 12px; margin-top: var(--space-2)">
-          {{ liveProgress.step }} · 当前：{{ liveProgress.label }}
+          {{ liveProgress.step }} · {{ t("当前：") }}{{ liveProgress.label }}
         </p>
       </div>
       <div class="card" v-if="costText" style="margin-top: var(--space-4)">
-        <div class="card-head"><h3>费用统计（估算）</h3></div>
+        <div class="card-head"><h3>{{ t("费用统计（估算）") }}</h3></div>
         <div class="stat-grid">
           <div class="stat"><span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9" /><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z" /></svg></span><div class="stat-body"><div class="label">LLM</div><div class="value" style="font-size: 15px">{{ costText.llm }}</div></div></div>
-          <div class="stat"><span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" /><circle cx="9" cy="9" r="2" /><path d="M21 15l-5-5L5 21" /></svg></span><div class="stat-body"><div class="label">图像</div><div class="value" style="font-size: 15px">{{ costText.image }}</div></div></div>
-          <div class="stat"><span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 6V18M8 9V15M16 9V15M5 11V13M19 11V13" /></svg></span><div class="stat-body"><div class="label">配音</div><div class="value" style="font-size: 15px">{{ costText.tts }}</div></div></div>
-          <div class="stat"><span class="stat-icon" style="background: var(--gradient-hot)"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1v22M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" /></svg></span><div class="stat-body"><div class="label">合计</div><div class="value" style="font-size: 16px">¥{{ costText.total }}</div></div></div>
+          <div class="stat"><span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" /><circle cx="9" cy="9" r="2" /><path d="M21 15l-5-5L5 21" /></svg></span><div class="stat-body"><div class="label">{{ t("图像") }}</div><div class="value" style="font-size: 15px">{{ costText.image }}</div></div></div>
+          <div class="stat"><span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 6V18M8 9V15M16 9V15M5 11V13M19 11V13" /></svg></span><div class="stat-body"><div class="label">{{ t("配音") }}</div><div class="value" style="font-size: 15px">{{ costText.tts }}</div></div></div>
+          <div class="stat"><span class="stat-icon" style="background: var(--gradient-hot)"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1v22M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" /></svg></span><div class="stat-body"><div class="label">{{ t("合计") }}</div><div class="value" style="font-size: 16px">¥{{ costText.total }}</div></div></div>
         </div>
-        <p style="color: var(--text-dim); font-size: 12px; margin-top: var(--space-3)">图像按 ¥0.3/张、文本按 ¥2+8/百万 token 估算；视频由你人工生成不计费；缓存命中不重复计费。</p>
+        <p style="color: var(--text-dim); font-size: 12px; margin-top: var(--space-3)">{{ t("图像按 ¥0.3/张、文本按 ¥2+8/百万 token 估算；视频由你人工生成不计费；缓存命中不重复计费。") }}</p>
       </div>
     </div>
 
@@ -1427,7 +1429,7 @@ function fileExistsLabel(file: string | undefined): string {
       <EditCards v-if="projectState.lastResult" :cards="projectState.lastResult.cards" @saved="onCardsSaved" />
       <div v-else class="empty">
         <img src="/src/assets/empty-generate.png" alt="" style="width: 240px; opacity: 0.9; margin-bottom: 12px" />
-        <p>尚无生成结果，先运行一次生成</p>
+        <p>{{ t("尚无生成结果，先运行一次生成") }}</p>
       </div>
     </div>
 
@@ -1438,7 +1440,7 @@ function fileExistsLabel(file: string | undefined): string {
     <div v-else-if="tab === 'asset'">
       <div v-if="!projectState.lastResult || !assetMap" class="empty">
         <img src="/src/assets/empty-generate.png" alt="" style="width: 220px; opacity: 0.9; margin-bottom: 12px" />
-        <p>暂无素材（生成后出现）。生成后可在本页对单张立绘、背景、CG、物品图或单句配音单独重新生成。</p>
+        <p>{{ t("暂无素材（生成后出现）。生成后可在本页对单张立绘、背景、CG、物品图或单句配音单独重新生成。") }}</p>
       </div>
       <template v-else>
         <div v-if="assetBusy" class="asset-regen-status">
@@ -1448,57 +1450,57 @@ function fileExistsLabel(file: string | undefined): string {
           </div>
           <span class="asset-regen-label">
             <template v-if="regenProgress">{{ regenProgress.done }}/{{ regenProgress.total }} · {{ regenProgress.label }}</template>
-            <template v-else>准备中…</template>
+            <template v-else>{{ t("准备中…") }}</template>
           </span>
-          <button class="btn danger small" @click="regenAbort = true">中断</button>
+          <button class="btn danger small" @click="regenAbort = true">{{ t("中断") }}</button>
         </div>
         <div class="asset-toolbar">
           <div class="asset-subtabs">
-            <button class="asset-subtab" :class="{ active: assetTab === 'figure' }" @click="assetTab = 'figure'">角色立绘</button>
-            <button class="asset-subtab" :class="{ active: assetTab === 'item' }" @click="assetTab = 'item'">物品图</button>
-            <button class="asset-subtab" :class="{ active: assetTab === 'bg' }" @click="assetTab = 'bg'">背景图</button>
+            <button class="asset-subtab" :class="{ active: assetTab === 'figure' }" @click="assetTab = 'figure'">{{ t("角色立绘") }}</button>
+            <button class="asset-subtab" :class="{ active: assetTab === 'item' }" @click="assetTab = 'item'">{{ t("物品图") }}</button>
+            <button class="asset-subtab" :class="{ active: assetTab === 'bg' }" @click="assetTab = 'bg'">{{ t("背景图") }}</button>
             <button class="asset-subtab" :class="{ active: assetTab === 'cg' }" @click="assetTab = 'cg'">CG</button>
-            <button class="asset-subtab" :class="{ active: assetTab === 'voice' }" @click="assetTab = 'voice'">配音</button>
+            <button class="asset-subtab" :class="{ active: assetTab === 'voice' }" @click="assetTab = 'voice'">{{ t("配音") }}</button>
           </div>
           <div v-if="assetTab !== 'voice'" class="asset-toolbar-right">
-            <span v-if="selectedCount" class="tag ok">已选 {{ selectedCount }}</span>
-            <button class="btn ghost small" @click="selectAllInTab">全选本区</button>
-            <button class="btn ghost small" :disabled="!selectedCount" @click="clearSelected">清空</button>
-            <button class="btn small" :disabled="!selectedCount || !!assetBusy" @click="regenSelected">重新生成已选（{{ selectedCount }}）</button>
+            <span v-if="selectedCount" class="tag ok">{{ t("已选") }} {{ selectedCount }}</span>
+            <button class="btn ghost small" @click="selectAllInTab">{{ t("全选本区") }}</button>
+            <button class="btn ghost small" :disabled="!selectedCount" @click="clearSelected">{{ t("清空") }}</button>
+            <button class="btn small" :disabled="!selectedCount || !!assetBusy" @click="regenSelected">{{ t("重新生成已选（") }}{{ selectedCount }}{{ t("）") }}</button>
           </div>
         </div>
 
         <div class="card" style="margin-top: var(--space-4)">
           <template v-if="assetTab === 'figure'">
             <div class="card-head">
-              <h3>角色立绘（三视图 → 立绘/表情/动作）</h3>
+              <h3>{{ t("角色立绘（三视图 → 立绘/表情/动作）") }}</h3>
             </div>
             <label class="field">
-              <span>对本区立绘的意见（可选）：</span>
-              <input type="text" v-model="assetFeedback.figure" placeholder="如：让「林澈」眼神更锐利、制服更有质感" />
+              <span>{{ t("对本区立绘的意见（可选）：") }}</span>
+              <input type="text" v-model="assetFeedback.figure" :placeholder="t('如：让「林澈」眼神更锐利、制服更有质感')" />
             </label>
             <div v-for="row in figureRows" :key="row.id" class="asset-row">
               <div class="asset-row-head">
                 <span class="asset-name">{{ row.name }}</span>
                 <span style="color: var(--text-faint); font-size: 11px">{{ row.id }}</span>
-                <span v-if="row.hasRef" class="tag ok" title="已在「卡片编辑」中为该角色设置参考图，三视图/动作将基于参考图生成">有参考图</span>
+                <span v-if="row.hasRef" class="tag ok" :title="t('已在「卡片编辑」中为该角色设置参考图，三视图/动作将基于参考图生成')">{{ t("有参考图") }}</span>
                 <span class="asset-file">{{ fileExistsLabel(row.threeView) }}</span>
-                <button class="btn small" :disabled="!!assetBusy" @click="regenThreeView(row.id)">重新生成三视图（联动全部）</button>
-                <button class="btn secondary small" :disabled="!!assetBusy" @click="regenAllFigure(row.id)">重新生成全部表情</button>
+                <button class="btn small" :disabled="!!assetBusy" @click="regenThreeView(row.id)">{{ t("重新生成三视图（联动全部）") }}</button>
+                <button class="btn secondary small" :disabled="!!assetBusy" @click="regenAllFigure(row.id)">{{ t("重新生成全部表情") }}</button>
               </div>
               <div class="asset-thumb-row">
-                <div v-if="row.threeView" class="asset-thumb" :title="'三视图（点击放大；有参考图时将基于参考图生成）'" @click="openPreview(row.threeView, `${row.name} · 三视图`)">
+                <div v-if="row.threeView" class="asset-thumb" :title="t('三视图（点击放大；有参考图时将基于参考图生成）')" @click="openPreview(row.threeView, `${row.name} · 三视图`)">
                   <label class="asset-sel" @click.stop><input type="checkbox" :checked="selected.has(`threeview:${row.id}`)" @change="toggleSelect(`threeview:${row.id}`)" /></label>
-                  <LazyThumb :path="row.threeView" alt="三视图" />
-                  <span class="thumb-label">三视图</span>
-                  <button class="btn ghost small" :disabled="!!assetBusy" @click.stop="reCutout('figure', `${row.id}_threeview`, row.threeView)">抠图</button>
+                  <LazyThumb :path="row.threeView" :alt="t('三视图')" />
+                  <span class="thumb-label">{{ t("三视图") }}</span>
+                  <button class="btn ghost small" :disabled="!!assetBusy" @click.stop="reCutout('figure', `${row.id}_threeview`, row.threeView)">{{ t("抠图") }}</button>
                 </div>
                 <div v-for="e in row.emotions" :key="e.emo" class="asset-thumb" :class="{ missing: !e.file }" :title="`${EMOTION_LABELS[e.emo]}（点击放大）`" @click="e.file && openPreview(e.file, `${row.name} · ${EMOTION_LABELS[e.emo]}`)">
                   <label class="asset-sel" @click.stop><input type="checkbox" :checked="selected.has(`figure:${row.id}:${e.emo}`)" @change="toggleSelect(`figure:${row.id}:${e.emo}`)" /></label>
                   <LazyThumb v-if="e.file" :path="e.file" :alt="EMOTION_LABELS[e.emo]" />
                   <span class="thumb-label">{{ EMOTION_LABELS[e.emo] }}</span>
-                  <button class="btn ghost small" :disabled="!!assetBusy" @click.stop="regenFigureEmotion(row.id, e.emo)">重生成</button>
-                  <button v-if="e.file" class="btn ghost small" :disabled="!!assetBusy" @click.stop="reCutout('figure', e.emo === 'normal' ? row.id : `${row.id}_${e.emo}`, e.file)">抠图</button>
+                  <button class="btn ghost small" :disabled="!!assetBusy" @click.stop="regenFigureEmotion(row.id, e.emo)">{{ t("重生成") }}</button>
+                  <button v-if="e.file" class="btn ghost small" :disabled="!!assetBusy" @click.stop="reCutout('figure', e.emo === 'normal' ? row.id : `${row.id}_${e.emo}`, e.file)">{{ t("抠图") }}</button>
                 </div>
               </div>
               <div v-if="row.actions.length" style="border-top: 1px dashed var(--border); margin-top: 8px; padding-top: 8px">
@@ -1507,8 +1509,8 @@ function fileExistsLabel(file: string | undefined): string {
                     <label class="asset-sel" @click.stop><input type="checkbox" :checked="selected.has(`action:${row.id}:${a.id}`)" @change="toggleSelect(`action:${row.id}:${a.id}`)" /></label>
                     <LazyThumb v-if="a.file" :path="a.file" :alt="a.name" />
                     <span class="thumb-label">{{ a.name }}</span>
-                    <button class="btn ghost small" :disabled="!!assetBusy" @click.stop="regenAction(row.id, a.id, a.name)">重生成</button>
-                    <button v-if="a.file" class="btn ghost small" :disabled="!!assetBusy" @click.stop="reCutout('figure', `${row.id}_act_${a.id}`, a.file)">抠图</button>
+                    <button class="btn ghost small" :disabled="!!assetBusy" @click.stop="regenAction(row.id, a.id, a.name)">{{ t("重生成") }}</button>
+                    <button v-if="a.file" class="btn ghost small" :disabled="!!assetBusy" @click.stop="reCutout('figure', `${row.id}_act_${a.id}`, a.file)">{{ t("抠图") }}</button>
                   </div>
                 </div>
               </div>
@@ -1516,33 +1518,33 @@ function fileExistsLabel(file: string | undefined): string {
           </template>
 
           <template v-else-if="assetTab === 'item'">
-            <div class="card-head"><h3>物品图</h3></div>
+            <div class="card-head"><h3>{{ t("物品图") }}</h3></div>
             <label class="field">
-              <span>对本区物品图的意见（可选）：</span>
-              <input type="text" v-model="assetFeedback.item" placeholder="如：物品要更有质感、更有光泽" />
+              <span>{{ t("对本区物品图的意见（可选）：") }}</span>
+              <input type="text" v-model="assetFeedback.item" :placeholder="t('如：物品要更有质感、更有光泽')" />
             </label>
             <div v-for="row in itemRows" :key="row.id" class="asset-row">
               <div class="asset-row-head">
                 <span class="asset-name">{{ row.name }}</span>
                 <span style="color: var(--text-faint); font-size: 11px">{{ row.id }}</span>
                 <span class="asset-file">{{ fileExistsLabel(row.file) }}</span>
-                <button class="btn small" :disabled="!!assetBusy" @click="regenItem(row.id)">重新生成</button>
+                <button class="btn small" :disabled="!!assetBusy" @click="regenItem(row.id)">{{ t("重新生成") }}</button>
               </div>
               <div class="asset-thumb-row">
-                <div class="asset-thumb" :title="'点击放大'" @click="row.file && openPreview(row.file, `${row.name} · 物品图`)">
+                <div class="asset-thumb" :title="t('点击放大')" @click="row.file && openPreview(row.file, `${row.name} · 物品图`)">
                   <LazyThumb v-if="row.file" :path="row.file" :alt="row.name" />
-                  <span class="thumb-label">物品图</span>
-                  <button v-if="row.file" class="btn ghost small" :disabled="!!assetBusy" @click.stop="reCutout('item', row.id, row.file)">抠图</button>
+                  <span class="thumb-label">{{ t("物品图") }}</span>
+                  <button v-if="row.file" class="btn ghost small" :disabled="!!assetBusy" @click.stop="reCutout('item', row.id, row.file)">{{ t("抠图") }}</button>
                 </div>
               </div>
             </div>
           </template>
 
           <template v-else-if="assetTab === 'bg'">
-            <div class="card-head"><h3>背景图</h3></div>
+            <div class="card-head"><h3>{{ t("背景图") }}</h3></div>
             <label class="field">
-              <span>对本区背景图的意见（可选）：</span>
-              <input type="text" v-model="assetFeedback.bg" placeholder="如：画面更通透、更有纵深感" />
+              <span>{{ t("对本区背景图的意见（可选）：") }}</span>
+              <input type="text" v-model="assetFeedback.bg" :placeholder="t('如：画面更通透、更有纵深感')" />
             </label>
             <div v-for="row in bgRows" :key="row.sceneId" class="asset-row">
               <div class="asset-row-head">
@@ -1550,13 +1552,13 @@ function fileExistsLabel(file: string | undefined): string {
                 <span class="asset-name">{{ row.location }}</span>
                 <span style="color: var(--text-faint); font-size: 11px">{{ row.sceneId }}</span>
                 <span class="asset-file">{{ fileExistsLabel(row.file) }}</span>
-                <button class="btn small" :disabled="!!assetBusy" @click="regenBg(row.sceneId)">重新生成</button>
+                <button class="btn small" :disabled="!!assetBusy" @click="regenBg(row.sceneId)">{{ t("重新生成") }}</button>
               </div>
               <div class="asset-thumb-row">
-                <div class="asset-thumb" :title="'点击放大'" @click="row.file && openPreview(row.file, `背景 · ${row.location}`)">
+                <div class="asset-thumb" :title="t('点击放大')" @click="row.file && openPreview(row.file, `背景 · ${row.location}`)">
                   <LazyThumb v-if="row.file" :path="row.file" :alt="row.location" />
-                  <span class="thumb-label">背景图</span>
-                  <button v-if="row.file" class="btn ghost small" :disabled="!!assetBusy" @click.stop="reCutout('bg', row.sceneId, row.file)">抠图</button>
+                  <span class="thumb-label">{{ t("背景图") }}</span>
+                  <button v-if="row.file" class="btn ghost small" :disabled="!!assetBusy" @click.stop="reCutout('bg', row.sceneId, row.file)">{{ t("抠图") }}</button>
                 </div>
               </div>
             </div>
@@ -1565,8 +1567,8 @@ function fileExistsLabel(file: string | undefined): string {
           <template v-else-if="assetTab === 'cg'">
             <div class="card-head"><h3>CG</h3></div>
             <label class="field">
-              <span>对本区 CG 的意见（可选）：</span>
-              <input type="text" v-model="assetFeedback.cg" placeholder="如：构图更有冲击力、光影更戏剧化" />
+              <span>{{ t("对本区 CG 的意见（可选）：") }}</span>
+              <input type="text" v-model="assetFeedback.cg" :placeholder="t('如：构图更有冲击力、光影更戏剧化')" />
             </label>
             <div v-for="row in cgRows" :key="row.sceneId" class="asset-row">
               <div class="asset-row-head">
@@ -1574,10 +1576,10 @@ function fileExistsLabel(file: string | undefined): string {
                 <span class="asset-name">{{ row.title }}</span>
                 <span style="color: var(--text-faint); font-size: 11px">{{ row.sceneId }}</span>
                 <span class="asset-file">{{ fileExistsLabel(row.file) }}</span>
-                <button class="btn small" :disabled="!!assetBusy" @click="regenCgRow(row.chapter, row.sceneId)">重新生成</button>
+                <button class="btn small" :disabled="!!assetBusy" @click="regenCgRow(row.chapter, row.sceneId)">{{ t("重新生成") }}</button>
               </div>
               <div class="asset-thumb-row">
-                <div class="asset-thumb" :title="'点击放大'" @click="row.file && openPreview(row.file, `CG · ${row.title}`)">
+                <div class="asset-thumb" :title="t('点击放大')" @click="row.file && openPreview(row.file, `CG · ${row.title}`)">
                   <LazyThumb v-if="row.file" :path="row.file" :alt="row.title" />
                   <span class="thumb-label">CG</span>
                   <button v-if="row.file" class="btn ghost small" :disabled="!!assetBusy" @click.stop="reCutout('cg', `${row.chapter - 1}_${row.sceneId}`, row.file)">抠图</button>
@@ -1588,25 +1590,25 @@ function fileExistsLabel(file: string | undefined): string {
 
           <template v-else>
             <div class="card-head">
-              <h3>配音</h3>
+              <h3>{{ t("配音") }}</h3>
               <div class="card-actions">
                 <button class="btn ghost small" v-for="c in voiceCharOptions" :key="c.value" @click="regenCharVoice(c.value)" :disabled="!!assetBusy">
-                  重配「{{ c.label }}」全部
+                  {{ t("重配「") }}{{ c.label }}{{ t("」全部") }}
                 </button>
               </div>
             </div>
             <div class="row" style="margin-bottom: 12px">
               <label class="field" style="flex: 1; margin-bottom: 0">
-                <span>章节筛选</span>
+                <span>{{ t("章节筛选") }}</span>
                 <select v-model="voiceChapterFilter">
-                  <option :value="0">全部章节</option>
+                  <option :value="0">{{ t("全部章节") }}</option>
                   <option v-for="o in voiceChapterOptions" :key="o.value" :value="o.value">{{ o.label }}</option>
                 </select>
               </label>
               <label class="field" style="flex: 1; margin-bottom: 0">
-                <span>角色筛选</span>
+                <span>{{ t("角色筛选") }}</span>
                 <select v-model="voiceCharFilter">
-                  <option value="">全部角色</option>
+                  <option value="">{{ t("全部角色") }}</option>
                   <option v-for="c in voiceCharOptions" :key="c.value" :value="c.value">{{ c.label }}</option>
                 </select>
               </label>
@@ -1622,15 +1624,15 @@ function fileExistsLabel(file: string | undefined): string {
                 <div style="color: var(--text-dim); font-size: 12px; margin-top: 4px; word-break: break-all">{{ row.text }}</div>
               </div>
               <div style="display: flex; align-items: center; gap: 6px; flex-shrink: 0">
-                <button v-if="row.file" class="btn ghost small" @click="playVoice(row.key, row.file)">{{ playingVoiceKey === row.key ? "⏸ 停止" : "▶ 试听" }}</button>
-                <button class="btn small" :disabled="!!assetBusy" @click="regenVoice(row.key)">重配</button>
+                <button v-if="row.file" class="btn ghost small" @click="playVoice(row.key, row.file)">{{ playingVoiceKey === row.key ? t("⏸ 停止") : t("▶ 试听") }}</button>
+                <button class="btn small" :disabled="!!assetBusy" @click="regenVoice(row.key)">{{ t("重配") }}</button>
               </div>
             </div>
             <div v-if="voiceRows.length > voiceLimit" style="text-align: center; margin-top: 8px">
-              <button class="btn secondary small" @click="voiceLimit += 100">显示更多（剩余 {{ voiceRows.length - voiceLimit }} 条）</button>
+              <button class="btn secondary small" @click="voiceLimit += 100">{{ t("显示更多（剩余") }} {{ voiceRows.length - voiceLimit }} {{ t("条）") }}</button>
             </div>
             <audio ref="audioRef" style="display: none" @ended="playingVoiceKey = ''"></audio>
-            <div v-if="!voiceRows.length" class="empty">该筛选下没有对白（或尚未生成配音）</div>
+            <div v-if="!voiceRows.length" class="empty">{{ t("该筛选下没有对白（或尚未生成配音）") }}</div>
           </template>
         </div>
       </template>
@@ -1639,42 +1641,42 @@ function fileExistsLabel(file: string | undefined): string {
     <div v-else-if="tab === 'video'">
       <div class="card" v-if="videoPoints.length">
         <div class="card-head">
-          <h3>AI 推荐的视频演出位（{{ videoPoints.length }} 个）</h3>
-          <div class="card-actions"><button class="btn secondary small" @click="checkVideos">刷新状态</button></div>
+          <h3>{{ t("AI 推荐的视频演出位（") }}{{ videoPoints.length }}{{ t(" 个）") }}</h3>
+          <div class="card-actions"><button class="btn secondary small" @click="checkVideos">{{ t("刷新状态") }}</button></div>
         </div>
-        <p style="color: var(--text-dim); font-size: 12px; margin-bottom: var(--space-4)">提示词粘贴到即梦/可灵生成，mp4 命名为 <code>video_&lt;id&gt;.mp4</code> 放入 <code>game/video/</code> 刷新后自动启用，零 API 费用。</p>
+        <p style="color: var(--text-dim); font-size: 12px; margin-bottom: var(--space-4)">{{ t("提示词粘贴到即梦/可灵生成，mp4 命名为") }} <code>video_&lt;id&gt;.mp4</code> {{ t("放入") }} <code>game/video/</code> {{ t("刷新后自动启用，零 API 费用。") }}</p>
         <div v-for="vp in videoPoints" :key="vp.id" style="border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px 14px; margin-bottom: 10px">
           <div class="row" style="justify-content: space-between">
             <span>
-              <span class="tag" :class="vp.enabled ? 'ok' : ''">{{ vp.enabled ? "已启用" : "未生成" }}</span>
+              <span class="tag" :class="vp.enabled ? 'ok' : ''">{{ vp.enabled ? t("已启用") : t("未生成") }}</span>
               <span style="font-weight: 600">{{ vp.title }}</span>
-              <span style="color: var(--text-dim); font-size: 12px; margin-left: 8px">第 {{ vp.chapter }} 章 · {{ vp.location }} · {{ vp.durationSecs }}s</span>
+              <span style="color: var(--text-dim); font-size: 12px; margin-left: 8px">{{ t("第") }} {{ vp.chapter }} {{ t("章") }} · {{ vp.location }} · {{ vp.durationSecs }}s</span>
             </span>
-            <button class="btn small" @click="copyText(vp.videoPrompt, '视频提示词')">复制提示词</button>
+            <button class="btn small" @click="copyText(vp.videoPrompt, '视频提示词')">{{ t("复制提示词") }}</button>
           </div>
           <p style="color: var(--text-dim); font-size: 12px; margin-top: 6px">{{ vp.description }}</p>
-          <p style="font-size: 12px; margin-top: 6px; color: var(--text-dim)">文件名：<code>video_{{ sanitizeId(vp.id) }}.mp4</code></p>
+          <p style="font-size: 12px; margin-top: 6px; color: var(--text-dim)">{{ t("文件名：") }}<code>video_{{ sanitizeId(vp.id) }}.mp4</code></p>
         </div>
       </div>
       <div v-else class="empty">
         <img src="/src/assets/empty-generate.png" alt="" style="width: 220px; opacity: 0.9; margin-bottom: 12px" />
-        <p>暂无视频推荐位（重新生成后出现）</p>
+        <p>{{ t("暂无视频推荐位（重新生成后出现）") }}</p>
       </div>
     </div>
 
     <div v-else-if="tab === 'script'">
       <div class="card">
         <div class="card-head">
-          <h3>分章剧本（按意见重写）</h3>
+          <h3>{{ t("分章剧本（按意见重写）") }}</h3>
           <div class="card-actions">
-            <button class="btn ghost small" @click="scriptChapterFeedback = {}">清空意见</button>
+            <button class="btn ghost small" @click="scriptChapterFeedback = {}">{{ t("清空意见") }}</button>
           </div>
         </div>
-        <p style="color: var(--text-dim); font-size: 12px; margin-bottom: var(--space-3)">选择章节 → 填写意见（可留空 = 直接重新生成）→ 点击「重新生成此章」。其余章节自动复用缓存。</p>
+          <p style="color: var(--text-dim); font-size: 12px; margin-bottom: var(--space-3)">{{ t("选择章节 → 填写意见（可留空 = 直接重新生成）→ 点击「重新生成此章」。其余章节自动复用缓存。") }}</p>
         <div v-for="ch in projectState.novel?.chapters ?? []" :key="ch.index" class="stage-row" style="margin-bottom: 8px">
           <div class="stage-row-label"><b>{{ ch.title }}</b></div>
-          <input type="text" v-model="scriptChapterFeedback[ch.index]" placeholder="意见（可选）：这一章节奏太慢，希望更快推进…" />
-          <button class="btn small" :disabled="busy" @click="regenChapter(ch.index)">重新生成此章</button>
+          <input type="text" v-model="scriptChapterFeedback[ch.index]" :placeholder="t('意见（可选）：这一章节奏太慢，希望更快推进…')" />
+          <button class="btn small" :disabled="busy" @click="regenChapter(ch.index)">{{ t("重新生成此章") }}</button>
         </div>
       </div>
       <div class="card" v-if="scriptFiles.length">
@@ -1682,26 +1684,26 @@ function fileExistsLabel(file: string | undefined): string {
           <select v-model="currentScript" style="flex: 1; max-width: 260px">
             <option v-for="f in scriptFiles" :key="f.name" :value="f.name">{{ f.name }}</option>
           </select>
-          <button class="btn secondary small" @click="tauri.openInExplorer(projectState.outputDir + '/game/scene')">打开剧本文件夹</button>
+          <button class="btn secondary small" @click="tauri.openInExplorer(projectState.outputDir + '/game/scene')">{{ t("打开剧本文件夹") }}</button>
         </div>
         <pre style="background: #fbf9ff; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px; margin-top: 10px; max-height: 420px; overflow: auto; font-size: 12px; line-height: 1.7; white-space: pre-wrap">{{ scriptFiles.find((f) => f.name === currentScript)?.text }}</pre>
       </div>
       <div v-else class="empty">
         <img src="/src/assets/empty-generate.png" alt="" style="width: 220px; opacity: 0.9; margin-bottom: 12px" />
-        <p>暂无剧本文件（生成后出现）</p>
+        <p>{{ t("暂无剧本文件（生成后出现）") }}</p>
       </div>
     </div>
 
     <div v-else-if="tab === 'failed'">
       <div class="card" v-if="failedTasks.length">
         <div class="card-head">
-          <h3>失败任务（{{ failedTasks.length }} 个）</h3>
-          <div class="card-actions"><button class="btn small" @click="retryFailed">定位重试</button></div>
+          <h3>{{ t("失败任务（") }}{{ failedTasks.length }}{{ t(" 个）") }}</h3>
+          <div class="card-actions"><button class="btn small" @click="retryFailed">{{ t("定位重试") }}</button></div>
         </div>
         <div style="display: flex; flex-direction: column; gap: 8px">
           <div v-for="(f, i) in failedTasks" :key="i" style="border: 1px solid var(--err-soft); background: var(--err-soft); border-radius: var(--radius-sm); padding: 10px 12px">
             <div style="display: flex; align-items: center; gap: 8px">
-              <span class="tag err">{{ f.kind === "image" ? "图像" : f.kind === "script" ? "剧本" : f.kind === "llm" ? "LLM" : "配音" }}</span>
+              <span class="tag err">{{ f.kind === "image" ? t("图像") : f.kind === "script" ? t("剧本") : f.kind === "llm" ? "LLM" : t("配音") }}</span>
               <span style="font-weight: 600; font-size: 13px">{{ f.id }}</span>
               <span style="color: var(--text-faint); font-size: 11px; margin-left: auto">{{ new Date(f.at).toLocaleTimeString() }}</span>
             </div>
@@ -1709,16 +1711,16 @@ function fileExistsLabel(file: string | undefined): string {
           </div>
         </div>
       </div>
-      <div v-else class="empty">暂无失败任务</div>
+      <div v-else class="empty">{{ t("暂无失败任务") }}</div>
     </div>
 
     <div v-else>
       <div class="card">
         <div class="card-head">
-          <h3>运行日志</h3>
+          <h3>{{ t("运行日志") }}</h3>
           <div class="card-actions">
-            <button class="btn secondary small" @click="saveLogs">保存日志</button>
-            <button class="btn ghost small" @click="copyLogs">复制</button>
+            <button class="btn secondary small" @click="saveLogs">{{ t("保存日志") }}</button>
+            <button class="btn ghost small" @click="copyLogs">{{ t("复制") }}</button>
           </div>
         </div>
         <div class="log-panel" ref="logPanelRef">
