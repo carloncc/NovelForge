@@ -13,11 +13,11 @@
   <a href="https://github.com/carloncc/NovelForge/releases"><img alt="Release" src="https://img.shields.io/github/v/release/carloncc/NovelForge"></a>
   <a href="https://github.com/carloncc/NovelForge/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/carloncc/NovelForge"></a>
   <a href="https://github.com/carloncc/NovelForge/issues"><img alt="Issues" src="https://img.shields.io/github/issues/carloncc/NovelForge"></a>
-  <a href="https://www.forgepeaknow.com/"><img alt="Website" src="https://img.shields.io/badge/Website-forgepeaknow.com-64748b"></a>
+  <a href="https://www.forgepeaknow.com/?utm_source=github&utm_medium=readme"><img alt="Website" src="https://img.shields.io/badge/Website-forgepeaknow.com-64748b"></a>
 </p>
 Tauri 2 + Vue 3 + WebGAL · 轻量快速 · API 全自定义
 
-[English](README.md) · **简体中文** · [日本語](README.ja-JP.md) · [한국어](README.ko-KR.md) · [官网](https://www.forgepeaknow.com/) · [更新日志](https://github.com/carloncc/NovelForge/releases)
+[English](README.md) · **简体中文** · [日本語](README.ja-JP.md) · [한국어](README.ko-KR.md) · [官网](https://www.forgepeaknow.com/?utm_source=github&utm_medium=readme) · [更新日志](https://github.com/carloncc/NovelForge/releases)
 
 </div>
 
@@ -72,7 +72,7 @@ Tauri 2 + Vue 3 + WebGAL · 轻量快速 · API 全自定义
 |---|---|
 | Windows / macOS / Linux | [最新 Release](https://github.com/carloncc/NovelForge/releases)（无需安装 Rust/Node） |
 | 任意平台（浏览器） | Web 演示版——免安装，浏览器直接运行（见下） |
-| 官网 | [https://www.forgepeaknow.com/](https://www.forgepeaknow.com/) —— Web 演示与最新动态 |
+| 官网 | [https://www.forgepeaknow.com/?utm_source=github&utm_medium=readme](https://www.forgepeaknow.com/?utm_source=github&utm_medium=readme) —— Web 演示与最新动态 |
 
 > 没有 API key 也能体验：自动进入演示模式（内置示例小说），完整跑通全流程——先试再配。
 
@@ -275,7 +275,7 @@ cd src-tauri && cargo test
 
 ## 社区
 
-- [官网](https://www.forgepeaknow.com/) —— Web 演示与最新动态
+- [官网](https://www.forgepeaknow.com/?utm_source=github&utm_medium=readme) —— Web 演示与最新动态
 - [Issues & 功能建议](https://github.com/carloncc/NovelForge/issues) —— 报 bug、提想法、给反馈
 - [Discussions](https://github.com/carloncc/NovelForge/discussions) —— 晒出你做出来的游戏、提问交流
 - [WebGAL](https://github.com/OpenWebGAL/WebGAL) —— 引擎本体，它的社区熟悉 WebGAL 场景脚本

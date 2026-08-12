@@ -13,14 +13,14 @@ Text walls are hard to read. One click turns your novel into a playable visual n
   <a href="https://github.com/carloncc/NovelForge/releases"><img alt="Release" src="https://img.shields.io/github/v/release/carloncc/NovelForge"></a>
   <a href="https://github.com/carloncc/NovelForge/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/carloncc/NovelForge"></a>
   <a href="https://github.com/carloncc/NovelForge/issues"><img alt="Issues" src="https://img.shields.io/github/issues/carloncc/NovelForge"></a>
-  <a href="https://www.forgepeaknow.com/"><img alt="Website" src="https://img.shields.io/badge/Website-forgepeaknow.com-64748b"></a>
+  <a href="https://www.forgepeaknow.com/?utm_source=github&utm_medium=readme"><img alt="Website" src="https://img.shields.io/badge/Website-forgepeaknow.com-64748b"></a>
   <img alt="Web demo" src="https://img.shields.io/badge/web%20demo-npm%20run%20dev-64748b">
   <img alt="Built with" src="https://img.shields.io/badge/Tauri%202%20%2B%20Vue%203-8b5cf6">
 </p>
 
 Tauri 2 + Vue 3 + WebGAL · Lightweight & fast · Bring-your-own API
 
-**English** · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [한국어](README.ko-KR.md) · [Official Site](https://www.forgepeaknow.com/) · [Changelog](https://github.com/carloncc/NovelForge/releases)
+**English** · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [한국어](README.ko-KR.md) · [Official Site](https://www.forgepeaknow.com/?utm_source=github&utm_medium=readme) · [Changelog](https://github.com/carloncc/NovelForge/releases)
 
 </div>
 
@@ -75,7 +75,7 @@ novel.txt ─▶ one click ─▶ sprites · expressions · CGs · backgrounds �
 |---|---|
 | Windows / macOS / Linux | [Latest release](https://github.com/carloncc/NovelForge/releases) (no Rust/Node needed) |
 | Any platform (browser) | Web demo — no install, runs in the browser (see below) |
-| Official site | [https://www.forgepeaknow.com/](https://www.forgepeaknow.com/) — web demo & news |
+| Official site | [https://www.forgepeaknow.com/?utm_source=github&utm_medium=readme](https://www.forgepeaknow.com/?utm_source=github&utm_medium=readme) — web demo & news |
 
 > No API key? The app drops into demo mode (built-in sample novel) and runs the full pipeline — try it before configuring anything.
 
@@ -279,7 +279,7 @@ cd src-tauri && cargo test
 
 ## Community
 
-- [Official site](https://www.forgepeaknow.com/) — web demo & latest news
+- [Official site](https://www.forgepeaknow.com/?utm_source=github&utm_medium=readme) — web demo & latest news
 - [Issues & feature requests](https://github.com/carloncc/NovelForge/issues) — bugs, ideas, feedback
 - [Discussions](https://github.com/carloncc/NovelForge/discussions) — show off games you made, ask questions
 - [WebGAL](https://github.com/OpenWebGAL/WebGAL) — the engine powering the output; its community knows WebGAL scene scripting

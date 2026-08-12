@@ -13,11 +13,11 @@
   <a href="https://github.com/carloncc/NovelForge/releases"><img alt="Release" src="https://img.shields.io/github/v/release/carloncc/NovelForge"></a>
   <a href="https://github.com/carloncc/NovelForge/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/carloncc/NovelForge"></a>
   <a href="https://github.com/carloncc/NovelForge/issues"><img alt="Issues" src="https://img.shields.io/github/issues/carloncc/NovelForge"></a>
-  <a href="https://www.forgepeaknow.com/"><img alt="Website" src="https://img.shields.io/badge/Website-forgepeaknow.com-64748b"></a>
+  <a href="https://www.forgepeaknow.com/?utm_source=github&utm_medium=readme"><img alt="Website" src="https://img.shields.io/badge/Website-forgepeaknow.com-64748b"></a>
 </p>
 Tauri 2 + Vue 3 + WebGAL · 가볍고 빠름 · API 완전 커스터마이즈
 
-[English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · **한국어** · [공식 사이트](https://www.forgepeaknow.com/) · [변경 로그](https://github.com/carloncc/NovelForge/releases)
+[English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · **한국어** · [공식 사이트](https://www.forgepeaknow.com/?utm_source=github&utm_medium=readme) · [변경 로그](https://github.com/carloncc/NovelForge/releases)
 
 </div>
 
@@ -72,7 +72,7 @@ Tauri 2 + Vue 3 + WebGAL · 가볍고 빠름 · API 완전 커스터마이즈
 |---|---|
 | Windows / macOS / Linux | [최신 릴리스](https://github.com/carloncc/NovelForge/releases)(Rust/Node 설치 불필요) |
 | 모든 플랫폼(브라우저) | Web 데모——설치 없이 브라우저에서 바로 실행(아래 참조) |
-| 공식 사이트 | [https://www.forgepeaknow.com/](https://www.forgepeaknow.com/) —— 웹 데모 및 최신 소식 |
+| 공식 사이트 | [https://www.forgepeaknow.com/?utm_source=github&utm_medium=readme](https://www.forgepeaknow.com/?utm_source=github&utm_medium=readme) —— 웹 데모 및 최신 소식 |
 
 > API 키 없이도 체험 가능: 자동으로 데모 모드(샘플 소설 내장)로 진입해 전체 과정이 동작합니다——설정 전에 먼저 시도해 보세요.
 
@@ -277,7 +277,7 @@ cd src-tauri && cargo test
 
 ## 커뮤니티
 
-- [공식 사이트](https://www.forgepeaknow.com/) —— 웹 데모 및 최신 소식
+- [공식 사이트](https://www.forgepeaknow.com/?utm_source=github&utm_medium=readme) —— 웹 데모 및 최신 소식
 - [Issues & 기능 요청](https://github.com/carloncc/NovelForge/issues) —— 버그 제보, 아이디어, 피드백
 - [Discussions](https://github.com/carloncc/NovelForge/discussions) —— 만든 게임 자랑하기, 질문하기
 - [WebGAL](https://github.com/OpenWebGAL/WebGAL) —— 엔진 본체. WebGAL 커뮤니티가 씬 스크립트에 정통합니다
