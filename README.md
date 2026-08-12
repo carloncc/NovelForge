@@ -54,9 +54,9 @@ Tauri 2 + Vue 3 + WebGAL · Lightweight & fast · Bring-your-own API
 
 | | Why |
 |---|---|
-| 🪄 **One click, zero manual work** | Hand-crafting a visual novel means painting every sprite, staging every scene and recording every line — passion-fueled labor. NovelForge is the lazy way: import the novel, press generate, and get a finished, playable game you can distribute. |
-| 🎬 **Watch the story, don't read it** | You came for the story, not the text blocks. Characters with expressions, scene CGs, voice-over and BGM deliver the immersion plain text can't — no need to build the visuals step by step. |
-| 🔥 **For the novels nobody else adapts** | Popular works get adaptations and translations. Niche novels don't even get translated — that's exactly where NovelForge shines: your niche story becomes a shareable visual novel in one click, with built-in multi-language translation (zh / en / ja / ko). |
+| 🪄 **One click, zero manual work** | Making a visual novel by hand means painting every sprite, staging every scene and recording every line. NovelForge automates all of it: import the novel, press generate, and get a finished, playable game you can distribute. |
+| 🎬 **Watch the story, don't read it** | Text carries the story, but sprites with expressions, scene CGs, voice-over and BGM add the immersion plain text can't — all generated automatically, no manual visual work. |
+| 🔥 **For the novels nobody else adapts** | Popular works get adaptations and translations; niche novels rarely get either. NovelForge targets exactly this gap: turn your niche story into a shareable visual novel, with built-in multi-language translation (zh / en / ja / ko). |
 
 ## One Click, Done
 
@@ -279,7 +279,7 @@ cd src-tauri && cargo test
 
 ## Community
 
-- [Official site](' + SITE + ') — web demo & latest news
+- [Official site](https://www.forgepeaknow.com/) — web demo & latest news
 - [Issues & feature requests](https://github.com/carloncc/NovelForge/issues) — bugs, ideas, feedback
 - [Discussions](https://github.com/carloncc/NovelForge/discussions) — show off games you made, ask questions
 - [WebGAL](https://github.com/OpenWebGAL/WebGAL) — the engine powering the output; its community knows WebGAL scene scripting
