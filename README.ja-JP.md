@@ -326,3 +326,4 @@ cd src-tauri && cargo test
 - [ ] ゲーム内キャラ図鑑
 - [ ] ナレーション音声（ナレーター声色）
 - [ ] 立ち絵の口パク同期
+- [Web サイト改善計画](./docs/WEBSITE_PLAN.md) —— 製品ページ / UTM ファネル / 統計

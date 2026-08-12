@@ -327,3 +327,4 @@ This software is provided "as is" without warranty of any kind. By using NovelFo
 - [ ] In-game character gallery
 - [ ] Narration voice (monologue voice)
 - [ ] Lip-sync for sprite portraits
+- [Website improvement plan](./docs/WEBSITE_PLAN.md) — official-site redesign (product page, UTM funnel, stats)
