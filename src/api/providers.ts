@@ -188,47 +188,9 @@ export interface DiscoveredModel {
 }
 
 /**
- * 内置模型上下文兜底表：网关不返回 context_length 时按模型名匹配。
- * 单位 token。常见模型按"满血版"上限填，部署版由用户手动覆盖。
+ * 默认上下文长度：128K（token）。网关 /models 不返回 context_length、
+ * 用户也没手动覆盖时使用。需要更大/更小的模型请在「配置页 → 上下文长度」里改。
  */
-const MODEL_CONTEXT_FALLBACKS: Record<string, number> = {
-  // DeepSeek 系列
-  "deepseek-chat": 128_000,
-  "deepseek-reasoner": 128_000,
-  "deepseek-v4-flash": 128_000,
-  "deepseek-v4-pro": 128_000,
-  // MiniMax 系列（用户当前视觉通道）
-  "MiniMax-M3": 1_000_000,
-  "MiniMax-M2.7": 256_000,
-  "MiniMax-M2.5": 128_000,
-  // Kimi（长文本）
-  "kimi-k2.5": 200_000,
-  "kimi-k2.6": 200_000,
-  "kimi-k2.7-code": 200_000,
-  "kimi-k3": 200_000,
-  // GLM
-  "glm-5": 128_000,
-  "glm-5.1": 128_000,
-  "glm-5.2": 128_000,
-  // Qwen
-  "qwen3.5-plus": 128_000,
-  "qwen3.6-plus": 128_000,
-  "qwen3.7-plus": 128_000,
-  "qwen3.7-max": 128_000,
-  "qwen3.8-max": 128_000,
-  "qwen-plus": 128_000,
-  // Moonshot
-  "moonshot-v1-8k": 8_192,
-  "moonshot-v1-32k": 32_768,
-  "moonshot-v1-128k": 131_072,
-  // OpenAI 常用
-  "gpt-4o": 128_000,
-  "gpt-4o-mini": 128_000,
-  "gpt-5.6-luna": 200_000,
-  // Grok
-  "grok-4.5": 256_000,
-};
-
 const DEFAULT_CONTEXT_LENGTH = 128_000;
 
 /** 从 /models 单项里尽量抽出一个 token 数；找不到返回 undefined */
@@ -251,7 +213,7 @@ function extractContextLength(record: Record<string, unknown>): number | undefin
 
 /**
  * 解析一个 API 配置的最终上下文 token 数。
- * 优先级：手动覆盖 (cfg.extra.contextLength) > /models 探测 > 内置表 > 默认 128K
+ * 优先级：手动覆盖 (cfg.extra.contextLength) > /models 探测 > 默认 128K
  */
 export function resolveContextLength(cfg: { model?: string; extra?: Record<string, unknown> } | undefined): number {
   if (!cfg) return DEFAULT_CONTEXT_LENGTH;
@@ -265,9 +227,6 @@ export function resolveContextLength(cfg: { model?: string; extra?: Record<strin
     : [];
   const hit = discovered.find((m) => m.id === cfg.model && typeof m.contextLength === "number");
   if (hit?.contextLength) return hit.contextLength;
-  if (cfg.model && MODEL_CONTEXT_FALLBACKS[cfg.model]) {
-    return MODEL_CONTEXT_FALLBACKS[cfg.model];
-  }
   return DEFAULT_CONTEXT_LENGTH;
 }
 
