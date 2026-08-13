@@ -24,6 +24,17 @@ if ((kindsOn.anchor || 0) !== 1) throw new Error("风格锚点任务数应为 1"
 const actionsTotal = cards.characters.reduce((n, c) => n + (c.actions?.length ?? 0), 0);
 if ((kindsOn.action || 0) !== actionsTotal) throw new Error("动作任务数不符");
 
+// 动作数量不设上限：6 个动作应全部生成动作立绘任务
+{
+  const many = buildImageTasks([], {
+    characters: [{ id: "hero", name: "主角", imagePrompt: "anime girl", actions: Array.from({ length: 6 }, (_, i) => ({ id: `a${i}`, name: `动作${i}`, prompt: `pose ${i}` })) }],
+    items: [],
+    scenes: [],
+  }, {});
+  const actionCount = many.filter((t) => t.kind === "action").length;
+  if (actionCount !== 6) throw new Error(`动作数量不应被截断：应为 6，实际 ${actionCount}`);
+}
+
 // 表情差分关闭：每角色 1 张（三视图/动作不受影响）
 const tasksOff = buildImageTasks(scripts, cards, { figurePerCharacter: 1, cgPerChapter: 3, maxPerChapter: 12, figureEmotions: false });
 const kindsOff = byKind(tasksOff);
@@ -76,19 +87,24 @@ if (!actionTask || actionTask.refFromTask !== "linche_threeview") throw new Erro
   console.log("  ✓ 三视图可基于角色参考图生成");
 }
 
-// 立绘/物品 prompt 强制纯色背景（透明立绘抠图前提）
+// 立绘/物品/三视图 prompt 强制纯绿幕背景（色度键抠图前提）；人物提示词里的背景词应被剥除
 {
-    const check = (c: boolean, m: string) => { if (!c) throw new Error(m); };
-  const tasks = buildImageTasks([], { characters: [{ id: "hero", name: "主角", imagePrompt: "anime girl" }], items: [{ id: "sword", name: "剑", imagePrompt: "a sword" }] }, {});
+  const check = (c: boolean, m: string) => { if (!c) throw new Error(m); };
+  const tasks = buildImageTasks([], { characters: [{ id: "hero", name: "主角", imagePrompt: "anime girl, full body, plain white background, clean illustration" }], items: [{ id: "sword", name: "剑", imagePrompt: "a sword, white background" }] }, {});
   const figure = tasks.find((t) => t.kind === "figure");
   const item = tasks.find((t) => t.kind === "item");
-  const bg = tasks.find((t) => t.kind === "background");
-  // 立绘/物品强制纯色背景（任意纯色，色度键可稳定抠出透明底）；不强制绿幕
-  check(!figure!.prompt.includes("green chroma background"), "立绘 prompt 不应强制绿幕");
-  check(!item!.prompt.includes("green chroma background"), "物品 prompt 不应强制绿幕");
-  check(figure!.prompt.includes("solid flat color background"), "立绘 prompt 应含纯色背景约束（供色度键抠图）");
-  check(item!.prompt.includes("solid flat color background"), "物品 prompt 应含纯色背景约束（供色度键抠图）");
+  const tv = tasks.find((t) => t.kind === "threeview");
+  // 立绘/物品/三视图统一强制纯绿幕（chroma key green）
+  check(figure!.prompt.includes("chroma key green background"), "立绘 prompt 应含纯绿幕背景约束（供色度键抠图）");
+  check(item!.prompt.includes("chroma key green background"), "物品 prompt 应含纯绿幕背景约束（供色度键抠图）");
+  check(tv!.prompt.includes("chroma key green background"), "三视图 prompt 应含纯绿幕背景约束");
+  // 人物提示词中原有的背景词应被剥除，且绿幕只出现一次（避免「两头」背景提示词冲突）
+  check(!figure!.prompt.includes("plain white background"), "立绘 prompt 不应残留背景词");
+  check(!item!.prompt.includes("white background"), "物品 prompt 不应残留背景词");
+  check(!tv!.prompt.includes("plain white background"), "三视图 prompt 不应残留背景词");
+  const greenCount = (figure!.prompt.match(/green background/gi) || []).length;
+  check(greenCount === 1, "立绘 prompt 背景描述应只有一处（避免两头提示词冲突）");
   check(figure!.prompt.includes("reference"), "立绘 prompt 应含参考图一致性提示");
-  console.log("  ✓ 立绘/物品强制纯色背景（色度键可抠），不强制绿幕");
+  console.log("  ✓ 立绘/物品/三视图强制纯绿幕（剥除背景词，仅一处背景约束）");
 }
 console.log("=== 图像任务构建验证通过 ===");

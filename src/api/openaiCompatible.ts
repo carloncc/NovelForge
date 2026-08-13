@@ -25,23 +25,56 @@ import { log } from "../utils/logger";
  * 全局图像请求并发上限：任务层并发再高（如 30），实际同时发往图片 API 的请求数也受此限制。
  * 许多图片服务（如 api2cn）并发上限很低，30 并发会触发大量 429；
  * 用信号量把实际并发压到 3，配合单请求退避即可稳定跑满而不再打爆服务端。
- * 上限会跟随用户设置的「图像/配音并发数」动态调整（setImageConcurrency），
- * 默认 3 仅是兜底，避免未设置时打爆服务端。
+ * 上限会跟随每个 API 自己配置的「并发数」动态调整（setImageConcurrency），
+ * 各 API（按 config.id 区分）持有独立限流器，互不影响。默认 3 仅是兜底，避免未设置时打爆服务端。
  */
-const IMAGE_CONCURRENCY = new ConcurrencyLimiter(3);
+const IMAGE_LIMITERS = new Map<string, ConcurrencyLimiter>();
 
-/** 跟随用户并发设置动态调整图片请求上限（由生成/重生成入口调用） */
-export function setImageConcurrency(n: number): void {
-  IMAGE_CONCURRENCY.setMaxConcurrent(n);
+function imageLimiterKey(cfg: ApiConfig): string {
+  return cfg.id || `${cfg.baseUrl ?? ""}|${cfg.model ?? ""}`;
+}
+
+function imageLimiterFor(cfg: ApiConfig): ConcurrencyLimiter {
+  const key = imageLimiterKey(cfg);
+  let limiter = IMAGE_LIMITERS.get(key);
+  if (!limiter) {
+    limiter = new ConcurrencyLimiter(3);
+    IMAGE_LIMITERS.set(key, limiter);
+  }
+  return limiter;
+}
+
+/** 设置某个 API 的图片请求并发上限（由生成/重生成入口按该 API 的并发配置调用） */
+export function setImageConcurrency(cfg: ApiConfig, n: number): void {
+  imageLimiterFor(cfg).setMaxConcurrent(n);
 }
 
 /**
- * 全局文本/视觉 LLM 请求并发上限。
- * 文本生成默认串行（并发 1）：章节剧本/分章/翻译的请求体可达 2 万+ 字符，
- * 并发会同时向文本 API 发大请求，触发网关限流 / error sending request。
- * 图片有独立 IMAGE_CONCURRENCY（可调），文本保持保守。
+ * 文本/视觉 LLM 请求并发上限（按 API 隔离，各配置互不影响）。
+ * 文本请求体可达 2 万+ 字符，并发过大会同时向文本 API 发大请求，触发网关限流 / error sending request。
+ * 因此每个文本/视觉 API 各自持有独立限流器，上限跟随该 API 配置的「并发数」（setLlmConcurrency）；
+ * 默认 3 是兜底。图片有独立 IMAGE_LIMITERS（可调）。
  */
-const LLM_CONCURRENCY = new ConcurrencyLimiter(1);
+const LLM_LIMITERS = new Map<string, ConcurrencyLimiter>();
+
+function llmLimiterKey(cfg: ApiConfig): string {
+  return cfg.id || `${cfg.baseUrl ?? ""}|${cfg.model ?? ""}`;
+}
+
+function llmLimiterFor(cfg: ApiConfig): ConcurrencyLimiter {
+  const key = llmLimiterKey(cfg);
+  let limiter = LLM_LIMITERS.get(key);
+  if (!limiter) {
+    limiter = new ConcurrencyLimiter(3);
+    LLM_LIMITERS.set(key, limiter);
+  }
+  return limiter;
+}
+
+/** 设置某个 API 的文本/视觉请求并发上限（由文本生成/视觉圣经入口按该 API 的并发配置调用） */
+export function setLlmConcurrency(cfg: ApiConfig, n: number): void {
+  llmLimiterFor(cfg).setMaxConcurrent(n);
+}
 
 /**
  * 通过 OpenAI 兼容的 GET /models 拉取模型列表，并按通道能力过滤。
@@ -147,6 +180,41 @@ export interface ChatOptions {
   maxContinue?: number;
   /** JSON 解析失败时最多修复重试次数（默认 2） */
   maxRepair?: number;
+  /** OpenAI 兼容 function calling：提供后请求体带上 tools/tool_choice，响应可返回 toolCalls */
+  tools?: ChatTool[];
+  /** 工具选择策略：默认 "auto"；可指定 "none"、"required" 或具体函数名（如 { type: "function", function: { name } }） */
+  toolChoice?: string | Record<string, unknown>;
+}
+
+/** OpenAI 兼容 tool 定义（function calling） */
+export interface ChatTool {
+  type: "function";
+  function: {
+    name: string;
+    description?: string;
+    parameters?: Record<string, unknown>;
+  };
+}
+
+/** 模型发起的工具调用 */
+export interface ToolCall {
+  id: string;
+  type: "function";
+  function: {
+    name: string;
+    arguments: string;
+  };
+}
+
+export type ChatMessageRole = "system" | "user" | "assistant" | "tool";
+
+/** 支持 function calling 的对话消息；无工具调用时与旧 { role, content } 完全兼容 */
+export interface ChatMessage {
+  role: ChatMessageRole;
+  content: string | null;
+  name?: string;
+  tool_call_id?: string;
+  tool_calls?: ToolCall[];
 }
 
 export interface VisionChatOptions extends ChatOptions {
@@ -232,9 +300,9 @@ export async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
 
 export async function chatCompletion(
   cfg: ApiConfig,
-  messages: { role: "system" | "user" | "assistant"; content: string }[],
+  messages: ChatMessage[],
   opts: ChatOptions = {},
-): Promise<{ content: string; promptTokens: number; completionTokens: number; finishReason?: string }> {
+): Promise<{ content: string; promptTokens: number; completionTokens: number; finishReason?: string; toolCalls?: ToolCall[] }> {
   const base = normalizeBaseUrl(cfg.baseUrl, (cfg.extra?.pathPrefix as string) || undefined);
   const url = `${base}/chat/completions`;
   const done = log.time("api", `chatCompletion ${cfg.model}`);
@@ -248,6 +316,10 @@ export async function chatCompletion(
     body.response_format = { type: "json_object" };
     body.temperature = 0.2;
   }
+  if (opts.tools?.length) {
+    body.tools = opts.tools;
+    body.tool_choice = opts.toolChoice ?? "auto";
+  }
   log.info("api", "LLM 请求发出", {
     url,
     model: cfg.model,
@@ -256,7 +328,7 @@ export async function chatCompletion(
     pathPrefix: cfg.extra?.pathPrefix,
     apiKey: maskKey(cfg.apiKey),
     messageCount: messages.length,
-    messages: messages.map((m) => ({ role: m.role, len: m.content.length, head: m.content.slice(0, 200) })),
+    messages: messages.map((m) => ({ role: m.role, len: m.content?.length ?? 0, head: (m.content ?? "").slice(0, 200) })),
     json: !!opts.json,
     maxTokens: opts.maxTokens,
     temperature: body.temperature,
@@ -322,9 +394,16 @@ export async function chatCompletion(
     const message = data.choices[0].message ?? {};
     const rawContent = typeof message.content === "string" ? message.content : "";
     const reasoning = typeof message.reasoning_content === "string" ? message.reasoning_content : "";
+    const toolCalls: ToolCall[] | undefined = Array.isArray(message.tool_calls)
+      ? message.tool_calls.filter(
+          (tc: unknown) =>
+            !!tc && (tc as ToolCall).type === "function" && !!(tc as ToolCall).function?.name,
+        )
+      : undefined;
     return {
       rawContent,
       reasoning,
+      toolCalls,
       finishReason: data.choices[0].finish_reason as string | undefined,
       promptTokens: (data.usage?.prompt_tokens as number | undefined) ?? 0,
       completionTokens: (data.usage?.completion_tokens as number | undefined) ?? 0,
@@ -346,7 +425,7 @@ export async function chatCompletion(
   const seenBudgets = new Set<number>();
 
   // 文本请求全局限流：并发 1（串行），避免多章节剧本同时发大请求打爆网关
-  return LLM_CONCURRENCY.run(() => withRetry(async () => {
+  return llmLimiterFor(cfg).run(() => withRetry(async () => {
     let response = await perform(escalation[0]);
     // 升级重试：
     //   ① content 为空且 finishReason=length → 预算被思考耗尽
@@ -390,16 +469,18 @@ export async function chatCompletion(
     const finishReason = response.finishReason;
     const promptTokens = response.promptTokens;
     const completionTokens = response.completionTokens;
+    const toolCalls = response.toolCalls;
     opts.onUsage?.(promptTokens, completionTokens);
-    done(`pt=${promptTokens} ct=${completionTokens} fr=${finishReason ?? "?"}`);
+    done(`pt=${promptTokens} ct=${completionTokens} fr=${finishReason ?? "?"}${toolCalls?.length ? ` tools=${toolCalls.length}` : ""}`);
     log.debug("api", "chatCompletion 成功", {
       promptTokens,
       completionTokens,
       finishReason,
+      toolCalls: toolCalls?.map((t) => t.function.name),
       contentLen: content.length,
       contentHead: content.slice(0, 120),
     });
-    return { content, promptTokens, completionTokens, finishReason };
+    return { content, promptTokens, completionTokens, finishReason, toolCalls };
   }));
 }
 
@@ -516,7 +597,7 @@ export async function chatJson<T>(
   user: string,
   opts: ChatOptions = {},
 ): Promise<T> {
-  const messages: { role: "system" | "user" | "assistant"; content: string }[] = [
+  const messages: ChatMessage[] = [
     { role: "system", content: system },
     { role: "user", content: user },
   ];
@@ -617,7 +698,7 @@ export async function chatVision(
   if (opts.maxTokens) body.max_tokens = opts.maxTokens;
 
   // 视觉请求与文本请求共享全局串行限流，避免并发打爆网关
-  const content = await LLM_CONCURRENCY.run(() => withRetry(async () => {
+  const content = await llmLimiterFor(cfg).run(() => withRetry(async () => {
     const res = await tauri.http({
       method: "POST",
       url: `${base}/chat/completions`,
@@ -828,9 +909,9 @@ export async function generateImage(
     promptHead: prompt.slice(0, 120),
   });
   try {
-    // 全局图像请求限流：任务并发再高，实际同时发往图片 API 的请求数也受此限制，
-    // 避免 30 个 worker 同时打爆服务端并发上限（429 Too Many Requests）。
-    const r = await IMAGE_CONCURRENCY.run(() => unifiedImage(cfg, tpl, {
+    // 图片请求限流（按 API 隔离）：任务并发再高，实际同时发往该图片 API 的请求数也受其自身并发配置限制，
+    // 避免多个 worker 同时打爆服务端并发上限（429 Too Many Requests）。
+    const r = await imageLimiterFor(cfg).run(() => unifiedImage(cfg, tpl, {
       prompt,
       width: w,
       height: h,

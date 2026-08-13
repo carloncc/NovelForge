@@ -7,6 +7,8 @@ export interface ApiConfig {
   /** 通用适配器模板 id（见 api/templates.ts）；空 = 兼容旧配置（OpenAI 兼容直连） */
   adapter?: string;
   extra?: Record<string, unknown>;
+  /** 该 API 的批量生成并发数（图像/配音等）；留空用通道默认值，各 API 互不影响 */
+  concurrency?: number;
 }
 
 export interface ApiChannel {
@@ -65,6 +67,8 @@ export interface CharacterCard {
   threeViewPrompt?: string;
   /** 该角色的动作立绘列表（如 拔剑/挥手/抱臂），基于三视图生成 */
   actions?: CharacterAction[];
+  /** 是否为次要角色/NPC（有台词但戏份少）；仅用于标注，生成流程与主要角色一致 */
+  isNpc?: boolean;
   /** Legacy inline image payload. Read during migration, but never write to new project JSON. */
   referenceImage?: string;
   /** Project-local character reference path used by current code. */
@@ -353,7 +357,6 @@ export interface GenerationOptions {
   imageBudgetPerChapter: number;
   cgPerChapter: number;
   skipCache: boolean;
-  maxConcurrent: number;
   videoPointsPerChapter: number;
   characterIntroCard: boolean;
   budgetYuan: number;
@@ -365,6 +368,8 @@ export interface GenerationOptions {
   styleAnchor?: boolean;
   /** 剧本文风描述（如"古风典雅""幽默风趣"），LLM 按此风格改写台词与旁白；留空不调整 */
   scriptStyle?: string;
+  /** 提取卡片使用 Agent 模式（多步自主扫描 + 工具调用），长小说更稳、可逐步补全 */
+  extractAgent?: boolean;
   /** 目标语言（如 en/ja），把小说翻译成该语言后再生成；空 = 使用原文 */
   language?: string;
   rerunChapters?: number[];

@@ -6,7 +6,7 @@ import type { ApiConfig } from "./types";
 
 const SYSTEM_PROMPT = `你是视觉小说制作人。从小说文本中提取制作视觉小说所需的结构化信息。
 要求：
-1. characters：所有有台词或推动剧情的主要角色（最多 10 个）。
+1. characters：所有有台词或推动剧情发展的人物都要提取，数量按剧情决定、不要人为设限（群像剧也不例外）。有台词但戏份少的次要角色/NPC（如店小二、守卫、丫鬟、路人等）也要提取，并标记 "isNpc": true。
    - id: 英文或拼音小写（如 linxiao），必须唯一
    - name: 中文姓名
    - appearance: 外貌描述（发型、眼睛、体型、气质）
@@ -14,13 +14,14 @@ const SYSTEM_PROMPT = `你是视觉小说制作人。从小说文本中提取制
    - personality: 性格特征
    - voiceDesc: 适合的音色描述（如"清冷的女声"）
    - voiceName: TTS 音色标识，必须从下面"可用音色列表"中选择最接近的一个（如果没有完全匹配的，选最接近的；不要编造列表外的值）
-   - imagePrompt: 用于 AI 绘画生成立绘的完整英文 prompt，包含人物全身像、服装、发型、表情、背景纯色（保证可抠图），风格统一为"动漫风格，精美立绘"
-   - threeViewPrompt: 用于生成该角色"三视图参考图"（正面/侧面/背面）的完整英文 prompt：同一角色设定、站姿自然、表情平静、全身可见、纯色背景。此图会作为该角色所有立绘/表情/动作的图生图参考，务必与人物的 imagePrompt 描述完全一致
-   - actions: 2-4 个该角色可能做出的经典动作（用于动作立绘，基于三视图图生图）：
+   - imagePrompt: 用于 AI 绘画生成立绘的完整英文 prompt，只描述人物本身（全身像、服装、发型、表情、姿态），禁止写任何背景/底色/场地/环境描述（系统会自动附加纯绿幕背景），风格统一为"动漫风格，精美立绘"
+   - threeViewPrompt: 用于生成该角色"三视图参考图"（正面/侧面/背面）的完整英文 prompt：同一角色设定、站姿自然、表情平静、全身可见，同样禁止写任何背景/底色描述（系统会自动附加纯绿幕背景）。此图会作为该角色所有立绘/表情/动作的图生图参考，务必与人物的 imagePrompt 描述完全一致
+   - actions: 该角色可能做出的经典动作（用于动作立绘，基于三视图图生图，数量不限，按角色特点给出；动作多的角色可以多给）：
      - id: 简短英文标识（如 point/wave/cross/crouch/hold）
      - name: 动作中文名（如 抬手、挥手、抱臂、蹲下、持剑）
      - prompt: 该动作的完整英文 prompt，在保持人物外观（发型/服装/体型）完全一致的前提下描述动作姿态与表情，纯色背景，全身可见，动漫风格
    - color: 角色的主题色（十六进制，用于 UI）
+   - isNpc: 布尔值。主要角色（有台词或推动剧情）填 false；次要角色/NPC（有台词但戏份少）填 true
 2. scenes：故事中出现的地点场景（最多 12 个）。
    - id: 唯一标识（如 classroom）
    - location: 地点名（如"城门前"）
@@ -40,6 +41,26 @@ function truncate(text: string, maxChars: number): string {
   return text.length > maxChars ? text.slice(0, maxChars) + "\n……(截断)" : text;
 }
 
+/** 归一化提取结果：兜底空数组、缺 title 补标题、音色回退到列表首个、动作列表规范化。经典单次提取与 Agent 流程共用。 */
+export function normalizeExtractionResult(result: ExtractionResult, lib: string[], title: string): ExtractionResult {
+  if (!Array.isArray(result.characters)) throw new Error("提取结果缺少 characters 字段");
+  result.scenes = result.scenes ?? [];
+  result.items = result.items ?? [];
+  result.title = result.title || title;
+  for (const c of result.characters) {
+    if (!c.voiceName || !lib.includes(c.voiceName)) {
+      c.voiceName = lib[0] || c.voiceName || "default";
+    }
+    // 动作列表归一化：只保留 id/name/prompt 都合法的项（数量不限，按剧情提取）
+    if (Array.isArray(c.actions)) {
+      c.actions = c.actions
+        .filter((a) => a && a.id && a.prompt)
+        .map((a) => ({ id: String(a.id).toLowerCase().replace(/[^a-z0-9_-]/g, "_"), name: a.name || a.id, prompt: a.prompt }));
+    }
+  }
+  return result;
+}
+
 export async function extractFromNovel(
   cfg: ApiConfig,
   novelText: string,
@@ -52,23 +73,7 @@ export async function extractFromNovel(
   const user = `小说标题：${title}\n\n可用音色列表：${lib.join(", ")}${fb}\n\n以下是小说全文（按模型上下文动态截断，剩余部分将不被 LLM 看到）：\n${truncate(novelText, inputCharBudget(cfg))}`;
   const outputTokens = Math.min(resolveContextLength(cfg), 240_000);
   const result = await chatJson<ExtractionResult>(cfg, SYSTEM_PROMPT, user, { maxTokens: outputTokens, onUsage });
-  if (!Array.isArray(result.characters)) throw new Error("提取结果缺少 characters 字段");
-  result.scenes = result.scenes ?? [];
-  result.items = result.items ?? [];
-  result.title = result.title || title;
-  for (const c of result.characters) {
-    if (!c.voiceName || !lib.includes(c.voiceName)) {
-      c.voiceName = lib[0] || c.voiceName || "default";
-    }
-    // 动作列表归一化：只保留 id/name/prompt 都合法的项
-    if (Array.isArray(c.actions)) {
-      c.actions = c.actions
-        .filter((a) => a && a.id && a.prompt)
-        .slice(0, 6)
-        .map((a) => ({ id: String(a.id).toLowerCase().replace(/[^a-z0-9_-]/g, "_"), name: a.name || a.id, prompt: a.prompt }));
-    }
-  }
-  return result;
+  return normalizeExtractionResult(result, lib, title);
 }
 
 export function demoExtract(novelText: string, title: string): ExtractionResult {
@@ -121,6 +126,21 @@ export function demoExtract(novelText: string, title: string): ExtractionResult 
       imagePrompt:
         "anime style, full body portrait of an old muscular blacksmith with grey beard and tanned skin, wearing rough cloth jacket and leather apron, holding a hammer, warm smile, standing pose, plain white background, clean illustration",
       color: "#868e96",
+    },
+    {
+      id: "xiaoer",
+      name: "店小二",
+      appearance: "圆脸，精明机灵，身量不高",
+      clothing: "灰色短打，白色围裙，搭着一条毛巾",
+      personality: "热情圆滑，消息灵通",
+      voiceDesc: "年轻清亮的男声",
+      voiceName: "xiaoer",
+      isNpc: true,
+      imagePrompt:
+        "anime style, full body portrait of a young inn waiter with a round face and clever eyes, wearing a grey short jacket with a white apron and a towel over his shoulder, friendly smile, standing pose, plain white background, clean illustration",
+      threeViewPrompt:
+        "anime style, three-view character reference sheet (front view / side view / back view) of a young inn waiter with a round face and clever eyes, grey short jacket with white apron and towel over shoulder, neutral standing pose, calm friendly expression, full body visible, plain white background, clean illustration, same design in all three views",
+      color: "#f08c00",
     },
   ];
 

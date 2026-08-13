@@ -11,6 +11,7 @@ import type {
 import { buildImageTasks, runImageTask } from "./images";
 import { setImageConcurrency } from "../api/openaiCompatible";
 import { buildVoiceJobs, runVoiceJob } from "./voice";
+import { concurrencyFor } from "../stores/configMigration";
 import { tauri } from "../utils/tauri";
 
 /** 单个素材重生成的共享上下文 */
@@ -41,8 +42,6 @@ export interface RegenContext {
   /** 是否启用风格锚点（跟随生成页设置） */
   styleAnchor?: boolean;
   visualBible?: ProjectVisualBible;
-  /** 图像并发数（跟随生成页设置，默认 30） */
-  concurrency?: number;
 }
 
 export interface RegenImageResult {
@@ -139,9 +138,9 @@ export async function regenerateImages(
   const total = tasks.length;
   let done = 0;
   const results: RegenImageResult[] = [];
-  const concurrency = Math.max(1, ctx.concurrency ?? 30);
-  // 图片请求全局限流跟随并发设置（与生成管线一致），避免被默认 3 卡死
-  setImageConcurrency(concurrency);
+  const concurrency = concurrencyFor(ctx.cfg, "image");
+  // 图片请求限流跟随该 API 自己的并发配置（与生成管线一致），各 API 互不影响
+  if (ctx.cfg) setImageConcurrency(ctx.cfg, concurrency);
   // 图生图参考链：threeview → 默认立绘(normal) → 表情(emotion) → 动作(action)。
   // refFromTask 依赖必须先完成，故按依赖分层批处理：同一层内并发，层间串行。
   const layerOf = (task: ImageTask): number => {
@@ -364,7 +363,7 @@ export async function regenerateCharacterVoice(
   if (!tts) return 0;
   const jobs = buildVoiceJobs(tts, ctx.chapters, ctx.cards.characters).filter((j) => j.charId === charId);
   const total = jobs.length;
-  const concurrency = Math.max(1, ctx.concurrency ?? 30);
+  const concurrency = concurrencyFor(ctx.ttsCfg, "tts");
   let done = 0;
   let count = 0;
   let idx = 0;

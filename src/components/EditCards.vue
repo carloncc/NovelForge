@@ -160,6 +160,7 @@ function reset(): void {
       >
         <span>
           <span style="color: var(--accent-2); font-weight: 600">{{ c.name }}</span>
+          <span v-if="c.isNpc" class="tag" style="margin-left: 6px">{{ t("NPC") }}</span>
           <span style="color: var(--text-dim); font-size: 12px; margin-left: 8px">{{ c.id }}</span>
         </span>
         <span style="color: var(--text-dim); font-size: 12px">{{ openChar === c.id ? "▲" : "▼" }}</span>

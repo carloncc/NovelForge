@@ -19,6 +19,7 @@ import type {
 import { STAGE_ORDER, languageName } from "./types";
 import type { RenderAssets, WebgalLanguage } from "./render";
 import { extractFromNovel, demoExtract } from "./extract";
+import { extractFromNovelAgent } from "./extractAgent";
 import { scriptChapter, demoScriptAll } from "./script";
 import { translateChapter } from "./translate";
 import { aiSplitChapters, splitChaptersForFallback } from "./split";
@@ -30,6 +31,8 @@ import { tauri } from "../utils/tauri";
 import { errMsg } from "../utils/errors";
 import { log as logger } from "../utils/logger";
 import { configIsUsable } from "../api/providers";
+import { concurrencyFor } from "../stores/configMigration";
+import { setLlmConcurrency } from "../api/openaiCompatible";
 import { assertVisualBibleApprovalStatus, assertVisualBibleReadyForImages } from "./visualBible";
 
 export interface PipelineInput {
@@ -68,6 +71,42 @@ export function titleHash(title: string): string {
   return h.toString(36);
 }
 
+/**
+ * LLM 文本错误是否值得自动重试：网络/限流/5xx/服务端临时/JSON 解析类可重试；
+ * 参数/鉴权/模型不存在等配置类错误不重试（避免浪费调用）。
+ */
+function isRetryableTextError(e: unknown): boolean {
+  const message = e instanceof Error ? e.message : String(e);
+  if (/timeout|timed ?out|network|socket|connect|ec?onn|etimedout|fetch failed|econnrefused|econnreset|broken pipe|server error|unavailable|overloaded|busy|internal|too many|rate limit|429|5\d\d|无法从响应中提取合法 JSON|JSON 无法解析|已中止/i.test(message)) {
+    return true;
+  }
+  if (/400|401|403|404|invalid api key|unauthorized|permission|not found|does not exist|unsupported|not supported|不支持|不可用|参数|鉴权|模型.{0,12}(?:不可用|不存在|未找到)/i.test(message)) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * LLM 文本调用失败自动重试：指数退避（3s→6s→…），尊重中止；配置类错误不重试直接抛出。
+ */
+async function withTextRetry<T>(
+  fn: () => Promise<T>,
+  opts: { retries?: number; baseDelayMs?: number; isAborted?: () => boolean; onRetry?: (attempt: number, delayMs: number, err: unknown) => void },
+): Promise<T> {
+  const retries = opts.retries ?? 2;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      if (opts.isAborted?.()) throw new Error("已中止");
+      if (attempt >= retries || !isRetryableTextError(e)) throw e;
+      const delay = (opts.baseDelayMs ?? 3000) * 2 ** attempt;
+      opts.onRetry?.(attempt + 1, delay, e);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+}
+
 /** 小说全文指纹：源路径 + 正文内容哈希，用于分章/卡片缓存作废判断 */
 function novelFingerprint(fullText: string): string {
   let h = 5381;
@@ -83,11 +122,12 @@ async function splitNovelForPipeline(
   fullText: string,
   onUsage?: (pt: number, ct: number) => void,
   feedback?: string,
+  concurrency = 3,
 ): Promise<ChapterInfo[]> {
   if (!cfg?.apiKey) {
     return splitChaptersForFallback(fullText);
   }
-  return aiSplitChapters(cfg, fullText, onUsage, 40000, feedback);
+  return aiSplitChapters(cfg, fullText, onUsage, 40000, feedback, concurrency);
 }
 
 /** 图片固定种子：用户指定则用之；否则按标题稳定派生，保证同一项目多次生成风格一致 */
@@ -325,7 +365,19 @@ export class Pipeline {
       at: Date.now(),
     });
     const feedback = this.feedback.split;
-    const chapters = await splitNovelForPipeline(this.input.llm!, fullText, this.onUsageCb, feedback);
+    const chapters = await withTextRetry(
+      () => splitNovelForPipeline(this.input.llm!, fullText, this.onUsageCb, feedback, concurrencyFor(this.input.llm, "llm")),
+      {
+        isAborted: () => this.aborted,
+        onRetry: (attempt, delay, e) =>
+          this.input.log({
+            step: "分章",
+            message: `AI 分章失败，${delay / 1000}s 后重试（第 ${attempt} 次）：${errMsg(e).slice(0, 100)}`,
+            level: "warn",
+            at: Date.now(),
+          }),
+      },
+    );
     await tauri.mkdirAll(this.cacheRoot);
     await tauri.writeTextFile(this.splitCacheFile(), JSON.stringify({ fp, chapters }, null, 2));
     return chapters;
@@ -356,8 +408,9 @@ export class Pipeline {
         progress: { done, total, label: title },
       });
     };
-    const concurrency = Math.max(1, this.options.maxConcurrent ?? 30);
     const results: (ChapterInfo | null)[] = new Array(total);
+    // 逐章翻译并发生成（并发数来自文本 API 配置；缓存命中直接复用，失败保留原文继续）
+    const concurrency = concurrencyFor(this.input.llm, "llm");
     let idx = 0;
     const worker = async (): Promise<void> => {
       while (idx < chapters.length) {
@@ -387,7 +440,19 @@ export class Pipeline {
           at: Date.now(),
         });
         try {
-          const tr = await translateChapter(cfg, ch, lang, this.onUsageCb, feedback);
+          const tr = await withTextRetry(
+            () => translateChapter(cfg, ch, lang, this.onUsageCb, feedback),
+            {
+              isAborted: () => this.aborted,
+              onRetry: (attempt, delay, e) =>
+                this.input.log({
+                  step: "翻译",
+                  message: `第 ${ch.index + 1} 章翻译失败，${delay / 1000}s 后重试（第 ${attempt} 次）：${errMsg(e).slice(0, 100)}`,
+                  level: "warn",
+                  at: Date.now(),
+                }),
+            },
+          );
           await tauri.writeTextFile(cacheFile, JSON.stringify(tr, null, 2));
           emitProgress(tr.title);
           results[pos] = { ...ch, title: tr.title, text: tr.text };
@@ -400,7 +465,15 @@ export class Pipeline {
             message: `第 ${ch.index + 1} 章：${errMsg(e)}`,
             at: Date.now(),
           });
-          throw e;
+          this.input.log({
+            step: "翻译",
+            message: `第 ${ch.index + 1} 章翻译失败，已保留原文继续（可在「失败项」定位重试）：${errMsg(e).slice(0, 100)}`,
+            level: "warn",
+            at: Date.now(),
+            taskId: `translate_${ch.index + 1}`,
+            taskKind: "llm",
+          });
+          results[pos] = ch;
         }
       }
     };
@@ -434,6 +507,9 @@ export class Pipeline {
     const { input } = this;
     this.cacheRoot = `${input.outputDir}/.novel2vn/cache`;
     const runStart = logger.time("pipeline", "管线整体运行");
+    // 文本/视觉请求限流跟随各 API 自己的并发配置（各 API 互不影响）
+    if (input.llm) setLlmConcurrency(input.llm, concurrencyFor(input.llm, "llm"));
+    if (input.vision) setLlmConcurrency(input.vision, concurrencyFor(input.vision, "vision"));
     const stages = new Set<StageKey>(input.stages ?? (STAGE_ORDER as StageKey[]));
     if (stages.has("image") && input.options.useImage) assertVisualBibleApprovalStatus(input.visualBible);
     logger.info("pipeline", "开始运行", {
@@ -551,9 +627,28 @@ export class Pipeline {
       }
       if (!cards) {
         try {
+          const useAgent = !!this.options.extractAgent;
+          const runExtract = (): Promise<ExtractionResult> =>
+            useAgent
+              ? extractFromNovelAgent(input.llm!, workingNovel.fullText, workingNovel.fileName.replace(/\.txt$/i, ""), {
+                  onUsage,
+                  isAborted: () => this.aborted,
+                  feedback: extractFeedback,
+                  log: (message, level = "info") => log({ step: "提取", message, level, at: Date.now() }),
+                })
+              : extractFromNovel(input.llm!, workingNovel.fullText, workingNovel.fileName.replace(/\.txt$/i, ""), onUsage, extractFeedback);
           cards = demo
             ? demoExtract(workingNovel.fullText, workingNovel.fileName.replace(/\.txt$/i, ""))
-            : await extractFromNovel(input.llm!, workingNovel.fullText, workingNovel.fileName.replace(/\.txt$/i, ""), onUsage, extractFeedback);
+            : await withTextRetry(runExtract, {
+                isAborted: () => this.aborted,
+                onRetry: (attempt, delay, e) =>
+                  log({
+                    step: "提取",
+                    message: `提取失败，${delay / 1000}s 后重试（第 ${attempt} 次）：${errMsg(e).slice(0, 100)}`,
+                    level: "warn",
+                    at: Date.now(),
+                  }),
+              });
         } catch (e) {
           this.recordFailure({
             id: "extract",
@@ -618,10 +713,10 @@ export class Pipeline {
           progress: { done: scriptDone, total: scriptTotal, label: title },
         });
       };
-      // 剧本是文本 LLM 请求：串行执行，不并发。
-      // 并发会同时向文本 API 发多个大请求（每章 body 可达 2 万+ 字符），
-      // 触发网关限流 / 连接失败（error sending request）。图片并发数是独立配置。
-      const scriptConcurrency = 1;
+      // 逐章剧本并发生成：并发数来自文本 API 配置（各自独立）。
+      // 文本请求体可达 2 万+ 字符，实际同时发出的请求数由该 API 的请求级限流器兜底
+      // （setLlmConcurrency，见 openaiCompatible.ts），避免并发过大打爆网关。
+      const scriptConcurrency = concurrencyFor(input.llm, "llm");
       const scriptResults: (ChapterScript | null)[] = new Array(activeChapters.length);
       let scriptIdx = 0;
       const scriptWorker = async (): Promise<void> => {
@@ -660,10 +755,22 @@ export class Pipeline {
               try {
                 script = demo
                   ? demoScriptAll([chapter], cards!)[0]
-                  : await scriptChapter(input.llm!, chapter, cards!, onUsage, {
-                      style: style || undefined,
-                      feedback: this.feedback.script?.[chapter.index],
-                    });
+                  : await withTextRetry(
+                      () => scriptChapter(input.llm!, chapter, cards!, onUsage, {
+                        style: style || undefined,
+                        feedback: this.feedback.script?.[chapter.index],
+                      }),
+                      {
+                        isAborted: () => this.aborted,
+                        onRetry: (attempt, delay, e) =>
+                          log({
+                            step: "剧本",
+                            message: `第 ${chapter.index + 1} 章剧本生成失败，${delay / 1000}s 后重试（第 ${attempt} 次）：${errMsg(e).slice(0, 100)}`,
+                            level: "warn",
+                            at: Date.now(),
+                          }),
+                      },
+                    );
               } catch (e) {
                 this.recordFailure({
                   id: `chapter_${chapter.index + 1}`,
@@ -672,7 +779,25 @@ export class Pipeline {
                   message: `第 ${chapter.index + 1} 章：${errMsg(e)}`,
                   at: Date.now(),
                 });
-                throw e;
+                log({
+                  step: "剧本",
+                  message: `第 ${chapter.index + 1} 章剧本失败（已跳过，可在「失败项」定位重试；其余章节继续生成）：${errMsg(e).slice(0, 100)}`,
+                  level: "error",
+                  at: Date.now(),
+                  taskId: `chapter_${chapter.index + 1}`,
+                  taskKind: "script",
+                });
+                continue;
+              }
+              if (!script) {
+                this.recordFailure({
+                  id: `chapter_${chapter.index + 1}`,
+                  kind: "script",
+                  step: "剧本",
+                  message: `第 ${chapter.index + 1} 章：剧本结果为空`,
+                  at: Date.now(),
+                });
+                continue;
               }
               await tauri.writeTextFile(cacheFile, JSON.stringify(script, null, 2));
               this.checkBudget();
@@ -750,7 +875,7 @@ export class Pipeline {
           input.materials,
           this.cacheRoot,
           input.log,
-          this.options.maxConcurrent,
+          concurrencyFor(input.image, "image"),
           this.options.figureEmotions,
           this.options.imageStyle,
           imageFeedback,
@@ -795,7 +920,7 @@ export class Pipeline {
       if (this.options.useTts && input.tts?.apiKey) {
         log({ step: "配音", message: "开始生成配音…", level: "info", at: Date.now() });
         const voiceForce = !!this.feedback.voice || input.forceStages?.includes("voice");
-        const vocal = await generateVoice(input.tts, chapters, cards!.characters, this.cacheRoot, input.log, this.options.maxConcurrent, voiceForce, () => this.aborted);
+        const vocal = await generateVoice(input.tts, chapters, cards!.characters, this.cacheRoot, input.log, concurrencyFor(input.tts, "tts"), voiceForce, () => this.aborted);
         this.cost.ttsChars = Object.keys(vocal).reduce((n, k) => n + (vocal[k] ? 1 : 0), 0) * 20;
         this.cost.ttsCostYuan = (this.cost.ttsChars / 1e6) * DEFAULT_PRICES.ttsYuanPer1mChars;
         assets.vocal = vocal;
@@ -857,6 +982,15 @@ export class Pipeline {
       chapters: chapters.length,
       stages: Array.from(stages),
     });
+
+    if (this.failedTasks.length) {
+      log({
+        step: "完成",
+        message: `有 ${this.failedTasks.length} 个任务失败（已跳过，可在「失败项」定位重试；重新生成时已完成的会复用缓存，只补失败项）`,
+        level: "warn",
+        at: Date.now(),
+      });
+    }
 
     return { meta, cards: cards!, chapters, assets, cost: this.cost, failedTasks: this.failedTasks, splitChapters: workingChapters };
   }

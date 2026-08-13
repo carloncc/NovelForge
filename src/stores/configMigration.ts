@@ -2,7 +2,20 @@ import type { ApiConfig, ApiPreset, ChannelKey } from "../core/types";
 
 export const CONFIG_SCHEMA_VERSION = 2 as const;
 
-export const DEFAULT_CONCURRENCY = 30 as const;
+/** 各通道默认并发数：文本/图像/配音都是批量生成（各自独立，互不影响）；识别默认串行 */
+export const DEFAULT_CONCURRENCY_BY_CHANNEL: Record<ChannelKey, number> = {
+  llm: 3,
+  vision: 1,
+  image: 3,
+  tts: 3,
+};
+
+/** 取某个 API 配置的并发数：配置了用配置值，否则用通道默认值 */
+export function concurrencyFor(cfg: ApiConfig | undefined, kind: ChannelKey): number {
+  const n = cfg?.concurrency;
+  if (typeof n === "number" && Number.isFinite(n) && n >= 1) return Math.floor(n);
+  return DEFAULT_CONCURRENCY_BY_CHANNEL[kind];
+}
 
 export interface ConfigFile {
   configSchemaVersion: typeof CONFIG_SCHEMA_VERSION;
@@ -10,8 +23,6 @@ export interface ConfigFile {
   activePresetId: string;
   outputDir?: string;
   recentOutputDirs?: string[];
-  /** 全局并发数：图像/配音/分章/视觉圣经等所有批量生成任务的并发上限，默认 30 */
-  concurrency?: number;
 }
 
 export interface ConfigMigrationResult {
@@ -157,7 +168,6 @@ export function migrateConfigFile(
       recentOutputDirs: Array.isArray(root.recentOutputDirs)
         ? root.recentOutputDirs.filter((dir): dir is string => typeof dir === "string")
         : [],
-      concurrency: typeof root.concurrency === "number" && root.concurrency >= 1 ? root.concurrency : DEFAULT_CONCURRENCY,
     },
   };
 }

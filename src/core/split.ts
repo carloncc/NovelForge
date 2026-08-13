@@ -116,9 +116,8 @@ async function detectBatch(
 }
 
 const BATCH = 40; // 每批候选块数量
-// AI 分章是文本 LLM 请求：并发过大会同时向文本 API 发大量请求，触发网关限流/连接失败。
-// 用低并发（3）在速度与稳定性间取平衡，避免 error sending request。
-const CONCURRENT = 3;
+// AI 分章并发数由文本 API 配置决定（concurrency 参数）；文本请求体较大，并发由该 API 的请求级限流器兜底，
+// 避免同时向文本 API 发大量请求触发网关限流/连接失败。
 
 /**
  * AI 分章：输入未切章全文，输出章节列表。
@@ -130,6 +129,7 @@ export async function aiSplitChapters(
   onUsage?: (pt: number, ct: number) => void,
   maxChapterChars = 40000,
   feedback?: string,
+  concurrency = 3,
 ): Promise<ChapterInfo[]> {
   const blocks = splitBlocks(fullText);
   if (blocks.length <= 1) {
@@ -148,7 +148,7 @@ export async function aiSplitChapters(
     }
   }
 
-  // 分批并行识别章节标题块 + 杂项丢弃块
+  // 分批识别章节标题块 + 杂项丢弃块（并发生成，并发数来自文本 API 配置）
   const marks: BlockMark[] = [];
   const discardSet = new Set<number>();
   const batches: number[][] = [];
@@ -159,7 +159,7 @@ export async function aiSplitChapters(
     batches.push(batch);
   }
   const queue = [...batches];
-  const workers = Array.from({ length: Math.min(CONCURRENT, queue.length) }, async () => {
+  const workers = Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
     while (queue.length) {
       const batch = queue.shift()!;
       const batchBlocks = batch.map((idx) => blocks[idx - 1]).filter((b): b is string => typeof b === "string");
@@ -224,7 +224,7 @@ export async function aiSplitChapters(
   const result: ChapterInfo[] = [];
   for (const ch of chapters) {
     if (ch.text.length > maxChapterChars) {
-      const sub = await aiSplitChapters(cfg, ch.text, onUsage, maxChapterChars, feedback);
+      const sub = await aiSplitChapters(cfg, ch.text, onUsage, maxChapterChars, feedback, concurrency);
       result.push(...sub.map((s, i) => ({ ...s, index: result.length + i, title: `${ch.title} ${i + 1}` })));
     } else {
       result.push(ch);

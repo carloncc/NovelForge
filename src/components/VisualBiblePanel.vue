@@ -55,6 +55,7 @@ const pendingCharImages = ref<Record<string, PendingImage>>({});
 const styleDescriptionText = ref("");
 const rewriteInstruction = ref("");
 const creating = ref(false);
+const createProgress = ref<{ phase: "style" | "threeview"; done: number; total: number } | null>(null);
 const busyKey = ref("");
 const createError = ref("");
 const styleError = ref("");
@@ -268,10 +269,13 @@ async function createDraft(): Promise<void> {
     cards,
     imageCfg,
     characterReferences,
-    concurrency: configState.concurrency ?? 30,
+    onProgress: (phase: "style" | "threeview", done: number, total: number) => {
+      createProgress.value = { phase, done, total };
+    },
   };
 
   creating.value = true;
+  createProgress.value = null;
   try {
     const created = styleSource.value === "reference_image"
       ? await createVisualBibleDraft({
@@ -298,6 +302,7 @@ async function createDraft(): Promise<void> {
     });
   } finally {
     creating.value = false;
+    createProgress.value = null;
   }
 }
 
@@ -662,6 +667,9 @@ function characterNeedsRegeneration(characterId: string): boolean {
           </div>
 
           <p v-if="createError" class="vb-error">{{ createError }}</p>
+          <p v-if="createProgress && createProgress.total > 0" class="vb-progress" style="font-size: 12px; color: var(--text-dim); margin: 4px 0">
+            {{ createProgress.phase === "style" ? t("整本小说风格分析") : t("角色三视图生成") }}：{{ createProgress.done }}/{{ createProgress.total }}
+          </p>
           <div class="vb-actions">
             <button class="btn" :disabled="!canCreateDraft" @click="createDraft">
               <span v-if="creating" class="spinner" />

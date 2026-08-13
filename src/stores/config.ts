@@ -4,7 +4,7 @@ import { tauri } from "../utils/tauri";
 import { getTemplate } from "../api/templates";
 import {
   CONFIG_SCHEMA_VERSION,
-  DEFAULT_CONCURRENCY,
+  DEFAULT_CONCURRENCY_BY_CHANNEL,
   loadConfigFile,
   UnsupportedConfigVersionError,
   type ConfigFile,
@@ -58,6 +58,7 @@ export function defaultApiConfig(kind: ChannelKey): ApiConfig {
     baseUrl: d.baseUrl,
     apiKey: "",
     model: d.model,
+    concurrency: DEFAULT_CONCURRENCY_BY_CHANNEL[kind],
     extra: kind === "tts"
       ? { voiceLibrary: [...DEFAULT_VOICE_LIBRARY] }
       : kind === "image"
@@ -118,7 +119,6 @@ export const configState = reactive<ConfigFile>({
   activePresetId: initialPreset.id,
   outputDir: "",
   recentOutputDirs: [],
-  concurrency: DEFAULT_CONCURRENCY,
 });
 let configPersistenceBlocked = false;
 let lastPersistedContent = "";
@@ -152,9 +152,6 @@ async function loadPersisted() {
     configState.configSchemaVersion = CONFIG_SCHEMA_VERSION;
     configState.outputDir = parsed.outputDir || "";
     configState.recentOutputDirs = parsed.recentOutputDirs ?? [];
-    configState.concurrency = typeof parsed.concurrency === "number" && parsed.concurrency >= 1
-      ? parsed.concurrency
-      : DEFAULT_CONCURRENCY;
   } catch (error) {
     if (error instanceof UnsupportedConfigVersionError) {
       configPersistenceBlocked = true;
@@ -173,7 +170,6 @@ function persistedConfigContent(): string {
     activePresetId: configState.activePresetId,
     outputDir: configState.outputDir,
     recentOutputDirs: configState.recentOutputDirs,
-    concurrency: configState.concurrency,
   });
 }
 

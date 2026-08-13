@@ -1,8 +1,9 @@
 import { chatCompletion, chatVision, generateImage, ReferenceImageError } from "../api/openaiCompatible";
+import { setLlmConcurrency } from "../api/openaiCompatible";
 import { tauri } from "../utils/tauri";
 import { extname, normalizePath, safeFilename } from "../utils/path";
 import { buildImageTasks, stripBackground } from "./images";
-import { DEFAULT_CONCURRENCY } from "../stores/configMigration";
+import { concurrencyFor } from "../stores/configMigration";
 import type {
   ApiConfig,
   AssetMap,
@@ -93,8 +94,8 @@ interface VisualBibleDraftBase {
   cards: ExtractionResult;
   imageCfg: ApiConfig;
   characterReferences?: Record<string, VisualBibleImageInput>;
-  /** 角色三视图并发生成数；默认 3（与全局并发数可独立配置） */
-  concurrency?: number;
+  /** 生成进度回调：phase 为 "style"（风格分析）| "threeview"（角色三视图） */
+  onProgress?: (phase: "style" | "threeview", done: number, total: number) => void;
 }
 
 export type CreateVisualBibleDraftInput = VisualBibleDraftBase & (
@@ -356,20 +357,26 @@ async function reduceStyleSummaries(
   llmCfg: ApiConfig,
   initialSummaries: string[],
   dependencies: VisualBibleServiceDependencies,
+  concurrency = concurrencyFor(llmCfg, "llm"),
 ): Promise<string[]> {
   let summaries = initialSummaries;
   while (summaries.join("\n").length > SUMMARY_BATCH_LIMIT) {
     const batches = styleSummaryBatches(summaries);
-    const reduced: string[] = [];
-    for (const batch of batches) {
-      const merged = await dependencies.chatText(
-        llmCfg,
-        "You merge visual-development evidence. Preserve recurring and distinctive traits; do not add plot or characters.",
-        `STYLE EVIDENCE BATCH\n${batch}\n\nReturn a terse English list covering era, genre, mood, palette, medium, linework, color treatment, lighting, texture, and camera traits.`,
-        { maxTokens: 1200, temperature: 0.1 },
-      );
-      reduced.push(requireNonEmptyStyle(merged, "Novel style evidence reduction").slice(0, 800));
-    }
+    const reduced: string[] = new Array(batches.length);
+    let batchIdx = 0;
+    const worker = async (): Promise<void> => {
+      while (batchIdx < batches.length) {
+        const i = batchIdx++;
+        const merged = await dependencies.chatText(
+          llmCfg,
+          "You merge visual-development evidence. Preserve recurring and distinctive traits; do not add plot or characters.",
+          `STYLE EVIDENCE BATCH\n${batches[i]}\n\nReturn a terse English list covering era, genre, mood, palette, medium, linework, color treatment, lighting, texture, and camera traits.`,
+          { maxTokens: 1200, temperature: 0.1 },
+        );
+        reduced[i] = requireNonEmptyStyle(merged, "Novel style evidence reduction").slice(0, 800);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(concurrency, batches.length) }, () => worker()));
     summaries = reduced;
   }
   return summaries;
@@ -379,10 +386,12 @@ export async function analyzeNovelStyle(
   llmCfg: ApiConfig,
   novel: NovelDoc,
   dependencies: VisualBibleServiceDependencies = DEFAULT_DEPENDENCIES,
-  concurrency: number = DEFAULT_CONCURRENCY,
+  concurrency = concurrencyFor(llmCfg, "llm"),
+  onProgress?: (done: number, total: number) => void,
 ): Promise<string> {
   const chunks = chunkNovelForStyleAnalysis(novel);
   if (!chunks.length) throw new Error("The novel has no enabled chapter text to analyze");
+  // 分段分析并发生成（并发数来自文本 API 配置），避免超长小说串行分析耗时十几分钟
   const summaries: string[] = new Array(chunks.length);
   let idx = 0;
   const worker = async (): Promise<void> => {
@@ -395,10 +404,11 @@ export async function analyzeNovelStyle(
         { maxTokens: 1200, temperature: 0.1 },
       );
       summaries[index] = requireNonEmptyStyle(summary, `Novel style analysis chunk ${index + 1}`).slice(0, 800);
+      onProgress?.(index + 1, chunks.length);
     }
   };
   await Promise.all(Array.from({ length: Math.min(concurrency, chunks.length) }, () => worker()));
-  const reducedSummaries = await reduceStyleSummaries(llmCfg, summaries, dependencies);
+  const reducedSummaries = await reduceStyleSummaries(llmCfg, summaries, dependencies, concurrency);
   const synthesisInput = reducedSummaries.map((summary, index) => `${index + 1}. ${summary}`).join("\n");
   const finalStyle = await dependencies.chatText(
     llmCfg,
@@ -499,7 +509,7 @@ function registerCharacterAssetKey(
 }
 
 function productionActionIds(character: CharacterCard): string[] {
-  const actionIds = character.actions?.slice(0, 4).map((action) => action.id) ?? [];
+  const actionIds = character.actions?.map((action) => action.id) ?? [];
   if (new Set(actionIds).size !== actionIds.length) {
     throw new CharacterAssetKeyConflictError(`task action IDs are duplicated within character "${character.id}"`);
   }
@@ -507,7 +517,7 @@ function productionActionIds(character: CharacterCard): string[] {
 }
 
 function characterWithHistoricalActions(bible: ProjectVisualBible, character: CharacterCard): CharacterCard {
-  const currentActions = character.actions?.slice(0, 4) ?? [];
+  const currentActions = character.actions ?? [];
   productionActionIds(character);
   const currentIds = new Set(currentActions.map((action) => action.id));
   const historicalActions = (bible.characters[character.id]?.actionIds ?? [])
@@ -557,7 +567,13 @@ async function createDraftStyle(
     return { description, referencePath, sourceReferenceB64: resolved.dataB64 };
   }
 
-  const description = await analyzeNovelStyle(input.llmCfg, input.novel, dependencies, input.concurrency);
+  const description = await analyzeNovelStyle(
+    input.llmCfg,
+    input.novel,
+    dependencies,
+    concurrencyFor(input.llmCfg, "llm"),
+    (done, total) => input.onProgress?.("style", done, total),
+  );
   const referencePath = revisionedArtifactPath("style-sample.png", artifactRevision);
   const sample = await dependencies.generateImage(
     input.imageCfg,
@@ -591,12 +607,13 @@ async function createDraftCharacters(
     ...styleArtifact,
     sourcePath: styleArtifactPath,
   };
-  const concurrency = Math.max(1, input.concurrency ?? DEFAULT_CONCURRENCY);
+  const concurrency = concurrencyFor(input.imageCfg, "image");
   const cards = input.cards.characters;
   let idx = 0;
   const worker = async (): Promise<void> => {
     while (idx < cards.length) {
-      const card = cards[idx++];
+      const pos = idx++;
+      const card = cards[pos];
       const reference = await resolveCharacterReference(input, card, artifactDir, artifactRevision);
       const prompt = normalizeStyleDescription(card.threeViewPrompt || card.imagePrompt);
       const references: ImageReference[] = [
@@ -627,6 +644,7 @@ async function createDraftCharacters(
         sourceRevision,
         sheetSourceRevision: sourceRevision,
       };
+      input.onProgress?.("threeview", pos + 1, cards.length);
     }
   };
   await Promise.all(Array.from({ length: Math.min(concurrency, cards.length) }, () => worker()));
@@ -637,6 +655,12 @@ export async function createVisualBibleDraft(
   input: CreateVisualBibleDraftInput,
   dependencies: VisualBibleServiceDependencies = DEFAULT_DEPENDENCIES,
 ): Promise<ProjectVisualBible> {
+  // 文本/视觉请求限流跟随各 API 自己的并发配置（各 API 互不影响）
+  if (input.styleSource === "novel_analysis") {
+    setLlmConcurrency(input.llmCfg, concurrencyFor(input.llmCfg, "llm"));
+  } else if (input.styleSource === "reference_image") {
+    setLlmConcurrency(input.visionCfg, concurrencyFor(input.visionCfg, "vision"));
+  }
   validateCharacterAssetKeys(input.cards.characters);
   const published = await mutateAndPublishVisualBible(input.outputDir, async (artifactDir, artifactRevision) => {
     const style = await createDraftStyle(input, dependencies, artifactDir, artifactRevision);
@@ -877,14 +901,14 @@ export async function regenerateCharacterDescription(
 
 严格要求：
 1. 必须输出严格的 JSON，不要 markdown 代码块，不要任何其他文字
-2. 背景必须是纯绿色 chroma key green（pure #00FF00 green filling the entire background, no gradient, no pattern, no text, no shadow），禁止使用任何其他底色
+2. 不要在 imagePrompt / threeViewPrompt 中写任何背景/底色/场地/环境描述（背景由系统统一附加纯绿幕 chroma key green，prompt 里写了反而会造成底色冲突）
 3. 描述该角色的发型/瞳色/服装/体型/气质，不要凭空添加小说里没有的元素
 4. 全身可见（full body visible），站姿自然，动漫风格
 
 输出 JSON 字段：
 {
-  "imagePrompt": "立绘的完整英文 prompt（包含人物外观/服装/绿幕背景）",
-  "threeViewPrompt": "三视图的完整英文 prompt（同一角色、站姿自然、表情平静、全身可见、绿幕背景）"
+  "imagePrompt": "立绘的完整英文 prompt（只描述人物外观/服装/姿态，不写背景）",
+  "threeViewPrompt": "三视图的完整英文 prompt（同一角色、站姿自然、表情平静、全身可见，不写背景）"
 }`;
 
   const userPrompt = `ROLE NAME

@@ -12,6 +12,8 @@ import { errMsg } from "../utils/errors";
 import { log as logger, dumpLogHistory } from "../utils/logger";
 import EditCards from "../components/EditCards.vue";
 import StepIndicator from "../components/StepIndicator.vue";
+import StageStatusBoard from "../components/StageStatusBoard.vue";
+import { useStageStatus } from "../composables/useStageStatus";
 import type { AssetMap, FailedTask, ImageTask, PipelineEvent, StageFeedback, StageKey, VideoSuggestion } from "../core/types";
 import { STAGE_LABELS, STAGE_ORDER, LANGUAGES } from "../core/types";
 import {
@@ -51,7 +53,7 @@ const videoStatus = ref<Record<string, boolean>>({});
 const copiedMsg = ref("");
 const logPanelRef = ref<HTMLElement | null>(null);
 
-const PIPELINE_STEPS = ["翻译", "提取", "剧本", "图像", "配音", "组装"];
+const PIPELINE_STEPS = ["分章", "翻译", "提取", "剧本", "图像", "配音", "组装"];
 const pipelineSteps = computed(() => PIPELINE_STEPS.map((s) => t(s)));
 const currentStep = ref(-1);
 const failedSteps = ref<number[]>([]);
@@ -113,6 +115,59 @@ const videoPoints = computed<(VideoSuggestion & { chapter: number; location: str
 
 const selectedStages = ref<Record<StageKey, boolean>>({ split: true, translate: true, extract: true, script: true, image: true, voice: true, assemble: true });
 const stageFeedback = ref<Partial<Record<StageKey, string>>>({});
+
+/* ---- 分阶段状态看板：各阶段 未运行/进行中/完成/失败 ---- */
+
+const stageStatus = useStageStatus({
+  getOutputDir: () => projectState.outputDir,
+  getNovel: () => projectState.novel,
+  getLanguage: () => projectState.options.language ?? "",
+  getFailedTasks: () => failedTasks.value,
+  getLogFailedStages: () => logFailedStages.value,
+  getBusy: () => busy.value,
+  getRunningStages: () => runningStages.value,
+});
+
+/** 每个阶段失败任务数（用于徽标显示） */
+const failedCounts = computed<Record<StageKey, number>>(() => {
+  const out = {} as Record<StageKey, number>;
+  for (const f of failedTasks.value) {
+    const k = stageStatus.STEP_TO_STAGE[f.step];
+    if (k) out[k] = (out[k] ?? 0) + 1;
+  }
+  return out;
+});
+
+/** 日志中「最后一条」为 error 的阶段（用于中断/未落盘运行的失败识别，成功后会更新为成功状态） */
+const logFailedStages = computed<Set<StageKey>>(() => {
+  const lastLevel = new Map<StageKey, string>();
+  for (const e of projectState.logs) {
+    const k = stageStatus.STEP_TO_STAGE[e.step];
+    if (k) lastLevel.set(k, e.level);
+  }
+  const set = new Set<StageKey>();
+  for (const [k, level] of lastLevel) if (level === "error") set.add(k);
+  return set;
+});
+
+/** 当前正在执行的阶段（从最近一条非 error 日志推导） */
+const runningStages = computed<StageKey[]>(() => {
+  if (!busy.value && !projectState.running) return [];
+  for (let i = projectState.logs.length - 1; i >= 0; i--) {
+    const e = projectState.logs[i];
+    if (e.level === "error") continue;
+    const k = stageStatus.STEP_TO_STAGE[e.step];
+    if (k) return [k];
+  }
+  return [];
+});
+
+watch(
+  () => [projectState.outputDir, projectState.lastResult?.failedTasks, projectState.options.language],
+  () => void stageStatus.refresh(),
+  { deep: true },
+);
+void stageStatus.refresh();
 
 /* ---- 风格参考图：上传图片 → AI 识别画风 → 写入统一画风约束 ---- */
 const styleRefSrc = ref("");
@@ -220,13 +275,6 @@ function resetRegenState(): void {
   regenAbort.value = false;
   regenProgress.value = null;
 }
-
-// 全局并发：优先使用系统配置页的「全局并发数」；未配置时回退到项目级设置（默认 30）
-const effectiveConcurrency = computed(() => {
-  const system = configState.concurrency;
-  if (typeof system === "number" && system >= 1) return system;
-  return Math.max(1, projectState.options.maxConcurrent || 30);
-});
 
 const regenPct = computed(() => {
   const p = regenProgress.value;
@@ -531,7 +579,6 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
       templateDir,
       options: {
         ...projectState.options,
-        maxConcurrent: effectiveConcurrency.value,
         rerunChapters: opts.rerunChapters !== undefined ? opts.rerunChapters ?? undefined : rerunChapters.value ?? undefined,
       },
       stages: opts.stages,
@@ -587,6 +634,7 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
     busy.value = false;
     projectState.running = false;
     pipelineRef.value = null;
+    void stageStatus.refresh();
   }
 }
 
@@ -628,78 +676,102 @@ function onVisualBibleChanged(): void {
   void loadAssetMapNow();
 }
 
-/* ==================== 分阶段操作 ==================== */
+/* ==================== 分阶段操作（统一入口 + 智能补漏） ==================== */
 
-function runSplitRegen(): void {
-  const fb = stageFeedback.value.split?.trim() || "";
-  void execute({
-    stages: ["split", "extract", "script", "image", "assemble"],
-    feedback: fb ? { split: fb } : undefined,
-    forceStages: ["split"],
-    rerunChapters: null,
-  }).then(() => {
-    stageFeedback.value.split = "";
+/**
+ * 重新生成某个阶段：只 force 目标阶段，下游复用缓存（已完成的阶段不会重新生成）。
+ * 智能补漏：目标阶段存在失败项且未填意见时，只重生成失败项（剧本→失败章节、翻译/图像→仅未缓存项）；
+ * 填了意见或想整阶段重跑时强制全量。
+ */
+function runStageRegen(stage: StageKey): void {
+  const fb = stageFeedback.value[stage]?.trim() || "";
+  const failedFor = failedTasks.value.filter((f) => stageStatus.STEP_TO_STAGE[f.step] === stage);
+  const hasFailed = failedFor.length > 0;
+  const feedback = fb ? ({ [stage]: fb } as Partial<StageFeedback>) : undefined;
+  const thenRefresh = (): void => {
+    void stageStatus.refresh();
     void loadAssetMapNow();
-  });
-}
+  };
+  const clearFb = (): void => {
+    stageFeedback.value[stage] = "";
+  };
 
-function runExtractRegen(): void {
-  const fb = stageFeedback.value.extract?.trim() || "";
-  void execute({
-    stages: ["extract", "script", "image", "assemble"],
-    feedback: fb ? { extract: fb } : undefined,
-    forceStages: ["extract"],
-    rerunChapters: null,
-  }).then(() => {
-    stageFeedback.value.extract = "";
-    void loadAssetMapNow();
-  });
-}
-
-function runScriptRegen(): void {
-  const fb = stageFeedback.value.script?.trim() || "";
-  const fbMap: Record<number, string> = {};
-  if (fb) for (const c of projectState.novel?.chapters ?? []) fbMap[c.index] = fb;
-  void execute({
-    stages: ["script", "assemble"],
-    feedback: fb ? { script: fbMap } : undefined,
-    forceStages: ["script"],
-    rerunChapters: null,
-  }).then(() => {
-    stageFeedback.value.script = "";
-  });
-}
-
-function runImageRegen(): void {
-  const fb = stageFeedback.value.image?.trim() || "";
-  void execute({
-    stages: ["image", "assemble"],
-    feedback: fb ? { image: fb } : undefined,
-    forceStages: ["image"],
-  }).then(() => {
-    stageFeedback.value.image = "";
-    void loadAssetMapNow();
-  });
-}
-
-function runVoiceRegen(): void {
-  void execute({ stages: ["voice", "assemble"], forceStages: ["voice"] }).then(() => void loadAssetMapNow());
-}
-
-function runAssemble(): void {
-  void execute({ stages: ["assemble"] });
-}
-
-function runTranslateRegen(): void {
-  const fb = stageFeedback.value.translate?.trim() || "";
-  void execute({
-    stages: ["translate", "extract", "script", "image", "assemble"],
-    feedback: fb ? { translate: fb } : undefined,
-    forceStages: ["translate"],
-    rerunChapters: null,
-  }).then(() => {
-    stageFeedback.value.translate = "";
-  });
+  switch (stage) {
+    case "split":
+      void execute({
+        stages: ["split", "extract", "script", "image", "assemble"],
+        feedback: feedback as StageFeedback | undefined,
+        forceStages: ["split"],
+        rerunChapters: null,
+      }).then(() => {
+        clearFb();
+        thenRefresh();
+      });
+      break;
+    case "translate": {
+      // 有失败项且无意见 → 不 force：缓存复用、只补未缓存的失败章
+      const force = hasFailed && !fb ? undefined : (["translate"] as StageKey[]);
+      void execute({
+        stages: ["translate", "extract", "script", "image", "assemble"],
+        feedback: feedback as StageFeedback | undefined,
+        forceStages: force,
+        rerunChapters: null,
+      }).then(() => {
+        clearFb();
+        thenRefresh();
+      });
+      break;
+    }
+    case "extract":
+      void execute({
+        stages: ["extract", "script", "image", "assemble"],
+        feedback: feedback as StageFeedback | undefined,
+        forceStages: ["extract"],
+        rerunChapters: null,
+      }).then(() => {
+        clearFb();
+        thenRefresh();
+      });
+      break;
+    case "script": {
+      const failedChapters = failedFor
+        .filter((f) => f.id.startsWith("chapter_"))
+        .map((f) => parseInt(f.id.replace("chapter_", ""), 10) - 1);
+      if (fb) {
+        const fbMap: Record<number, string> = {};
+        for (const c of projectState.novel?.chapters ?? []) fbMap[c.index] = fb;
+        void execute({ stages: ["script", "assemble"], feedback: { script: fbMap }, forceStages: ["script"], rerunChapters: null });
+      } else if (failedChapters.length) {
+        // 只重生成失败章节，其余复用缓存
+        void execute({ stages: ["script", "assemble"], rerunChapters: failedChapters });
+      } else {
+        void execute({ stages: ["script", "assemble"], forceStages: ["script"], rerunChapters: null });
+      }
+      clearFb();
+      break;
+    }
+    case "image": {
+      // 有失败项且无意见 → 不 force：只补未生成的失败图
+      const force = hasFailed && !fb ? undefined : (["image"] as StageKey[]);
+      void execute({
+        stages: ["image", "assemble"],
+        feedback: feedback as StageFeedback | undefined,
+        forceStages: force,
+      }).then(() => {
+        clearFb();
+        thenRefresh();
+      });
+      break;
+    }
+    case "voice":
+      void execute({ stages: ["voice", "assemble"], forceStages: ["voice"] }).then(thenRefresh);
+      break;
+    case "assemble":
+      void execute({ stages: ["assemble"] }).then(() => {
+        void stageStatus.refresh();
+      });
+      break;
+  }
 }
 
 function regenChapter(idx: number): void {
@@ -746,7 +818,6 @@ async function regenCtx(): Promise<RegenContext | null> {
     verifyCfg: projectState.options.imageSelfCheck ? visionCfg : undefined,
     visionCfg: configIsUsable(visionCfg, "vision") ? visionCfg : undefined,
     imageSeed: projectState.options.imageSeed || undefined,
-    concurrency: effectiveConcurrency.value,
     styleAnchor: projectState.options.styleAnchor,
     visualBible: projectState.visualBible?.status === "approved" ? projectState.visualBible : undefined,
   };
@@ -986,6 +1057,7 @@ async function loadProjectState(): Promise<void> {
   await restoreProject(projectState.outputDir);
   addRecentOutputDir(projectState.outputDir);
   pushLog({ step: "项目", message: `已加载项目状态：${projectState.outputDir}`, level: "success", at: Date.now() });
+  await stageStatus.refresh();
 }
 
 async function checkVideos(): Promise<void> {
@@ -1073,9 +1145,9 @@ async function retryFailed(): Promise<void> {
   }
   if (chapterIds.size) {
     rerunChapters.value = Array.from(chapterIds);
-    copiedMsg.value = t("已定位失败章节，点击「开始生成」重试（其余章节复用缓存）");
+    copiedMsg.value = t("已定位失败章节，点击「开始生成」将只重试失败项（其余自动复用缓存）");
   } else {
-    copiedMsg.value = t("无章节级失败；请勾选「跳过缓存」后重跑以重试图像任务");
+    copiedMsg.value = t("失败项为图片/翻译类：点击「开始生成」重跑对应阶段即可，已完成的自动复用缓存、只补失败项");
   }
   setTimeout(() => (copiedMsg.value = ""), 4000);
 }
@@ -1256,10 +1328,6 @@ function fileExistsLabel(file: string | undefined): string {
             <span>{{ t("预算上限（¥，0 = 不限）") }}</span>
             <input type="number" v-model.number="projectState.options.budgetYuan" min="0" step="0.5" />
           </label>
-          <label class="field" :title="t('同时生成图片/配音的任务数。调大可显著提速，但会同时消耗多张额度；默认 30，可到系统配置页统一调整')">
-            <span>{{ t("图像/配音并发数") }}</span>
-            <input type="number" v-model.number="projectState.options.maxConcurrent" min="1" max="100" />
-          </label>
           <label class="field" :title="t('固定所有图片生成的随机种子：同一种子下背景/CG/立绘的画风与角色更稳定一致。0 = 按小说标题自动派生')">
             <span>{{ t("固定种子（0 = 按标题自动派生）") }}</span>
             <input type="number" v-model.number="projectState.options.imageSeed" min="0" />
@@ -1293,6 +1361,10 @@ function fileExistsLabel(file: string | undefined): string {
           <span v-else style="color: var(--text-faint); font-size: 11px">{{ t("写入游戏文件") }}</span>
         </label>
       </div>
+      <label style="display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-2); cursor: pointer; white-space: nowrap; margin-top: var(--space-2)">
+        <input type="checkbox" v-model="projectState.options.extractAgent" />
+        {{ t("Agent 模式（多步自主扫描 + 工具调用，超长小说更稳）") }}
+      </label>
       <p style="color: var(--text-dim); font-size: 12px; margin-top: var(--space-2)">
         {{ t("未勾选的阶段会复用已有结果（卡片/剧本/素材），不会重新计费；若某阶段从未运行过则会提示需先运行。") }}
       </p>
@@ -1320,44 +1392,19 @@ function fileExistsLabel(file: string | undefined): string {
     </div>
 
     <div class="card" v-if="projectState.lastResult" style="margin-top: var(--space-4)">
-      <div class="card-head"><h3>{{ t("分阶段操作（不满意可单独重生成）") }}</h3></div>
-      <div style="display: flex; flex-direction: column; gap: 10px">
-        <div class="stage-row">
-          <div class="stage-row-label"><span class="stage-dot">①</span><b>{{ t("分章") }}</b></div>
-          <input type="text" v-model="stageFeedback.split" :placeholder="t('意见（可选）：如「每章约 8000 字，按剧情自然切分」…')" />
-          <button class="btn small" :disabled="busy" @click="runSplitRegen">{{ t("重新分章（连后续）") }}</button>
-        </div>
-        <div class="stage-row">
-          <div class="stage-row-label"><span class="stage-dot">②</span><b>{{ t("翻译") }}</b></div>
-          <input type="text" v-model="stageFeedback.translate" :placeholder="t('意见（可选）：如「人名保持拼音，语气更自然」…')" />
-          <button class="btn small" :disabled="busy" @click="runTranslateRegen">{{ t("重新翻译（连后续）") }}</button>
-        </div>
-        <div class="stage-row">
-          <div class="stage-row-label"><span class="stage-dot">③</span><b>{{ t("提取卡片") }}</b></div>
-          <input type="text" v-model="stageFeedback.extract" :placeholder="t('意见（可选）：如「主角要有两个女性角色」…')" />
-          <button class="btn small" :disabled="busy" @click="runExtractRegen">{{ t("重新提取（连剧本/图像）") }}</button>
-        </div>
-        <div class="stage-row">
-          <div class="stage-row-label"><span class="stage-dot">④</span><b>{{ t("剧本") }}</b></div>
-          <input type="text" v-model="stageFeedback.script" :placeholder="t('意见（可选）：如「对话更口语化，高潮更激烈」…')" />
-          <button class="btn small" :disabled="busy" @click="runScriptRegen">{{ t("重新剧本（全部章节）") }}</button>
-        </div>
-        <div class="stage-row">
-          <div class="stage-row-label"><span class="stage-dot">⑤</span><b>{{ t("图像") }}</b></div>
-          <input type="text" v-model="stageFeedback.image" :placeholder="t('意见（可选）：如「整体更有电影感，背景更精致」…')" />
-          <button class="btn small" :disabled="busy" @click="runImageRegen">{{ t("重新生成全部图像") }}</button>
-        </div>
-        <div class="stage-row">
-          <div class="stage-row-label"><span class="stage-dot">⑥</span><b>{{ t("配音") }}</b></div>
-          <span style="color: var(--text-faint); font-size: 12px">{{ t("TTS 不接收意见；如需重配请点击右侧按钮（全部重配）") }}</span>
-          <button class="btn small" :disabled="busy" @click="runVoiceRegen">{{ t("重新配音（全部）") }}</button>
-        </div>
-        <div class="stage-row">
-          <div class="stage-row-label"><span class="stage-dot">⑦</span><b>{{ t("组装") }}</b></div>
-          <span style="color: var(--text-faint); font-size: 12px">{{ t("把当前卡片/剧本/素材重新写入游戏目录") }}</span>
-          <button class="btn small" :disabled="busy" @click="runAssemble">{{ t("重新组装") }}</button>
+      <div class="card-head">
+        <h3>{{ t("分阶段状态（点击「重新生成」单独重跑；已完成阶段复用缓存不计费）") }}</h3>
+        <div class="card-actions">
+          <span v-if="!busy" class="hint" style="font-size: 12px; color: var(--text-dim)">{{ t("失败阶段重试将只补失败项") }}</span>
         </div>
       </div>
+      <StageStatusBoard
+        :statuses="stageStatus.stageStatus.value"
+        :failed-counts="failedCounts"
+        :feedback="stageFeedback"
+        :busy="busy"
+        @regen="runStageRegen"
+      />
       <p style="color: var(--text-dim); font-size: 12px; margin-top: var(--space-2)">
         {{ t("单条立绘 / 单句配音的重生成请在下方「素材」页操作。") }}
       </p>

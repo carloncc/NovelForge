@@ -59,6 +59,9 @@ const FIGURE_BG_SUFFIX =
   ", solid chroma key green background (pure #00FF00 green filling the entire background, no gradient, no pattern, no objects, no other people, no text, no shadow, no green elements on the character), full body visible, no legs cut off";
 const ITEM_BG_SUFFIX =
   ", solid chroma key green background (pure #00FF00 green filling the entire background, no gradient, no pattern, no reflection, no text, no shadow)";
+/** 三视图绿幕背景后缀：三视图同样强制纯绿幕，与立绘/动作保持一致（作抠图与图生图参考） */
+const THREEVIEW_GREEN_SUFFIX =
+  ", three-view character reference sheet, front view / side view / back view, neutral standing pose, calm expression, full body visible, solid chroma key green background (pure #00FF00 green filling the entire background, no gradient, no pattern, no text, no shadow)";
 
 // 风格锚点：一张纯场景/无人物的画风基准图，后续所有背景/CG 以它做参考图，强制全项目同一画风
 const ANCHOR_PROMPT =
@@ -68,9 +71,9 @@ const ANCHOR_PROMPT =
 const REF_HINT =
   ", exactly match the reference image: same character, same hair and eye color, same clothing and colors, same art style, same proportions, front-facing full body";
 
-/** 三视图基于角色参考图生成：以参考图为基准，输出正/侧/背三视图设定图 */
+/** 三视图基于角色参考图生成：以参考图为基准，输出正/侧/背三视图设定图（背景由 THREEVIEW_GREEN_SUFFIX 统一附加） */
 const THREEVIEW_REF_HINT =
-  ", based on the reference image: keep the exact same character (hair, eyes, clothing, colors, proportions, art style), generate a clean three-view character sheet (front view / side view / back view), neutral standing pose, calm expression, full body visible, solid chroma key green background (pure #00FF00 green)";
+  ", based on the reference image: keep the exact same character (hair, eyes, clothing, colors, proportions, art style), generate a clean three-view character sheet";
 
 /** 背景/CG 风格锚定提示：参考图为画风基准，内容必须全新 */
 const STYLE_ANCHOR_HINT =
@@ -101,13 +104,13 @@ function styleSuffix(style?: string): string {
   return `, ${s.replace(/[,，。.]+$/, "")}, ${STYLE_HINT}`;
 }
 
-/** 从立绘 prompt 兜底推导三视图 prompt（无 threeViewPrompt 时用） */
+/** 从立绘 prompt 兜底推导三视图 prompt 主体（不含背景，背景由 THREEVIEW_GREEN_SUFFIX 统一附加） */
 function threeViewFallback(imagePrompt: string): string {
   const clean = stripBackground(imagePrompt)
     .replace(/standing pose[^,]*/gi, "")
     .replace(/clean illustration[^,]*/gi, "")
     .replace(/[,，\s]+$/, "");
-  return `${clean}, three-view character reference sheet, front view / side view / back view, neutral standing pose, calm expression, full body visible, solid chroma key green background (pure #00FF00 green)`;
+  return `${clean}, three-view character reference sheet, front view / side view / back view, neutral standing pose, calm expression, full body visible`;
 }
 
 /**
@@ -121,7 +124,10 @@ export function stripBackground(prompt: string): string {
   return prompt
     .replace(/[,，;；]\s*(?:plain|solid|uniform|clean|simple|empty|white|black|grey|gray|light|dark|deep|pale|bright|vibrant|soft|warm|cool|saturated|muted|pastel|chrome|chroma\s*key|studio|gradient)\s+[^,，;；]*?\b(background|backdrop|wallpaper|scene|setting)\b[^,，;；]*/gi, "")
     .replace(/[,，;；]\s*[^,，;；]*?(plain\s+solid\s+\w+\s+background|plain\s+white\s+background|plain\s+light\s+background|plain\s+dark\s+background|solid\s+color\s+background|solid\s+chroma\s+key\s+green\s+background|clean\s+light\s+gray\s+background|clean\s+white\s+background|empty\s+background|gradient\s+background)[^,，;；]*/gi, "")
-    .replace(/[,，;；]\s*[^,，;；]*?(纯色背景|纯绿背景|纯白背景|纯灰背景|单一背景|平面背景|干净背景)[^,，;；]*/gi, "")
+    .replace(/[,，;；]\s*(?:white|plain|solid|clean|simple|uniform|light|dark|gray|grey|black|colored|color|transparent)\s*(?:colored\s+)?(?:background|backdrop|wall)\b[^,，;；]*/gi, "")
+    .replace(/[,，;；]\s*(?:on|against|in front of)\s+(?:a\s+)?(?:plain|solid|clean|white|black|grey|gray|light|dark)\s*(?:colored\s+)?(?:background|backdrop|wall)\b[^,，;；]*/gi, "")
+    .replace(/[,，;；]\s*(?:studio|green|green\s+screen)\s*(?:screen\s*)?(?:background|backdrop)\b[^,，;；]*/gi, "")
+    .replace(/[,，;；]\s*[^,，;；]*?(纯色背景|纯绿背景|纯白背景|纯灰背景|单一背景|平面背景|干净背景|绿幕背景|白色背景|黑色背景|灰色背景|浅色背景|深色背景|素色背景|纯底色)[^,，;；]*/gi, "")
     .replace(/background\s+with[^,，;；]*/gi, "")
     .replace(/[,，;；\s]+$/, "")
     .trim();
@@ -184,7 +190,8 @@ export function buildImageTasks(
         prompt:
           stripBackground(char.threeViewPrompt || threeViewFallback(char.imagePrompt)) +
           style +
-          (char.referenceImage ? THREEVIEW_REF_HINT : ""),
+          (char.referenceImage ? THREEVIEW_REF_HINT : "") +
+          THREEVIEW_GREEN_SUFFIX,
         ...(char.referenceImage ? { references: [inlineIdentityReference(char.referenceImage)] } : {}),
         fileName: `threeview_${sanitizeId(char.id)}.png`,
         width: 1024,
@@ -209,9 +216,9 @@ export function buildImageTasks(
         usage: `立绘-${char.name}${isNormal ? "" : `（${emo}）`}`,
       });
     }
-    // ③ 动作立绘（基于三视图图生图）
+    // ③ 动作立绘（基于三视图图生图；动作数量不限，按角色卡片提取）
     if (threeView && withActions && Array.isArray(char.actions)) {
-      for (const a of char.actions.slice(0, 4)) {
+      for (const a of char.actions) {
         tasks.push({
           kind: "action",
           id: `${char.id}_act_${a.id}`,
@@ -572,7 +579,8 @@ export async function runImageTask(
           }
         }
         if (referenceBlocks.length) {
-          finalPrompt = `Style reference for consistent art direction — ${referenceBlocks.join(" ")}. Subject description: ${finalPrompt}`;
+          // 合并成单一提示词：主体描述在前，参考图描述作为附加约束；避免「风格段 + 主体段」两头式 prompt
+          finalPrompt = `${finalPrompt}, ${referenceBlocks.join(", ")}`;
         }
       }
       // 兜底截断：所有路径都确保不超过 MiniMax 1500 字符限制
@@ -694,8 +702,8 @@ export async function generateImages(
 ): Promise<{ images: ImageResultMap; failed: FailedTask[] }> {
   const result: ImageResultMap = { bg: {}, cg: {}, figure: {}, item: {} };
   const failed: FailedTask[] = [];
-  // 图片请求全局限流跟随用户并发设置：任务 worker 数与 API 实际并发一致，不再被默认 3 卡死
-  setImageConcurrency(concurrency);
+  // 图片请求限流跟随该 API 自己的并发配置：任务 worker 数与 API 实际并发一致，各 API 互不影响
+  if (cfg) setImageConcurrency(cfg, concurrency);
   const approvedBible = visualBible?.status === "approved" ? visualBible : undefined;
   const projectOutputDir = cacheRoot.replace(/[\\/]\.novel2vn[\\/]cache[\\/]?$/, "");
   const tasks = buildImageTasks(chapters, cards, {
