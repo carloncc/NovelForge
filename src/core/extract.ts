@@ -49,7 +49,7 @@ export async function extractFromNovel(
   const lib = voiceLibraryFor(cfg);
   const fb = feedback ? `\n\n用户对上一版提取结果的修改意见（请严格参考并落实）：${feedback}` : "";
   const user = `小说标题：${title}\n\n可用音色列表：${lib.join(", ")}${fb}\n\n以下是小说全文（可能截断）：\n${truncate(novelText, 70000)}`;
-  const result = await chatJson<ExtractionResult>(cfg, SYSTEM_PROMPT, user, { maxTokens: 16000, onUsage });
+  const result = await chatJson<ExtractionResult>(cfg, SYSTEM_PROMPT, user, { maxTokens: 24000, onUsage });
   if (!Array.isArray(result.characters)) throw new Error("提取结果缺少 characters 字段");
   result.scenes = result.scenes ?? [];
   result.items = result.items ?? [];

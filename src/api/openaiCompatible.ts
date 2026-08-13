@@ -324,27 +324,36 @@ export async function chatCompletion(
   };
 
   // 基础预算：调用方显式指定则用之，否则给推理型模型一个默认预算（避免思考耗尽）
+  // 升级路径必须严格递增：opts.maxTokens=16000 → [16000, 24000, 32000]，
+  // 修复旧版 [16000, 16000] 去重后只跑一次的 bug
   const baseBudget = opts.maxTokens ?? 8000;
-  const escalation = opts.maxTokens ? [opts.maxTokens, Math.max(opts.maxTokens, 12000)] : [baseBudget, baseBudget * 2];
+  const escalation = opts.maxTokens
+    ? Array.from(new Set([opts.maxTokens, opts.maxTokens + 8000, Math.max(opts.maxTokens * 2, 24000)])).sort((a, b) => a - b)
+    : [baseBudget, baseBudget * 2];
   const seenBudgets = new Set<number>();
 
   return withRetry(async () => {
     let response = await perform(escalation[0]);
-    // content 为空且因长度截断 → 预算被思考耗尽，放大重试
+    // 升级重试：
+    //   ① content 为空且 finishReason=length → 预算被思考耗尽
+    //   ② JSON 模式下解析失败且 finishReason=length → 残 JSON 也算截断
+    //   满足任一即放大 max_tokens 再试
     for (let i = 1; i < escalation.length; i++) {
       const budget = escalation[i];
       if (seenBudgets.has(budget)) break;
       seenBudgets.add(budget);
-      if (response.rawContent.trim() && response.finishReason !== "length") break;
-      if (!response.rawContent.trim() && response.finishReason === "length") {
-        log.warn("api", "content 为空且输出被截断，放大 max_tokens 重试", {
-          budget,
-          reasoningLen: response.reasoning.length,
-        });
-        response = await perform(budget);
-      } else {
-        break;
-      }
+      const truncated = response.finishReason === "length";
+      const empty = !response.rawContent.trim();
+      const brokenJson = truncated && opts.json && !canParseJson(response.rawContent);
+      if (!truncated || (!empty && !brokenJson)) break;
+      log.warn("api", "输出被截断（content 为空或 JSON 不完整），放大 max_tokens 重试", {
+        budget,
+        reasoningLen: response.reasoning.length,
+        rawLen: response.rawContent.length,
+        empty,
+        brokenJson,
+      });
+      response = await perform(budget);
     }
 
     let content = response.rawContent;
@@ -410,8 +419,30 @@ export function extractJson(text: string): unknown {
       /* fallthrough */
     }
   }
+  throw new Error("无法从响应中提取合法 JSON");
+}
 
-  throw new Error(`无法解析 JSON 输出: ${cleaned.slice(0, 500)}`);
+/** 轻量 JSON 可解析性探测（用于截断重试判断） */
+function canParseJson(text: string): boolean {
+  const cleaned = text.replace(/```json|```/g, "").trim();
+  if (!cleaned) return false;
+  try {
+    JSON.parse(cleaned);
+    return true;
+  } catch {
+    /* fallthrough */
+  }
+  const start = cleaned.indexOf("{");
+  const end = cleaned.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    try {
+      JSON.parse(cleaned.slice(start, end + 1));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  return false;
 }
 
 /**
