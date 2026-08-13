@@ -248,6 +248,69 @@ fn apply_despill(
     }
 }
 
+/// 清除"被前景包围的内部绿污染像素"（绿底 AI 立绘常见，头发间隙处残留绿块）。
+/// 判据：
+///   1. 不透明（alpha >= 0.5）
+///   2. 8 邻域全是不透明像素（被前景完全包围，没通向图像边缘的透明路径）
+///   3. 颜色明显偏绿：g - max(r,b) > 30
+/// 满足全部条件 → 去绿（强度 0.85，保留少量色调避免完全灰）。
+/// 仅适用于绿底场景（与 `despill` 的 aggressive 共用入口）。
+fn sweep_trapped_green(rgba: &mut RgbaImage, alpha: &[f32]) {
+    let (w, h) = rgba.dimensions();
+    let n = (w * h) as usize;
+    let mut trap: Vec<bool> = vec![false; n];
+    for y in 1..h.saturating_sub(1) {
+        for x in 1..w.saturating_sub(1) {
+            let i = (y * w + x) as usize;
+            if alpha[i] < 0.5 {
+                continue;
+            }
+            let p = rgba.get_pixel(x, y);
+            let r = p[0] as f32;
+            let g = p[1] as f32;
+            let b = p[2] as f32;
+            if g - r.max(b) <= 30.0 {
+                continue;
+            }
+            // 8 邻域是否全是不透明像素
+            let mut all_opaque = true;
+            for dy in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let xx = x as i32 + dx;
+                    let yy = y as i32 + dy;
+                    let j = (yy as u32 * w + xx as u32) as usize;
+                    if alpha[j] < 0.5 {
+                        all_opaque = false;
+                        break;
+                    }
+                }
+                if !all_opaque {
+                    break;
+                }
+            }
+            if all_opaque {
+                trap[i] = true;
+            }
+        }
+    }
+    for i in 0..n {
+        if !trap[i] {
+            continue;
+        }
+        let p = rgba.get_pixel_mut((i % w as usize) as u32, (i / w as usize) as u32);
+        let r = p[0] as f32;
+        let g = p[1] as f32;
+        let b = p[2] as f32;
+        let max_rb = r.max(b);
+        let spill = g - max_rb;
+        let out_g = g - spill * 0.85;
+        p[1] = out_g.round().clamp(0.0, 255.0) as u8;
+    }
+}
+
 /// 色度键抠图（连通性洪水填充 + 边缘羽化 + 去绿边 + alpha 中值平滑）：
 /// - 从图像四条边播种，沿相似色扩散；与背景色距离 < thr 的像素置透明
 /// - thr..thr_edge 之间羽化（平滑过渡到不透明）；超过 thr_edge 视为前景边界，不扩散
@@ -336,6 +399,14 @@ pub fn cutout(data_b64: &str, threshold: f32) -> Result<String, String> {
 
     // 去绿边/绿晕（在应用 alpha 前处理颜色，避免绿边留在前景上）
     despill(&mut rgba, &alpha_out, green);
+
+    // 内部绿污染清除：绿底 AI 立绘常见"头发间隙处残留绿块"——这些像素不透明、被前景包围
+    // （洪水填充没蔓延进去），但颜色仍是绿幕色（g 显著高于 max(r,b)）。需要把这种"trap 像素"
+    // 去绿：判据 = 不透明（α > 0.5）且 8 邻域全是不透明像素（被前景完全包围，没有通向图像边缘
+    // 的透明路径）且 g - max(r,b) > 30 → 强去绿。
+    if green {
+        sweep_trapped_green(&mut rgba, &alpha_out);
+    }
 
     let mut writes: Vec<(u32, u32, [u8; 4])> = Vec::with_capacity((w * h) as usize / 8);
     for (x, y, base) in rgba.enumerate_pixels() {

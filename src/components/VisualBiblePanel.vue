@@ -491,7 +491,7 @@ async function regenerateCharacterDesc(characterId: string): Promise<void> {
   charErrors.value[characterId] = "";
   try {
     const { imagePrompt, threeViewPrompt } = await regenerateCharacterDescription(visionCfg, character);
-    await persistRegeneratedCharacterDescription(
+    const { card: updatedCard } = await persistRegeneratedCharacterDescription(
       outputDir.value,
       current,
       characterId,
@@ -499,6 +499,14 @@ async function regenerateCharacterDesc(characterId: string): Promise<void> {
       imagePrompt,
       threeViewPrompt,
     );
+    // 同步到 projectState.lastResult.cards.characters —— 否则 buildImageTasks 还会用旧 prompt
+    const lastResult = projectState.lastResult;
+    if (lastResult?.cards?.characters) {
+      const idx = lastResult.cards.characters.findIndex((c) => c.id === characterId);
+      if (idx >= 0) {
+        lastResult.cards.characters.splice(idx, 1, updatedCard);
+      }
+    }
     await refreshApprovalValidation();
     await afterMutation();
     pushLog({

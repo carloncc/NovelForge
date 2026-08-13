@@ -933,6 +933,7 @@ ${character.imagePrompt || "(none)"}
 /**
  * 把重新生成的角色描述持久化到 visual bible + 同步卡片 + 失效缓存。
  * 必须在 regenerateCharacterDescription 拿到 imagePrompt/threeViewPrompt 之后调用。
+ * 返回更新后的（bible, card）供调用方同步更新 projectState.lastResult.cards。
  */
 export async function persistRegeneratedCharacterDescription(
   outputDir: string,
@@ -941,10 +942,11 @@ export async function persistRegeneratedCharacterDescription(
   characterCard: CharacterCard,
   imagePrompt: string,
   threeViewPrompt: string,
-): Promise<ProjectVisualBible> {
+): Promise<{ bible: ProjectVisualBible; card: CharacterCard }> {
   const storedCharacter = bible.characters[characterId];
   if (!storedCharacter) throw new Error(`Character is missing from visual bible: ${characterId}`);
   const invalidationCharacter = characterWithHistoricalActions(bible, characterCard);
+  const updatedCard: CharacterCard = { ...characterCard, imagePrompt, threeViewPrompt };
   await mutateAndPublishVisualBible(outputDir, async () => {
     const next = cloneVisualBible(bible);
     const nextCharacter = next.characters[characterId];
@@ -953,11 +955,11 @@ export async function persistRegeneratedCharacterDescription(
     nextCharacter.approved = false;
     return {
       bible: next,
-      cards: [{ ...characterCard, imagePrompt, threeViewPrompt }],
+      cards: [updatedCard],
       afterPublish: () => invalidateCharacterCaches(outputDir, invalidationCharacter),
     };
   }, bible);
-  return bible;
+  return { bible, card: updatedCard };
 }
 
 function normalizeImageExtension(imageTypeOrPath: string): string {
