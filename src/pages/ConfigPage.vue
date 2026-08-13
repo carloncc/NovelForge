@@ -16,6 +16,7 @@ import { errMsg } from "../utils/errors";
 import { log } from "../utils/logger";
 import { t } from "../i18n";
 import { knownImageModelCapabilities } from "../api/providers";
+import { resolveContextLength, inputCharBudget } from "../api/providers";
 import type { ApiConfig, ChannelKey, ImageModelCapabilities } from "../core/types";
 import type { DiscoveredModel } from "../api/providers";
 
@@ -340,6 +341,32 @@ watch(
             <label class="field">
               <span>{{ t("路径前缀（可选）") }}</span>
               <input type="text" v-model="cfg.extra!.pathPrefix" :placeholder="t('留空自动 /v1')" />
+            </label>
+          </div>
+
+          <div v-if="ch.key === 'llm' || ch.key === 'vision'" class="cfg-row">
+            <label class="field grow-2">
+              <span>{{ t("上下文长度 token（留空 = 自动探测，留空时填默认 128000）") }}</span>
+              <input
+                type="number"
+                min="1024"
+                step="1024"
+                :value="(cfg.extra!.contextLength as number | string | undefined) ?? ''"
+                :placeholder="t('例如 128000；自动探测到时会显示当前值')"
+                @change="
+                  (e: any) => {
+                    const v = (e.target as HTMLInputElement).value.trim();
+                    cfg.extra!.contextLength = v === '' ? undefined : Number(v);
+                  }
+                "
+              />
+            </label>
+            <label class="field">
+              <span>{{ t("当前解析值") }}</span>
+              <div class="cfg-context-resolved">
+                <code>{{ resolveContextLength(cfg).toLocaleString() }}</code>
+                <span class="cfg-context-budget">{{ t("输入预算") }}：{{ inputCharBudget(cfg).toLocaleString() }} {{ t("字符") }}</span>
+              </div>
             </label>
           </div>
 

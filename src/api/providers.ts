@@ -183,6 +183,106 @@ export interface ProviderPreset {
 export interface DiscoveredModel {
   id: string;
   capabilities: ModelCapability[];
+  /** 模型上下文窗口大小（token 数），由 /models 探测到的字段 */
+  contextLength?: number;
+}
+
+/**
+ * 内置模型上下文兜底表：网关不返回 context_length 时按模型名匹配。
+ * 单位 token。常见模型按"满血版"上限填，部署版由用户手动覆盖。
+ */
+const MODEL_CONTEXT_FALLBACKS: Record<string, number> = {
+  // DeepSeek 系列
+  "deepseek-chat": 128_000,
+  "deepseek-reasoner": 128_000,
+  "deepseek-v4-flash": 128_000,
+  "deepseek-v4-pro": 128_000,
+  // MiniMax 系列（用户当前视觉通道）
+  "MiniMax-M3": 1_000_000,
+  "MiniMax-M2.7": 256_000,
+  "MiniMax-M2.5": 128_000,
+  // Kimi（长文本）
+  "kimi-k2.5": 200_000,
+  "kimi-k2.6": 200_000,
+  "kimi-k2.7-code": 200_000,
+  "kimi-k3": 200_000,
+  // GLM
+  "glm-5": 128_000,
+  "glm-5.1": 128_000,
+  "glm-5.2": 128_000,
+  // Qwen
+  "qwen3.5-plus": 128_000,
+  "qwen3.6-plus": 128_000,
+  "qwen3.7-plus": 128_000,
+  "qwen3.7-max": 128_000,
+  "qwen3.8-max": 128_000,
+  "qwen-plus": 128_000,
+  // Moonshot
+  "moonshot-v1-8k": 8_192,
+  "moonshot-v1-32k": 32_768,
+  "moonshot-v1-128k": 131_072,
+  // OpenAI 常用
+  "gpt-4o": 128_000,
+  "gpt-4o-mini": 128_000,
+  "gpt-5.6-luna": 200_000,
+  // Grok
+  "grok-4.5": 256_000,
+};
+
+const DEFAULT_CONTEXT_LENGTH = 128_000;
+
+/** 从 /models 单项里尽量抽出一个 token 数；找不到返回 undefined */
+function extractContextLength(record: Record<string, unknown>): number | undefined {
+  const candidates = [
+    record.context_length,
+    record.max_input_tokens,
+    record.max_context_length,
+    record.context_window,
+    record.contextWindow,
+    (record.limits as Record<string, unknown> | undefined)?.context_length,
+    (record.top_provider as Record<string, unknown> | undefined)?.context_length,
+  ];
+  for (const raw of candidates) {
+    const n = typeof raw === "string" ? Number(raw) : (raw as number | undefined);
+    if (typeof n === "number" && Number.isFinite(n) && n > 0) return n;
+  }
+  return undefined;
+}
+
+/**
+ * 解析一个 API 配置的最终上下文 token 数。
+ * 优先级：手动覆盖 (cfg.extra.contextLength) > /models 探测 > 内置表 > 默认 128K
+ */
+export function resolveContextLength(cfg: { model?: string; extra?: Record<string, unknown> } | undefined): number {
+  if (!cfg) return DEFAULT_CONTEXT_LENGTH;
+  const override = cfg.extra?.contextLength;
+  const overrideNum = typeof override === "string" ? Number(override) : (override as number | undefined);
+  if (typeof overrideNum === "number" && Number.isFinite(overrideNum) && overrideNum > 0) {
+    return Math.floor(overrideNum);
+  }
+  const discovered = Array.isArray(cfg.extra?.discoveredModels)
+    ? (cfg.extra!.discoveredModels as DiscoveredModel[])
+    : [];
+  const hit = discovered.find((m) => m.id === cfg.model && typeof m.contextLength === "number");
+  if (hit?.contextLength) return hit.contextLength;
+  if (cfg.model && MODEL_CONTEXT_FALLBACKS[cfg.model]) {
+    return MODEL_CONTEXT_FALLBACKS[cfg.model];
+  }
+  return DEFAULT_CONTEXT_LENGTH;
+}
+
+/**
+ * 根据模型上下文算"安全输入字符预算"。
+ * - 中英文保守估算：1 token ≈ 1.5 字符（中文 1.5~2 字符/token；英文 4 字符/token）
+ *   取下限确保不超限，但会保守（英文文本利用率约 37%）
+ * - 扣掉输出预留（默认 32K 输出 + 4K reasoning 余量 = 36K token）
+ * - 绝对上限 1_000_000 字符防荒谬值
+ */
+export function inputCharBudget(cfg: { model?: string; extra?: Record<string, unknown> } | undefined): number {
+  const context = resolveContextLength(cfg);
+  const reservedOutput = 36_000;
+  const safeTokens = Math.max(2_000, context - reservedOutput);
+  return Math.min(1_000_000, Math.floor(safeTokens * 1.5));
 }
 
 export const PROVIDERS: ProviderPreset[] = [
@@ -302,7 +402,10 @@ export function parseModelList(payload: unknown, providerId: ProviderId): Discov
     const record = entry as Record<string, unknown>;
     const id = record.id ?? record.name;
     if (typeof id !== "string" || !id.trim()) throw new Error("模型条目缺少有效 id");
-    return { id: id.trim(), capabilities: classifyModelCapabilities(record, providerId) };
+    const contextLength = extractContextLength(record);
+    const model: DiscoveredModel = { id: id.trim(), capabilities: classifyModelCapabilities(record, providerId) };
+    if (contextLength) model.contextLength = contextLength;
+    return model;
   });
   return models.filter((model, index) => models.findIndex((candidate) => candidate.id === model.id) === index);
 }

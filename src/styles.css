@@ -1467,6 +1467,27 @@ code {
   font-size: 11px;
 }
 
+.cfg-context-resolved {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-soft);
+  font-size: 12.5px;
+}
+.cfg-context-resolved code {
+  font-family: var(--font-mono, monospace);
+  font-size: 13px;
+  color: var(--primary);
+  font-weight: 600;
+}
+.cfg-context-budget {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
 .cfg-details {
   margin-top: var(--space-3);
   border-top: 1px dashed var(--border);
