@@ -618,7 +618,10 @@ export class Pipeline {
           progress: { done: scriptDone, total: scriptTotal, label: title },
         });
       };
-      const scriptConcurrency = Math.max(1, this.options.maxConcurrent ?? 30);
+      // 剧本是文本 LLM 请求：串行执行，不并发。
+      // 并发会同时向文本 API 发多个大请求（每章 body 可达 2 万+ 字符），
+      // 触发网关限流 / 连接失败（error sending request）。图片并发数是独立配置。
+      const scriptConcurrency = 1;
       const scriptResults: (ChapterScript | null)[] = new Array(activeChapters.length);
       let scriptIdx = 0;
       const scriptWorker = async (): Promise<void> => {

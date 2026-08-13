@@ -36,6 +36,14 @@ export function setImageConcurrency(n: number): void {
 }
 
 /**
+ * 全局文本/视觉 LLM 请求并发上限。
+ * 文本生成默认串行（并发 1）：章节剧本/分章/翻译的请求体可达 2 万+ 字符，
+ * 并发会同时向文本 API 发大请求，触发网关限流 / error sending request。
+ * 图片有独立 IMAGE_CONCURRENCY（可调），文本保持保守。
+ */
+const LLM_CONCURRENCY = new ConcurrencyLimiter(1);
+
+/**
  * 通过 OpenAI 兼容的 GET /models 拉取模型列表，并按通道能力过滤。
  * 无 apiKey 或请求失败时抛出可读错误；返回的列表可存入 config.extra.discoveredModels。
  */export async function fetchModelsForChannel(cfg: ApiConfig, kind: ChannelKey): Promise<DiscoveredModel[]> {
@@ -337,7 +345,8 @@ export async function chatCompletion(
     : [baseBudget, baseBudget * 2];
   const seenBudgets = new Set<number>();
 
-  return withRetry(async () => {
+  // 文本请求全局限流：并发 1（串行），避免多章节剧本同时发大请求打爆网关
+  return LLM_CONCURRENCY.run(() => withRetry(async () => {
     let response = await perform(escalation[0]);
     // 升级重试：
     //   ① content 为空且 finishReason=length → 预算被思考耗尽
@@ -391,7 +400,7 @@ export async function chatCompletion(
       contentHead: content.slice(0, 120),
     });
     return { content, promptTokens, completionTokens, finishReason };
-  });
+  }));
 }
 
 export function extractJson(text: string): unknown {
@@ -607,7 +616,8 @@ export async function chatVision(
   };
   if (opts.maxTokens) body.max_tokens = opts.maxTokens;
 
-  const content = await withRetry(async () => {
+  // 视觉请求与文本请求共享全局串行限流，避免并发打爆网关
+  const content = await LLM_CONCURRENCY.run(() => withRetry(async () => {
     const res = await tauri.http({
       method: "POST",
       url: `${base}/chat/completions`,
@@ -666,7 +676,7 @@ export async function chatVision(
       completionTokens: usage.completion_tokens ?? 0,
     });
     return reply;
-  });
+  }));
   done(`len=${content.length}`);
   return content;
 }

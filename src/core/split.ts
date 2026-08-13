@@ -116,7 +116,9 @@ async function detectBatch(
 }
 
 const BATCH = 40; // 每批候选块数量
-const CONCURRENT = 30; // 并发批数
+// AI 分章是文本 LLM 请求：并发过大会同时向文本 API 发大量请求，触发网关限流/连接失败。
+// 用低并发（3）在速度与稳定性间取平衡，避免 error sending request。
+const CONCURRENT = 3;
 
 /**
  * AI 分章：输入未切章全文，输出章节列表。
