@@ -326,9 +326,14 @@ export async function chatCompletion(
   // 基础预算：调用方显式指定则用之，否则给推理型模型一个默认预算（避免思考耗尽）
   // 升级路径必须严格递增：opts.maxTokens=16000 → [16000, 24000, 32000]，
   // 修复旧版 [16000, 16000] 去重后只跑一次的 bug
+  // 若调用方已给足预算（≥64K，通常是按模型上下文动态算的），首轮直接用最大预算，
+  // 不再放大（避免超模型 max_tokens 被服务端 400 拒绝）。
   const baseBudget = opts.maxTokens ?? 8000;
+  const generous = typeof opts.maxTokens === "number" && opts.maxTokens >= 64_000;
   const escalation = opts.maxTokens
-    ? Array.from(new Set([opts.maxTokens, opts.maxTokens + 8000, Math.max(opts.maxTokens * 2, 24000)])).sort((a, b) => a - b)
+    ? (generous
+        ? [opts.maxTokens, opts.maxTokens]
+        : Array.from(new Set([opts.maxTokens, opts.maxTokens + 8000, Math.max(opts.maxTokens * 2, 24000)])).sort((a, b) => a - b))
     : [baseBudget, baseBudget * 2];
   const seenBudgets = new Set<number>();
 
@@ -337,7 +342,7 @@ export async function chatCompletion(
     // 升级重试：
     //   ① content 为空且 finishReason=length → 预算被思考耗尽
     //   ② JSON 模式下解析失败且 finishReason=length → 残 JSON 也算截断
-    //   满足任一即放大 max_tokens 再试
+    //   满足任一即放大 max_tokens 再试（已给足预算时首轮即最大，跳过放大）
     for (let i = 1; i < escalation.length; i++) {
       const budget = escalation[i];
       if (seenBudgets.has(budget)) break;

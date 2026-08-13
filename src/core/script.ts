@@ -12,6 +12,7 @@ import type {
   SceneJSON,
 } from "./types";
 import { chatJson } from "../api/openaiCompatible";
+import { resolveContextLength } from "../api/providers";
 import type { ApiConfig } from "./types";
 
 interface ScriptModel {
@@ -133,7 +134,10 @@ export async function scriptChapter(
     `\n章节正文：\n${chapter.text}`,
   ].join("\n");
 
-  const model = await chatJson<ScriptModel>(cfg, SYSTEM_PROMPT, user, { maxTokens: 24000, onUsage });
+  // deepseek 等推理模型把 reasoning 计入 max_tokens；思考常达 2 万+ token。
+  // 按模型上下文给足预算，避免首轮截断触发多轮重试（每轮都是大请求，易撞网络失败）。
+  const scriptOutputTokens = Math.min(resolveContextLength(cfg), 240_000);
+  const model = await chatJson<ScriptModel>(cfg, SYSTEM_PROMPT, user, { maxTokens: scriptOutputTokens, onUsage });
 
   const scenes: SceneJSON[] = (model.scenes || []).map((s, i) => {
     const lines: Line[] = (s.lines || []).map((l) =>

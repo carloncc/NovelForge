@@ -1,6 +1,7 @@
 import type { ApiConfig, ChapterInfo } from "./types";
 import { languageName } from "./types";
 import { chatCompletion } from "../api/openaiCompatible";
+import { resolveContextLength } from "../api/providers";
 
 export interface TranslatedChapter {
   title: string;
@@ -30,7 +31,7 @@ export async function translateChapter(
       { role: "system", content: SYSTEM_PROMPT },
       { role: "user", content: user },
     ],
-    { maxTokens: 16000, temperature: 0.3, onUsage },
+    { maxTokens: Math.min(resolveContextLength(cfg), 240_000), temperature: 0.3, onUsage },
   );
   const raw = (r.content || "").trim();
   const lines = raw.split("\n");

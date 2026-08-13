@@ -1,6 +1,6 @@
 import type { CharacterCard, ExtractionResult, ItemCard, SceneCard } from "./types";
 import { chatJson } from "../api/openaiCompatible";
-import { inputCharBudget } from "../api/providers";
+import { inputCharBudget, resolveContextLength } from "../api/providers";
 import { voiceLibraryFor } from "../stores/config";
 import type { ApiConfig } from "./types";
 
@@ -50,7 +50,8 @@ export async function extractFromNovel(
   const lib = voiceLibraryFor(cfg);
   const fb = feedback ? `\n\n用户对上一版提取结果的修改意见（请严格参考并落实）：${feedback}` : "";
   const user = `小说标题：${title}\n\n可用音色列表：${lib.join(", ")}${fb}\n\n以下是小说全文（按模型上下文动态截断，剩余部分将不被 LLM 看到）：\n${truncate(novelText, inputCharBudget(cfg))}`;
-  const result = await chatJson<ExtractionResult>(cfg, SYSTEM_PROMPT, user, { maxTokens: 24000, onUsage });
+  const outputTokens = Math.min(resolveContextLength(cfg), 240_000);
+  const result = await chatJson<ExtractionResult>(cfg, SYSTEM_PROMPT, user, { maxTokens: outputTokens, onUsage });
   if (!Array.isArray(result.characters)) throw new Error("提取结果缺少 characters 字段");
   result.scenes = result.scenes ?? [];
   result.items = result.items ?? [];
