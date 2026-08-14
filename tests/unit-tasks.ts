@@ -15,7 +15,7 @@ function byKind(tasks: { kind: string }[]): Record<string, number> {
 }
 
 // 表情差分开启：每角色 5 张立绘 + 1 张三视图 + 动作 + 1 张风格锚点
-const tasksOn = buildImageTasks(scripts, cards, { figurePerCharacter: 1, cgPerChapter: 3, maxPerChapter: 12, figureEmotions: true });
+const tasksOn = buildImageTasks(scripts, cards, { figurePerCharacter: 1, cgPerChapter: 0, maxPerChapter: 0, figureEmotions: true });
 const kindsOn = byKind(tasksOn);
 console.log("表情差分开启:", kindsOn);
 if ((kindsOn.figure || 0) !== cards.characters.length * 5) throw new Error("表情差分立绘任务数不符");
@@ -36,7 +36,7 @@ if ((kindsOn.action || 0) !== actionsTotal) throw new Error("动作任务数不�
 }
 
 // 表情差分关闭：每角色 1 张（三视图/动作不受影响）
-const tasksOff = buildImageTasks(scripts, cards, { figurePerCharacter: 1, cgPerChapter: 3, maxPerChapter: 12, figureEmotions: false });
+const tasksOff = buildImageTasks(scripts, cards, { figurePerCharacter: 1, cgPerChapter: 0, maxPerChapter: 0, figureEmotions: false });
 const kindsOff = byKind(tasksOff);
 console.log("表情差分关闭:", kindsOff);
 if ((kindsOff.figure || 0) !== cards.characters.length) throw new Error("普通立绘任务数不符");

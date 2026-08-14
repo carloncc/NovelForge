@@ -157,8 +157,8 @@ export function buildImageTasks(
 ): ImageTask[] {
   const tasks: ImageTask[] = [];
   const figurePerCharacter = opts.figurePerCharacter ?? 1;
-  const cgPerChapter = opts.cgPerChapter ?? 3;
-  const maxPerChapter = opts.maxPerChapter ?? 12;
+  const cgPerChapter = opts.cgPerChapter ?? 0;
+  const maxPerChapter = opts.maxPerChapter ?? 0;
   const useEmotions = opts.figureEmotions !== false;
   const threeView = opts.threeView !== false;
   const withActions = opts.actions !== false;
@@ -200,7 +200,8 @@ export function buildImageTasks(
       });
     }
     // ② 立绘（默认姿态）→ 以三视图为参考图
-    const emotions = useEmotions ? FIGURE_EMOTIONS : ["normal"];
+    // 表情不设上限：优先角色自定义表情集（AI 按剧情提取），缺省用标准 5 表情
+    const emotions = useEmotions ? (char.emotions?.length ? char.emotions : FIGURE_EMOTIONS) : ["normal"];
     for (const emo of emotions) {
       const isNormal = emo === "normal";
       tasks.push({
@@ -215,6 +216,25 @@ export function buildImageTasks(
         height: 1024,
         usage: `立绘-${char.name}${isNormal ? "" : `（${emo}）`}`,
       });
+    }
+    // ②b 服装差分立绘（基于三视图图生图；套数按剧情由 AI 决定，不设上限；
+    //    每套只生成 normal 姿态作为换装底图，其余表情沿用当前服装）
+    if (threeView && Array.isArray(char.costumes)) {
+      for (const ct of char.costumes) {
+        tasks.push({
+          kind: "figure",
+          id: `${char.id}_ct_${ct.id}`,
+          characterId: char.id,
+          emotion: "normal",
+          costume: ct.id,
+          prompt: stripBackground(ct.prompt) + REF_HINT + style + FIGURE_BG_SUFFIX,
+          refFromTask: `${char.id}_threeview`,
+          fileName: `figure_${sanitizeId(char.id)}_ct_${sanitizeId(ct.id)}_normal.png`,
+          width: 1024,
+          height: 1024,
+          usage: `立绘-${char.name}-${ct.name}`,
+        });
+      }
     }
     // ③ 动作立绘（基于三视图图生图；动作数量不限，按角色卡片提取）
     if (threeView && withActions && Array.isArray(char.actions)) {
@@ -250,7 +270,7 @@ export function buildImageTasks(
   for (const chapter of chapters) {
     let count = 0;
     for (const scene of chapter.scenes) {
-      if (count >= maxPerChapter) break;
+      if (maxPerChapter > 0 && count >= maxPerChapter) break;
       tasks.push({
         kind: "background",
         id: scene.id,
@@ -264,7 +284,7 @@ export function buildImageTasks(
     }
     let cgCount = 0;
     for (const scene of chapter.scenes) {
-      if (cgCount >= cgPerChapter) break;
+      if (cgPerChapter > 0 && cgCount >= cgPerChapter) break;
       if (scene.cgEvent) {
         tasks.push({
           kind: "cg",
@@ -708,8 +728,8 @@ export async function generateImages(
   const projectOutputDir = cacheRoot.replace(/[\\/]\.novel2vn[\\/]cache[\\/]?$/, "");
   const tasks = buildImageTasks(chapters, cards, {
     figurePerCharacter: 1,
-    cgPerChapter: 3,
-    maxPerChapter: 12,
+    cgPerChapter: 0,
+    maxPerChapter: 0,
     figureEmotions,
     style: approvedBible?.styleDescription ?? style,
     feedback,

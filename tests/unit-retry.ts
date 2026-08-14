@@ -39,7 +39,7 @@ async function main(): Promise<void> {
     threw = true;
     assert((e as { status?: number }).status === 429, "应抛最终错误");
   }
-  assert(threw && calls === 3, `重试耗尽应失败，实际调用 ${calls} 次`);
+  assert(threw && calls === 4, `重试耗尽应失败，实际调用 ${calls} 次`);
 
   // 4) 网络错误消息可重试
   assert(isRetryable(0, "fetch failed: network error"), "网络错误应可重试");

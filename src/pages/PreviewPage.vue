@@ -48,6 +48,13 @@ async function openInBrowser(): Promise<void> {
   await tauri.openUrl(url.value);
 }
 
+/** 鉴赏室：立绘换装/表情/缩放、CG 画廊、角色图鉴、BGM 试听 */
+async function openAppreciation(): Promise<void> {
+  if (!url.value) return;
+  const ap = url.value.replace(/index\.html$/, "appreciation.html");
+  await tauri.openUrl(ap);
+}
+
 onMounted(() => {
   if (projectState.lastResult) {
     void startPreview();
@@ -71,6 +78,7 @@ onBeforeUnmount(() => {
           <span v-if="starting" class="spinner" />
           {{ t("启动/刷新") }}
         </button>
+        <button class="btn secondary" :disabled="!url" @click="openAppreciation">{{ t("鉴赏室") }}</button>
         <button class="btn secondary" :disabled="!url" @click="openInBrowser">{{ t("系统浏览器打开") }}</button>
         <button class="btn danger" :disabled="!url" @click="stopPreview">{{ t("停止") }}</button>
       </div>

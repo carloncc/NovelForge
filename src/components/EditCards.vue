@@ -136,6 +136,21 @@ function reset(): void {
   local.value = JSON.parse(JSON.stringify(props.cards));
   savedMsg.value = t("已恢复为上次生成时的卡片");
 }
+
+function addCostume(c: CharacterCard): void {
+  if (!c.costumes) c.costumes = [];
+  const base = `costume_${c.costumes.length + 1}`;
+  c.costumes.push({
+    id: base,
+    name: t("新服装"),
+    prompt: `${c.imagePrompt}, wearing [${t("描述该服装的款式/颜色/材质")}]`,
+  });
+}
+
+function removeCostume(c: CharacterCard, idx: number): void {
+  c.costumes?.splice(idx, 1);
+  if (!c.costumes?.length) c.costumes = undefined;
+}
 </script>
 
 <template>
@@ -190,6 +205,21 @@ function reset(): void {
           <span>{{ t("立绘提示词（imagePrompt）") }}</span>
           <textarea v-model="c.imagePrompt" rows="3" />
         </label>
+        <div class="field" style="margin-top: 10px">
+          <span style="display: flex; align-items: center; justify-content: space-between">
+            <span>{{ t("服装差分（数量不限，按剧情添加）") }}</span>
+            <button class="btn ghost small" @click="addCostume(c)">＋ {{ t("添加服装") }}</button>
+          </span>
+          <div v-for="(ct, ci) in c.costumes || []" :key="ct.id" style="border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; margin-top: 8px">
+            <div class="row" style="align-items: center; gap: 8px">
+              <input type="text" v-model="ct.name" style="flex: 1; font-size: 12.5px" :placeholder="t('服装名（如 日常服/礼服/战斗服）')" />
+              <input type="text" v-model="ct.id" style="flex: 0.8; font-size: 12px; font-family: monospace" placeholder="casual" />
+              <button class="btn danger small" @click="removeCostume(c, ci)">{{ t("删除") }}</button>
+            </div>
+            <textarea v-model="ct.prompt" rows="2" style="margin-top: 6px; font-size: 12px" :placeholder="t('该服装的英文图像提示词（人物外貌一致 + 服装描述）')" />
+          </div>
+          <p v-if="!c.costumes?.length" style="color: var(--text-faint); font-size: 12px; margin-top: 6px">{{ t("未添加服装差分（可仅用默认服装）") }}</p>
+        </div>
         <label class="field">
           <span>{{ t("三视图提示词（threeViewPrompt，可选）") }}</span>
           <textarea v-model="c.threeViewPrompt" rows="3" :placeholder="t('留空则由立绘提示词自动推导')" />

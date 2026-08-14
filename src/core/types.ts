@@ -37,6 +37,7 @@ export interface ApiPreset {
   active: Record<ChannelKey, string>;
 }
 
+/** 用量统计（API 返回的事实数据，不依赖价格估算） */
 export interface CostStats {
   llmTokens: number;
   imageCount: number;
@@ -44,6 +45,14 @@ export interface CostStats {
   llmCostYuan: number;
   imageCostYuan: number;
   ttsCostYuan: number;
+}
+
+/** 服装差分（基于三视图图生图生成，供剧情换装与鉴赏室使用） */
+export interface CharacterCostume {
+  id: string;
+  name: string;
+  /** 该服装的英文图像提示词（含角色外观 + 服装描述） */
+  prompt: string;
 }
 
 /** 角色动作（基于三视图图生图生成，保证形象一致） */
@@ -67,6 +76,10 @@ export interface CharacterCard {
   threeViewPrompt?: string;
   /** 该角色的动作立绘列表（如 拔剑/挥手/抱臂），基于三视图生成 */
   actions?: CharacterAction[];
+  /** 服装差分列表（如 日常服/礼服/战斗服），由 AI 按剧情决定数量、不设上限；每套生成 normal 立绘供换装 */
+  costumes?: CharacterCostume[];
+  /** 自定义表情集（由 AI 按剧情决定，不设上限；缺省使用标准 5 表情） */
+  emotions?: string[];
   /** 是否为次要角色/NPC（有台词但戏份少）；仅用于标注，生成流程与主要角色一致 */
   isNpc?: boolean;
   /** Legacy inline image payload. Read during migration, but never write to new project JSON. */
@@ -245,6 +258,8 @@ export interface ImageTask {
   emotion?: string;
   /** 该动作对应的角色动作 id（仅 kind=action） */
   actionId?: string;
+  /** 服装差分标识（figure 任务）：为该服装生成 normal 立绘 */
+  costume?: string;
   refFromTask?: string;
   fileName: string;
   width: number;
@@ -354,12 +369,14 @@ export interface GenerationOptions {
   characterPoses: boolean;
   /** 生成后用多模态模型自检图片（核对描述/无畸形），不合格自动重生成 1 次 */
   imageSelfCheck: boolean;
+  /** 每章图像数上限（0 = 不限制，默认） */
   imageBudgetPerChapter: number;
+  /** 每章 CG 数上限（0 = 不限制，默认） */
   cgPerChapter: number;
   skipCache: boolean;
+  /** 每章视频推荐点数上限（0 = 不限制，默认） */
   videoPointsPerChapter: number;
   characterIntroCard: boolean;
-  budgetYuan: number;
   /** 统一画风描述（英文/中文均可），用于让所有立绘/背景/CG 保持同一画风；留空使用默认画风 */
   imageStyle?: string;
   /** 图片固定种子：0=按小说标题自动派生（同一种子生成结果更稳定一致，利于统一画风） */

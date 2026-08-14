@@ -107,6 +107,19 @@ function charParams(required: string[]): Record<string, unknown> {
       voiceDesc: { type: "string", description: "适合的音色描述（如「清冷的女声」）" },
       color: { type: "string", description: "十六进制主题色，如 #3b5bdb" },
       isNpc: { type: "boolean", description: "是否次要角色/NPC（有台词但戏份少）；主要角色填 false" },
+      costumes: {
+        type: "array",
+        description: "服装差分列表（数量按剧情决定、不设上限；剧情出现换装就要收录）",
+        items: {
+          type: "object",
+          properties: {
+            id: { type: "string", description: "简短英文标识，如 casual/formal/battle/pajama" },
+            name: { type: "string", description: "服装中文名，如 日常服/礼服/战斗服" },
+            prompt: { type: "string", description: "该服装的英文图像提示词（人物外貌一致 + 服装款式颜色材质，全身，纯色背景）" },
+          },
+          required: ["id", "name", "prompt"],
+        },
+      },
     },
     required,
   };
@@ -448,6 +461,7 @@ const ENRICH_SYSTEM = `你是视觉小说美术与制作总监。下面给出从
 - imagePrompt：用于 AI 绘画生成立绘的完整英文 prompt，只描述人物本身（全身像、服装、发型、表情、姿态），禁止写任何背景/底色/场地/环境描述（系统会自动附加纯绿幕背景），风格统一为"动漫风格，精美立绘"
 - threeViewPrompt：用于生成该角色"三视图参考图"（正面/侧面/背面）的完整英文 prompt：同一角色设定、站姿自然、表情平静、全身可见，同样禁止写任何背景/底色描述（系统会自动附加纯绿幕背景），务必与人物的 imagePrompt 描述完全一致
 - actions：该角色可能做出的经典动作 [{id, name, prompt}]（prompt 为英文，保持人物外观完全一致，纯色背景，全身可见，动漫风格；数量不限，按角色特点给出）
+- costumes：该角色的服装差分 [{id, name, prompt}]（数量按剧情决定、不设上限；剧情出现换装就要收录；prompt 为英文，人物外貌一致 + 服装款式颜色材质，全身可见，纯色背景）
 - color：十六进制主题色
 - isNpc：布尔值。次要角色/NPC（有台词但戏份少）填 true；主要角色填 false
 
@@ -456,7 +470,7 @@ const ENRICH_SYSTEM = `你是视觉小说美术与制作总监。下面给出从
 
 规则：
 - 补全缺失字段，不要删除已有信息，不要改变 id。
-- 角色数量按剧情决定、不要人为设限；场景最多 12 个、物品最多 10 个。`;
+- 角色/场景/物品数量一律按剧情决定、不设上限（上限会损害最终游戏效果）。`;
 
 async function enrichCards(
   cfg: ApiConfig,
@@ -517,17 +531,13 @@ async function enrichCards(
 
 /* ==================== 汇总输出 ==================== */
 
-function applyCaps<T>(items: T[], cap: number): T[] {
-  return items.slice(0, cap);
-}
-
 export function finalizeState(state: ExtractAgentState, lib: string[], title: string): ExtractionResult {
   const result: ExtractionResult = {
     title,
-    // 角色数量按剧情决定、不做上限；场景/物品保留稳妥上限
+    // 数量一律按剧情决定，不做任何上限（上限会损害最终游戏效果）
     characters: [...state.characters.values()],
-    scenes: applyCaps([...state.scenes.values()], 12),
-    items: applyCaps([...state.items.values()], 10),
+    scenes: [...state.scenes.values()],
+    items: [...state.items.values()],
   };
   return normalizeExtractionResult(result, lib, title);
 }

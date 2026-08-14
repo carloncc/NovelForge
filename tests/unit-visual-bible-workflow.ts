@@ -87,7 +87,6 @@ const OPTIONS: GenerationOptions = {
   maxConcurrent: 1,
   videoPointsPerChapter: 0,
   characterIntroCard: false,
-  budgetYuan: 0,
   imageStyle: "",
   imageSeed: 0,
   styleAnchor: false,

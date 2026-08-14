@@ -1,7 +1,7 @@
 ﻿import type { ChapterScript, ExtractionResult, ProjectMeta } from "./types";
 import type { RenderAssets, WebgalLanguage } from "./render";
 import { renderChapter, renderConfig, renderStart, sanitizeId } from "./render";
-import { tauri } from "../utils/tauri";
+import { tauri, type FsEntry } from "../utils/tauri";
 import { basename, joinPath, normalizePath } from "../utils/path";
 import { log } from "../utils/logger";
 
@@ -128,6 +128,9 @@ export async function assembleProject(input: AssembleInput): Promise<{ gameDir: 
   input.log("复制素材…");
   await copyAssets(input.assets, normalizedOutputDir);
 
+  await copyBuiltinSe(normalizedOutputDir, input);
+  await writeAppreciation(normalizedOutputDir, input);
+
   await writeVideoPlan(normalizedOutputDir, input.chapters, videos);
   await writeExportGuide(normalizedOutputDir, title);
 
@@ -159,6 +162,54 @@ export async function assembleProject(input: AssembleInput): Promise<{ gameDir: 
   log.info("project", "项目组装完成", { outputDir: normalizedOutputDir, meta });
 
   return { gameDir: normalizedOutputDir, meta };
+}
+
+/** 内置环境音效（SE）：复制 src/gameExtra/se/*.wav 到 game/vocal/；用户同名文件已存在时跳过（用户素材优先） */
+async function copyBuiltinSe(outputDir: string, input: AssembleInput): Promise<void> {
+  try {
+    const seDir = joinPath(process.cwd(), "src/gameExtra/se");
+    const entries = await tauri.listDir(seDir).catch(() => [] as FsEntry[]);
+    for (const e of entries) {
+      if (e.isDir || !e.name.endsWith(".wav")) continue;
+      const dest = joinPath(outputDir, "game/vocal", e.name);
+      if (await tauri.pathExists(dest)) continue; // 用户同名覆盖优先
+      await tauri.copyFile(e.path, dest);
+    }
+  } catch {
+    /* SE 缺失不影响游戏 */
+  }
+}
+
+/** 鉴赏室：生成素材清单数据（appreciation-data.js）+ 复制鉴赏页（立绘换装/表情/缩放、CG 画廊、角色图鉴、BGM 试听） */
+async function writeAppreciation(outputDir: string, input: AssembleInput): Promise<void> {
+  const basename = (p: string) => p.split(/[\\/]/).pop() || p;
+  const characters = input.cards.characters.map((c) => ({
+    id: c.id,
+    name: c.name,
+    clothing: c.clothing,
+    appearance: c.appearance,
+    isNpc: c.isNpc === true,
+    costumes: (c.costumes || []).map((ct) => ({ id: ct.id, name: ct.name })),
+    emotions: c.emotions,
+  }));
+  const cgs = [...new Set(Object.values(input.assets.cg))].map((p) => ({
+    file: basename(p),
+    name: basename(p).replace(/\.(png|jpg|jpeg|webp)$/i, ""),
+  }));
+  const bgms = [...new Set(Object.values(input.assets.bgm || {}))].map((p) => ({
+    file: basename(p),
+    name: basename(p).replace(/\.(mp3|ogg|wav|m4a|opus)$/i, ""),
+  }));
+  const data = { characters, cgs, bgms };
+  const js = `window.APPRECIATION_DATA = ${JSON.stringify(data)};\n`;
+  try {
+    await tauri.writeTextFile(joinPath(outputDir, "appreciation-data.js"), js);
+    // 鉴赏页模板随项目分发（与 index.html 平级，浏览器直接打开即可）
+    const tpl = joinPath(process.cwd(), "src/gameExtra/appreciation.html");
+    await tauri.copyFile(tpl, joinPath(outputDir, "appreciation.html"));
+  } catch (e) {
+    input.log(`鉴赏室资源写入失败（不影响游戏本体）：${(e as Error).message.slice(0, 80)}`);
+  }
 }
 
 /** 标题画面图：优先取第一章首张 CG（名场面最适合做标题视觉），否则取首张背景图 */
@@ -331,10 +382,14 @@ async function writeExportGuide(outputDir: string, title: string): Promise<void>
     "   剧本文件：game/scene/ch*.txt（文本编辑器直接改，保存后预览刷新生效）",
     "   立绘：game/figure/ · 背景：game/background/ · 配音：game/vocal/ · 视频：game/video/",
     "   视频推荐位：见同目录 video_plan.txt",
+    "   鉴赏室（立绘换装/表情/缩放、CG 画廊、角色图鉴、BGM 试听）：打开 appreciation.html",
+    "   游戏内设置（音量/文本速度/自动播放/跳过/存档管理）：标题界面「选项」/ 游戏中右上角菜单",
     "   BGM：把音乐文件（mp3/ogg）放入 game/bgm/，文件名含关键词自动按氛围播放：",
     "     战斗氛围 → 文件名含 battle/war/fight（如 battle_theme.mp3）",
     "     宁静氛围 → 文件名含 calm/peace/piano（如 calm_piano.mp3）",
     "     悲伤氛围 → 文件名含 sad/sorrow（如 sad_theme.mp3）",
+    "   环境音效（SE）：内置雨/雷/风/战斗/门/脚步/挥剑/张力音效已放入 game/vocal/（se_*.wav），按场景氛围自动播放；",
+    "     用同名文件（如 se_rain.wav）替换可自定义音效；不需要可在 vocal 里删除对应文件",
     "     欢快氛围 → 文件名含 happy/joy/bright（如 happy_theme.mp3）",
     "     神秘氛围 → 文件名含 mystery/dark/moon（如 mystery_theme.mp3）",
     "",

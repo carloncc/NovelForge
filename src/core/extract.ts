@@ -20,15 +20,19 @@ const SYSTEM_PROMPT = `你是视觉小说制作人。从小说文本中提取制
      - id: 简短英文标识（如 point/wave/cross/crouch/hold）
      - name: 动作中文名（如 抬手、挥手、抱臂、蹲下、持剑）
      - prompt: 该动作的完整英文 prompt，在保持人物外观（发型/服装/体型）完全一致的前提下描述动作姿态与表情，纯色背景，全身可见，动漫风格
+   - costumes: 该角色的服装差分（用于换装演出与鉴赏室），数量按剧情决定、不设上限；剧情中出现换装的场景（如日常服、礼服、战斗服、睡衣等）都要收录；至少包含剧情主要服装：
+     - id: 简短英文标识（如 casual/formal/battle/pajama）
+     - name: 服装中文名（如 日常服、礼服、战斗服）
+     - prompt: 该服装的完整英文 prompt，在保持人物外貌（发型/体型/五官）完全一致的前提下描述该服装的款式/颜色/材质，全身可见，纯色背景，动漫风格
    - color: 角色的主题色（十六进制，用于 UI）
    - isNpc: 布尔值。主要角色（有台词或推动剧情）填 false；次要角色/NPC（有台词但戏份少）填 true
-2. scenes：故事中出现的地点场景（最多 12 个）。
+2. scenes：故事中出现的地点场景（数量按剧情决定、不设上限）。
    - id: 唯一标识（如 classroom）
    - location: 地点名（如"城门前"）
    - atmosphere: 氛围（如"阴沉的黄昏"）
    - time: 时间
    - imagePrompt: 生成背景图的英文 prompt，无人物，动漫场景风格
-3. items：重要的物品（获得、交接、使用的关键道具，最多 10 个）。
+3. items：重要的物品（获得、交接、使用的关键道具，数量按剧情决定、不设上限）。
    - id: 唯一标识
    - name: 物品名
    - appearance: 外观描述
@@ -56,6 +60,12 @@ export function normalizeExtractionResult(result: ExtractionResult, lib: string[
       c.actions = c.actions
         .filter((a) => a && a.id && a.prompt)
         .map((a) => ({ id: String(a.id).toLowerCase().replace(/[^a-z0-9_-]/g, "_"), name: a.name || a.id, prompt: a.prompt }));
+    }
+    // 服装差分归一化：数量不限，按剧情提取
+    if (Array.isArray(c.costumes)) {
+      c.costumes = c.costumes
+        .filter((ct) => ct && ct.id && ct.prompt)
+        .map((ct) => ({ id: String(ct.id).toLowerCase().replace(/[^a-z0-9_-]/g, "_"), name: ct.name || ct.id, prompt: ct.prompt }));
     }
   }
   return result;

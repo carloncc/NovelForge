@@ -77,6 +77,20 @@ function motionFor(emotion?: string): string | null {
 }
 
 /** 旁白/剧情中有明显动作或冲击感 → 触发舞台镜头震动 */
+/** 环境音效匹配：按场景氛围/时间/地点关键词输出 SE（playEffect），无匹配返回 null */
+function detectSe(scene: SceneJSON): string | null {
+  const hay = `${scene.location} ${scene.atmosphere ?? ""} ${scene.time ?? ""}`;
+  if (/雨|下雨|大雨|雷雨|暴雨|骤雨/.test(hay)) return "rain";
+  if (/雷|闪电|轰鸣/.test(hay)) return "thunder";
+  if (/风|风声|呼啸|寒风/.test(hay)) return "wind";
+  if (/战斗|打斗|激战|厮杀|搏斗|混战|战场|交锋/.test(hay)) return "battle";
+  if (/剑|拔刀|挥剑|武器|刀光|兵刃/.test(hay)) return "sword";
+  if (/门|敲门|推门|叩门|门环/.test(hay)) return "door";
+  if (/脚步|脚步声|走廊|巷|小巷|逼近|接近/.test(hay)) return "step";
+  if (/夜|深夜|阴森|阴冷|紧张|危险|追杀|逃亡|悬念|寂静/.test(hay)) return "tension";
+  return null;
+}
+
 function isDramatic(text: string): boolean {
   return /(轰鸣|爆炸|崩塌|巨响|震耳|怒吼|嘶吼|冲撞|猛然|狠狠|轰然|剧烈|颤抖|踉跄|飞扑|倒下|拔出|挥剑|斩|劈开)/.test(text);
 }
@@ -129,6 +143,7 @@ export function renderChapter(
   let entranceIdx = 0;
   // BGM 状态：WebGAL 的 changeScene 不自动清舞台，跨场景/跨章节残留的音乐需显式停止
   let lastBgm: string | null = null;
+  let lastSe: string | null = null;
   const bgmUnlocked = new Set<string>();
 
   // 单句渲染（主流程与分支选择共用），idx 为台词在场景内的配音键序号
@@ -181,6 +196,15 @@ export function renderChapter(
         const motion = motionFor(line.emotion);
         if (motion) out.push(`setTempAnimation:${motion} -target=fig-${slot} -next;`);
       }
+      // 高潮台词演出：背景虚化 + 说话立绘特写推进（1500ms），句末恢复景深
+      if (useActions && isDramatic(line.text)) {
+        if (slot) {
+          out.push(`setTransform:{"blur":5} -target=bg-main -duration=700 -next;`);
+          out.push(`setTransform:{"scale":{"x":1.22,"y":1.22},"position":{"x":0,"y":0}} -target=fig-${slot} -duration=1500 -next;`);
+          out.push(`setTransform:{"scale":{"x":1,"y":1}} -target=fig-${slot} -duration=800 -next;`);
+          out.push(`setTransform:{"blur":0} -target=bg-main -duration=800 -next;`);
+        }
+      }
       // 更新最近说话顺序（用于驱逐）
       const oi = stageOrder.indexOf(line.characterId);
       if (oi >= 0) stageOrder.splice(oi, 1);
@@ -201,11 +225,15 @@ export function renderChapter(
     } else if (line.monologue) {
       if (useActions && isDramatic(line.text)) {
         out.push(`setAnimation:shake -target=bg-main -next;`);
+        out.push(`setTransform:{"blur":5} -target=bg-main -duration=700 -next;`);
+        out.push(`setTransform:{"blur":0} -target=bg-main -duration=900 -next;`);
       }
       out.push(`intro:${esc(line.text)} -hold;`);
     } else {
       if (useActions && isDramatic(line.text)) {
         out.push(`setAnimation:shake -target=bg-main -next;`);
+        out.push(`setTransform:{"blur":5} -target=bg-main -duration=700 -next;`);
+        out.push(`setTransform:{"blur":0} -target=bg-main -duration=900 -next;`);
       }
       out.push(`:${esc(line.text)};`);
     }
@@ -233,6 +261,15 @@ export function renderChapter(
     const bgFile = opts.assets.bg[scene.id];
     if (bgFile) {
       out.push(`changeBg:${getBaseName(bgFile)} -next;`);
+      // 景深对焦入场：先虚化后聚焦，制造电影感场景切换
+      out.push(`setTransform:{"blur":12} -target=bg-main -duration=0 -next;`);
+      out.push(`setTransform:{"blur":0} -target=bg-main -duration=1000 -next;`);
+    }
+    // 环境音效（SE）：按场景氛围匹配播放（用户可用同名文件覆盖内置音效）
+    const se = detectSe(scene);
+    if (se && se !== lastSe) {
+      lastSe = se;
+      out.push(`playEffect:se_${se}.wav -volume=25 -next;`);
     }
 
     // 视频推荐位：有用户放置的视频文件则播放，否则注释占位（不执行）
@@ -250,6 +287,8 @@ export function renderChapter(
     const cg = scene.cgEvent;
     if (cg && cgFile) {
       out.push(`changeBg:${getBaseName(cgFile)} -next;`);
+      // 名场面特写运镜：缓慢推近 CG，强化冲击力
+      out.push(`setTransform:{"scale":{"x":1.08,"y":1.08}} -target=bg-main -duration=2500 -next;`);
       out.push(`unlockCg:${getBaseName(cgFile)} -name=${esc(cg.title || cg.description || "CG")};`);
       out.push(`:${esc(cg.description || cg.title)};`);
       out.push(`changeBg:${bgFile ? getBaseName(bgFile) : "none"} -next;`);

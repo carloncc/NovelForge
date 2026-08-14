@@ -87,10 +87,9 @@ const costText = computed(() => {
   if (!r) return null;
   const c = r.cost;
   return {
-    llm: `${c.llmTokens.toLocaleString()} tokens · ¥${c.llmCostYuan.toFixed(3)}`,
-    image: `${c.imageCount} 张 · ¥${c.imageCostYuan.toFixed(2)}`,
-    tts: `${c.ttsChars.toLocaleString()} 字符 · ¥${c.ttsCostYuan.toFixed(3)}`,
-    total: (c.llmCostYuan + c.imageCostYuan + c.ttsCostYuan).toFixed(2),
+    llm: `${c.llmTokens.toLocaleString()} tokens`,
+    image: `${c.imageCount} ${t("张")}`,
+    tts: `${c.ttsChars.toLocaleString()} ${t("字符")}`,
   };
 });
 
@@ -1308,25 +1307,25 @@ function fileExistsLabel(file: string | undefined): string {
       </div>
 
       <div class="card" style="margin-bottom: 0">
-        <div class="card-head"><h3>{{ t("预算与范围") }}</h3></div>
+        <div class="card-head"><h3>{{ t("生成范围") }}</h3></div>
         <div class="row">
           <label class="field">
-            <span>{{ t("每章 CG 数上限") }}</span>
-            <input type="number" v-model.number="projectState.options.cgPerChapter" min="0" max="10" />
+            <span>{{ t("每章 CG 数上限") }}（0 = {{ t("不限制") }}）</span>
+            <input type="number" v-model.number="projectState.options.cgPerChapter" min="0" placeholder="0" />
           </label>
           <label class="field">
-            <span>{{ t("每章图像数上限") }}</span>
-            <input type="number" v-model.number="projectState.options.imageBudgetPerChapter" min="0" max="50" />
+            <span>{{ t("每章图像数上限") }}（0 = {{ t("不限制") }}）</span>
+            <input type="number" v-model.number="projectState.options.imageBudgetPerChapter" min="0" placeholder="0" />
           </label>
           <label class="field">
-            <span>{{ t("视频推荐点数上限") }}</span>
-            <input type="number" v-model.number="projectState.options.videoPointsPerChapter" min="0" max="5" />
+            <span>{{ t("视频推荐点数上限") }}（0 = {{ t("不限制") }}）</span>
+            <input type="number" v-model.number="projectState.options.videoPointsPerChapter" min="0" placeholder="0" />
           </label>
         </div>
         <div class="row">
           <label class="field">
-            <span>{{ t("预算上限（¥，0 = 不限）") }}</span>
-            <input type="number" v-model.number="projectState.options.budgetYuan" min="0" step="0.5" />
+
+
           </label>
           <label class="field" :title="t('固定所有图片生成的随机种子：同一种子下背景/CG/立绘的画风与角色更稳定一致。0 = 按小说标题自动派生')">
             <span>{{ t("固定种子（0 = 按标题自动派生）") }}</span>
@@ -1461,14 +1460,12 @@ function fileExistsLabel(file: string | undefined): string {
         </p>
       </div>
       <div class="card" v-if="costText" style="margin-top: var(--space-4)">
-        <div class="card-head"><h3>{{ t("费用统计（估算）") }}</h3></div>
+        <div class="card-head"><h3>{{ t("用量统计") }}</h3></div>
         <div class="stat-grid">
           <div class="stat"><span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9" /><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z" /></svg></span><div class="stat-body"><div class="label">LLM</div><div class="value" style="font-size: 15px">{{ costText.llm }}</div></div></div>
           <div class="stat"><span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" /><circle cx="9" cy="9" r="2" /><path d="M21 15l-5-5L5 21" /></svg></span><div class="stat-body"><div class="label">{{ t("图像") }}</div><div class="value" style="font-size: 15px">{{ costText.image }}</div></div></div>
           <div class="stat"><span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 6V18M8 9V15M16 9V15M5 11V13M19 11V13" /></svg></span><div class="stat-body"><div class="label">{{ t("配音") }}</div><div class="value" style="font-size: 15px">{{ costText.tts }}</div></div></div>
-          <div class="stat"><span class="stat-icon" style="background: var(--gradient-hot)"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1v22M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" /></svg></span><div class="stat-body"><div class="label">{{ t("合计") }}</div><div class="value" style="font-size: 16px">¥{{ costText.total }}</div></div></div>
         </div>
-        <p style="color: var(--text-dim); font-size: 12px; margin-top: var(--space-3)">{{ t("图像按 ¥0.3/张、文本按 ¥2+8/百万 token 估算；视频由你人工生成不计费；缓存命中不重复计费。") }}</p>
       </div>
     </div>
 

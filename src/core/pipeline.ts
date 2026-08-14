@@ -186,16 +186,6 @@ export class Pipeline {
     });
   }
 
-  private checkBudget(): void {
-    const b = this.options.budgetYuan ?? 0;
-    if (b > 0) {
-      const total = this.cost.llmCostYuan + this.cost.imageCostYuan + this.cost.ttsCostYuan;
-      if (total > b) {
-        throw new Error(`超出预算 ¥${b}（本次累计 ¥${total.toFixed(2)}），已中止；可调高预算或勾选「跳过缓存」重跑`);
-      }
-    }
-  }
-
   private log(msg: string, level: PipelineEvent["level"] = "info", step = "管线"): void {
     this.input.log({ step, message: msg, level, at: Date.now() });
   }
@@ -456,7 +446,6 @@ export class Pipeline {
           await tauri.writeTextFile(cacheFile, JSON.stringify(tr, null, 2));
           emitProgress(tr.title);
           results[pos] = { ...ch, title: tr.title, text: tr.text };
-          this.checkBudget();
         } catch (e) {
           this.recordFailure({
             id: `translate_${ch.index + 1}`,
@@ -664,7 +653,6 @@ export class Pipeline {
           const cleared = await this.invalidateAfterCardsChange();
           this.log(`重新提取完成，已使 ${cleared.script} 个剧本缓存 / ${cleared.images} 个立绘物品图缓存失效，后续阶段将使用新卡片`, "success", "提取");
         }
-        this.checkBudget();
         log({
           step: "提取",
           message: `提取完成：${cards.characters.length} 角色 / ${cards.scenes.length} 场景 / ${cards.items.length} 物品`,
@@ -800,8 +788,7 @@ export class Pipeline {
                 continue;
               }
               await tauri.writeTextFile(cacheFile, JSON.stringify(script, null, 2));
-              this.checkBudget();
-            } else {
+                } else {
               log({
                 step: "剧本",
                 message: `[缓存] 第 ${chapter.index + 1} 章：${chapter.title}`,
@@ -894,7 +881,6 @@ export class Pipeline {
         this.cost.imageCostYuan = this.cost.imageCount * DEFAULT_PRICES.imageYuanEach;
         Object.assign(assets, images);
         await this.persistAssets(assets);
-        this.checkBudget();
         this.checkAbort();
         logger.info("pipeline", "图像阶段完成", {
           bg: Object.keys(images.bg).length,
@@ -925,7 +911,6 @@ export class Pipeline {
         this.cost.ttsCostYuan = (this.cost.ttsChars / 1e6) * DEFAULT_PRICES.ttsYuanPer1mChars;
         assets.vocal = vocal;
         await this.persistAssets(assets);
-        this.checkBudget();
         logger.info("pipeline", "配音阶段完成", { vocalCount: Object.keys(vocal).length });
       } else {
         log({ step: "配音", message: "配音已关闭或未配置 TTS API，跳过", level: "warn", at: Date.now() });
