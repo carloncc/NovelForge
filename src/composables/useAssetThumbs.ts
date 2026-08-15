@@ -11,9 +11,12 @@ import { tauri } from "../utils/tauri";
 const MAX_CONCURRENT = 4;
 
 const cache = ref<Record<string, string>>({});
-const failed = new Set<string>();
+const failed = new Map<string, number>();
 const inflight = new Set<string>();
 const pending: string[] = [];
+
+// 失败路径的退避时间：避免「生成过程中文件还没落盘 → 读取失败 → 永久 failed」导致缩略图必须点一下才加载
+const FAIL_RETRY_MS = 5000;
 
 export function mimeOf(p: string): string {
   const l = p.toLowerCase();
@@ -32,15 +35,28 @@ async function loadOne(p: string): Promise<void> {
   try {
     const b64 = await tauri.readFileBase64(p);
     cache.value[p] = `data:${mimeOf(p)};base64,${b64}`;
+    failed.delete(p);
   } catch {
-    failed.add(p);
+    // 失败带时间戳；退避结束后自动重新入队重试（文件可能在生成中/刚写入），无需用户点击
+    failed.set(p, Date.now());
+    const t = window.setTimeout(() => {
+      window.clearTimeout(t);
+      if (!cache.value[p] && !inflight.has(p)) {
+        failed.delete(p);
+        pending.push(p);
+        pump();
+      }
+    }, FAIL_RETRY_MS);
   }
 }
 
 function pump(): void {
   while (inflight.size < MAX_CONCURRENT && pending.length) {
     const p = pending.shift()!;
-    if (cache.value[p] || failed.has(p) || inflight.has(p)) continue;
+    const failedAt = failed.get(p);
+    if (cache.value[p] || inflight.has(p)) continue;
+    if (failedAt !== undefined && Date.now() - failedAt < FAIL_RETRY_MS) continue;
+    failed.delete(p);
     inflight.add(p);
     loadOne(p).finally(() => {
       inflight.delete(p);
@@ -53,7 +69,12 @@ function pump(): void {
 export function loadAssetDataUrl(p: string): string {
   if (!p) return "";
   if (cache.value[p]) return cache.value[p];
-  if (failed.has(p)) return "";
+  const failedAt = failed.get(p);
+  if (failedAt !== undefined && Date.now() - failedAt < FAIL_RETRY_MS) {
+    // 退避中：不返回空字符串导致显示失败图标，而是延迟到退避结束后自动重试；
+    // 但此刻 cache 无值，调用方应显示「加载中」而非「失败」。这里仍安排一次重试确保恢复。
+    return "";
+  }
   if (!inflight.has(p)) {
     pending.push(p);
     pump();
@@ -83,7 +104,6 @@ export function clearThumbCache(paths?: string[]): void {
 export function ensureAssetLoaded(p: string): Promise<string> {
   if (!p) return Promise.resolve("");
   if (cache.value[p]) return Promise.resolve(cache.value[p]);
-  if (failed.has(p)) return Promise.resolve("");
   loadAssetDataUrl(p);
   return new Promise((resolve) => {
     const t0 = Date.now();

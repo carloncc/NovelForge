@@ -1,15 +1,15 @@
 import { tauri } from "../utils/tauri";
 import type { ApiConfig, ChannelKey, ImageModelCapabilities, ImageReference } from "../core/types";
-import { sizeRatio, unifiedImage, unifiedTts, utf8FromB64 } from "./universal";
+import { unifiedImage, unifiedTts, utf8FromB64 } from "./universal";
 import { resolveTemplate, getTemplate } from "./templates";
 import { ConcurrencyLimiter } from "../utils/performance";
+import { classifyError } from "../utils/errorClassifier";
 import {
   configIsUsable,
   knownImageModelCapabilities,
   parseModelList,
   protocolForConfig,
   providerIdForConfig,
-  rawReferenceBase64,
   ReferenceImageError,
   referenceDataUrl,
   resolveImageModelCapabilities,
@@ -44,9 +44,16 @@ function imageLimiterFor(cfg: ApiConfig): ConcurrencyLimiter {
   return limiter;
 }
 
-/** 设置某个 API 的图片请求并发上限（由生成/重生成入口按该 API 的并发配置调用） */
+/**
+ * 图像并发硬上限：即使用户在配置里填了 30/50，实际同时发往图片 API 的请求也不超过此值。
+ * 第三方图像服务（如中转站）并发上限通常很低，30 并发极易触发 429（用户实测「生成图片都是 429」）。
+ * 8 并发配合单请求退避足以稳定跑满大多数服务。
+ */
+const IMAGE_MAX_CONCURRENT = 8;
+
+/** 设置某个 API 的图片请求并发上限（由生成/重生成入口按该 API 的并发配置调用），封顶到 IMAGE_MAX_CONCURRENT */
 export function setImageConcurrency(cfg: ApiConfig, n: number): void {
-  imageLimiterFor(cfg).setMaxConcurrent(n);
+  imageLimiterFor(cfg).setMaxConcurrent(Math.max(1, Math.min(IMAGE_MAX_CONCURRENT, Math.floor(n) || 1)));
 }
 
 /**
@@ -270,29 +277,30 @@ function extractProviderBaseError(data: unknown): string | null {
   return null;
 }
 
-export function isRetryable(status: number, text: string): boolean {
-  if (status >= 500 || status === 429) return true;
-  return /timeout|timed out|network|socket|connect|ECONN|ETIMEDOUT|fetch failed|error sending request|请求失败|dns|resolve|refused/i.test(text);
-}
-
-export const RETRY_DELAYS = [800, 2500, 6000];
-
+/**
+ * 统一重试：错误分类驱动 + 递增间隔（首次 1s、二次 10s、之后每次 +10s，封顶 60s）。
+ * 硬失败（鉴权/参数/中止/内容审查）立即抛出；网络/限流/未知退避重试。
+ */
 export async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
   let lastErr: unknown;
-  for (let attempt = 0; attempt <= RETRY_DELAYS.length; attempt++) {
+  const retries = 2;
+  for (let attempt = 0; ; attempt++) {
     try {
       return await fn();
     } catch (e) {
       lastErr = e;
-      const err = e as { status?: number; message?: string };
-      if (attempt >= RETRY_DELAYS.length || !isRetryable(err.status ?? 0, err.message ?? "")) {
+      const status = typeof (e as { status?: number }).status === "number" ? (e as { status?: number }).status : undefined;
+      const cls = classifyError(e, status);
+      if (cls === "auth" || cls === "invalid_param" || cls === "aborted" || cls === "content_moderation") {
         throw e;
       }
-      log.warn("api", `请求失败，准备第 ${attempt + 1} 次重试`, {
-        status: err.status ?? 0,
-        message: (err.message ?? String(e)).slice(0, 300),
+      if (attempt >= retries) throw e;
+      const delay = attempt === 0 ? 1000 : Math.min(60_000, attempt * 10_000);
+      log.warn("api", `请求失败，${delay / 1000}s 后第 ${attempt + 1} 次重试`, {
+        status: status ?? 0,
+        message: String(e instanceof Error ? e.message : e).slice(0, 300),
       });
-      await new Promise((r) => setTimeout(r, RETRY_DELAYS[attempt]));
+      await new Promise((r) => setTimeout(r, delay));
     }
   }
   throw lastErr;
@@ -760,131 +768,6 @@ export async function chatVision(
   }));
   done(`len=${content.length}`);
   return content;
-}
-
-export interface ImageResult {
-  fileName: string;
-  dataB64: string;
-}
-
-export function imageEndpointForConfig(cfg: ApiConfig): string {
-  return protocolForConfig(cfg, "image") === "minimax-image"
-    ? "/v1/image_generation"
-    : "/v1/images/generations";
-}
-
-export function buildImageRequestBody(
-  cfg: ApiConfig,
-  prompt: string,
-  opts: { size?: string; count?: number; references?: ImageReference[] } = {},
-): Record<string, unknown> {
-  const protocol = protocolForConfig(cfg, "image");
-  const count = opts.count ?? 1;
-  const capabilities = resolveImageModelCapabilities(cfg);
-  const references = routeImageReferences(cfg, opts.references ?? []);
-  const encoded = references.map((reference) => capabilities.referenceEncoding === "data-url"
-    ? referenceDataUrl(reference)
-    : rawReferenceBase64(reference));
-  const referenceFields = {
-    ...(encoded[0] ? { image: encoded[0] } : {}),
-    ...(encoded[1] ? { image2: encoded[1] } : {}),
-    ...(encoded[2] ? { image3: encoded[2] } : {}),
-  };
-  if (protocol === "minimax-image") {
-    const [w, h] = (opts.size ?? "1024x1024").split("x").map((n) => parseInt(n, 10));
-    return {
-      model: cfg.model,
-      prompt,
-      aspect_ratio: sizeRatio(w, h),
-      n: count,
-      ...referenceFields,
-    };
-  }
-  if (protocol === "siliconflow-image") {
-    return {
-      model: cfg.model,
-      prompt,
-      image_size: opts.size ?? "1024x1024",
-      batch_size: count,
-      ...referenceFields,
-    };
-  }
-  return {
-    model: cfg.model,
-    prompt,
-    ...(opts.size ? { size: opts.size } : {}),
-    n: count,
-    ...referenceFields,
-  };
-}
-
-export function ttsEndpointForConfig(cfg: ApiConfig): string {
-  return protocolForConfig(cfg, "tts") === "minimax-speech"
-    ? "/v1/t2a_v2"
-    : "/v1/audio/speech";
-}
-
-export function buildTtsRequestBody(
-  cfg: ApiConfig,
-  text: string,
-  voice: string,
-): Record<string, unknown> {
-  const protocol = protocolForConfig(cfg, "tts");
-  if (protocol === "minimax-speech") {
-    return {
-      model: cfg.model,
-      text,
-      stream: false,
-      voice_setting: { voice_id: voice, speed: 1, vol: 1, pitch: 0 },
-      audio_setting: { format: "mp3", sample_rate: 32000 },
-    };
-  }
-  if (protocol === "siliconflow-speech") {
-    const model = cfg.model || "FunAudioLLM/CosyVoice2-0.5B";
-    return {
-      model,
-      input: text,
-      voice: `${model}:${voice === "default" ? "anna" : voice}`,
-    };
-  }
-  return {
-    model: cfg.model,
-    input: text,
-    voice: voice === "default" ? "alloy" : voice,
-  };
-}
-
-export function extractImageValue(raw: unknown): string {
-  const obj = raw as { data?: unknown };
-  const data = obj?.data;
-  const first = Array.isArray(data) ? (data[0] as Record<string, unknown> | undefined) : data as Record<string, unknown> | undefined;
-  const imageUrls = first?.image_urls;
-  if (Array.isArray(imageUrls) && typeof imageUrls[0] === "string") return imageUrls[0];
-  if (typeof first?.url === "string") return first.url;
-  if (typeof first?.b64_json === "string") return first.b64_json;
-  if (typeof first?.base64 === "string") return first.base64;
-  if (typeof first === "string") return first;
-  throw new Error("图片响应中未找到结果字段");
-}
-
-function hexToBase64(hex: string): string {
-  const clean = hex.replace(/\s+/g, "");
-  const bytes = new Uint8Array(clean.length / 2);
-  for (let i = 0; i < bytes.length; i++) {
-    bytes[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
-  }
-  if (typeof Buffer !== "undefined") return Buffer.from(bytes).toString("base64");
-  let binary = "";
-  for (const b of bytes) binary += String.fromCharCode(b);
-  return btoa(binary);
-}
-
-export function parseMinimaxAudioResponse(json: unknown): { dataB64: string; mime: string } {
-  const audio = (json as { data?: { audio?: unknown } })?.data?.audio;
-  if (typeof audio !== "string" || !audio) {
-    throw new Error("MiniMax TTS 响应缺少 data.audio");
-  }
-  return { dataB64: hexToBase64(audio), mime: "audio/mpeg" };
 }
 
 export async function generateImage(

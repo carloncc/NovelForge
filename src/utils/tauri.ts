@@ -201,7 +201,10 @@ function wrap<A extends unknown[], R>(name: string, fn: (...args: A) => R): (...
 
 /** 决定 tauri 调用失败的日志级别：文件不存在/网络瞬时失败为低级别，其余为 ERROR */
 function failureLogLevel(name: string, errText: string): "error" | "warn" | "debug" {
-  if (name === "readTextFile" && /ENOENT|os error 2|No such file|找不到指定的文件|不存在/i.test(errText)) {
+  if (
+    (name === "readTextFile" || name === "readFileBase64" || name === "hasTransparency" || name === "pathExists")
+    && /ENOENT|os error 2|No such file|找不到指定的文件|不存在/i.test(errText)
+  ) {
     return "debug";
   }
   if (name === "http" && /error sending request|请求失败|timed? out|ECONN|ETIMEDOUT|fetch failed|Could not connect/i.test(errText)) {

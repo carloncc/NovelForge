@@ -1,4 +1,4 @@
-﻿import type { ChapterScript, CharacterCard, PipelineEvent, ApiConfig } from "./types";
+﻿import type { ChapterScript, CharacterCard, PipelineEvent, ApiConfig, FailedTask } from "./types";
 import { ttsSpeech } from "../api/openaiCompatible";
 import { tauri } from "../utils/tauri";
 import { errMsg } from "../utils/errors";
@@ -22,8 +22,9 @@ export function buildVoiceJobs(
 ): VoiceJob[] {
   const library = voiceLibraryFor(cfg);
   const fallbackVoice = library[0] || "default";
+  const charById = new Map(characters.map((c) => [c.id, c]));
   const voiceName = (charId: string): string => {
-    const char = characters.find((c) => c.id === charId);
+    const char = charById.get(charId);
     const v = char?.voiceName || char?.id || "default";
     return library.includes(v) ? v : fallbackVoice;
   };
@@ -104,7 +105,7 @@ export async function runVoiceJob(
     }
     log({
       step: "配音",
-      message: `配音失败（跳过）：${(e as Error).message.slice(0, 120)}`,
+      message: `配音失败（跳过）：${errMsg(e).slice(0, 120)}`,
       level: "warn",
       at: Date.now(),
     });
@@ -121,8 +122,9 @@ export async function generateVoice(
   concurrency = 3,
   force = false,
   isAborted?: () => boolean,
-): Promise<Record<string, string>> {
+): Promise<{ vocal: Record<string, string>; failed: FailedTask[] }> {
   const vocal: Record<string, string> = {};
+  const failed: FailedTask[] = [];
   await tauri.mkdirAll(cacheDirFor(cacheRoot, "vocal"));
   logger.info("voice", "开始生成配音", { characters: characters.length, concurrency, force });
 
@@ -148,11 +150,21 @@ export async function generateVoice(
       const job = jobs[idx++];
       const path = await runVoiceJob(cfg, job, cacheRoot, log, force);
       emitProgress(job);
-      if (path) vocal[job.key] = path;
+      if (path) {
+        vocal[job.key] = path;
+      } else {
+        failed.push({
+          id: `vocal_${job.key}`,
+          kind: "tts",
+          step: "配音",
+          message: `台词配音失败：${job.voice}「${job.text.slice(0, 30)}…」`,
+          at: Date.now(),
+        });
+      }
     }
   };
 
   await Promise.all(Array.from({ length: concurrency }, () => runner()));
-  logger.info("voice", "配音生成完成", { total: jobs.length, success: Object.keys(vocal).length });
-  return vocal;
+  logger.info("voice", "配音生成完成", { total: jobs.length, success: Object.keys(vocal).length, failed: failed.length });
+  return { vocal, failed };
 }

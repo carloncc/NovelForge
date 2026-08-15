@@ -1,6 +1,7 @@
 import type { ApiConfig } from "./types";
 import { chatVision } from "../api/openaiCompatible";
 import { extractJson } from "../api/openaiCompatible";
+import { log } from "../utils/logger";
 
 const STYLE_SYSTEM = `你是画风分析专家。分析用户给出的图片的视觉风格，输出一段可直接用于 AI 绘图的英文风格约束。
 要求：
@@ -96,10 +97,99 @@ export async function describeReferenceImage(
   const reply = await chatVision(cfg, REFERENCE_DESC_SYSTEM, "请描述这张参考图。", imageB64, {
     maxTokens: 800,
     temperature: 0.1,
+    timeoutSecs: 30,
     onUsage,
   });
   const data = extractJson(reply) as { prompt?: unknown };
   const prompt = typeof data?.prompt === "string" ? data.prompt.trim() : "";
   if (!prompt) throw new Error("图片识别 API 未返回参考图描述");
   return prompt;
+}
+
+/**
+ * 进程级缓存版本的 describeReferenceImage：同一张参考图（按内容哈希）只调用一次视觉模型。
+ * 项目中大量任务共享同一张风格锚图/身份图，避免 N 次重复 vision 调用（耗时 + 计费）。
+ * 参考图描述是「可选增强」：视觉通道限流（429）或失败时快速降级返回空串，绝不阻塞/反复重试，
+ * 否则 205 个图像任务同时打视觉 API 会触发大量 429（用户实测 MiniMax 视觉通道连续 429）。
+ *
+ * 并发保护：模块级信号量把视觉描述请求压到 1，避免与图像生成并发叠加打爆服务端。
+ * 失败缓存：失败（含 429）后冷却 30s，期间同一参考图直接返回空（降级），避免反复重试浪费。
+ */
+const referenceDescCache = new Map<string, Promise<string>>();
+const referenceDescFailedAt = new Map<string, number>();
+const REF_DESC_FAIL_COOLDOWN_MS = 30_000;
+
+// 健康开关：连续 2 次失败（429 限流或超时）后，本次进程内禁用参考图描述增强，
+// 全部降级为按原提示词生成，避免视觉通道故障阻塞整个图像阶段（每个任务都等串行描述）。
+const REF_DESC_MAX_CONSECUTIVE_FAILS = 2;
+let refDescConsecutiveFails = 0;
+let refDescDisabled = false;
+
+export function isReferenceDescriptionDisabled(): boolean {
+  return refDescDisabled;
+}
+
+// 简单信号量：同时最多 1 个参考图描述请求在途（视觉通道限流敏感，串行最稳）
+let refDescInFlight = 0;
+const refDescWaiters: Array<() => void> = [];
+function acquireRefDescSlot(): Promise<void> {
+  if (refDescInFlight < 1) {
+    refDescInFlight++;
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => refDescWaiters.push(resolve));
+}
+function releaseRefDescSlot(): void {
+  refDescInFlight--;
+  const next = refDescWaiters.shift();
+  if (next) next();
+}
+
+function referenceDescKey(imageB64: string): string {
+  return `${imageB64.length}:${imageB64.slice(0, 256)}`;
+}
+
+export function describeReferenceImageCached(
+  cfg: ApiConfig,
+  imageB64: string,
+  onUsage?: (pt: number, ct: number) => void,
+): Promise<string> {
+  // 健康开关已触发：直接降级（返回空描述），不再调用视觉 API
+  if (refDescDisabled) return Promise.resolve("");
+  const key = referenceDescKey(imageB64);
+  const hit = referenceDescCache.get(key);
+  if (hit) return hit;
+  // 失败冷却期内直接降级（返回空描述），避免同一参考图反复触发视觉 API 加重限流
+  const failedAt = referenceDescFailedAt.get(key);
+  if (failedAt !== undefined && Date.now() - failedAt < REF_DESC_FAIL_COOLDOWN_MS) {
+    return Promise.resolve("");
+  }
+  const pending = (async () => {
+    await acquireRefDescSlot();
+    try {
+      const description = await describeReferenceImage(cfg, imageB64, onUsage);
+      refDescConsecutiveFails = 0;
+      return description;
+    } catch (e) {
+      referenceDescFailedAt.set(key, Date.now());
+      // 连续失败达到阈值 → 本次进程内禁用视觉描述增强（多为 429 限流，继续调用只会更糟）
+      refDescConsecutiveFails++;
+      if (refDescConsecutiveFails >= REF_DESC_MAX_CONSECUTIVE_FAILS && !refDescDisabled) {
+        refDescDisabled = true;
+        refDescConsecutiveFails = 0;
+        log.warn("recognize", "参考图描述连续失败（疑似视觉通道限流），本次生成已禁用该增强", { fails: REF_DESC_MAX_CONSECUTIVE_FAILS });
+      }
+      throw e;
+    } finally {
+      releaseRefDescSlot();
+    }
+  })();
+  referenceDescCache.set(key, pending.catch(() => "").then((v) => {
+    // 失败时从成功缓存移除，但保留失败冷却
+    if (v === "") {
+      referenceDescCache.delete(key);
+    }
+    return v;
+  }));
+  return referenceDescCache.get(key)!;
 }

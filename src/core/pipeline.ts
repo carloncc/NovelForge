@@ -29,6 +29,7 @@ import { assembleProject, gameKeyFor } from "./project";
 import { cacheDirFor } from "./cache";
 import { tauri } from "../utils/tauri";
 import { errMsg } from "../utils/errors";
+import { classifyError } from "../utils/errorClassifier";
 import { log as logger } from "../utils/logger";
 import { configIsUsable } from "../api/providers";
 import { concurrencyFor } from "../stores/configMigration";
@@ -75,32 +76,25 @@ export function titleHash(title: string): string {
  * LLM 文本错误是否值得自动重试：网络/限流/5xx/服务端临时/JSON 解析类可重试；
  * 参数/鉴权/模型不存在等配置类错误不重试（避免浪费调用）。
  */
-function isRetryableTextError(e: unknown): boolean {
-  const message = e instanceof Error ? e.message : String(e);
-  if (/timeout|timed ?out|network|socket|connect|ec?onn|etimedout|fetch failed|econnrefused|econnreset|broken pipe|server error|unavailable|overloaded|busy|internal|too many|rate limit|429|5\d\d|无法从响应中提取合法 JSON|JSON 无法解析|已中止/i.test(message)) {
-    return true;
-  }
-  if (/400|401|403|404|invalid api key|unauthorized|permission|not found|does not exist|unsupported|not supported|不支持|不可用|参数|鉴权|模型.{0,12}(?:不可用|不存在|未找到)/i.test(message)) {
-    return false;
-  }
-  return true;
-}
-
 /**
- * LLM 文本调用失败自动重试：指数退避（3s→6s→…），尊重中止；配置类错误不重试直接抛出。
+ * LLM 文本调用失败自动重试：错误分类驱动（网络/限流/未知退避重试；鉴权/参数/中止/内容审查直接失败）+ 递增间隔（1s→10s→…→60s）。
  */
 async function withTextRetry<T>(
   fn: () => Promise<T>,
-  opts: { retries?: number; baseDelayMs?: number; isAborted?: () => boolean; onRetry?: (attempt: number, delayMs: number, err: unknown) => void },
+  opts: { retries?: number; isAborted?: () => boolean; onRetry?: (attempt: number, delayMs: number, err: unknown) => void },
 ): Promise<T> {
   const retries = opts.retries ?? 2;
   for (let attempt = 0; ; attempt++) {
+    if (opts.isAborted?.()) throw new Error("已中止");
     try {
       return await fn();
     } catch (e) {
-      if (opts.isAborted?.()) throw new Error("已中止");
-      if (attempt >= retries || !isRetryableTextError(e)) throw e;
-      const delay = (opts.baseDelayMs ?? 3000) * 2 ** attempt;
+      const cls = classifyError(e);
+      // 硬失败（鉴权/参数/中止）与内容审查 → 不重试直接抛出
+      if (cls === "auth" || cls === "invalid_param" || cls === "aborted" || cls === "content_moderation") throw e;
+      if (attempt >= retries) throw e;
+      // 网络/限流/未知 → 递增退避（首次 1s、二次 10s、之后每次 +10s，封顶 60s）
+      const delay = attempt === 0 ? 1000 : Math.min(60_000, attempt * 10_000);
       opts.onRetry?.(attempt + 1, delay, e);
       await new Promise((r) => setTimeout(r, delay));
     }
@@ -154,6 +148,28 @@ export function ensureUniqueSceneIds(script: ChapterScript): void {
   }
 }
 
+/** 跨章场景 id 唯一化：LLM 不同章都可能输出 s1/s2…，同名会导致背景图/配音/BGM 互相覆盖
+ * （实测 92 个背景任务挤进 6 个文件）。在整批章节收集完成后调用一次，确保全局唯一。
+ * 幂等：带 _数字 后缀的 id 视为已唯一，不重复处理。 */
+export function dedupeSceneIdsAcrossChapters(chapters: ChapterScript[]): void {
+  const used = new Set<string>();
+  for (const chapter of chapters) {
+    for (const scene of chapter.scenes) {
+      const raw = scene.id || "s";
+      const base = /_\d+$/.test(raw) ? raw : raw;
+      if (!used.has(base)) {
+        used.add(base);
+        scene.id = base;
+        continue;
+      }
+      let n = 2;
+      while (used.has(`${base}_${n}`)) n++;
+      used.add(`${base}_${n}`);
+      scene.id = `${base}_${n}`;
+    }
+  }
+}
+
 export class Pipeline {
   private cost: CostStats = {
     llmTokens: 0,
@@ -167,6 +183,8 @@ export class Pipeline {
   private aborted = false;
   private failedTasks: FailedTask[] = [];
   private onUsageCb?: (pt: number, ct: number) => void;
+  /** 图像阶段是否有任务失败（中断/429/400）。失败时跳过组装，避免产出缺图残次品。 */
+  private imageHadFailures = false;
 
   constructor(private input: PipelineInput) {}
 
@@ -184,6 +202,25 @@ export class Pipeline {
       taskId: f.id,
       taskKind: f.kind,
     });
+    // 增量落盘：中断/崩溃/重启后「失败项」仍可恢复
+    void this.persistFailedTasks();
+  }
+
+  /** 当前失败的只读快照（供中止/异常路径回填 UI，避免失败列表丢失） */
+  getFailedTasks(): FailedTask[] {
+    return this.failedTasks.slice();
+  }
+
+  private failedFile(): string {
+    return `${this.input.outputDir}/.novel2vn/failed.json`;
+  }
+
+  private async persistFailedTasks(): Promise<void> {
+    try {
+      await tauri.writeTextFile(this.failedFile(), JSON.stringify(this.failedTasks, null, 2));
+    } catch {
+      /* 失败列表落盘失败不阻断 */
+    }
   }
 
   private log(msg: string, level: PipelineEvent["level"] = "info", step = "管线"): void {
@@ -253,10 +290,25 @@ export class Pipeline {
 
   private async persistAssets(assets: RenderAssets): Promise<void> {
     try {
+      // 先读磁盘已有映射，再合并本次结果，避免并发写或中断时互相覆盖丢失
+      let existing: AssetMap | null = null;
+      const assetsFile = `${this.input.outputDir}/.novel2vn/assets.json`;
+      try {
+        const existingMap = await this.readCachedJson<AssetMap>(assetsFile);
+        if (existingMap) existing = existingMap;
+      } catch {
+        /* 无旧映射 */
+      }
       await tauri.writeTextFile(
-        `${this.input.outputDir}/.novel2vn/assets.json`,
+        assetsFile,
         JSON.stringify(
-          { bg: assets.bg, cg: assets.cg, figure: assets.figure, item: assets.item, vocal: assets.vocal },
+          {
+            bg: { ...(existing?.bg ?? {}), ...assets.bg },
+            cg: { ...(existing?.cg ?? {}), ...assets.cg },
+            figure: { ...(existing?.figure ?? {}), ...assets.figure },
+            item: { ...(existing?.item ?? {}), ...assets.item },
+            vocal: { ...(existing?.vocal ?? {}), ...assets.vocal },
+          },
           null,
           2,
         ),
@@ -829,19 +881,21 @@ export class Pipeline {
     chapters.forEach((c, i) => {
       c.chapter = i;
     });
+    // 跨章场景 id 唯一化：LLM 不同章都输出 s1/s2… 时，背景图/配音/BGM 会互相覆盖
+    dedupeSceneIdsAcrossChapters(chapters);
 
+    // 素材映射始终以磁盘已有内容为基础（合并而非覆盖）：
+    // 即使本次勾选 image/voice 且中途失败/中断，也不会把之前已生成的图映射清空
+    // （旧实现：未勾选 image/voice 才恢复 → 勾选 image 且部分失败时 persistAssets 用不完整
+    //  内容覆盖 assets.json，导致「把前面的图弄没了」）。
     const assets: RenderAssets = { bg: {}, cg: {}, figure: {}, item: {}, vocal: {}, bgm: {} };
-
-    // 未勾选图像/配音时，从磁盘恢复已生成的素材映射
-    if (!stages.has("image") || !stages.has("voice")) {
-      const existing = await this.loadAssetMap();
-      if (existing) {
-        assets.bg = existing.bg ?? {};
-        assets.cg = existing.cg ?? {};
-        assets.figure = existing.figure ?? {};
-        assets.item = existing.item ?? {};
-        assets.vocal = existing.vocal ?? {};
-      }
+    const existingAssets = await this.loadAssetMap();
+    if (existingAssets) {
+      assets.bg = existingAssets.bg ?? {};
+      assets.cg = existingAssets.cg ?? {};
+      assets.figure = existingAssets.figure ?? {};
+      assets.item = existingAssets.item ?? {};
+      assets.vocal = existingAssets.vocal ?? {};
     }
 
     /* ==================== ④ 图像 ==================== */
@@ -862,7 +916,8 @@ export class Pipeline {
           input.materials,
           this.cacheRoot,
           input.log,
-          concurrencyFor(input.image, "image"),
+          // 图像并发封顶 8：即使用户配置 30，也避免同时打爆第三方图片服务触发 429
+          Math.min(8, concurrencyFor(input.image, "image")),
           this.options.figureEmotions,
           this.options.imageStyle,
           imageFeedback,
@@ -875,8 +930,10 @@ export class Pipeline {
           () => this.aborted,
           input.visualBible,
           input.vision,
+          input.llm,
         );
         this.failedTasks.push(...failed);
+        this.imageHadFailures = this.imageHadFailures || failed.length > 0;
         this.cost.imageCount = Object.values(images.bg).length + Object.values(images.cg).length + Object.values(images.figure).length + Object.values(images.item).length;
         this.cost.imageCostYuan = this.cost.imageCount * DEFAULT_PRICES.imageYuanEach;
         Object.assign(assets, images);
@@ -906,7 +963,8 @@ export class Pipeline {
       if (this.options.useTts && input.tts?.apiKey) {
         log({ step: "配音", message: "开始生成配音…", level: "info", at: Date.now() });
         const voiceForce = !!this.feedback.voice || input.forceStages?.includes("voice");
-        const vocal = await generateVoice(input.tts, chapters, cards!.characters, this.cacheRoot, input.log, concurrencyFor(input.tts, "tts"), voiceForce, () => this.aborted);
+        const { vocal, failed: voiceFailed } = await generateVoice(input.tts, chapters, cards!.characters, this.cacheRoot, input.log, concurrencyFor(input.tts, "tts"), voiceForce, () => this.aborted);
+        this.failedTasks.push(...voiceFailed);
         this.cost.ttsChars = Object.keys(vocal).reduce((n, k) => n + (vocal[k] ? 1 : 0), 0) * 20;
         this.cost.ttsCostYuan = (this.cost.ttsChars / 1e6) * DEFAULT_PRICES.ttsYuanPer1mChars;
         assets.vocal = vocal;
@@ -923,7 +981,31 @@ export class Pipeline {
 
     /* ==================== ⑥ 组装 ==================== */
     let meta: ProjectMeta | null = null;
-    if (stages.has("assemble")) {
+    if (stages.has("assemble") && this.imageHadFailures && stages.has("image")) {
+      // 图像阶段存在失败/中断任务：跳过组装，避免产出缺图残次品。
+      // 用户可在「失败项」重试补图后再组装（或手动勾选组装阶段重跑）。
+      log({
+        step: "组装",
+        message: `图像阶段有 ${this.failedTasks.filter((f) => f.step === "图像").length} 个任务失败/中断，已跳过组装（可在「失败项」重试补图后再组装）`,
+        level: "warn",
+        at: Date.now(),
+      });
+      this.imageHadFailures = false;
+      meta = await this.loadMeta();
+      if (!meta) {
+        meta = {
+          title: cards!.title || workingNovel.fileName.replace(/\.txt$/i, ""),
+          gameKey: gameKeyFor(cards!.title || workingNovel.fileName),
+          chapterCount: chapters.length,
+          charCount: cards!.characters.length,
+          sceneCount: chapters.reduce((n, c) => n + c.scenes.length, 0),
+          lineCount: chapters.reduce((n, c) => n + c.scenes.reduce((m, s) => m + s.lines.length, 0), 0),
+          outputDir: input.outputDir,
+          webgalVersion: "4.6.3",
+          generatedAt: new Date().toISOString(),
+        };
+      }
+    } else if (stages.has("assemble")) {
       log({ step: "组装", message: `组装项目到 ${input.outputDir}…`, level: "info", at: Date.now() });
       const r = await assembleProject({
         outputDir: input.outputDir,
@@ -976,6 +1058,8 @@ export class Pipeline {
         at: Date.now(),
       });
     }
+
+    await this.persistFailedTasks();
 
     return { meta, cards: cards!, chapters, assets, cost: this.cost, failedTasks: this.failedTasks, splitChapters: workingChapters };
   }

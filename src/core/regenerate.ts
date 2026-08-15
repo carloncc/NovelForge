@@ -37,6 +37,8 @@ export interface RegenContext {
   verifyCfg?: ApiConfig;
   /** 多模态模型：生成前把参考图描述成文字合入提示词（重生成时同样生效） */
   visionCfg?: ApiConfig;
+  /** 文本 LLM：内容审查时用 LLM 改写提示词重试（与生成管线一致） */
+  safeRewriteCfg?: ApiConfig;
   /** 固定种子（跟随生成页设置，保持与管线一致） */
   imageSeed?: number;
   /** 是否启用风格锚点（跟随生成页设置） */
@@ -89,14 +91,14 @@ async function mergeAssetMap(outputDir: string, results: RegenImageResult[]): Pr
  * 按条件重新生成一批图像任务（跳过缓存、覆盖旧文件）。
  * predicate 接收单个任务，返回 true 的任务会被重生成。
  * signal.aborted() 返回 true 时停止调度后续任务（进行中的单张请求无法中断，完成即止）。
- * onProgress 每完成一张回调一次（done/total/label），用于界面显示实时进度。
+ * onProgress 每完成一张回调一次（done/total/label/path），用于界面显示实时进度并逐张刷新缩略图。
  */
 export async function regenerateImages(
   ctx: RegenContext,
   predicate: (task: ImageTask) => boolean,
   feedback?: string,
   signal?: { aborted: () => boolean },
-  onProgress?: (done: number, total: number, label: string) => void,
+  onProgress?: (done: number, total: number, label: string, path?: string) => void,
 ): Promise<RegenImageResult[]> {
   const cacheRoot = cacheRootFor(ctx.outputDir);
   const approvedBible = ctx.visualBible?.status === "approved" ? ctx.visualBible : undefined;
@@ -138,7 +140,15 @@ export async function regenerateImages(
   const total = tasks.length;
   let done = 0;
   const results: RegenImageResult[] = [];
-  const concurrency = concurrencyFor(ctx.cfg, "image");
+  // 每完成一张立即增量合并进 assets.json：批量重生成过程中素材页也能逐张看到新图。
+  // 用串行链防并发 read-modify-write 丢失（多 worker 同时合并会互相覆盖）。
+  let mergeChain: Promise<void> = Promise.resolve();
+  const mergeIncremental = (r: RegenImageResult): Promise<void> => {
+    mergeChain = mergeChain.then(() => mergeAssetMap(ctx.outputDir, [r]));
+    return mergeChain;
+  };
+  // 图像并发封顶 8：避免配置的 30 并发打爆第三方图片服务触发 429
+  const concurrency = Math.min(8, concurrencyFor(ctx.cfg, "image"));
   // 图片请求限流跟随该 API 自己的并发配置（与生成管线一致），各 API 互不影响
   if (ctx.cfg) setImageConcurrency(ctx.cfg, concurrency);
   // 图生图参考链：threeview → 默认立绘(normal) → 表情(emotion) → 动作(action)。
@@ -184,19 +194,23 @@ export async function regenerateImages(
           outputDir: ctx.outputDir,
           verifyCfg: ctx.verifyCfg,
           visionCfg: ctx.visionCfg,
+          safeRewriteCfg: ctx.safeRewriteCfg,
           styleAnchorPath: anchorPath,
         });
         done++;
-        onProgress?.(done, total, task.usage ?? task.fileName);
         if (path) {
           results.push({ task, path });
           figureBase[task.id] = path;
+          // 先合并映射再回调：前端 onProgress 立即读 assets.json 时已包含新图
+          await mergeIncremental({ task, path });
+          onProgress?.(done, total, task.usage ?? task.fileName, path);
+        } else {
+          onProgress?.(done, total, task.usage ?? task.fileName);
         }
       }
     };
     await Promise.all(Array.from({ length: Math.min(concurrency, layerTasks.length) }, () => worker()));
   }
-  await mergeAssetMap(ctx.outputDir, results);
   return results;
 }
 

@@ -1,14 +1,16 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 import { computed, nextTick, ref, watch } from "vue";
 import { t } from "../i18n";
 import { open } from "@tauri-apps/plugin-dialog";
-import { projectState, pushLog, clearLogs, scheduleSave, restoreProject } from "../stores/project";
+import { projectState, pushLog, clearLogs, scheduleSave, restoreProject, getStageLastLevels, getLastActiveStage } from "../stores/project";
 import { activeConfig, configState, addRecentOutputDir } from "../stores/config";
 import { Pipeline } from "../core/pipeline";
 import { resolveTemplateDir } from "../utils/template";
 import { tauri, isTauri } from "../utils/tauri";
 import { sanitizeId } from "../core/render";
 import { errMsg } from "../utils/errors";
+import { ERROR_CLASS_ICON, ERROR_CLASS_LABEL, classifyError } from "../utils/errorClassifier";
+import { cutoutErrorHint } from "../utils/cutoutErrorHint";
 import { log as logger, dumpLogHistory } from "../utils/logger";
 import EditCards from "../components/EditCards.vue";
 import StepIndicator from "../components/StepIndicator.vue";
@@ -29,7 +31,7 @@ import {
   regenerateImages,
   type RegenContext,
 } from "../core/regenerate";
-import { reCutoutAsset } from "../core/images";
+import { reCutoutAsset, buildImageTasks } from "../core/images";
 import { recognizeStyle } from "../core/recognize";
 import { configIsUsable } from "../api/providers";
 import { useAssetThumbs, ensureAssetLoaded, clearThumbCache } from "../composables/useAssetThumbs";
@@ -47,6 +49,8 @@ const error = ref("");
 const busy = ref(false);
 const pendingResumeStages = ref<StageKey[]>([]);
 const pipelineRef = ref<Pipeline | null>(null);
+/** 中止/异常路径从 Pipeline 收回的失败任务（未完成 run 的失败项也可见） */
+const lastRunFailedTasks = ref<FailedTask[]>([]);
 const scriptFiles = ref<{ name: string; text: string }[]>([]);
 const currentScript = ref("");
 const videoStatus = ref<Record<string, boolean>>({});
@@ -93,7 +97,26 @@ const costText = computed(() => {
   };
 });
 
-const failedTasks = computed<FailedTask[]>(() => projectState.lastResult?.failedTasks ?? []);
+const failedTasks = computed<FailedTask[]>(() => {
+  const persisted = projectState.lastResult?.failedTasks ?? [];
+  const extra = lastRunFailedTasks.value.filter(
+    (f) => !persisted.some((x) => x.id === f.id),
+  );
+  return [...persisted, ...extra];
+});
+
+/** 失败任务按错误分类汇总（失败项页签顶部小卡） */
+const failedTaskSummary = computed(() => {
+  const counts = new Map<string, { count: number; label: string; icon: string }>();
+  for (const f of failedTasks.value) {
+    const cls = classifyError({ message: f.message });
+    const key = ERROR_CLASS_LABEL[cls];
+    const cur = counts.get(key) ?? { count: 0, label: key, icon: ERROR_CLASS_ICON[cls] };
+    cur.count++;
+    counts.set(key, cur);
+  }
+  return [...counts.values()].sort((a, b) => b.count - a.count);
+});
 
 const videoPoints = computed<(VideoSuggestion & { chapter: number; location: string; enabled: boolean })[]>(() => {
   const r = projectState.lastResult;
@@ -139,26 +162,17 @@ const failedCounts = computed<Record<StageKey, number>>(() => {
 
 /** 日志中「最后一条」为 error 的阶段（用于中断/未落盘运行的失败识别，成功后会更新为成功状态） */
 const logFailedStages = computed<Set<StageKey>>(() => {
-  const lastLevel = new Map<StageKey, string>();
-  for (const e of projectState.logs) {
-    const k = stageStatus.STEP_TO_STAGE[e.step];
-    if (k) lastLevel.set(k, e.level);
-  }
+  const levels = getStageLastLevels();
   const set = new Set<StageKey>();
-  for (const [k, level] of lastLevel) if (level === "error") set.add(k);
+  for (const k of STAGE_ORDER) if (levels[k] === "error") set.add(k);
   return set;
 });
 
-/** 当前正在执行的阶段（从最近一条非 error 日志推导） */
+/** 当前正在执行的阶段（由增量维护的「最近非 error 日志阶段」推导，O(1)） */
 const runningStages = computed<StageKey[]>(() => {
   if (!busy.value && !projectState.running) return [];
-  for (let i = projectState.logs.length - 1; i >= 0; i--) {
-    const e = projectState.logs[i];
-    if (e.level === "error") continue;
-    const k = stageStatus.STEP_TO_STAGE[e.step];
-    if (k) return [k];
-  }
-  return [];
+  const last = getLastActiveStage();
+  return last ? [last] : [];
 });
 
 watch(
@@ -261,11 +275,16 @@ function openPreview(path: string | undefined, label: string): void {
   preview.value = { path, label };
 }
 
-function regenCtl(): { signal: { aborted: () => boolean }; onProgress: (done: number, total: number, label: string) => void } {
+function regenCtl(): { signal: { aborted: () => boolean }; onProgress: (done: number, total: number, label: string, path?: string) => void } {
   return {
     signal: { aborted: () => regenAbort.value },
-    onProgress: (done, total, label) => {
+    onProgress: (done, total, label, path) => {
       regenProgress.value = { done, total, label };
+      // 重生成覆盖同名文件：清该路径的缩略图缓存并重新加载，让新图逐张上屏
+      if (path) {
+        clearThumbCache([path]);
+        loadAssetDataUrl(path);
+      }
     },
   };
 }
@@ -341,6 +360,65 @@ async function regenSelected(): Promise<void> {
   } finally {
     assetBusy.value = "";
     resetRegenState();
+    await loadAssetMapNow(true);
+  }
+}
+
+/**
+ * 补全缺失图片：检查所有图像任务，只重新生成「缓存目录里没有对应文件」的任务；
+ * 已存在的图完全不动（不覆盖、不丢失），一次性把中断/失败遗漏的图补齐。
+ */
+async function regenMissingImages(): Promise<void> {
+  const ctx = await regenCtx();
+  if (!ctx) return;
+  const cacheRoot = `${ctx.outputDir}/.novel2vn/cache`;
+  const approvedBible = ctx.visualBible?.status === "approved" ? ctx.visualBible : undefined;
+  const allTasks = buildImageTasks(ctx.chapters, ctx.cards, {
+    figureEmotions: ctx.figureEmotions ?? true,
+    threeView: ctx.threeView !== false,
+    actions: ctx.actions !== false,
+    style: approvedBible?.styleDescription ?? ctx.style,
+    baseSeed: ctx.imageSeed,
+    styleAnchor: approvedBible ? false : ctx.styleAnchor !== false,
+  });
+  // 预检缺失：任务文件在 cache/images 下不存在（含 .png/.jpg/.webp 变体）
+  const missingIds = new Set<string>();
+  for (const t of allTasks) {
+    if (t.kind === "anchor") continue; // 锚点不在素材映射里，跳过
+    const base = `${cacheRoot}/images/${t.fileName.replace(/\.png$/i, "")}`;
+    const hasFile = await Promise.any([
+      tauri.pathExists(`${base}.png`).catch(() => false),
+      tauri.pathExists(`${base}.jpg`).catch(() => false),
+      tauri.pathExists(`${base}.jpeg`).catch(() => false),
+      tauri.pathExists(`${base}.webp`).catch(() => false),
+    ]).catch(() => false);
+    if (!hasFile) missingIds.add(t.id);
+  }
+  if (!missingIds.size) {
+    pushLog({ step: "素材", message: "没有缺失的图片，无需补全", level: "info", at: Date.now() });
+    return;
+  }
+  assetBusy.value = `补全缺失图片（${missingIds.size} 张）`;
+  resetRegenState();
+  try {
+    const { signal, onProgress } = regenCtl();
+    const predicate = (t: ImageTask) => missingIds.has(t.id);
+    const results = await regenerateImages(ctx, predicate, undefined, signal, onProgress);
+    pushLog({
+      step: "素材",
+      message: results.length
+        ? `补全缺失图片完成：重新生成 ${results.length} 张（已存在的图未改动）`
+        : "补全缺失图片完成（没有需要补的）",
+      level: "success",
+      at: Date.now(),
+    });
+    await afterAssetRegen(`补全缺失图片（${results.length} 张）`, results.length);
+  } catch (e) {
+    pushLog({ step: "素材", message: `补全缺失图片失败：${errMsg(e)}`, level: "error", at: Date.now() });
+  } finally {
+    assetBusy.value = "";
+    resetRegenState();
+    await loadAssetMapNow(true);
   }
 }
 
@@ -356,12 +434,16 @@ async function reCutout(mapKey: "figure" | "item", assetKey: string, filePath: s
     const newPath = await reCutoutAsset(projectState.outputDir, mapKey, assetKey, filePath, (ev) => pushLog(ev));
     if (newPath && newPath !== filePath) {
       pushLog({ step: "素材", message: `抠图完成：${assetKey} → 透明底 PNG`, level: "success", at: Date.now() });
+      // 抠图产生了新文件：重新组装，把新图复制进游戏目录（否则预览里还是旧图）
+      await execute({ stages: ["assemble"] });
     } else if (newPath === filePath) {
       pushLog({ step: "素材", message: `${assetKey} 无需抠图（已透明或背景无法识别）`, level: "info", at: Date.now() });
     }
-    await loadAssetMapNow();
+    await loadAssetMapNow(true);
   } catch (e) {
-    pushLog({ step: "素材", message: `抠图失败：${assetKey}（${errMsg(e)}）`, level: "error", at: Date.now() });
+    const msg = errMsg(e);
+    const hint = cutoutErrorHint(msg);
+    pushLog({ step: "素材", message: `抠图失败：${assetKey}（${msg.slice(0, 220)}${hint ? " " + hint : ""}）`, level: "error", at: Date.now() });
   } finally {
     assetBusy.value = "";
   }
@@ -370,7 +452,12 @@ async function reCutout(mapKey: "figure" | "item", assetKey: string, filePath: s
 // 素材预览/试听：读成 base64 data-URL（桌面/网页通用），失败不重试、并发受限，避免卡死
 const { loadAssetDataUrl, mimeOf } = useAssetThumbs();
 
-async function loadAssetMapNow(): Promise<void> {
+/**
+ * 素材映射重载。clearAll=false（默认，生成期间轮询）：只清"新增/消失"路径的缩略图缓存，
+ * 避免每次 2s 刷新都清空全部缓存、导致可见图全部重新读盘。
+ * clearAll=true（管线完成/中止/重生成后）：同一路径可能被覆盖为新图，需全清。
+ */
+async function loadAssetMapNow(clearAll = false): Promise<void> {
   try {
     if (!projectState.outputDir) {
       assetMap.value = null;
@@ -378,13 +465,46 @@ async function loadAssetMapNow(): Promise<void> {
     }
     const { text } = await tauri.readTextFile(`${projectState.outputDir}/.novel2vn/assets.json`);
     const next = JSON.parse(text) as AssetMap;
-    // 素材映射重载（重生成/管线完成后）时，同一路径的文件可能已被覆盖为新的图片，
-    // 必须清掉缩略图缓存，否则 UI 仍显示旧图。
-    clearThumbCache();
+    if (clearAll) {
+      clearThumbCache();
+    } else {
+      const changed = diffAssetPaths(assetMap.value, next);
+      if (changed.length) {
+        clearThumbCache(changed);
+      }
+    }
     assetMap.value = next;
+    // 缩略图缓存被清后，LazyThumb 通过 watch 感知缓存条目消失并自动重新加载（见 LazyThumb.vue），
+    // 无需在此主动全量重读，避免一次性把上百张图读进内存。
+    // 结构兜底（单点）：lastResult 缺 cards/chapters（首次运行、中止后）时从磁盘补，
+    // 素材页行结构恢复后，映射里的每张图才能对应显示到行上。
+    // ensureLiveResultShape 只读磁盘、不回调 loadAssetMapNow，无递归。
+    if (!projectState.lastResult?.cards?.characters?.length || !projectState.lastResult?.chapters?.length) {
+      void ensureLiveResultShape(projectState.outputDir);
+    }
   } catch {
     assetMap.value = null;
   }
+}
+
+/** 比较新旧 assetMap 的素材路径，返回新增/消失的路径（同路径覆盖无法感知，需 clearAll） */
+function diffAssetPaths(oldMap: AssetMap | null, newMap: AssetMap | null): string[] {
+  const collect = (m: AssetMap | null, into: Set<string>): void => {
+    if (!m) return;
+    for (const v of Object.values(m.bg ?? {})) if (v) into.add(v);
+    for (const v of Object.values(m.cg ?? {})) if (v) into.add(v);
+    for (const v of Object.values(m.figure ?? {})) if (v) into.add(v);
+    for (const v of Object.values(m.item ?? {})) if (v) into.add(v);
+    for (const v of Object.values(m.vocal ?? {})) if (v) into.add(v);
+  };
+  const oldSet = new Set<string>();
+  const newSet = new Set<string>();
+  collect(oldMap, oldSet);
+  collect(newMap, newSet);
+  const changed: string[] = [];
+  for (const p of oldSet) if (!newSet.has(p)) changed.push(p);
+  for (const p of newSet) if (!oldSet.has(p)) changed.push(p);
+  return changed;
 }
 
 // 生成期间实时刷新素材：每张图生成后会增量写入 assets.json，这里每 2s 轮询一次，
@@ -396,6 +516,8 @@ function startAssetLiveRefresh(): void {
   if (assetLiveTimer !== undefined) return;
   assetLiveTimer = window.setInterval(() => {
     if (!projectState.outputDir) return;
+    // 结构同步与映射刷新共用 2s 轮询节拍（确保首次运行/中止后素材页结构也能跟上）
+    syncLiveResultShape();
     void tauri
       .readTextFile(`${projectState.outputDir}/.novel2vn/assets.json`)
       .then(({ text }) => {
@@ -563,7 +685,19 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
   }
   busy.value = true;
   projectState.running = true;
-  const log = (ev: PipelineEvent) => pushLog(ev);
+  const log = (ev: PipelineEvent) => {
+    pushLog(ev);
+    // 结构同步：提取/剧本阶段产出后（或任一进度事件）从磁盘补 cards/chapters，
+    // 让素材页行结构在首次运行/中止后也即时可用（2s 节流）。
+    if (ev.progress || (ev.step === "提取" && ev.level === "success") || (ev.step === "剧本" && ev.level === "success")) {
+      syncLiveResultShape();
+    }
+    // 图像阶段每张图完成即有 progress 事件（assets.json 已增量写入）→ 立即刷新素材页，
+    // 实现「生成一张就显示一个」，无需等整批完成。
+    if (ev.step === "图像" && ev.progress) {
+      void loadAssetMapNow().catch(() => {});
+    }
+  };
   try {
     const templateDir = await resolveTemplateDir();
     const pipeline = new Pipeline({
@@ -593,10 +727,16 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
       level: "info",
       at: Date.now(),
     });
+    // 生成期间实时刷新素材：先确保 lastResult 有结构（首次生成或重开程序时可能为空），
+    // 这样素材页立即可用，图片每生成一张就通过 assetLiveRefresh 增量显示。
+    if (!projectState.lastResult?.chapters?.length && projectState.outputDir) {
+      await ensureLiveResultShape(projectState.outputDir);
+      await loadAssetMapNow();
+    }
     startAssetLiveRefresh();
     const result = await pipeline.run();
     stopAssetLiveRefresh();
-    await loadAssetMapNow();
+    await loadAssetMapNow(true);
     projectState.lastResult = result;
     addRecentOutputDir(result.meta.outputDir);
     if (result.splitChapters?.length && projectState.novel) {
@@ -610,7 +750,7 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
     }
     if (opts.stages.includes("assemble")) {
       await checkVideos();
-      await loadAssetMapNow();
+      await loadAssetMapNow(true);
     }
     if (opts.clearLogsFirst) tab.value = "cards";
     log({ step: "完成", message: `全部完成！项目输出到 ${result.meta.outputDir}，可前往「预览」页试玩`, level: "success", at: Date.now() });
@@ -618,8 +758,11 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
   } catch (e) {
     const msg = errMsg(e);
     logger.error("page", "生成失败", { message: msg });
-    // 中途失败也刷新素材：已增量落盘的图片保留并显示，重跑时只补缺失项
-    void loadAssetMapNow();
+    // 中途失败/中止也刷新素材：已增量落盘的图片保留并显示，重跑时只补缺失项
+    void loadAssetMapNow(true);
+    // 收回 Pipeline 已记录的失败任务，避免中止/崩溃后「失败项」丢失
+    const failed = pipelineRef.value?.getFailedTasks?.() ?? [];
+    if (failed.length) lastRunFailedTasks.value = failed;
     if (msg === "已中止") {
       logger.warn("page", "生成被用户中止");
       log({ step: "中止", message: t("已停止生成，进度已保存（缓存命中部分不会重复计费）"), level: "warn", at: Date.now() });
@@ -638,6 +781,7 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
 }
 
 function start(): void {
+  lastRunFailedTasks.value = [];
   void execute({ stages: selectedStagesList.value, clearLogsFirst: true });
 }
 
@@ -667,29 +811,27 @@ async function resumeAfterVisualApproval(): Promise<void> {
   await execute({ stages, clearLogsFirst: false });
   if (stages.includes("assemble")) {
     await checkVideos();
-    await loadAssetMapNow();
+    await loadAssetMapNow(true);
   }
 }
 
 function onVisualBibleChanged(): void {
-  void loadAssetMapNow();
+  void loadAssetMapNow(true);
 }
 
 /* ==================== 分阶段操作（统一入口 + 智能补漏） ==================== */
 
 /**
- * 重新生成某个阶段：只 force 目标阶段，下游复用缓存（已完成的阶段不会重新生成）。
- * 智能补漏：目标阶段存在失败项且未填意见时，只重生成失败项（剧本→失败章节、翻译/图像→仅未缓存项）；
- * 填了意见或想整阶段重跑时强制全量。
+ * 重新生成某个阶段：默认「继续」语义——缓存命中复用、只补缺失/失败项，不整批重跑；
+ * 只有填写了意见才强制该阶段全量重生成（分章除外：点击即重新分章）。
  */
 function runStageRegen(stage: StageKey): void {
   const fb = stageFeedback.value[stage]?.trim() || "";
   const failedFor = failedTasks.value.filter((f) => stageStatus.STEP_TO_STAGE[f.step] === stage);
-  const hasFailed = failedFor.length > 0;
   const feedback = fb ? ({ [stage]: fb } as Partial<StageFeedback>) : undefined;
   const thenRefresh = (): void => {
     void stageStatus.refresh();
-    void loadAssetMapNow();
+    void loadAssetMapNow(true);
   };
   const clearFb = (): void => {
     stageFeedback.value[stage] = "";
@@ -697,6 +839,7 @@ function runStageRegen(stage: StageKey): void {
 
   switch (stage) {
     case "split":
+      // 分章无「补缺」概念：点击即重新分章（下游按指纹/标题自动复用或作废缓存）
       void execute({
         stages: ["split", "extract", "script", "image", "assemble"],
         feedback: feedback as StageFeedback | undefined,
@@ -708,8 +851,8 @@ function runStageRegen(stage: StageKey): void {
       });
       break;
     case "translate": {
-      // 有失败项且无意见 → 不 force：缓存复用、只补未缓存的失败章
-      const force = hasFailed && !fb ? undefined : (["translate"] as StageKey[]);
+      // 填了意见 → 全量重翻；否则「继续」：只补未缓存/失败的章节，已翻译的复用缓存
+      const force = fb ? (["translate"] as StageKey[]) : undefined;
       void execute({
         stages: ["translate", "extract", "script", "image", "assemble"],
         feedback: feedback as StageFeedback | undefined,
@@ -722,10 +865,12 @@ function runStageRegen(stage: StageKey): void {
       break;
     }
     case "extract":
+      // 填了意见 → 强制重提取（并作废下游剧本/立绘缓存）；否则复用缓存/补缺，
+      // 避免点一次「重新生成」就把整套剧本和图片全部作废从头再来
       void execute({
         stages: ["extract", "script", "image", "assemble"],
         feedback: feedback as StageFeedback | undefined,
-        forceStages: ["extract"],
+        forceStages: fb ? (["extract"] as StageKey[]) : undefined,
         rerunChapters: null,
       }).then(() => {
         clearFb();
@@ -736,22 +881,29 @@ function runStageRegen(stage: StageKey): void {
       const failedChapters = failedFor
         .filter((f) => f.id.startsWith("chapter_"))
         .map((f) => parseInt(f.id.replace("chapter_", ""), 10) - 1);
+      // 剧本变化后场景 id 可能变化：带上图像阶段（继续语义）补新场景的图；
+      // 视觉圣经未批准时跳过图像阶段，避免阻断剧本重生成。
+      const canFillImages = projectState.options.useImage && !visualBibleNeedsReview(projectState.visualBible);
+      const stages: StageKey[] = canFillImages ? ["script", "image", "assemble"] : ["script", "assemble"];
       if (fb) {
         const fbMap: Record<number, string> = {};
         for (const c of projectState.novel?.chapters ?? []) fbMap[c.index] = fb;
-        void execute({ stages: ["script", "assemble"], feedback: { script: fbMap }, forceStages: ["script"], rerunChapters: null });
+        void execute({ stages, feedback: { script: fbMap }, forceStages: ["script"], rerunChapters: null });
       } else if (failedChapters.length) {
         // 只重生成失败章节，其余复用缓存
-        void execute({ stages: ["script", "assemble"], rerunChapters: failedChapters });
+        void execute({ stages, rerunChapters: failedChapters });
       } else {
-        void execute({ stages: ["script", "assemble"], forceStages: ["script"], rerunChapters: null });
+        // 「继续」：全部章节复用缓存，缺缓存的补生成，不整批重写（避免白烧 LLM 费用）
+        void execute({ stages, rerunChapters: null }).then(() => {
+          void loadScripts();
+        });
       }
       clearFb();
       break;
     }
     case "image": {
-      // 有失败项且无意见 → 不 force：只补未生成的失败图
-      const force = hasFailed && !fb ? undefined : (["image"] as StageKey[]);
+      // 填了意见 → 全量重生成；否则「继续」：缓存命中复用、只补缺失/失败的图
+      const force = fb ? (["image"] as StageKey[]) : undefined;
       void execute({
         stages: ["image", "assemble"],
         feedback: feedback as StageFeedback | undefined,
@@ -763,7 +915,8 @@ function runStageRegen(stage: StageKey): void {
       break;
     }
     case "voice":
-      void execute({ stages: ["voice", "assemble"], forceStages: ["voice"] }).then(thenRefresh);
+      // 「继续」：只补缺失配音，不整批重配
+      void execute({ stages: ["voice", "assemble"] }).then(thenRefresh);
       break;
     case "assemble":
       void execute({ stages: ["assemble"] }).then(() => {
@@ -775,13 +928,17 @@ function runStageRegen(stage: StageKey): void {
 
 function regenChapter(idx: number): void {
   const fb = scriptChapterFeedback.value[idx]?.trim() ?? "";
+  // 重写本章后场景 id 可能变化：图像阶段（继续语义）自动补上新场景的图，
+  // 其余章节/图片全部复用缓存。视觉圣经未批准时跳过图像阶段，避免阻断剧本重生成。
+  const canFillImages = projectState.options.useImage && !visualBibleNeedsReview(projectState.visualBible);
   void execute({
-    stages: ["script", "assemble"],
+    stages: canFillImages ? ["script", "image", "assemble"] : ["script", "assemble"],
     feedback: { script: { [idx]: fb } },
     rerunChapters: null,
   }).then(() => {
     scriptChapterFeedback.value[idx] = "";
     void loadScripts();
+    void loadAssetMapNow(true);
   });
 }
 
@@ -793,6 +950,7 @@ async function regenCtx(): Promise<RegenContext | null> {
   const imageCfg = activeConfig("image");
   const ttsCfg = activeConfig("tts");
   const visionCfg = activeConfig("vision");
+  const llmCfg = activeConfig("llm");
   if (projectState.options.imageSelfCheck && !configIsUsable(visionCfg, "vision")) {
     pushLog({
       step: "图片识别",
@@ -816,6 +974,7 @@ async function regenCtx(): Promise<RegenContext | null> {
     actions: projectState.options.characterPoses !== false,
     verifyCfg: projectState.options.imageSelfCheck ? visionCfg : undefined,
     visionCfg: configIsUsable(visionCfg, "vision") ? visionCfg : undefined,
+    safeRewriteCfg: configIsUsable(llmCfg, "llm") ? llmCfg : undefined,
     imageSeed: projectState.options.imageSeed || undefined,
     styleAnchor: projectState.options.styleAnchor,
     visualBible: projectState.visualBible?.status === "approved" ? projectState.visualBible : undefined,
@@ -825,7 +984,7 @@ async function regenCtx(): Promise<RegenContext | null> {
 async function afterAssetRegen(label: string, resultsLength: number): Promise<void> {
   pushLog({ step: "素材", message: `${label}：已重新生成 ${resultsLength} 项，正在重新组装…`, level: "success", at: Date.now() });
   await execute({ stages: ["assemble"] });
-  await loadAssetMapNow();
+  await loadAssetMapNow(true);
 }
 
 async function regenFigureEmotion(charId: string, emo: string): Promise<void> {
@@ -1012,7 +1171,7 @@ async function regenVoice(key: string): Promise<void> {
   } finally {
     assetBusy.value = "";
     resetRegenState();
-    await loadAssetMapNow();
+    await loadAssetMapNow(true);
   }
 }
 
@@ -1031,7 +1190,7 @@ async function regenCharVoice(charId: string): Promise<void> {
   } finally {
     assetBusy.value = "";
     resetRegenState();
-    await loadAssetMapNow();
+    await loadAssetMapNow(true);
   }
 }
 
@@ -1057,6 +1216,63 @@ async function loadProjectState(): Promise<void> {
   addRecentOutputDir(projectState.outputDir);
   pushLog({ step: "项目", message: `已加载项目状态：${projectState.outputDir}`, level: "success", at: Date.now() });
   await stageStatus.refresh();
+}
+
+/**
+ * 生成期间让素材页有可用的结构（lastResult 缺 chapters/cards 时从磁盘补上）。
+ * 只读磁盘，不覆盖 projectState.options/novel 等运行态，避免影响本次生成参数。
+ * 目的：图片每生成一张（assets.json 增量写入）就能在素材页即时显示，无需等整批生成完。
+ * 只要磁盘上已有 cards.json / 剧本缓存，就始终以磁盘为准刷新结构：
+ * 提取阶段写完 cards.json、剧本阶段每章写完缓存后，素材页行结构即时跟上
+ * （覆盖首次运行、中止后、以及重跑剧本导致结构变化三种场景）。
+ */
+async function ensureLiveResultShape(outputDir: string): Promise<void> {
+  try {
+    if (!projectState.lastResult) {
+      projectState.lastResult = {
+        meta: null as never,
+        cards: { title: "", characters: [], scenes: [], items: [] },
+        cost: { llmTokens: 0, imageCount: 0, ttsChars: 0, llmCostYuan: 0, imageCostYuan: 0, ttsCostYuan: 0 },
+        chapters: [],
+        assets: {},
+        failedTasks: [],
+      };
+    }
+    const cardsFile = `${outputDir}/.novel2vn/cards.json`;
+    if (await tauri.pathExists(cardsFile)) {
+      const { text } = await tauri.readTextFile(cardsFile);
+      const cards = JSON.parse(text) as import("../core/types").ExtractionResult;
+      if (Array.isArray(cards.characters)) projectState.lastResult.cards = cards;
+    }
+    const entries = await tauri.listDir(`${outputDir}/.novel2vn/cache`).catch(() => [] as { name: string; path: string; isDir: boolean }[]);
+    const files = entries
+      .filter((e) => !e.isDir && /^script(_demo)?_ch\d+_/.test(e.name))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    if (files.length) {
+      const chapters: import("../core/types").ChapterScript[] = [];
+      for (const f of files) {
+        try {
+          const { text } = await tauri.readTextFile(f.path);
+          const sc = JSON.parse(text) as import("../core/types").ChapterScript;
+          chapters[sc.chapter] = sc;
+        } catch {
+          /* 跳过损坏缓存 */
+        }
+      }
+      projectState.lastResult.chapters = chapters.filter(Boolean);
+    }
+  } catch {
+    /* 恢复失败不阻断生成 */
+  }
+}
+
+/** 节流版结构同步：进度事件密集（每张图一条）时最多每 2s 同步一次 */
+let lastShapeSyncAt = 0;
+function syncLiveResultShape(): void {
+  const now = Date.now();
+  if (now - lastShapeSyncAt < 2000) return;
+  lastShapeSyncAt = now;
+  if (projectState.outputDir) void ensureLiveResultShape(projectState.outputDir);
 }
 
 async function checkVideos(): Promise<void> {
@@ -1511,6 +1727,7 @@ function fileExistsLabel(file: string | undefined): string {
             <button class="btn ghost small" @click="selectAllInTab">{{ t("全选本区") }}</button>
             <button class="btn ghost small" :disabled="!selectedCount" @click="clearSelected">{{ t("清空") }}</button>
             <button class="btn small" :disabled="!selectedCount || !!assetBusy" @click="regenSelected">{{ t("重新生成已选（") }}{{ selectedCount }}{{ t("）") }}</button>
+            <button class="btn primary small" :disabled="!!assetBusy" @click="regenMissingImages">{{ t("补全缺失图片") }}</button>
           </div>
         </div>
 
@@ -1742,10 +1959,14 @@ function fileExistsLabel(file: string | undefined): string {
           <h3>{{ t("失败任务（") }}{{ failedTasks.length }}{{ t(" 个）") }}</h3>
           <div class="card-actions"><button class="btn small" @click="retryFailed">{{ t("定位重试") }}</button></div>
         </div>
+        <div v-if="failedTaskSummary.length > 1" style="display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px">
+          <span v-for="s in failedTaskSummary" :key="s.label" class="tag" style="background: var(--err-soft); color: var(--text)">{{ s.icon }} {{ s.label }} × {{ s.count }}</span>
+        </div>
         <div style="display: flex; flex-direction: column; gap: 8px">
           <div v-for="(f, i) in failedTasks" :key="i" style="border: 1px solid var(--err-soft); background: var(--err-soft); border-radius: var(--radius-sm); padding: 10px 12px">
             <div style="display: flex; align-items: center; gap: 8px">
               <span class="tag err">{{ f.kind === "image" ? t("图像") : f.kind === "script" ? t("剧本") : f.kind === "llm" ? "LLM" : t("配音") }}</span>
+              <span>{{ ERROR_CLASS_ICON[classifyError({ message: f.message })] }} {{ ERROR_CLASS_LABEL[classifyError({ message: f.message })] }}</span>
               <span style="font-weight: 600; font-size: 13px">{{ f.id }}</span>
               <span style="color: var(--text-faint); font-size: 11px; margin-left: auto">{{ new Date(f.at).toLocaleTimeString() }}</span>
             </div>

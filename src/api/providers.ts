@@ -39,6 +39,13 @@ const KNOWN_IMAGE_CAPABILITIES: Record<string, ImageModelCapabilities> = {
     supportsImageEdit: true,
     referenceEncoding: "raw-base64",
   },
+  // GPT-Image 系列（openai-image 适配器）
+  "gpt-image-2": {
+    maxReferenceImages: 3,
+    supportsSeed: false,
+    supportsImageEdit: true,
+    referenceEncoding: "raw-base64",
+  },
 };
 
 function customImageCapabilities(raw: unknown): ImageModelCapabilities | undefined {
@@ -381,41 +388,4 @@ export function providerIdForConfig(config: ApiConfig): ProviderId {
   if (url.includes("minimaxi") || url.includes("minimax")) return "minimax";
   if (url.includes("localhost:11434") || url.includes("127.0.0.1:11434")) return "ollama";
   return "custom";
-}
-
-export function siliconFlowVoices(model: string): string[] {
-  const prefix = model || "FunAudioLLM/CosyVoice2-0.5B";
-  return ["alex", "anna", "bella", "benjamin", "charles", "claire", "david", "diana"].map(
-    (voice) => `${prefix}:${voice}`,
-  );
-}
-
-export function applyProviderDefaults(
-  channels: Record<ModelCapability, ApiConfig>,
-  providerId: ProviderId,
-  apiKey: string,
-): void {
-  const provider = PROVIDERS.find((item) => item.id === providerId);
-  if (!provider) throw new Error(`未知供应商：${providerId}`);
-  for (const kind of ["llm", "vision", "image", "tts"] as const) {
-    const config = channels[kind];
-    config.extra ??= {};
-    config.extra.provider = providerId;
-    config.extra.protocol = kind === "llm" || kind === "vision"
-      ? "openai-chat"
-      : providerId === "siliconflow"
-        ? kind === "image" ? "siliconflow-image" : "siliconflow-speech"
-        : providerId === "openai"
-          ? kind === "image" ? "openai-image" : "openai-speech"
-          : providerId === "minimax"
-            ? kind === "image" ? "minimax-image" : "minimax-speech"
-            : "custom-json";
-    config.extra.discoveredModels = [];
-    config.apiKey = apiKey;
-    config.baseUrl = provider.supports[kind] ? provider.baseUrl : "";
-    config.model = provider.defaults[kind] ?? "";
-    if (kind === "tts" && providerId === "siliconflow") {
-      config.extra.voiceLibrary = siliconFlowVoices(config.model);
-    }
-  }
 }

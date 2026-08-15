@@ -1,5 +1,5 @@
 import type { ApiConfig } from "../src/core/types";
-import { chatVision, RETRY_DELAYS, testVision, VisionApiError } from "../src/api/openaiCompatible";
+import { chatVision, testVision, VisionApiError } from "../src/api/openaiCompatible";
 import { PROVIDERS, protocolForConfig } from "../src/api/providers";
 import { loadConfigFile, migrateConfigFile } from "../src/stores/configMigration";
 import { createApiPreset, defaultApiConfig } from "../src/stores/config";
@@ -275,8 +275,12 @@ async function main(): Promise<void> {
       "自检不得吞掉文本模型/视觉能力错误",
     );
 
-    const retryDelays = [...RETRY_DELAYS];
-    RETRY_DELAYS.splice(0, RETRY_DELAYS.length, 0, 0);
+    // 重试间隔默认 1s/10s/…，测试里把 setTimeout 立即执行以加速重试耗尽路径
+    const originalSetTimeout = globalThis.setTimeout;
+    globalThis.setTimeout = ((fn: (...args: unknown[]) => void) => {
+      fn();
+      return 0 as unknown as ReturnType<typeof setTimeout>;
+    }) as typeof setTimeout;
     try {
       tauri.http = async () => ({
         status: 503,
@@ -289,7 +293,7 @@ async function main(): Promise<void> {
         "服务端重试耗尽后自检必须返回明确不可用错误",
       );
     } finally {
-      RETRY_DELAYS.splice(0, RETRY_DELAYS.length, ...retryDelays);
+      globalThis.setTimeout = originalSetTimeout;
     }
   } finally {
     tauri.http = originalHttp;

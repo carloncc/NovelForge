@@ -244,7 +244,8 @@ export function resolveTemplate(cfg: { adapter?: string; extra?: Record<string, 
   // 旧配置未选适配器时：按协议自动映射（硅基流动自动启用 seed/负面提示词增强模板）
   const protocol = cfg.extra?.protocol;
   if (protocol === "siliconflow-image") return getTemplate("siliconflow-image");
-  if (protocol === "siliconflow-speech") return getTemplate("siliconflow-speech");
+  // 硅基流动语音走 OpenAI 兼容 TTS（未提供独立预置模板，明确回退而非静默 undefined）
+  if (protocol === "siliconflow-speech") return getTemplate("openai-tts");
   return undefined;
 }
 

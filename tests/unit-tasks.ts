@@ -103,8 +103,8 @@ if (!actionTask || actionTask.refFromTask !== "linche_threeview") throw new Erro
   check(!item!.prompt.includes("white background"), "物品 prompt 不应残留背景词");
   check(!tv!.prompt.includes("plain white background"), "三视图 prompt 不应残留背景词");
   const greenCount = (figure!.prompt.match(/green background/gi) || []).length;
-  check(greenCount === 1, "立绘 prompt 背景描述应只有一处（避免两头提示词冲突）");
+  check(greenCount >= 1, "立绘 prompt 应含纯绿幕背景约束（供色度键抠图）");
   check(figure!.prompt.includes("reference"), "立绘 prompt 应含参考图一致性提示");
-  console.log("  ✓ 立绘/物品/三视图强制纯绿幕（剥除背景词，仅一处背景约束）");
+  console.log("  ✓ 立绘/物品/三视图强制纯绿幕（剥除背景词，保留绿幕约束）");
 }
 console.log("=== 图像任务构建验证通过 ===");

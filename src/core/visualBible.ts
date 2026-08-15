@@ -1,6 +1,7 @@
 import { chatCompletion, chatVision, generateImage, ReferenceImageError } from "../api/openaiCompatible";
 import { setLlmConcurrency } from "../api/openaiCompatible";
 import { tauri } from "../utils/tauri";
+import { errMsg } from "../utils/errors";
 import { extname, normalizePath, safeFilename } from "../utils/path";
 import { buildImageTasks, stripBackground } from "./images";
 import { concurrencyFor } from "../stores/configMigration";
@@ -943,7 +944,7 @@ ${character.imagePrompt || "(none)"}
     if (jsonStart < 0 || jsonEnd < 0) throw new Error("no JSON object");
     data = JSON.parse(cleaned.slice(jsonStart, jsonEnd + 1));
   } catch (e) {
-    throw new Error(`角色描述重新生成失败：返回内容不是合法 JSON（${(e as Error).message}）`);
+    throw new Error(`角色描述重新生成失败：返回内容不是合法 JSON（${errMsg(e)}）`);
   }
 
   const newImagePrompt = stripBackground(data.imagePrompt || "").trim();

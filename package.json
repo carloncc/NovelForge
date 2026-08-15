@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "node scripts/check-template.mjs && vue-tsc --noEmit && vite build",
     "preview": "vite preview",
+    "test": "node scripts/run-tests.mjs",
     "tauri": "tauri",
     "prepare:template": "node scripts/fetch-webgal-template.mjs",
     "check:template": "node scripts/check-template.mjs"

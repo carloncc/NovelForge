@@ -106,6 +106,45 @@ function main(): void {
   assert(!cfg.includes(";之城"), "config 标题含分号");
   assert(!cfg.includes("\n第二章"), "config 标题含换行");
 
+  // 6) CG 查找：assets.cg 的 key 是 `${chapter}_${sceneId}`（非 scene.id），
+  // 以及生成阶段写入的 scene.cgFile 捷径；两者都必须触发 CG 演出（回归测试）
+  const s6 = makeScript({
+    scenes: [{
+      id: "s1",
+      location: "城门前",
+      atmosphere: "",
+      time: "",
+      bgPrompt: "bg",
+      cgEvent: { triggerIndex: 1, title: "名场面", description: "CG 描述", imagePrompt: "cg prompt" },
+      itemEvents: [],
+      lines: [
+        { type: "narration", text: "前奏" },
+        { type: "dialogue", characterId: "linche", text: "高潮！", emotion: "normal" },
+      ],
+      figures: [],
+    }],
+  });
+  const cgAssets: RenderAssets = { ...assets, cg: { "0_s1": "/x/cg_0_s1.png" } };
+  const out6 = renderChapter(s6, { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets: cgAssets, introCard: false }, 1);
+  assert(out6.includes("changeBg:cg_0_s1.png"), "CG 未按 章节_sceneId key 播放");
+  assert(out6.includes("unlockCg:cg_0_s1.png"), "CG 未解锁（unlockCg 缺失）");
+  const s7 = makeScript({
+    scenes: [{
+      id: "s1",
+      location: "城门前",
+      atmosphere: "",
+      time: "",
+      bgPrompt: "bg",
+      cgEvent: { triggerIndex: 1, title: "名场面", description: "CG 描述", imagePrompt: "cg prompt" },
+      cgFile: "/x/cg_scene_shortcut.png",
+      itemEvents: [],
+      lines: [{ type: "narration", text: "前奏" }],
+      figures: [],
+    }],
+  });
+  const out7 = renderChapter(s7, { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets, introCard: false }, 1);
+  assert(out7.includes("changeBg:cg_scene_shortcut.png"), "scene.cgFile 捷径未生效");
+
   console.log("=== 渲染注入边界测试通过 ===");
 }
 main();

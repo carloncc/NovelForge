@@ -139,22 +139,26 @@ export async function scriptChapter(
   const scriptOutputTokens = Math.min(resolveContextLength(cfg), 240_000);
   const model = await chatJson<ScriptModel>(cfg, SYSTEM_PROMPT, user, { maxTokens: scriptOutputTokens, onUsage });
 
+  const resolveSceneId = makeSceneIdResolver(cards, chapter.index);
   const scenes: SceneJSON[] = (model.scenes || []).map((s, i) => {
-    const lines: Line[] = (s.lines || []).map((l) =>
-      l.type === "dialogue"
-        ? {
-            type: "dialogue" as const,
-            characterId: l.characterId || cards.characters[0]?.id || "narrator",
-            emotion: l.emotion || "normal",
-            action: l.action || undefined,
-            text: l.text,
-          }
-        : {
-            type: "narration" as const,
-            text: l.text,
-            monologue: !!l.monologue,
-          },
-    );
+    const lines: Line[] = (s.lines || [])
+      // 过滤空文本行：LLM 可能输出无 text 的 narration/dialogue，会令渲染阶段 esc(undefined) 崩溃
+      .filter((l) => typeof l?.text === "string" && l.text.trim().length > 0)
+      .map((l) =>
+        l.type === "dialogue"
+          ? {
+              type: "dialogue" as const,
+              characterId: l.characterId || cards.characters[0]?.id || "narrator",
+              emotion: l.emotion || "normal",
+              action: l.action || undefined,
+              text: l.text,
+            }
+          : {
+              type: "narration" as const,
+              text: l.text,
+              monologue: !!l.monologue,
+            },
+      );
 
     const itemEvents: ItemEvent[] = (s.itemEvents || []).map((ie, j) => ({
       triggerIndex: Math.min(j * 2 + 1, Math.max(lines.length - 1, 0)),
@@ -191,11 +195,11 @@ export async function scriptChapter(
     const choices: Choice[] = (s.choices || []).slice(0, 3).map((c, k) => ({
       id: c.id || `choice_${s.id || i}_${k}`,
       prompt: (c.prompt || "继续").slice(0, 20),
-      lines: (c.lines || []).slice(0, 6).map(mapLine),
+      lines: (c.lines || []).filter((l) => typeof l?.text === "string" && l.text.trim().length > 0).slice(0, 6).map(mapLine),
     }));
 
     return {
-      id: s.id || `s${i + 1}`,
+      id: resolveSceneId(s, i),
       location: s.location,
       atmosphere: s.atmosphere,
       time: s.time,
@@ -221,6 +225,49 @@ export async function scriptChapter(
     title: chapter.title,
     scenes: scenes.length ? scenes : [fallbackScene(chapter, cards)],
   };
+}
+
+/**
+ * 把剧本里的场景 id 解析为「全局唯一 + 可关联场景卡」的 id：
+ * 1. 优先匹配场景卡：location 完全一致 → 复用场景卡 id（保证背景图按场景卡去重/关联）
+ * 2. 否则用 `ch{章}_` 前缀保证跨章唯一（LLM 常给 s1/s2…，不同章重复会导致 bg 文件互相覆盖）
+ * 3. 同一章内重复（如两个场景都匹配到同一场景卡）自动追加 _2/_3，避免图互相覆盖
+ */
+function makeSceneIdResolver(cards: ExtractionResult, chapterIndex: number) {
+  const used = new Set<string>();
+  return function resolveSceneId(
+    s: ScriptModel["scenes"][number],
+    fallbackIndex: number,
+  ): string {
+    const raw = s?.id?.trim() || "";
+    const location = (s?.location || "").trim();
+    // 1) location 精确匹配场景卡
+    if (location) {
+      const card = cards.scenes.find(
+        (sc) => sc.location === location || sc.id === location || sc.id === raw,
+      );
+      if (card?.id) return unique(card.id);
+    }
+    // 2) location 归一化匹配（去掉"的/的…"等，防 LLM 改写导致失配）
+    if (location) {
+      const norm = (x: string) => x.toLowerCase().replace(/[\s·:：,，。、的]/g, "");
+      const card = cards.scenes.find((sc) => norm(sc.location) === norm(location) || norm(sc.id) === norm(location));
+      if (card?.id) return unique(card.id);
+    }
+    // 3) 兜底：章内唯一 → 跨章唯一（ch{index}_{id}），避免不同章同名场景互相覆盖
+    const base = raw || `s${fallbackIndex + 1}`;
+    return unique(`ch${chapterIndex + 1}_${base}`);
+  };
+  function unique(base: string): string {
+    if (!used.has(base)) {
+      used.add(base);
+      return base;
+    }
+    let n = 2;
+    while (used.has(`${base}_${n}`)) n++;
+    used.add(`${base}_${n}`);
+    return `${base}_${n}`;
+  }
 }
 
 function fallbackScene(chapter: ChapterInfo, cards: ExtractionResult): SceneJSON {

@@ -11,6 +11,8 @@ import type {
 import { saveProjectState, restoreProjectState } from "../utils/persist";
 import { tauri } from "../utils/tauri";
 import { log } from "../utils/logger";
+import { STEP_TO_STAGE } from "../composables/useStageStatus";
+import type { StageKey } from "../core/types";
 
 export interface ProjectState {
   novel: NovelDoc | null;
@@ -108,10 +110,12 @@ export async function restoreProject(outputDir: string): Promise<void> {
   if (r.options) projectState.options = { ...projectState.options, ...r.options };
   if (r.lastResult) {
     const chapters = await loadCachedChapters(outputDir);
+    const failedTasks = await loadFailedTasks(outputDir);
     log.debug("store", "恢复项目完成", {
       hasNovel: !!r.novel,
       materials: r.materials?.length ?? 0,
       cachedChapters: chapters.length,
+      failedTasks: failedTasks.length,
     });
     projectState.lastResult = {
       meta: r.lastResult.meta,
@@ -119,8 +123,24 @@ export async function restoreProject(outputDir: string): Promise<void> {
       cost: r.lastResult.cost,
       chapters,
       assets: {},
-      failedTasks: [],
+      failedTasks,
     };
+  }
+}
+
+// 从 .novel2vn/failed.json 恢复失败任务（中断/崩溃/重启后「失败项」仍可定位重试）
+async function loadFailedTasks(outputDir: string): Promise<import("../core/types").FailedTask[]> {
+  try {
+    const file = `${outputDir}/.novel2vn/failed.json`;
+    if (!(await tauri.pathExists(file))) return [];
+    const { text } = await tauri.readTextFile(file);
+    const parsed = JSON.parse(text) as unknown;
+    if (Array.isArray(parsed)) {
+      return parsed.filter((f) => f && typeof f.id === "string" && typeof f.step === "string");
+    }
+    return [];
+  } catch {
+    return [];
   }
 }
 
@@ -167,12 +187,41 @@ watch(
 
 export function clearLogs(): void {
   projectState.logs = [];
+  for (const k of Object.keys(stageLastLevels) as StageKey[]) stageLastLevels[k] = undefined;
+  lastActiveStage = undefined;
+}
+
+/** 增量维护：每个阶段日志的「最后一条级别」，避免每次 pushLog 全量扫描 2000 条日志 */
+const stageLastLevels = reactive<Record<StageKey, PipelineEvent["level"] | undefined>>({
+  split: undefined,
+  translate: undefined,
+  extract: undefined,
+  script: undefined,
+  image: undefined,
+  voice: undefined,
+  assemble: undefined,
+});
+
+/** 最近一条非 error 日志对应的阶段（当前正在执行/刚完成的阶段） */
+let lastActiveStage: StageKey | undefined;
+
+export function getStageLastLevels(): Record<StageKey, PipelineEvent["level"] | undefined> {
+  return stageLastLevels;
+}
+
+export function getLastActiveStage(): StageKey | undefined {
+  return lastActiveStage;
 }
 
 export function pushLog(ev: PipelineEvent): void {
   projectState.logs.push(ev);
   if (projectState.logs.length > 2000) {
     projectState.logs.splice(0, projectState.logs.length - 2000);
+  }
+  const stage = STEP_TO_STAGE[ev.step];
+  if (stage) {
+    stageLastLevels[stage] = ev.level;
+    if (ev.level !== "error") lastActiveStage = stage;
   }
 }
 

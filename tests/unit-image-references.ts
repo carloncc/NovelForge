@@ -203,7 +203,7 @@ function testCapabilitiesDedupAndLimits(): void {
   assert(contradictory instanceof ReferenceImageError && contradictory.code === "REFERENCE_UNSUPPORTED", "contradictory custom capability settings should be rejected");
 }
 
-async function testMissingReferencesAndNoFallback(): Promise<void> {
+async function testMissingReferencesDegradeToTextOnly(): Promise<void> {
   await tauri.removePath(ROOT).catch(() => {});
   const bible: ProjectVisualBible = {
     version: 1,
@@ -226,13 +226,13 @@ async function testMissingReferencesAndNoFallback(): Promise<void> {
     width: 1024,
     height: 1024,
   };
-  let missing: unknown;
-  try {
-    await resolveImageTaskReferences(task, { outputDir: ROOT, visualBible: bible, figureBase: {} });
-  } catch (error) {
-    missing = error;
-  }
-  assert(missing instanceof ReferenceImageError && missing.code === "REFERENCE_MISSING", "declared missing paths should throw REFERENCE_MISSING");
+  // 生成的参考图与圣经参考图都缺失时：降级为纯文本生图，不再抛 REFERENCE_MISSING，
+  // 避免上游任务失败/中断导致整批任务连环失败（曾出现 20+ 任务全部 REFERENCE_MISSING）。
+  const degraded = await resolveImageTaskReferences(task, { outputDir: ROOT, visualBible: bible, figureBase: {} });
+  assert(
+    Array.isArray(degraded) && degraded.every((reference) => reference.role !== "identity"),
+    "missing generated and bible identities should degrade to text-only generation without throwing",
+  );
 
   const requests: Record<string, unknown>[] = [];
   const originalHttp = tauri.http;
@@ -802,6 +802,10 @@ async function testApprovedBibleFingerprintPreventsOldCacheBypass(): Promise<voi
   };
   let requestCount = 0;
   const originalHttp = tauri.http;
+  const originalSizeMatches = tauri.imageSizeMatches;
+  // 模拟的生成图是 1x1 像素，无法通过 1024x1024 尺寸校验；
+  // 尺寸校验通过与否由 imageSizeMatches 负责，这里模拟为一致，聚焦指纹绑定对缓存生效的控制。
+  tauri.imageSizeMatches = async () => true;
   tauri.http = async () => {
     requestCount++;
     return {
@@ -817,6 +821,7 @@ async function testApprovedBibleFingerprintPreventsOldCacheBypass(): Promise<voi
     await generateImages(qwenConfig(), [], cards, [], cacheRoot, () => {}, 1, false, undefined, undefined, false, false, false, undefined, undefined, true, undefined, bible);
   } finally {
     tauri.http = originalHttp;
+    tauri.imageSizeMatches = originalSizeMatches;
   }
   assert(requestCount === 1, "cache reuse should resume after it is bound to the approved visual-bible fingerprint");
 }
@@ -905,11 +910,48 @@ async function testThreeViewRegenerationExecutesReferenceCascadeInOrder(): Promi
   assert(requests.every((request) => !request.image2), "character images should not include global style reference to avoid subject contamination");
 }
 
+async function testWrongSizeCacheIsRegeneratedInsteadOfSkipped(): Promise<void> {
+  await tauri.removePath(ROOT).catch(() => {});
+  const cacheRoot = `${ROOT}/.novel2vn/cache`;
+  const cachedFile = `${cacheRoot}/images/figure_alice_normal.png`;
+  await tauri.writeFileBase64(cachedFile, Buffer.from("old-wrong-size").toString("base64"));
+  const task: ImageTask = {
+    kind: "figure",
+    id: "alice",
+    characterId: "alice",
+    prompt: "alice",
+    fileName: "figure_alice_normal.png",
+    width: 1024,
+    height: 1024,
+  };
+  let requestCount = 0;
+  const originalHttp = tauri.http;
+  const originalSizeMatches = tauri.imageSizeMatches;
+  tauri.imageSizeMatches = async () => false; // 尺寸不符 → 缓存作废
+  tauri.http = async () => {
+    requestCount++;
+    return {
+      status: 200,
+      bodyBase64: Buffer.from(JSON.stringify({ data: [{ b64_json: PNG_B64 }] })).toString("base64"),
+      contentType: "application/json",
+      headers: {},
+    };
+  };
+  try {
+    const path = await runImageTask(qwenConfig(), task, cacheRoot, () => {}, { force: false, outputDir: ROOT });
+    assert(path !== null && requestCount === 1, "wrong-size cache must be regenerated, never silently skipped");
+  } finally {
+    tauri.http = originalHttp;
+    tauri.imageSizeMatches = originalSizeMatches;
+  }
+}
+
 async function main(): Promise<void> {
   await testQwenUsesThreeOrderedDataUrls();
   await testCustomAdapterReceivesRawBase64();
   testCapabilitiesDedupAndLimits();
-  await testMissingReferencesAndNoFallback();
+  await testMissingReferencesDegradeToTextOnly();
+  await testWrongSizeCacheIsRegeneratedInsteadOfSkipped();
   await testLocalReferenceCapabilityErrorIsTypedAndNotRetried();
   await testSelfCheckSendsEveryReferenceInRoleOrder();
   await testApprovedIdentityIsUsedWhenPoseGenerationIsDisabled();

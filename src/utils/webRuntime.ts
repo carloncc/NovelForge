@@ -9,6 +9,7 @@ import { zipSync } from "fflate";
 import type { FsEntry, HttpResult } from "./tauri";
 import * as vfs from "./vfsWeb";
 import { log, truncate } from "./logger";
+import { errMsg } from "./errors";
 
 export function isWeb(): boolean {
   return typeof window !== "undefined" && typeof indexedDB !== "undefined";
@@ -66,7 +67,7 @@ export async function webHttp(args: {
     const json = (await resp.json()) as { status: number; contentType: string; bodyBase64: string };
     return { status: json.status, contentType: json.contentType, bodyBase64: json.bodyBase64 };
   } catch (e) {
-    log.warn("webRuntime", "同源代理失败，尝试直连", { url: args.url, error: (e as Error).message });
+    log.warn("webRuntime", "同源代理失败，尝试直连", { url: args.url, error: errMsg(e) });
     return directFetch(args);
   }
 }
@@ -283,7 +284,9 @@ export async function webHasTransparency(dataB64: string): Promise<boolean> {
 }
 
 /** 色度键抠图（对齐 Rust 实现）：边缘采样背景色 → 从四边 flood-fill 连通约束 → 边缘羽化。
- *  只移除与边缘相连的背景区域，主体内部与背景相近的孤立像素（如脸部高光）不会被误删。 */
+ *  只移除与边缘相连的背景区域，主体内部与背景相近的孤立像素（如脸部高光）不会被误删。
+ *  绿幕下启用色度加权距离（降 G 权重）+ 暗色前景保护（max(rgb)<60 当前景边界），
+ *  对齐 Rust cutout.rs 行为，避免「绿底把黑色抠成灰色半透明」。 */
 export async function webCutoutImage(dataB64: string, threshold = 40): Promise<string> {
   try {
     const img = await loadImage(dataB64);
@@ -330,14 +333,33 @@ export async function webCutoutImage(dataB64: string, threshold = 40): Promise<s
     const bgG = median(gs);
     const bgB = median(bs);
 
-    const thr = threshold; // 完全透明容差（欧氏距离）
-    const thrEdge = thr + 40; // 羽化区间上界 / 扩散停止边界
+    // 绿幕识别（对齐 Rust is_green_screen）
+    const green =
+      bgG >= 60 &&
+      (bgG - Math.max(bgR, bgB) > 30 ||
+        (bgB > bgR + 15 && bgG >= bgB - 15) ||
+        (bgG > bgR + 10 && bgG > bgB + 10 && bgG >= (bgR + bgB) * 0.55));
+
+    // 绿幕下用更大容差与色度加权距离（降 G 权重）
+    const thr = green ? Math.max(threshold, 80) : threshold;
+    const thrEdge = green ? thr + 90 : thr + 40;
 
     const dist = (i: number) => {
       const dr = px[i] - bgR;
       const dg = px[i + 1] - bgG;
       const db = px[i + 2] - bgB;
+      if (green) {
+        // 色度加权：G 权重 0.25（对齐 Rust）
+        return Math.sqrt(dr * dr + db * db + dg * dg * 0.25);
+      }
       return Math.sqrt(dr * dr + dg * dg + db * db);
+    };
+
+    const DARK_FG_THRESH = 60;
+    const isDarkFg = (i: number) => {
+      if (!green) return false;
+      const r = px[i], g = px[i + 1], b = px[i + 2];
+      return Math.max(r, g, b) < DARK_FG_THRESH;
     };
 
     // 从四条边播种 flood-fill
@@ -353,6 +375,11 @@ export async function webCutoutImage(dataB64: string, threshold = 40): Promise<s
       if (visited[idx]) continue;
       visited[idx] = 1;
       const i = idx * 4;
+      // 暗色前景保护（绿幕下）：不透 + 不扩散
+      if (isDarkFg(i)) {
+        px[i + 3] = 255;
+        continue;
+      }
       const d = dist(i);
       if (d > thrEdge) continue; // 前景边界：不扩散
       if (d <= thr) {

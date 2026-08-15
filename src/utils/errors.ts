@@ -83,18 +83,6 @@ const ERROR_MESSAGES: Record<ErrorCode, string> = {
 };
 
 /**
- * 错误建议映射
- */
-const ERROR_SUGGESTIONS: Partial<Record<ErrorCode, string>> = {
-  [ErrorCode.TEMPLATE_NOT_FOUND]: "请检查 WebGAL 模板是否正确安装。尝试重新下载应用或运行 pnpm prepare:template",
-  [ErrorCode.FILE_NOT_FOUND]: "请确认文件路径正确，文件未被移动或删除",
-  [ErrorCode.PATH_PERMISSION_DENIED]: "请检查文件夹权限，或选择其他可写入的目录",
-  [ErrorCode.API_TIMEOUT]: "请检查网络连接，或稍后重试",
-  [ErrorCode.API_REQUEST_FAILED]: "请检查 API 配置和网络连接",
-  [ErrorCode.ZIP_CREATION_FAILED]: "请确保输出目录有足够的磁盘空间",
-};
-
-/**
  * 创建用户友好的错误对象
  */
 export function createError(
@@ -104,35 +92,6 @@ export function createError(
 ): NovelForgeError {
   const message = customMessage || ERROR_MESSAGES[code];
   return new NovelForgeError(message, code, details);
-}
-
-/**
- * 格式化错误信息供用户查看
- */
-export function formatError(error: Error | NovelForgeError): string {
-  if (error instanceof NovelForgeError) {
-    let message = error.message;
-    
-    // 添加详细信息
-    if (error.details) {
-      const detailStr = Object.entries(error.details)
-        .map(([key, value]) => `${key}: ${value}`)
-        .join(", ");
-      if (detailStr) {
-        message += ` (${detailStr})`;
-      }
-    }
-    
-    // 添加建议
-    const suggestion = ERROR_SUGGESTIONS[error.code as ErrorCode];
-    if (suggestion) {
-      message += `\n💡 建议：${suggestion}`;
-    }
-    
-    return message;
-  }
-  
-  return error.message || "未知错误";
 }
 
 /**
@@ -154,60 +113,4 @@ export async function safeAsync<T>(
       originalError: error instanceof Error ? error.message : String(error),
     });
   }
-}
-
-/**
- * 日志错误（用于调试）
- */
-export function logError(error: Error | NovelForgeError, context?: string): void {
-  const prefix = context ? `[${context}]` : "";
-  console.error(`${prefix} Error:`, error);
-  
-  if (error instanceof NovelForgeError) {
-    console.error(`Error Code: ${error.code}`);
-    if (error.details) {
-      console.error("Details:", error.details);
-    }
-  }
-}
-
-/**
- * 重试机制
- */
-export async function retry<T>(
-  operation: () => Promise<T>,
-  options: {
-    maxAttempts?: number;
-    delayMs?: number;
-    backoff?: boolean;
-    onRetry?: (attempt: number, error: Error) => void;
-  } = {}
-): Promise<T> {
-  const {
-    maxAttempts = 3,
-    delayMs = 1000,
-    backoff = true,
-    onRetry,
-  } = options;
-
-  let lastError: Error;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      return await operation();
-    } catch (error) {
-      lastError = error instanceof Error ? error : new Error(String(error));
-      
-      if (attempt < maxAttempts) {
-        if (onRetry) {
-          onRetry(attempt, lastError);
-        }
-        
-        const delay = backoff ? delayMs * attempt : delayMs;
-        await new Promise(resolve => setTimeout(resolve, delay));
-      }
-    }
-  }
-
-  throw lastError!;
 }

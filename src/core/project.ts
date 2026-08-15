@@ -4,6 +4,8 @@ import { renderChapter, renderConfig, renderStart, sanitizeId } from "./render";
 import { tauri, type FsEntry } from "../utils/tauri";
 import { basename, joinPath, normalizePath } from "../utils/path";
 import { log } from "../utils/logger";
+import { errMsg } from "../utils/errors";
+import { ConcurrencyLimiter } from "../utils/performance";
 
 export interface AssembleInput {
   outputDir: string;
@@ -85,6 +87,18 @@ export async function assembleProject(input: AssembleInput): Promise<{ gameDir: 
     joinPath(normalizedTemplateDir, "game/animation"),
     joinPath(normalizedOutputDir, "game/animation")
   );
+  // WebGAL 引擎启动必需文件：flowchart.json（流程图）与 userStyleSheet.css（用户样式）。
+  // 缺失会导致引擎启动报 404 并影响渲染初始化（图片不显示 / 流程图报错）。
+  for (const f of ["flowchart.json", "userStyleSheet.css"]) {
+    try {
+      await tauri.copyFile(
+        joinPath(normalizedTemplateDir, "game", f),
+        joinPath(normalizedOutputDir, "game", f),
+      );
+    } catch {
+      /* 模板缺失则跳过 */
+    }
+  }
 
   input.log("渲染剧本文件…");
   const chapterCount = input.chapters.length;
@@ -164,10 +178,14 @@ export async function assembleProject(input: AssembleInput): Promise<{ gameDir: 
   return { gameDir: normalizedOutputDir, meta };
 }
 
-/** 内置环境音效（SE）：复制 src/gameExtra/se/*.wav 到 game/vocal/；用户同名文件已存在时跳过（用户素材优先） */
+/**
+ * 内置环境音效（SE）：从 WebGAL 模板 game/vocal/（随应用资源打包，路径可靠）复制到输出 game/vocal/。
+ * 用户同名文件已存在时跳过（用户素材优先）。
+ * 旧实现用 process.cwd()+"/src/gameExtra/se"，打包后 cwd 非源码目录导致 SE 从未复制（playEffect 404）。
+ */
 async function copyBuiltinSe(outputDir: string, input: AssembleInput): Promise<void> {
   try {
-    const seDir = joinPath(process.cwd(), "src/gameExtra/se");
+    const seDir = joinPath(input.templateDir, "game/vocal");
     const entries = await tauri.listDir(seDir).catch(() => [] as FsEntry[]);
     for (const e of entries) {
       if (e.isDir || !e.name.endsWith(".wav")) continue;
@@ -182,7 +200,7 @@ async function copyBuiltinSe(outputDir: string, input: AssembleInput): Promise<v
 
 /** 鉴赏室：生成素材清单数据（appreciation-data.js）+ 复制鉴赏页（立绘换装/表情/缩放、CG 画廊、角色图鉴、BGM 试听） */
 async function writeAppreciation(outputDir: string, input: AssembleInput): Promise<void> {
-  const basename = (p: string) => p.split(/[\\/]/).pop() || p;
+  const basename = (p?: string) => (p || "").split(/[\\/]/).pop() || "";
   const characters = input.cards.characters.map((c) => ({
     id: c.id,
     name: c.name,
@@ -208,7 +226,7 @@ async function writeAppreciation(outputDir: string, input: AssembleInput): Promi
     const tpl = joinPath(process.cwd(), "src/gameExtra/appreciation.html");
     await tauri.copyFile(tpl, joinPath(outputDir, "appreciation.html"));
   } catch (e) {
-    input.log(`鉴赏室资源写入失败（不影响游戏本体）：${(e as Error).message.slice(0, 80)}`);
+    input.log(`鉴赏室资源写入失败（不影响游戏本体）：${errMsg(e).slice(0, 80)}`);
   }
 }
 
@@ -230,28 +248,35 @@ function pickTitleBgm(bgmMap: Record<string, string>): string | undefined {
 
 async function copyAssets(assets: RenderAssets, outputDir: string): Promise<void> {
   const seen = new Set<string>();
+  // 有界并发拷贝：文件彼此独立，串行 IPC 往返在大项目上是组装阶段的最大瓶颈。
+  const limiter = new ConcurrencyLimiter(8);
   const copy = async (path: string | undefined, destDir: string): Promise<void> => {
     if (!path) return;
     const name = basename(path);
     const destKey = destDir + name;
+    // 去重判断在提交任务前同步完成，保证并发下不重复拷贝
     if (seen.has(destKey)) return;
     seen.add(destKey);
-    try {
-      await tauri.copyFile(path, joinPath(destDir, name));
-    } catch {
-      /* skip missing */
-    }
+    await limiter.run(async () => {
+      try {
+        await tauri.copyFile(path, joinPath(destDir, name));
+      } catch {
+        /* skip missing */
+      }
+    });
   };
 
   const bgDir = joinPath(outputDir, "game/background");
   const figureDir = joinPath(outputDir, "game/figure");
   const vocalDir = joinPath(outputDir, "game/vocal");
 
-  for (const p of Object.values(assets.bg)) await copy(p, bgDir);
-  for (const p of Object.values(assets.cg)) await copy(p, bgDir);
-  for (const p of Object.values(assets.figure)) await copy(p, figureDir);
-  for (const p of Object.values(assets.item)) await copy(p, figureDir);
-  for (const p of Object.values(assets.vocal)) await copy(p, vocalDir);
+  const jobs: Array<Promise<void>> = [];
+  for (const p of Object.values(assets.bg)) jobs.push(copy(p, bgDir));
+  for (const p of Object.values(assets.cg)) jobs.push(copy(p, bgDir));
+  for (const p of Object.values(assets.figure)) jobs.push(copy(p, figureDir));
+  for (const p of Object.values(assets.item)) jobs.push(copy(p, figureDir));
+  for (const p of Object.values(assets.vocal)) jobs.push(copy(p, vocalDir));
+  await Promise.all(jobs);
 }
 
 async function copyDirIfExists(src: string, dst: string): Promise<void> {

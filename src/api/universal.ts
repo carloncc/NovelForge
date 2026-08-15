@@ -2,6 +2,7 @@ import type { ApiConfig, ImageReference } from "../core/types";
 import { rawReferenceBase64, ReferenceImageError, referenceDataUrl } from "./providers";
 import { tauri } from "../utils/tauri";
 import { log } from "../utils/logger";
+import { classifyError } from "../utils/errorClassifier";
 
 /* ============ 统一能力模型 ============ */
 
@@ -278,6 +279,11 @@ export function smartErrorText(json: unknown): string | undefined {
   if (obj.base_resp && typeof obj.base_resp === "object") {
     const b = obj.base_resp as Record<string, unknown>;
     if (typeof b.status_message === "string" && b.status_message) return b.status_message;
+    // MiniMax：base_resp.status_msg + status_code（如 2013 prompt 超长）
+    if (typeof b.status_msg === "string" && b.status_msg) {
+      const code = typeof b.status_code === "number" ? `（code ${b.status_code}）` : "";
+      return `${b.status_msg}${code}`;
+    }
   }
   if (obj.output && typeof obj.output === "object") {
     const o = obj.output as Record<string, unknown>;
@@ -329,11 +335,6 @@ async function decodeResult(
 
 /* ============ HTTP 请求（带重试） ============ */
 
-function isRetryable(status: number, text: string): boolean {
-  if (status >= 500 || status === 429) return true;
-  return /timeout|timed out|network|socket|connect|ECONN|ETIMEDOUT|fetch failed|error sending request|请求失败|dns|resolve|refused/i.test(text);
-}
-
 function referenceErrorFromResponse(raw: string): ReferenceImageError | undefined {
   const match = /\b(REFERENCE_UNSUPPORTED|REFERENCE_MISSING)\b/i.exec(raw);
   if (!match) return undefined;
@@ -347,7 +348,7 @@ function referenceErrorFromResponse(raw: string): ReferenceImageError | undefine
   return new ReferenceImageError(message, code);
 }
 
-const RETRY_DELAYS = [800, 2500, 6000];
+const RETRY_DELAYS = [1000, 10000, 20000, 30000, 40000, 50000, 60000];
 
 /** 构造 multipart/form-data 字符串（跨 Tauri/浏览器统一，无需真实 FormData） */
 export function buildMultipartBody(
@@ -437,7 +438,11 @@ async function postJson(
     } catch (e) {
       lastErr = e;
       const err = e as { status?: number; message?: string };
-      if (attempt >= RETRY_DELAYS.length || !isRetryable(err.status ?? 0, err.message ?? "")) {
+      const cls = classifyError(e, err.status);
+      if (cls === "auth" || cls === "invalid_param" || cls === "aborted" || cls === "content_moderation") {
+        throw e;
+      }
+      if (attempt >= RETRY_DELAYS.length) {
         throw e;
       }
       await new Promise((r) => setTimeout(r, RETRY_DELAYS[attempt]));

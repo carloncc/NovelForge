@@ -34,7 +34,7 @@ export function sceneVocalKey(chapter: number, sceneId: string, idx: number): st
 }
 
 function esc(text: string): string {
-  return text
+  return (text || "")
     .replace(/\\/g, "\\\\")
     .replace(/;/g, "\\;")
     .replace(/:/g, "\\:")
@@ -95,10 +95,10 @@ function isDramatic(text: string): boolean {
   return /(轰鸣|爆炸|崩塌|巨响|震耳|怒吼|嘶吼|冲撞|猛然|狠狠|轰然|剧烈|颤抖|踉跄|飞扑|倒下|拔出|挥剑|斩|劈开)/.test(text);
 }
 
-function renderItemEvent(scene: SceneJSON, idx: number, opts: RenderOptions): string[] {
+function renderItemEvent(scene: SceneJSON, idx: number, opts: RenderOptions, itemById?: Map<string, ItemCard>): string[] {
   const ev = scene.itemEvents[idx];
   if (!ev) return [];
-  const item = opts.items.find((i) => i.id === ev.itemId);
+  const item = itemById?.get(ev.itemId) ?? opts.items.find((i) => i.id === ev.itemId);
   const file = opts.assets.item[ev.itemId];
   const name = comment(item?.name || ev.itemId);
   const desc = esc(ev.description || item?.appearance || "道具出现");
@@ -145,11 +145,16 @@ export function renderChapter(
   let lastBgm: string | null = null;
   let lastSe: string | null = null;
   const bgmUnlocked = new Set<string>();
+  // 热循环预索引：避免每行/每道具事件线性扫描（数千行 × 数十角色）
+  const charById = new Map(opts.characters.map((c) => [c.id, c]));
+  const itemById = new Map(opts.items.map((i) => [i.id, i]));
 
   // 单句渲染（主流程与分支选择共用），idx 为台词在场景内的配音键序号
   const renderLine = (line: Line, idx: number, scene: SceneJSON): void => {
+    // 防御：旧缓存剧本可能含空 text 行，直接跳过避免生成空指令/崩溃
+    if (!line || !line.text || !String(line.text).trim()) return;
     if (line.type === "dialogue") {
-      const char = opts.characters.find((c) => c.id === line.characterId);
+      const char = charById.get(line.characterId) ?? opts.characters.find((c) => c.id === line.characterId);
       const figureFile = opts.assets.figure[line.characterId];
       // 立绘优先级：台词指定动作 → 对应动作立绘；否则表情差分立绘；否则默认立绘
       let displayFile = figureFile;
@@ -283,9 +288,18 @@ export function renderChapter(
       }
     }
 
-    const cgFile = opts.assets.cg[scene.id];
+    // CG 映射 key 为 `${chapter.chapter}_${scene.id}`（images.ts 按此记录），
+    // 直接用 scene.id 查不到会导致 CG 演出整段被跳过；scene.cgFile 是生成阶段写入的捷径，两者都兜底。
+    const cgFile = scene.cgFile || opts.assets.cg[`${chapter.chapter}_${scene.id}`] || opts.assets.cg[scene.id];
     const cg = scene.cgEvent;
     if (cg && cgFile) {
+      // CG 整幅插画演出：先清空立绘（避免人物与 CG 同屏叠加），播 CG 后恢复原立绘状态
+      const useActions = opts.figureActions !== false;
+      const clearExit = useActions ? " -exit=exit" : "";
+      out.push(`changeFigure:none -left${clearExit} -next;`);
+      out.push(`changeFigure:none -right${clearExit} -next;`);
+      stageSlot.clear();
+      stageOrder.length = 0;
       out.push(`changeBg:${getBaseName(cgFile)} -next;`);
       // 名场面特写运镜：缓慢推近 CG，强化冲击力
       out.push(`setTransform:{"scale":{"x":1.08,"y":1.08}} -target=bg-main -duration=2500 -next;`);
@@ -302,14 +316,14 @@ export function renderChapter(
     scene.lines.forEach((line, i) => {
       const evIdx = eventIdxByTrigger.get(i);
       if (evIdx !== undefined) {
-        out.push(...renderItemEvent(scene, evIdx, opts));
+        out.push(...renderItemEvent(scene, evIdx, opts, itemById));
       }
       renderLine(line, i, scene);
     });
 
     const lastEvIdx = eventIdxByTrigger.get(scene.lines.length);
     if (lastEvIdx !== undefined) {
-      out.push(...renderItemEvent(scene, lastEvIdx, opts));
+      out.push(...renderItemEvent(scene, lastEvIdx, opts, itemById));
     }
 
     // 分支选择：场景末尾弹出选项，各分支为独立 label 块，结束后跳回合并点继续

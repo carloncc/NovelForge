@@ -207,7 +207,13 @@ async function retryMigrationPersistence(): Promise<void> {
 }
 
 watch(
-  () => JSON.stringify(configState),
+  () =>
+    JSON.stringify({
+      presets: configState.presets,
+      activePresetId: configState.activePresetId,
+      outputDir: configState.outputDir,
+      recentOutputDirs: configState.recentOutputDirs,
+    }),
   () => {
     if (configPersistenceBlocked) return;
     if (persistedConfigContent() === lastPersistedContent) return;

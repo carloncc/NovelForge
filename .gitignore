@@ -5,8 +5,14 @@ src-tauri/gen/
 resources/
 *.log
 output/
-.novel2vn/
+.novel2n/
 .DS_Store
 Thumbs.db
 src-tauri/templates/webgal/
 docs/logo-candidates/
+
+# 测试临时产物（stage-runner / visual-bible-workflow / xiangxing 等跑测产生的中间缓存与输出）
+tests/.tmp-*/
+tests/.tmp-baseline-*.txt
+# 跑测覆盖的 cutout 输出快照（与已跟踪的 cutout_green_bg_input.out.png 重复）
+tests/cutout-fixtures/green_bg_input.out.png

@@ -14,12 +14,15 @@
   VisualBibleCacheBinding,
 } from "./types";
 import type { ApiConfig } from "./types";
-import { generateImage, ReferenceImageError, VisionApiError, setImageConcurrency } from "../api/openaiCompatible";
+import { generateImage, ReferenceImageError, VisionApiError, setImageConcurrency, chatCompletion } from "../api/openaiCompatible";
 import { resolveImageModelCapabilities } from "../api/providers";
 import { verifyImage } from "./selfcheck";
-import { describeReferenceImage } from "./recognize";
+import { describeReferenceImageCached } from "./recognize";
 import { tauri } from "../utils/tauri";
 import { errMsg } from "../utils/errors";
+import { classifyError } from "../utils/errorClassifier";
+import { sanitizePrompt, appendSafeStyleSuffix } from "../utils/promptRewriter";
+import { cutoutErrorHint } from "../utils/cutoutErrorHint";
 import { cacheDirFor, cacheHit } from "./cache";
 import { sanitizeId } from "./render";
 import { log as logger } from "../utils/logger";
@@ -52,16 +55,23 @@ const STYLE_HINT = "consistent art direction, same visual style, no dimension ch
 
 // 统一负面提示词：避免低质量/畸形/水印等破坏画风与观感的元素
 const DEFAULT_NEGATIVE =
-  "lowres, bad anatomy, bad hands, extra fingers, mutated hands, deformed, disfigured, missing fingers, extra digit, watermark, signature, text, logo, jpeg artifacts, blurry, noise, low quality, worst quality";
+  "lowres, bad anatomy, bad hands, extra fingers, mutated hands, deformed, disfigured, missing fingers, extra digit, watermark, signature, text, logo, jpeg artifacts, blurry, noise, low quality, worst quality, black background, dark background, white background, gray background, plain background, solid color background, gradient background, empty background, scenery, landscape";
 
 // 立绘/物品强制纯色背景：生成纯色底，色度键可稳定抠出透明底（统一使用亮绿色 chroma key green）
+// 与视觉圣经绿幕 prompt 保持一致结构：明确"背景区域每个像素都是同一种绿"，并排除黑/白/灰等
+// 会被色度键误判的底色（此前多个项目出现 AI 画纯黑底，导致黑色前景被色度键误抠）。
+//
+// 【发丝/缝隙反阴影加固】AI 对蓬松头发的发丝间隙、衣服褶皱、手指缝隙天然会加"体积阴影/自阴影/环境光遮蔽"
+// 让图更立体，但这会导致抠图后这些缝隙残留偏绿暗块。本段前置追加（靠近主提示词，模型权重更高），
+// 显式禁止：发丝间/手指间/衣缝间也必须是同一纯绿，禁止任何体积阴影、自阴影、边缘暗化。
 const FIGURE_BG_SUFFIX =
-  ", solid chroma key green background (pure #00FF00 green filling the entire background, no gradient, no pattern, no objects, no other people, no text, no shadow, no green elements on the character), full body visible, no legs cut off";
+  ", solid chroma key green #00FF00 background filling 100% of every exposed area including all gaps between hair strands, between fingers, between clothing folds, and around every body contour edge, the background in these gaps is the EXACT same pure #00FF00 green as the rest of the background, absolutely no volumetric shadow, no self-shadow, no depth darkening, no ambient occlusion, no contact shadow anywhere on the background, the character's silhouette must sit on flat uniform green with no darker green outline ring, on a solid chroma key green background, the background is pure #00FF00 green, completely uniform flat color filling 100% of the background area edge-to-edge, every single pixel of the background area is exactly the same green, absolutely no gradient, no pattern, no texture, no lighting variation, no other colors in the background, no white, no black, no gray, no dark, no light, no scenery, no floor, no objects, no shadow under character, no green elements on the character, character stands centered with green background visible on all four sides, full body visible from head to feet, no legs cut off";
 const ITEM_BG_SUFFIX =
-  ", solid chroma key green background (pure #00FF00 green filling the entire background, no gradient, no pattern, no reflection, no text, no shadow)";
-/** 三视图绿幕背景后缀：三视图同样强制纯绿幕，与立绘/动作保持一致（作抠图与图生图参考） */
+  ", on a solid chroma key green background, the background is pure #00FF00 green, completely uniform flat color filling 100% of the background area, every pixel of the background area is exactly the same green, no gradient, no pattern, no texture, no other colors, no white, no black, no gray, no reflection, no shadow, no text";
+/** 三视图绿幕背景后缀：三视图同样强制纯绿幕，与立绘/动作保持一致（作抠图与图生图参考）
+ * 【发丝/缝隙反阴影加固】与 FIGURE_BG_SUFFIX 同源：禁止发丝间/手指间/衣缝间体积阴影。 */
 const THREEVIEW_GREEN_SUFFIX =
-  ", three-view character reference sheet, front view / side view / back view, neutral standing pose, calm expression, full body visible, solid chroma key green background (pure #00FF00 green filling the entire background, no gradient, no pattern, no text, no shadow)";
+  ", three-view character reference sheet, front view / side view / back view, neutral standing pose, calm expression, full body visible, solid chroma key green #00FF00 background filling 100% of every exposed area including all gaps between hair strands, between fingers, between clothing folds, and around every body contour edge, the background in these gaps is the exact same pure #00FF00 green, absolutely no volumetric shadow, no self-shadow, no depth darkening, no ambient occlusion, no contact shadow on the background, on a solid chroma key green background, the background is pure #00FF00 green, completely uniform flat color filling 100% of the background area, every pixel of the background area is exactly the same green, no gradient, no pattern, no texture, no other colors, no white, no black, no gray, no shadow";
 
 // 风格锚点：一张纯场景/无人物的画风基准图，后续所有背景/CG 以它做参考图，强制全项目同一画风
 const ANCHOR_PROMPT =
@@ -127,10 +137,44 @@ export function stripBackground(prompt: string): string {
     .replace(/[,，;；]\s*(?:white|plain|solid|clean|simple|uniform|light|dark|gray|grey|black|colored|color|transparent)\s*(?:colored\s+)?(?:background|backdrop|wall)\b[^,，;；]*/gi, "")
     .replace(/[,，;；]\s*(?:on|against|in front of)\s+(?:a\s+)?(?:plain|solid|clean|white|black|grey|gray|light|dark)\s*(?:colored\s+)?(?:background|backdrop|wall)\b[^,，;；]*/gi, "")
     .replace(/[,，;；]\s*(?:studio|green|green\s+screen)\s*(?:screen\s*)?(?:background|backdrop)\b[^,，;；]*/gi, "")
+    // centered on a light gray background / on a plain background（不带逗号前缀也剥掉，否则与绿幕后缀冲突）
+    .replace(/(?:centered|centred|centering|sitting|standing|placed|set)\s+on\s+(?:a\s+)?(?:plain|solid|clean|simple|empty|uniform|colored|white|black|grey|gray|light|dark|deep|vivid|soft|pale|bright|blue|green|red|pink)\s*(?:[\w-]+\s+){0,3}?(?:background|backdrop|wall)\b[^,，;；]*/gi, "")
+    .replace(/\bon\s+(?:a\s+)?(?:plain|solid|clean|simple|empty|uniform|colored|white|black|grey|gray|light|dark|deep|vivid|soft|pale|bright|blue|green|red|pink)\s*(?:[\w-]+\s+){0,3}?(?:background|backdrop|wall)\b[^,，;；]*/gi, "")
     .replace(/[,，;；]\s*[^,，;；]*?(纯色背景|纯绿背景|纯白背景|纯灰背景|单一背景|平面背景|干净背景|绿幕背景|白色背景|黑色背景|灰色背景|浅色背景|深色背景|素色背景|纯底色)[^,，;；]*/gi, "")
     .replace(/background\s+with[^,，;；]*/gi, "")
+    .replace(/[,，;；]\s*[,，;；]+/g, ",")
     .replace(/[,，;；\s]+$/, "")
     .trim();
+}
+
+const SAFE_REWRITE_SYSTEM = `你是 AI 绘图提示词安全改写器。图像模型因提示词疑似涉及裸露/色情/情色/未成年等内容返回审查拒绝。
+任务：在保持角色身份、服装款式、姿态、画风、构图完全一致的前提下，把提示词改写成可安全通过审查的版本。
+规则：
+1. 只输出改写后的提示词正文，不要任何解释。
+2. 删除/替换可能触发审查的敏感描述（裸露、紧身暴露、性暗示、未成年、撩拨等），改为保守、健康、全年龄的表述。
+3. 保留：发型/瞳色/五官/体型/服装颜色/款式/配饰/姿态/表情/画风关键词/背景约束（含 chroma key green）。
+4. 保持英文（若原文是英文则输出英文）。
+5. 若提示词已安全无需改动，原样返回。`;
+
+/**
+ * 用文本 LLM 把提示词改写成「可安全通过图像审查」的版本（内容审查报错时调用）。
+ * 失败返回 null，由调用方兜底（用规则改写或放弃重试）。
+ */
+async function safeRewritePrompt(cfg: ApiConfig, prompt: string): Promise<string | null> {
+  try {
+    const r = await chatCompletion(
+      cfg,
+      [
+        { role: "system", content: SAFE_REWRITE_SYSTEM },
+        { role: "user", content: `待改写的绘图提示词：\n${prompt}` },
+      ],
+      { maxTokens: 1500, temperature: 0.2 },
+    );
+    const rewritten = (r.content || "").trim();
+    return rewritten || null;
+  } catch {
+    return null;
+  }
 }
 
 export interface BuildImageTaskOptions {
@@ -322,17 +366,7 @@ async function copyMaterial(mat: MaterialAsset, targetPath: string): Promise<voi
   }
 }
 
-/** 生成失败是否可重试：网络/5xx/429/超时/参考图类/服务端临时错误可重试；参数/鉴权/格式类不可重试 */
-function isRetryableImageError(e: unknown): boolean {
-  const message = e instanceof Error ? e.message : String(e);
-  const text = message.toLowerCase();
-  // 明确不可重试：参数错误/提示词限制/鉴权/资源不存在/格式不支持
-  if (/invalid params?|invalid_?request|bad request|400|prompt length|prompt.*(too|must)|does not exist|not found|invalid api key|unauthorized|401|403|permission|not supported|unsupported|not supported|must be|require|missing required|refused by|empty result|结果对象|响应中未找到/.test(text)) {
-    return false;
-  }
-  // 可重试：5xx/429/网络/超时/服务端不可用/参考图类/自检类
-  return /5\d\d|429|timeout|timed ?out|network|socket|connect|ec?onn|etimedout|fetch failed|econnrefused|econnreset|broken pipe|server error|unavailable|overloaded|busy|internal|too many|rate limit|reference|retry|temporary/i.test(text);
-}
+/** 生成失败是否可重试（网络/5xx/429/超时/参考图类/服务端临时错误可重试；参数/鉴权/格式类不可重试） */
 
 export async function ensureCutout(
   path: string,
@@ -345,6 +379,17 @@ export async function ensureCutout(
     const b64 = await tauri.readFileBase64(path);
     if (await tauri.hasTransparency(b64)) return path;
     const res = await tauri.cutoutImage(b64, 40);
+    // 深色背景（黑/墨蓝等）：色度键无法区分黑发/黑衣服/深色物品与深色背景，硬抠会把主体抠成半透明灰。
+    // 保留原图（宁可有背景也不伤主体），提示用户可改用 AI 抠图或重新生成绿幕立绘。
+    if (res.method === "skip-dark") {
+      log({
+        step: "图像",
+        message: `背景为深色，色度键无法安全抠出主体，已保留原图：${task.usage}（可改用 AI 抠图或重新生成绿幕立绘）`,
+        level: "warn",
+        at: Date.now(),
+      });
+      return path;
+    }
     const out = res.dataB64;
     const pngPath = path.replace(/\.(jpg|jpeg)$/i, ".png");
     await tauri.writeFileBase64(pngPath, out);
@@ -355,9 +400,11 @@ export async function ensureCutout(
     log({ step: "图像", message: `无背景立绘（${method}）：${task.usage}`, level: "info", at: Date.now() });
     return pngPath;
   } catch (e) {
+    const msg = errMsg(e);
+    const hint = cutoutErrorHint(msg);
     log({
       step: "图像",
-      message: `抠图失败，保留原图：${task.usage}（${errMsg(e).slice(0, 100)}）`,
+      message: `抠图失败，保留原图：${task.usage}（${msg.slice(0, 220)}${hint ? " " + hint : ""}）`,
       level: "warn",
       at: Date.now(),
     });
@@ -378,6 +425,8 @@ export interface ImageRunOptions {
   verifyCfg?: ApiConfig;
   /** 多模态模型：生成前把参考图描述成文字合入提示词，使图生图更严格还原参考图（可选） */
   visionCfg?: ApiConfig;
+  /** 文本 LLM：内容审查（裸露/色情/未成年等）时用 LLM 把提示词改写成安全版后重试 */
+  safeRewriteCfg?: ApiConfig;
   /** 风格锚点图路径：背景/CG 以其为参考图统一画风（仅当任务无其它参考图时生效） */
   styleAnchorPath?: string;
   /** 负面提示词（走适配器模板 $negativePrompt，模板未映射则忽略） */
@@ -436,31 +485,67 @@ export async function resolveImageTaskReferences(
 
   if (task.refFromTask) {
     const generatedPath = context.figureBase?.[task.refFromTask];
+    let identity: ImageReference | null = null;
     if (generatedPath) {
-      references.unshift(await fileReference(generatedPath, "identity", `Generated identity for ${task.id}`));
-    } else if (bibleCharacter) {
-      const storedPath = bibleCharacter.threeViewPath;
+      try {
+        identity = await fileReference(generatedPath, "identity", `Generated identity for ${task.id}`);
+      } catch (e) {
+        // 参考图文件缺失（上游任务被尺寸校验删除/上轮失败/中断）：不硬失败，降级到圣经图或纯文本生图，
+        // 避免一个依赖失败拖垮整批任务（曾出现 20+ 任务连环 REFERENCE_MISSING）。
+        logger.warn("images", "生成的参考图缺失，尝试降级", {
+          task: task.id,
+          refFromTask: task.refFromTask,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+    }
+    if (!identity && bibleCharacter) {
+      try {
+        identity = await fileReference(
+          visualBibleArtifactPath(context.outputDir, bibleCharacter.threeViewPath),
+          "identity",
+          `Approved identity for ${task.characterId}`,
+        );
+      } catch (e) {
+        logger.warn("images", "圣经参考图也缺失，改用纯文本生图", {
+          task: task.id,
+          characterId: task.characterId,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+    }
+    if (identity) references.unshift(identity);
+    // 无任何可用身份参考图：降级为纯文本生图（角色一致性交给提示词），不再抛 REFERENCE_MISSING
+  } else if (characterDerivative && bibleCharacter) {
+    try {
       references.unshift(await fileReference(
-        visualBibleArtifactPath(context.outputDir, storedPath),
+        visualBibleArtifactPath(context.outputDir, bibleCharacter.threeViewPath),
         "identity",
         `Approved identity for ${task.characterId}`,
       ));
-    } else {
-      throw new ReferenceImageError(`Required generated reference ${task.refFromTask} is unavailable for ${task.id}`, "REFERENCE_MISSING");
+    } catch (e) {
+      // 圣经图缺失：降级纯文本生图，不阻断整批
+      logger.warn("images", "圣经参考图缺失，该任务降级为纯文本生图", {
+        task: task.id,
+        characterId: task.characterId,
+        error: e instanceof Error ? e.message : String(e),
+      });
     }
-  } else if (characterDerivative && bibleCharacter) {
-    references.unshift(await fileReference(
-      visualBibleArtifactPath(context.outputDir, bibleCharacter.threeViewPath),
-      "identity",
-      `Approved identity for ${task.characterId}`,
-    ));
   } else if (task.kind === "threeview" && bibleCharacter && !references.some((reference) => reference.role === "identity")) {
     const storedPath = bibleCharacter.sourceReferencePath ?? bibleCharacter.threeViewPath;
-    references.unshift(await fileReference(
-      visualBibleArtifactPath(context.outputDir, storedPath),
-      "identity",
-      `Character source for ${task.characterId}`,
-    ));
+    try {
+      references.unshift(await fileReference(
+        visualBibleArtifactPath(context.outputDir, storedPath),
+        "identity",
+        `Character source for ${task.characterId}`,
+      ));
+    } catch (e) {
+      logger.warn("images", "三视图源参考图缺失，该任务降级为纯文本生图", {
+        task: task.id,
+        characterId: task.characterId,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
   }
 
   if (bible) {
@@ -468,17 +553,75 @@ export async function resolveImageTaskReferences(
     // style_reference 参数的"人物特征污染"会导致角色偏离自身描述（如"男身体女头"）。
     const isCharacterImage = task.kind === "threeview" || task.kind === "figure" || task.kind === "action";
     if (!isCharacterImage) {
-      references.push(await fileReference(
-        visualBibleArtifactPath(context.outputDir, bible.styleReferencePath),
-        "style",
-        "Approved global style reference",
-        false,
-      ));
+      try {
+        references.push(await fileReference(
+          visualBibleArtifactPath(context.outputDir, bible.styleReferencePath),
+          "style",
+          "Approved global style reference",
+          false,
+        ));
+      } catch (e) {
+        // 风格参考图缺失：仅降级为文字风格约束（styleDescription 已合入提示词），不阻断
+        logger.warn("images", "全局风格参考图缺失，该任务仅用文字风格约束", {
+          task: task.id,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
     }
   } else if ((task.kind === "background" || task.kind === "cg") && context.styleAnchorPath) {
-    references.push(await fileReference(context.styleAnchorPath, "style", "Legacy style anchor", false));
+    try {
+      references.push(await fileReference(context.styleAnchorPath, "style", "Legacy style anchor", false));
+    } catch (e) {
+      logger.warn("images", "风格锚点图缺失，该任务仅用文字风格约束", {
+        task: task.id,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
   }
   return references;
+}
+
+/** 单个图像任务的已知提示词字符上限：配置里显式设置优先；否则按适配器取常见服务限制。返回 0 = 不主动截断 */
+export function imagePromptLimitFor(cfg: ApiConfig): number {
+  const n = cfg.extra?.imagePromptCharLimit;
+  if (typeof n === "number" && Number.isFinite(n) && n > 0) return Math.floor(n);
+  if (cfg.adapter === "minimax-image") return 1500;
+  return 0;
+}
+
+/** 从服务端报错里解析提示词长度上限（如「prompt length must be less than 1500」），解析不到返回 0 */
+export function promptLimitFromError(message: string): number {
+  const m =
+    /prompt length must be less than (\d+)/i.exec(message)
+    ?? /提示词.{0,24}(?:超过|不能大于|需小于|必须少于|≤|小于)\s*(\d{3,})/.exec(message);
+  if (!m) return 0;
+  const n = parseInt(m[1], 10);
+  return Number.isFinite(n) && n >= 200 ? n : 0;
+}
+
+/**
+ * 把超长绘图提示词压缩到 maxChars 以内：
+ * 1. 绿幕/三视图等「背景约束后缀」整段优先保留（抠图质量依赖，头部给它让预算）；
+ * 2. 头部（主体描述）按逗号短语边界截断，去掉中间的风格长句；
+ * 3. 极端受限（后缀都放不下）时只保留后缀尾部。
+ */
+export function fitImagePrompt(prompt: string, maxChars: number): string {
+  if (prompt.length <= maxChars) return prompt;
+  const greenIdx = prompt.search(/, solid chroma key green|, on a solid chroma key green|, three-view character reference sheet/i);
+  let tail = "";
+  let headLimit = maxChars;
+  if (greenIdx >= 0) {
+    tail = prompt.slice(greenIdx);
+    headLimit = maxChars - tail.length;
+  }
+  if (headLimit <= 160) {
+    return tail ? tail.slice(-maxChars) : prompt.slice(0, maxChars);
+  }
+  let head = (greenIdx >= 0 ? prompt.slice(0, greenIdx) : prompt).slice(0, headLimit);
+  const lastComma = head.lastIndexOf(", ");
+  if (lastComma > headLimit * 0.5) head = head.slice(0, lastComma);
+  head = head.replace(/[,;，；\s]+$/, "");
+  return tail ? `${head}${tail}` : head;
 }
 
 /** 执行单个图像任务（管线批处理与单素材重生成共用） */
@@ -496,25 +639,42 @@ export async function runImageTask(
   let resolvedReferences: ImageReference[] = [];
   let materialReference: ImageReference | undefined;
 
+  // 视觉圣经三视图复用：角色三视图已在视觉圣经确认过（approved）→ 直接复用其图，不重复生成。
+  // 视觉圣经流程已生成并确认 threeview_<id>.png，此处作为最终素材直接引用，避免每轮重生成。
+  // 仅「非强制重生成」时复用；force=true（用户主动重生成三视图）时仍走正常生成级联。
+  if (task.kind === "threeview" && task.characterId && !opts.force) {
+    const approvedBible = opts.visualBible?.status === "approved" ? opts.visualBible : undefined;
+    const charBible = approvedBible?.characters?.[task.characterId];
+    if (charBible?.threeViewPath && opts.outputDir) {
+      const biblePath = `${opts.outputDir.replace(/[\\/]$/, "").replace(/\\/g, "/")}/.novel2vn/visual-bible/${charBible.threeViewPath}`;
+      if (await tauri.pathExists(biblePath).catch(() => false)) {
+        return biblePath;
+      }
+    }
+  }
+
   const cached = opts.force ? null : await cacheHit(cacheDir, task.fileName);
   if (cached) {
-    // 尺寸校验：缓存图尺寸与任务要求不一致（如旧竖屏背景）→ 视为缓存失效重新生成
+    // 尺寸校验：缓存图尺寸与要求不一致（如旧竖屏背景）→ 视为缓存失效重新生成
     if (task.width > 0 && task.height > 0) {
       const sizeOk = await tauri.imageSizeMatches(cached, task.width, task.height).catch(() => true);
-      if (!sizeOk) {
-        logger.info("images", "缓存图尺寸与要求不符，重新生成", { id: task.id, fileName: task.fileName, want: `${task.width}x${task.height}` });
-        await tauri.removePath(cached).catch(() => {});
-      } else {
+      if (sizeOk) {
         path = cached;
         source = "缓存";
         logger.debug("images", "图像命中缓存", { id: task.id, fileName: task.fileName });
+      } else {
+        logger.info("images", "缓存图尺寸与要求不符，重新生成", { id: task.id, fileName: task.fileName, want: `${task.width}x${task.height}` });
+        await tauri.removePath(cached).catch(() => {});
+        // 删除后继续走下方生成分支（path 仍为 null）
       }
     } else {
       path = cached;
       source = "缓存";
       logger.debug("images", "图像命中缓存", { id: task.id, fileName: task.fileName });
     }
-  } else {
+  }
+  // 缓存未命中/缓存已作废 → 用户素材或 AI 生成
+  if (!path) {
     const mat = findMaterial(opts.materials ?? [], task);
     if (mat) {
       const useAsItemReference = !!cfg && task.kind === "item" && opts.visualBible?.status === "approved";
@@ -563,23 +723,18 @@ export async function runImageTask(
       }
       // 参考图增强：有参考图且配置了多模态模型时，先把参考图描述成文字合入提示词。
       // 只提取风格要素（色盘/线条/光影/笔触），不提取人物特征，避免风格参考图污染角色一致性。
-      // MiniMax image-01 限制 prompt < 1500 字符；最终截断到安全上限。
       let finalPrompt = task.prompt;
-      const MAX_PROMPT_CHARS = 1400;
       if (opts.visionCfg?.apiKey && resolvedReferences.length && finalPrompt) {
         const referenceBlocks: string[] = [];
         for (const reference of resolvedReferences) {
           if (!reference.dataB64) continue;
-          const remainingBudget = MAX_PROMPT_CHARS - 300 - referenceBlocks.join(" ").length;
-          if (remainingBudget < 100) break;
           try {
-            let description = await describeReferenceImage(opts.visionCfg, reference.dataB64);
+            let description = await describeReferenceImageCached(opts.visionCfg, reference.dataB64);
             if (description) {
               // 对 style 参考图额外过滤人物相关词，只保留纯风格关键字
               if (reference.role === "style") {
                 description = filterStyleOnlyFromDescription(description);
               }
-              if (description.length > remainingBudget) description = description.slice(0, remainingBudget);
               const roleLabel = reference.role === "style" ? "全局风格参考图" : reference.role === "identity" ? "人物身份参考图" : "参考图";
               referenceBlocks.push(`[${roleLabel}] ${description}`);
               log({
@@ -590,10 +745,16 @@ export async function runImageTask(
               });
             }
           } catch (e) {
+            // 视觉描述是可选增强：失败（尤其 429 限流）静默降级为按原提示词生成，
+            // 避免每个任务反复刷 warn 且浪费视觉通道配额。
+            const status = typeof (e as { status?: number }).status === "number" ? (e as { status?: number }).status : undefined;
+            const isRateLimited = status === 429;
             log({
               step: "图像",
-              message: `参考图描述失败，按原提示词生成：${task.usage}（${errMsg(e).slice(0, 100)}）`,
-              level: "warn",
+              message: isRateLimited
+                ? `参考图描述被限流，按原提示词生成：${task.usage}`
+                : `参考图描述失败，按原提示词生成：${task.usage}（${errMsg(e).slice(0, 100)}）`,
+              level: isRateLimited ? "info" : "warn",
               at: Date.now(),
             });
           }
@@ -603,19 +764,28 @@ export async function runImageTask(
           finalPrompt = `${finalPrompt}, ${referenceBlocks.join(", ")}`;
         }
       }
-      // 兜底截断：所有路径都确保不超过 MiniMax 1500 字符限制
-      if (finalPrompt.length > MAX_PROMPT_CHARS) {
-        log({ step: "图像", message: `提示词超长（${finalPrompt.length}→${MAX_PROMPT_CHARS}），已截断：${task.usage}`, level: "warn", at: Date.now() });
-        finalPrompt = finalPrompt.slice(0, MAX_PROMPT_CHARS);
+      // 部分图像服务对提示词长度有硬限制（如 MiniMax image-01：prompt ≤1500 字符）。
+      // 按已知上限主动压缩（绿幕/背景约束后缀优先保留），避免每个任务先白失败一次。
+      const promptLimit = imagePromptLimitFor(cfg);
+      if (promptLimit > 0 && finalPrompt.length > promptLimit) {
+        logger.info("images", "提示词超长，已按服务端上限压缩", {
+          id: task.id,
+          from: finalPrompt.length,
+          to: promptLimit,
+        });
+        finalPrompt = fitImagePrompt(finalPrompt, promptLimit);
       }
-      // 生成失败自动重试（网络/5xx/超时等临时错误；参数类错误不重试避免浪费）
+      // 生成失败自动重试：分类驱动 + 内容审查自动改写提示词 + 递增间隔（1s→10s→20s→…→60s 封顶）
       const retryCount = Math.max(0, opts.retryCount ?? 3) - 1;
-      const baseDelay = opts.retryDelayMs ?? 3000;
       let img: { dataB64: string; mime: string };
-      let lastErr: unknown;
+      let prompt = finalPrompt;
+      // 内容审查改写阶梯：0=原提示词 → 1=规则改写 → 2=LLM 语义改写 → 3=追加全年龄安全后缀
+      let moderationStage = 0;
+      // 提示词超长压缩：服务端报错携带上限时按上限压缩重试 1 次（覆盖未预设上限的服务）
+      let promptFitted = false;
       for (let attempt = 0; ; attempt++) {
         try {
-          img = await generateImage(cfg, finalPrompt, {
+          img = await generateImage(cfg, prompt, {
             references: resolvedReferences,
             size: `${task.width}x${task.height}`,
             seed: task.seed,
@@ -623,22 +793,97 @@ export async function runImageTask(
           });
           break;
         } catch (e) {
-          lastErr = e;
-          const retryable = isRetryableImageError(e);
-          if (!retryable || attempt >= retryCount) {
+          const status = typeof (e as { status?: number }).status === "number" ? (e as { status?: number }).status : undefined;
+          const rawMessage = e instanceof Error ? e.message : String(e);
+
+          // 提示词超长（如「prompt length must be less than 1500」）：按服务端上限压缩重试 1 次
+          const limit = promptLimitFromError(rawMessage);
+          if (limit > 0 && !promptFitted) {
+            prompt = fitImagePrompt(prompt, limit);
+            promptFitted = true;
             log({
               step: "图像",
-              message: `生成失败（${retryable ? "已重试耗尽" : "不可重试"}）：${task.usage}（${errMsg(e).slice(0, 120)}）`,
+              message: `提示词超长（服务端上限 ${limit} 字符），已压缩重试：${task.usage}`,
+              level: "warn",
+              at: Date.now(),
+            });
+            continue;
+          }
+
+          const cls = classifyError(e, status);
+
+          // 内容审查：阶梯式改写提示词重试，最大化过审概率（严格模型连「战斗」「剑」都拒）
+          if (cls === "content_moderation" && moderationStage < 3) {
+            moderationStage++;
+            if (moderationStage === 1) {
+              // 第 1 阶：规则改写（快、零成本）；规则没命中时若配了文本 LLM 则顺带完成第 2 阶改写
+              const { prompt: safe, replaced } = sanitizePrompt(finalPrompt);
+              prompt = safe;
+              if (replaced === 0 || safe === finalPrompt) {
+                if (opts.safeRewriteCfg?.apiKey) {
+                  const llmSafe = await safeRewritePrompt(opts.safeRewriteCfg, finalPrompt);
+                  if (llmSafe) {
+                    prompt = llmSafe;
+                    moderationStage = 2;
+                  } else {
+                    prompt = appendSafeStyleSuffix(safe);
+                  }
+                } else {
+                  prompt = appendSafeStyleSuffix(safe);
+                }
+              }
+            } else if (moderationStage === 2) {
+              // 第 2 阶：LLM 语义改写（对暴力/裸露词更可靠）
+              const llmSafe = opts.safeRewriteCfg?.apiKey ? await safeRewritePrompt(opts.safeRewriteCfg, prompt) : null;
+              if (llmSafe) {
+                prompt = llmSafe;
+              } else {
+                prompt = appendSafeStyleSuffix(prompt);
+                moderationStage = 3;
+              }
+            } else {
+              // 第 3 阶：追加全年龄安全后缀
+              prompt = appendSafeStyleSuffix(prompt);
+            }
+            log({
+              step: "图像",
+              message: `检测到内容审查，已改写提示词重试（第 ${moderationStage} 阶）：${task.usage}`,
+              level: "warn",
+              at: Date.now(),
+            });
+            continue;
+          }
+
+          // 内容审查改写全部用尽后仍失败 → 抛出（不再白烧钱）
+          if (cls === "content_moderation") {
+            log({
+              step: "图像",
+              message: `生成失败（内容审查，改写后仍失败）：${task.usage}（${errMsg(e).slice(0, 120)}）`,
               level: "error",
               at: Date.now(),
             });
             throw e;
           }
-          const isRateLimit = /429|too many|rate limit/i.test(errMsg(e));
-          // 429/速率限制退避更长（5s→10s→20s），避免连续打爆 API
-          const delay = isRateLimit
-            ? 5000 * 2 ** attempt
-            : baseDelay * 2 ** attempt;
+          if (cls === "auth" || cls === "invalid_param" || cls === "aborted") {
+            log({
+              step: "图像",
+              message: `生成失败（${cls}）：${task.usage}（${errMsg(e).slice(0, 120)}）`,
+              level: "error",
+              at: Date.now(),
+            });
+            throw e;
+          }
+          if (attempt >= retryCount) {
+            log({
+              step: "图像",
+              message: `生成失败（已重试耗尽）：${task.usage}（${errMsg(e).slice(0, 120)}）`,
+              level: "error",
+              at: Date.now(),
+            });
+            throw e;
+          }
+          // 网络/限流/未知 → 递增退避重试（首次 1s、二次 10s、之后每次 +10s，封顶 60s）
+          const delay = attempt === 0 ? 1000 : Math.min(60_000, attempt * 10_000);
           log({
             step: "图像",
             message: `生成失败，${delay / 1000}s 后重试（${attempt + 1}/${retryCount}）：${task.usage}（${errMsg(e).slice(0, 100)}）`,
@@ -719,6 +964,7 @@ export async function generateImages(
   isAborted?: () => boolean,
   visualBible?: ProjectVisualBible,
   visionCfg?: ApiConfig,
+  safeRewriteCfg?: ApiConfig,
 ): Promise<{ images: ImageResultMap; failed: FailedTask[] }> {
   const result: ImageResultMap = { bg: {}, cg: {}, figure: {}, item: {} };
   const failed: FailedTask[] = [];
@@ -798,7 +1044,16 @@ export async function generateImages(
   const emotionPass = tasks.filter((t) => t.kind === "figure" && t.emotion && t.emotion !== "normal");
   const actionPass = tasks.filter((t) => t.kind === "action");
 
+  // 任务 key 覆盖计数：同一 id 多次产出（scene.id 重复等）会互相覆盖 → 记录差异让用户可察觉
+  let overwriteCount = 0;
   const record = (task: ImageTask, path: string) => {
+    const map =
+      task.kind === "background" ? result.bg
+      : task.kind === "cg" ? result.cg
+      : task.kind === "figure" || task.kind === "threeview" || task.kind === "action" ? result.figure
+      : task.kind === "item" ? result.item
+      : null;
+    if (map && map[task.id] !== undefined && map[task.id] !== path) overwriteCount++;
     switch (task.kind) {
       case "background": result.bg[task.id] = path; break;
       case "cg": result.cg[task.id] = path; break;
@@ -811,38 +1066,74 @@ export async function generateImages(
   };
 
   // 每生成一张立即增量写入 assets.json：即使中途失败/中止，已生成的图也已落盘，
-  // 下次只需重跑缺失项，不必整体重新生成。
+  // 下次只需重跑缺失项，不必整体重新生成。写盘做 800ms 节流合并，
+  // 避免 N 张图 = N 次全量 read-parse-write（大项目写放大）。
   let assetsPersistInFlight: Promise<void> | null = null;
-  const persistIncremental = (): void => {
-    const write = async (): Promise<void> => {
-      const assetsFile = `${projectOutputDir}/.novel2vn/assets.json`;
-      let existing: AssetMap | null = null;
-      try {
-        const { text } = await tauri.readTextFile(assetsFile);
-        existing = JSON.parse(text) as AssetMap;
-      } catch {
-        existing = null;
-      }
-      const next: AssetMap = {
-        bg: { ...(existing?.bg ?? {}), ...result.bg },
-        cg: { ...(existing?.cg ?? {}), ...result.cg },
-        figure: { ...(existing?.figure ?? {}), ...result.figure },
-        item: { ...(existing?.item ?? {}), ...result.item },
-        vocal: existing?.vocal ?? {},
-      };
-      try {
-        await tauri.writeTextFile(assetsFile, JSON.stringify(next, null, 2));
-      } catch {
-        /* 增量落盘失败不阻断生成 */
-      }
-    };
-    if (assetsPersistInFlight) {
-      assetsPersistInFlight = assetsPersistInFlight.then(write, write);
-    } else {
-      assetsPersistInFlight = write().finally(() => {
-        assetsPersistInFlight = null;
-      });
+  let assetsFlushTimer: ReturnType<typeof setTimeout> | undefined;
+  /** 等待「包含当前记录的落盘」完成的回调队列：persistIncremental 返回的 Promise 在此 resolve */
+  let assetsFlushWaiters: Array<() => void> = [];
+  const write = async (): Promise<void> => {
+    const assetsFile = `${projectOutputDir}/.novel2vn/assets.json`;
+    let existing: AssetMap | null = null;
+    try {
+      const { text } = await tauri.readTextFile(assetsFile);
+      existing = JSON.parse(text) as AssetMap;
+    } catch {
+      existing = null;
     }
+    const next: AssetMap = {
+      bg: { ...(existing?.bg ?? {}), ...result.bg },
+      cg: { ...(existing?.cg ?? {}), ...result.cg },
+      figure: { ...(existing?.figure ?? {}), ...result.figure },
+      item: { ...(existing?.item ?? {}), ...result.item },
+      vocal: existing?.vocal ?? {},
+    };
+    try {
+      await tauri.writeTextFile(assetsFile, JSON.stringify(next, null, 2));
+    } catch {
+      /* 增量落盘失败不阻断生成 */
+    }
+  };
+  const resolveFlushWaiters = (): void => {
+    const waiters = assetsFlushWaiters;
+    assetsFlushWaiters = [];
+    for (const w of waiters) w();
+  };
+  /**
+   * 把 result 增量合并进 assets.json（800ms 合并窗口）。
+   * 返回 Promise：在「包含本次记录的落盘」完成后 resolve，调用方可 await 后再发进度事件，
+   * 保证前端 progress 回调读到的 assets.json 一定已包含刚完成的图。
+   */
+  const persistIncremental = (): Promise<void> => {
+    const whenWritten = new Promise<void>((resolve) => assetsFlushWaiters.push(resolve));
+    if (assetsFlushTimer === undefined) {
+      assetsFlushTimer = setTimeout(() => {
+        assetsFlushTimer = undefined;
+        assetsPersistInFlight = (assetsPersistInFlight ?? Promise.resolve())
+          .then(write)
+          .then(() => {
+            assetsPersistInFlight = null;
+            resolveFlushWaiters();
+          });
+      }, 800);
+    }
+    return whenWritten;
+  };
+  /** 立即把挂起的增量写 flush 落盘（generateImages 返回/中止前调用，避免尾部记录丢失）；
+   * 同时统一 resolve 所有等待者，避免挂起的 await persistIncremental() 永久等待。 */
+  const flushAssets = async (): Promise<void> => {
+    if (assetsFlushTimer !== undefined) {
+      globalThis.clearTimeout(assetsFlushTimer);
+      assetsFlushTimer = undefined;
+    }
+    // 链上一个写完成后再补一次最终写，确保挂起期间的 result 快照落盘
+    assetsPersistInFlight = (assetsPersistInFlight ?? Promise.resolve())
+      .then(write)
+      .then(() => {
+        assetsPersistInFlight = null;
+        resolveFlushWaiters();
+      });
+    await assetsPersistInFlight;
   };
 
   const runPass = async (pass: ImageTask[], anchorPath?: string) => {
@@ -860,14 +1151,18 @@ export async function generateImages(
             outputDir: projectOutputDir,
             verifyCfg,
             visionCfg,
+            safeRewriteCfg,
             styleAnchorPath: anchorPath,
             negativePrompt: DEFAULT_NEGATIVE,
           });
-          emitProgress(task);
           if (p) {
             record(task, p);
-            persistIncremental();
+            // 先落盘 assets.json 再发进度事件：前端 progress 回调立即读 assets.json 时，
+            // 新图映射已写入 → 素材页真正「生成一张显示一个」。
+            // （旧顺序先 emitProgress 后 persistIncremental，前端读到旧数据导致中途不刷新）
+            await persistIncremental();
           }
+          emitProgress(task);
         } catch (e) {
           if (e instanceof VisionApiError) throw e;
           emitProgress(task, "（失败）");
@@ -881,7 +1176,7 @@ export async function generateImages(
           });
           log({
             step: "图像",
-            message: `失败（已跳过，可在「失败项」重试）：${task.usage}（${(e as Error).message.slice(0, 100)}）`,
+            message: `失败（已跳过，可在「失败项」重试）：${task.usage}（${errMsg(e).slice(0, 100)}）`,
             level: "error",
             at: Date.now(),
             taskId: task.id,
@@ -928,15 +1223,37 @@ export async function generateImages(
     }
   }
 
+  // 任务数 vs 实际产物数差异：scene.id 重复等会导致任务产出互相覆盖（92 个背景任务挤进 6 张），
+  // 此处显式告警，避免「生成了但图不够」被静默吞掉。
+  const produced = Object.keys(result.bg).length + Object.keys(result.cg).length + Object.keys(result.figure).length + Object.keys(result.item).length;
+  const recordableTasks = tasks.filter((t) => t.kind !== "anchor").length;
+  const missing = recordableTasks - produced - failed.length;
+  if (missing > 0 || overwriteCount > 0) {
+    log({
+      step: "图像",
+      message: `图像阶段完成：任务 ${recordableTasks} 个，产出 ${produced} 张，失败 ${failed.length} 个${missing > 0 ? `，${missing} 个任务产出缺失（多因场景 id 重复互相覆盖）` : ""}${overwriteCount > 0 ? `，${overwriteCount} 个任务 key 被覆盖` : ""}`,
+      level: "warn",
+      at: Date.now(),
+    });
+  }
   logger.info("images", "图像素材生成完成", {
     bg: Object.keys(result.bg).length,
     cg: Object.keys(result.cg).length,
     figure: Object.keys(result.figure).length,
     item: Object.keys(result.item).length,
     failed: failed.length,
+    overwriteCount,
+    recordableTasks,
+    produced,
   });
 
-  if (approvedBible && cfg && failed.length === 0 && !isAborted?.()) {
+  // 无条件写缓存绑定标记（即使本次有部分任务失败，甚至用户中止）：
+  // 成功生成的图已落盘 → 下次 cacheHit 命中；缺失/失败的重新生成（补缺），不会全量重跑。
+  // 修复：旧逻辑要求 failed.length===0 且未中止才写，导致任一失败或中止后整批图永远无法缓存复用，
+  // 每次重跑项目都全量重新生成（用户报告「中断后必须全部重新生成」）。
+  // 写 marker 前先 flush 增量 assets.json，保证已生成图的映射完整落盘。
+  await flushAssets();
+  if (approvedBible && cfg) {
     await tauri.writeTextFile(visualBibleCacheMarker, JSON.stringify(approvedCacheBinding));
   }
 
@@ -1045,7 +1362,9 @@ export async function reCutoutAsset(
     }
     return newPath;
   } catch (e) {
-    log({ step: "图像", message: `重新抠图失败：${assetKey}（${errMsg(e).slice(0, 120)}）`, level: "error", at: Date.now() });
+    const msg = errMsg(e);
+    const hint = cutoutErrorHint(msg);
+    log({ step: "图像", message: `重新抠图失败：${assetKey}（${msg.slice(0, 220)}${hint ? " " + hint : ""}）`, level: "error", at: Date.now() });
     return null;
   }
 }

@@ -89,7 +89,21 @@ async function applySettings(): Promise<void> {
     return;
   }
   try {
-    await tauri.writeTextFile(`${dir}/game/config.txt`, renderConfig(title, key, settings.value.language));
+    // 保留已有标题图/标题曲：只改标题/GameKey/语言，避免「应用设置」后标题画面丢图丢音乐
+    let titleImg: string | undefined;
+    let titleBgm: string | undefined;
+    try {
+      const existing = await tauri.readTextFile(`${dir}/game/config.txt`);
+      for (const line of existing.text.split(/\r?\n/)) {
+        const img = /^\s*Title_img:(.*);\s*$/.exec(line);
+        const bgm = /^\s*Title_bgm:(.*);\s*$/.exec(line);
+        if (img) titleImg = img[1].trim() || undefined;
+        if (bgm) titleBgm = bgm[1].trim() || undefined;
+      }
+    } catch {
+      /* 无旧配置（未组装过） */
+    }
+    await tauri.writeTextFile(`${dir}/game/config.txt`, renderConfig(title, key, settings.value.language, titleImg, titleBgm));
     setMsg(t("游戏配置已应用（标题 / Game_key / 界面语言）"));
     pushLog({ step: "导出", message: `已应用导出设置：${title} / ${key} / ${settings.value.language}`, level: "success", at: Date.now() });
   } catch (e) {
