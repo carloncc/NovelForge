@@ -26,9 +26,6 @@ encoding_rs = "0.8"
 once_cell = "1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 zip = "2"
-# AI 抠图：ONNX Runtime 跑 isnet-anime 分割模型（下载后缓存，失败自动回退色度键抠图）
-ort = { version = "2.0.0-rc.13", features = ["download-binaries"] }
-ndarray = "0.16"
 # 内嵌 WebGAL 引擎模板，使便携版 exe 无需外部 templates 目录即可单独运行
 include_dir = "0.7"
 

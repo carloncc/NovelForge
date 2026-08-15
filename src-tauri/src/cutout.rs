@@ -248,14 +248,27 @@ fn apply_despill(
     }
 }
 
-/// 清除"被前景包围的内部绿污染像素"（绿底 AI 立绘常见，头发间隙处残留绿块）。
-/// 判据：
-///   1. 不透明（alpha >= 0.5）
-///   2. 8 邻域全是不透明像素（被前景完全包围，没通向图像边缘的透明路径）
-///   3. 颜色明显偏绿：g - max(r,b) > 30
-/// 满足全部条件 → 去绿（强度 0.85，保留少量色调避免完全灰）。
+/// 清除"被前景包围的内部绿污染像素"（绿底 AI 立绘常见，头发/手指/衣缝间隙处残留绿块）。
+///
+/// 用户反馈：之前实现仅当 `g - max(r,b) > 30` 时去绿（且只压 85%），对发丝边缘抗锯齿产生的
+/// "半透明发丝×绿幕" 暗青绿混合色（如 rgb(5,44,34)，b 接近 g，g-max ≈ 10）判定不命中，
+/// 残留 alpha=1.0 的深绿块。修复：
+///
+///   判据放宽：
+///     1. alpha_out >= 0.5（不透明或主体不透明）
+///     2. 8 邻域全是不透明（被前景完全包围，没通向图像边缘的透明路径）
+///     3. max(rgb) < 60 且 g 是 r/b 中最大者（偏绿暗像素 = 背景绿泄漏到前景内部的发丝间隙/暗部）
+///
+///   命中后：
+///     - 彻底去绿：`out_g = max(r, b)`（去掉绿色分量到与红蓝持平），不再保留 15% 残余
+///     - 设为透明：alpha_out 置 0（这些是被前景包围的背景泄漏，应作为背景被抠掉）
+///
+///   风险控制：仅在「被前景完全包围」的孤立像素上生效，不影响大块连通真暗前景（黑发/黑衣），
+///   也避开了洪流填充触达过的区域（那些已被正确抠掉/羽化）。
+///
 /// 仅适用于绿底场景（与 `despill` 的 aggressive 共用入口）。
-fn sweep_trapped_green(rgba: &mut RgbaImage, alpha: &[f32]) {
+/// 返回命中像素数（被彻底去绿 + 置透明的像素），用于统计与调试。
+fn sweep_trapped_green(rgba: &mut RgbaImage, alpha: &mut Vec<f32>) -> usize {
     let (w, h) = rgba.dimensions();
     let n = (w * h) as usize;
     let mut trap: Vec<bool> = vec![false; n];
@@ -266,14 +279,21 @@ fn sweep_trapped_green(rgba: &mut RgbaImage, alpha: &[f32]) {
                 continue;
             }
             let p = rgba.get_pixel(x, y);
-            let r = p[0] as f32;
-            let g = p[1] as f32;
-            let b = p[2] as f32;
-            if g - r.max(b) <= 30.0 {
+            let r = p[0];
+            let g = p[1];
+            let b = p[2];
+            let mx = r.max(g).max(b);
+            if mx >= 60 {
                 continue;
             }
-            // 8 邻域是否全是不透明像素
-            let mut all_opaque = true;
+            // 偏绿判定：g 是三通道中最大的（捕获纯绿残留 + 青绿/墨绿混合色）
+            if !(g > r && g >= b) {
+                continue;
+            }
+            // 8 邻域 alpha_out >= 0.2：用户真实项目里发丝间隙的暗绿像素常处于「半透明发丝边缘包围」
+            // 状态（不是被 100% 不透明包围的孤立岛，而是邻域含 feather 半透明像素）。
+            // 放宽阈值到 0.2 才能让这些像素被 sweep 处理；纯背景边缘（alpha 极低）仍不算包围。
+            let mut surrounded = true;
             for dy in -1i32..=1 {
                 for dx in -1i32..=1 {
                     if dx == 0 && dy == 0 {
@@ -282,33 +302,36 @@ fn sweep_trapped_green(rgba: &mut RgbaImage, alpha: &[f32]) {
                     let xx = x as i32 + dx;
                     let yy = y as i32 + dy;
                     let j = (yy as u32 * w + xx as u32) as usize;
-                    if alpha[j] < 0.5 {
-                        all_opaque = false;
+                    if alpha[j] < 0.2 {
+                        surrounded = false;
                         break;
                     }
                 }
-                if !all_opaque {
+                if !surrounded {
                     break;
                 }
             }
-            if all_opaque {
+            if surrounded {
                 trap[i] = true;
             }
         }
     }
+    let mut count = 0usize;
     for i in 0..n {
         if !trap[i] {
             continue;
         }
-        let p = rgba.get_pixel_mut((i % w as usize) as u32, (i / w as usize) as u32);
-        let r = p[0] as f32;
-        let g = p[1] as f32;
-        let b = p[2] as f32;
-        let max_rb = r.max(b);
-        let spill = g - max_rb;
-        let out_g = g - spill * 0.85;
-        p[1] = out_g.round().clamp(0.0, 255.0) as u8;
+        let x = (i % w as usize) as u32;
+        let y = (i / w as usize) as u32;
+        // 彻底去绿：把 G 压到与 R/B 持平（变中性灰），不再保留 15% 残余 → 视觉上不再偏绿
+        let p = rgba.get_pixel_mut(x, y);
+        let max_rb = p[0].max(p[2]);
+        p[1] = max_rb;
+        // 这些像素是被前景包围的背景绿泄漏，应作为背景被抠掉：alpha 置 0（透明）
+        alpha[i] = 0.0;
+        count += 1;
     }
+    count
 }
 
 /// 色度键抠图（连通性洪水填充 + 边缘羽化 + 去绿边 + alpha 中值平滑）：
@@ -317,7 +340,20 @@ fn sweep_trapped_green(rgba: &mut RgbaImage, alpha: &[f32]) {
 /// - 前景内部与背景色相近的孤立像素（如脸部高光、浅色头发内侧）因“不连通”而不会被误删
 /// - 最后做 despill（去除绿幕常见的绿边/绿晕）与 alpha 3x3 中值平滑（去噪点/空洞）
 /// - 对亮绿色背景自动切换为色度加权距离（降亮度权重）+ 更大容差，把有渐变/光照的绿底也抠干净
+/// 返回 (PNG base64, 被置为全透明的像素比例 0.0~1.0)。比例用于判断“背景识别是否过激”
+/// （例如 AI 画了纯黑背景，黑色前景与背景色距离≈0 会被误抠，removed 会异常偏高）。
 pub fn cutout(data_b64: &str, threshold: f32) -> Result<String, String> {
+    cutout_with_stats(data_b64, threshold).map(|(b64, _, _, _, _)| b64)
+}
+
+/// 同 `cutout`，但额外返回被置全透明的像素比例 + 背景是否为绿幕 + 背景是否为深色（黑）。
+/// - 绿幕背景 removed 偏高是“抠干净”的正常成功指标，调用方不得据此降级 AI；
+/// - 深色背景（黑/墨蓝等）色度键原理上无法区分“黑发/黑衣服”与“黑背景”（距离≈0 被误抠成
+///   半透明灰），调用方应保留原图而非继续抠。
+pub fn cutout_with_stats(
+    data_b64: &str,
+    threshold: f32,
+) -> Result<(String, f32, bool, bool, usize), String> {
     let bytes = B64
         .decode(data_b64)
         .map_err(|e| format!("base64 解码失败: {e}"))?;
@@ -330,6 +366,11 @@ pub fn cutout(data_b64: &str, threshold: f32) -> Result<String, String> {
     // RGB 欧氏距离会因亮度差放大导致洪水填充提前终止 → 残留绿块。
     // 色度加权 + 更大容差可彻底抠掉。
     let green = is_green_screen(bg);
+    // 深色背景（黑/墨蓝/深灰渐变等）：色度键无法区分黑发/黑衣服/深色物品与深色背景
+    // （RGB 距离≈0 会互相误判，把主体羽化成半透明灰）。阈值 90 覆盖「深蓝/炭黑渐变」
+    // 这类物品图常见背景（采样 max 常在 60~90，旧阈值 60 漏判导致深色物品被扣成半透明黑）。
+    // 前置标记给调用方，让其保留原图而不是继续抠。
+    let dark_bg = !green && bg.iter().fold(0.0f32, |m, v| m.max(*v)) < 90.0;
     // 绿底用更大的容差：AI 生成的渐变/带噪点绿底距离中位色能到 80~120；
     // thr_edge 给更宽的羽化带，让飘动的半透明发丝要么完全抠掉、要么完整保留（少出怪异半透色）。
     let thr = if green { threshold.max(80.0) } else { threshold.max(4.0) };
@@ -357,6 +398,28 @@ pub fn cutout(data_b64: &str, threshold: f32) -> Result<String, String> {
             continue;
         }
         visited[i] = true;
+        // 暗色前景保护（绿幕下精确版）：max(rgb)<60 且「不偏绿」（r≈g 或 g≤r 或 g≤b，即真黑/真灰前景）
+        // → 当前景边界，不透 + 不扩散，避免黑发/黑衣被色度键羽化成半透明灰。
+        // 偏绿（g>r 或 g>b）的暗像素 → 当作绿幕背景泄漏让色度键正常处理。
+        if green {
+            let p = rgba.get_pixel(x, y);
+            let r = p[0]; let g = p[1]; let b = p[2];
+            let mx = r.max(g).max(b);
+            if mx < 60 && !(g > r) && !(g > b) {
+                alpha_out[i] = 1.0;
+                continue;
+            }
+        } else {
+            // 非绿幕下的暗色前景保护（物品图重点）：远离背景色的暗像素是深色主体
+            // （黑剑/深色道具/黑色描边），作为前景边界不透 + 不扩散，
+            // 避免落在羽化带 (thr..thr_edge) 被扣成半透明黑。
+            let p = rgba.get_pixel(x, y);
+            let mx = p[0].max(p[1]).max(p[2]);
+            if mx < 60 && dist_at(x, y) > thr {
+                alpha_out[i] = 1.0;
+                continue;
+            }
+        }
         let d = dist_at(x, y);
         if d > thr_edge {
             continue; // 前景边界：不扩散，保持不透明
@@ -384,7 +447,21 @@ pub fn cutout(data_b64: &str, threshold: f32) -> Result<String, String> {
     }
 
     // alpha 3x3 中值平滑：去掉孤立噪点/1px 空洞，让边缘更干净
-    let alpha_out = alpha_median3x3(&alpha_out, w, h);
+    let mut alpha_out = alpha_median3x3(&alpha_out, w, h);
+    // 暗色前景保护二次落地（通用）：median 平滑会把 dark-fg 像素 alpha=1.0 被 8 个
+    // 半透明邻居中值化成 ~0.54，导致黑色人物/深色物品依旧呈灰色半透明。
+    // 绿幕下排除「偏绿」暗像素（那是背景泄漏）；非绿幕下所有暗像素一律保护
+    // （真正的深色背景图已由 dark_bg 前置拦截，不会走到这里）。
+    for y in 0..h {
+        for x in 0..w {
+            let p = rgba.get_pixel(x, y);
+            let r = p[0]; let g = p[1]; let b = p[2];
+            let mx = r.max(g).max(b);
+            if mx < 60 && (!green || (!(g > r) && !(g > b))) {
+                alpha_out[idx(x, y)] = 1.0;
+            }
+        }
+    }
 
     let mut max_opaque = 0f32;
     for (x, y, p) in rgba.enumerate_pixels() {
@@ -400,13 +477,16 @@ pub fn cutout(data_b64: &str, threshold: f32) -> Result<String, String> {
     // 去绿边/绿晕（在应用 alpha 前处理颜色，避免绿边留在前景上）
     despill(&mut rgba, &alpha_out, green);
 
-    // 内部绿污染清除：绿底 AI 立绘常见"头发间隙处残留绿块"——这些像素不透明、被前景包围
-    // （洪水填充没蔓延进去），但颜色仍是绿幕色（g 显著高于 max(r,b)）。需要把这种"trap 像素"
-    // 去绿：判据 = 不透明（α > 0.5）且 8 邻域全是不透明像素（被前景完全包围，没有通向图像边缘
-    // 的透明路径）且 g - max(r,b) > 30 → 强去绿。
-    if green {
-        sweep_trapped_green(&mut rgba, &alpha_out);
-    }
+    // 内部绿污染清除：绿底 AI 立绘常见"头发/手指/衣缝间隙处残留绿块"——这些像素不透明、被
+    // 前景完全包围（洪水填充没蔓延进去），颜色仍是绿幕色或其与前景边缘抗锯齿的暗青绿混合色
+    // （g 是三通道中最大者）。判据放宽覆盖：α >= 0.5 且 8 邻域全不透明 且 max(rgb) < 60 且
+    // g 是 r/g/b 中最大。命中后：彻底去绿（g 压到 max(r,b)）+ alpha 置 0（透明），
+    // 把这些背景泄漏彻底抠掉。
+    let sweep_count = if green {
+        sweep_trapped_green(&mut rgba, &mut alpha_out)
+    } else {
+        0
+    };
 
     let mut writes: Vec<(u32, u32, [u8; 4])> = Vec::with_capacity((w * h) as usize / 8);
     for (x, y, base) in rgba.enumerate_pixels() {
@@ -429,7 +509,13 @@ pub fn cutout(data_b64: &str, threshold: f32) -> Result<String, String> {
     let mut out_buf = std::io::Cursor::new(Vec::new());
     rgba.write_to(&mut out_buf, ImageFormat::Png)
         .map_err(|e| format!("PNG 编码失败: {e}"))?;
-    Ok(B64.encode(out_buf.into_inner()))
+    let removed = count_transparent(&rgba) as f32 / (w * h).max(1) as f32;
+    Ok((B64.encode(out_buf.into_inner()), removed, green, dark_bg, sweep_count))
+}
+
+/// 统计 RGBA 图像中 alpha == 0 的像素数（用于判断色度键是否过激）
+fn count_transparent(rgba: &image::RgbaImage) -> u32 {
+    rgba.pixels().filter(|p| p[3] == 0).count() as u32
 }
 
 /// 检查图片是否已经包含大范围透明区域（用户已抠好的素材则跳过抠图）
@@ -733,5 +819,346 @@ mod tests {
         let mut buf = std::io::Cursor::new(Vec::new());
         img.write_to(&mut buf, ImageFormat::Png).unwrap();
         assert!(has_transparency(&B64.encode(buf.into_inner())).unwrap());
+    }
+
+    #[test]
+    fn cutout_reports_green_bg() {
+        // 绿幕图必须返回 bg_is_green=true：commands 层据此永不降级 AI，纯代码抠绿即可成功
+        let (_, removed, green, dark, _sweep) =
+            cutout_with_stats(&make_green_bg_art(), 40.0).expect("绿底抠图应成功");
+        assert!(green, "绿幕背景应被识别为 green=true");
+        assert!(!dark, "绿幕背景不应被判为深色");
+        // 绿幕背景占比高 → removed 偏高是成功指标，不影响 green 判定
+        assert!(removed > 0.4, "绿幕背景 removed 应偏高（背景占比大）");
+    }
+
+    #[test]
+    fn cutout_white_bg_is_not_green() {
+        let (_, _, green, dark, _sweep) =
+            cutout_with_stats(&make_white_bg_art(), 40.0).expect("白底抠图应成功");
+        assert!(!green, "白底不应被识别为绿幕");
+        assert!(!dark, "白底不应被判为深色");
+    }
+
+    /// 复现用户问题：AI 生成的绿幕立绘四周常有一圈暗色（黑）边缘/晕影，
+    /// 若 sample_bg_color 采样到暗边则背景被误判为黑 → 黑色头发/衣服被误抠成透明。
+    fn make_green_bg_with_dark_edge() -> String {
+        let mut img = RgbaImage::new(64, 64);
+        // 外围 8px 模拟 AI 暗色边缘（黑）
+        for y in 0..64 {
+            for x in 0..64 {
+                if x < 8 || y < 8 || x >= 64 - 8 || y >= 64 - 8 {
+                    img.put_pixel(x, y, Rgba([8, 8, 8, 255]));
+                } else {
+                    img.put_pixel(x, y, Rgba([0, 255, 0, 255])); // 内部纯绿底
+                }
+            }
+        }
+        // 中心黑色方块模拟"黑色头发/衣服的人物"
+        for y in 24..40 {
+            for x in 24..40 {
+                img.put_pixel(x, y, Rgba([12, 12, 12, 255]));
+            }
+        }
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, ImageFormat::Png).unwrap();
+        B64.encode(buf.into_inner())
+    }
+
+    #[test]
+    fn green_bg_with_dark_edge_keeps_dark_figure() {
+        let b64 = make_green_bg_with_dark_edge();
+        let (out, removed, green, dark, _sweep) = cutout_with_stats(&b64, 40.0).expect("抠图应成功");
+        let out_img = image::load_from_memory(&B64.decode(&out).unwrap())
+            .unwrap()
+            .to_rgba8();
+        // 中心黑色人物必须保留（不透明）——这是用户报"黑色被抠掉"的核心
+        assert!(
+            out_img.get_pixel(32, 32)[3] > 200,
+            "中心黑色人物应保留（被误抠成透明/半透明即 bug）"
+        );
+        assert!(
+            out_img.get_pixel(30, 30)[3] > 200,
+            "黑色人物内部应保留"
+        );
+        eprintln!("green={green} dark={dark} removed={removed:.2}");
+    }
+
+    /// 复现用户"黑色被扣成透明灰"：AI 生成的是黑色背景人物图（非绿幕）。
+    /// 色度键采样到黑背景 → 灰黑色人物到黑背景距离落在羽化带(thr..thr_edge) → 被抠成半透明灰。
+    fn make_dark_bg_figure() -> String {
+        let mut img = RgbaImage::new(64, 64);
+        for p in img.pixels_mut() {
+            *p = Rgba([5, 5, 5, 255]); // 黑背景（模拟 AI 未画绿幕）
+        }
+        // 灰黑人物方块（模拟黑发/黑衣服人物）
+        for y in 16..48 {
+            for x in 16..48 {
+                img.put_pixel(x, y, Rgba([40, 40, 40, 255]));
+            }
+        }
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, ImageFormat::Png).unwrap();
+        B64.encode(buf.into_inner())
+    }
+
+    #[test]
+    fn dark_bg_figure_is_cut_to_semitransparent() {
+        let b64 = make_dark_bg_figure();
+        let (out, removed, green, dark, _sweep) = cutout_with_stats(&b64, 40.0).expect("抠图应成功");
+        let out_img = image::load_from_memory(&B64.decode(&out).unwrap())
+            .unwrap()
+            .to_rgba8();
+        let alpha_center = out_img.get_pixel(32, 32)[3];
+        eprintln!(
+            "dark_bg_figure: green={green} dark={dark} removed={removed:.2} center_alpha={}",
+            alpha_center
+        );
+        // 深色背景必须被识别并拦截（调用方保留原图，不继续抠）
+        assert!(dark, "深色背景应被识别并拦截");
+        // 双保险：即使调用方忽略拦截直接使用色度键输出，
+        // 暗色前景保护也应保证黑色人物不被羽化成半透明（alpha 保持不透明）
+        assert!(
+            alpha_center > 200,
+            "黑色人物应保持不透明（被扣成透明灰即 bug）"
+        );
+    }
+
+    /// 复现用户「物品黑被扣成半透明黑」：物品图常见深蓝/炭黑渐变背景（采样 max 常在 60~90）。
+    /// 旧阈值 60 漏判 dark_bg → 色度键羽化带把深色物品扣成半透明黑。
+    fn make_dark_navy_bg_item() -> String {
+        let mut img = RgbaImage::new(64, 64);
+        for p in img.pixels_mut() {
+            *p = Rgba([32, 48, 64, 255]); // 深蓝背景（max=64，旧阈值 60 判不出深色）
+        }
+        // 深色物品方块（模拟黑剑/深色道具）
+        for y in 20..44 {
+            for x in 20..44 {
+                img.put_pixel(x, y, Rgba([10, 20, 30, 255]));
+            }
+        }
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, ImageFormat::Png).unwrap();
+        B64.encode(buf.into_inner())
+    }
+
+    #[test]
+    fn dark_navy_bg_item_is_intercepted() {
+        let b64 = make_dark_navy_bg_item();
+        let (out, removed, green, dark, _sweep) = cutout_with_stats(&b64, 40.0).expect("抠图应成功");
+        assert!(!green, "深蓝背景不应判为绿幕");
+        assert!(
+            dark,
+            "深蓝/炭黑背景应被判为深色并拦截（旧阈值 60 漏判导致物品被扣成半透明黑）"
+        );
+        // 拦截路径返回原图：深色物品必须不透明
+        let out_img = image::load_from_memory(&B64.decode(&out).unwrap())
+            .unwrap()
+            .to_rgba8();
+        assert!(
+            out_img.get_pixel(32, 32)[3] > 200,
+            "深色物品应保留不透明（被扣成半透明即 bug）"
+        );
+        eprintln!("dark_navy_item: green={green} dark={dark} removed={removed:.2}");
+    }
+
+    /// 近灰背景（max=92，恰好越过深色阈值 90）+ 黑色物品：色度键正常路径。
+    /// 背景应被抠除；物品核心（黑）与暗色边缘（59 灰，落在羽化带 thr..thr_edge）
+    /// 必须保持不透明——验证非绿幕暗色前景保护（旧实现会把 59 灰边缘羽化成半透明黑）。
+    fn make_gray_bg_black_item() -> String {
+        let mut img = RgbaImage::new(64, 64);
+        for p in img.pixels_mut() {
+            *p = Rgba([92, 92, 92, 255]); // 近灰背景
+        }
+        // 黑色物品核心（10） + 暗色过渡边缘（59）
+        for y in 20..44 {
+            for x in 20..44 {
+                img.put_pixel(x, y, Rgba([10, 10, 10, 255]));
+            }
+        }
+        for y in 18..46 {
+            for x in 18..46 {
+                if x < 20 || y < 20 || x >= 44 || y >= 44 {
+                    img.put_pixel(x, y, Rgba([59, 59, 59, 255]));
+                }
+            }
+        }
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, ImageFormat::Png).unwrap();
+        B64.encode(buf.into_inner())
+    }
+
+    #[test]
+    fn gray_bg_keeps_black_item_opaque() {
+        let b64 = make_gray_bg_black_item();
+        let (out, removed, green, dark, _sweep) = cutout_with_stats(&b64, 40.0).expect("抠图应成功");
+        assert!(!green, "近灰背景不应判为绿幕");
+        assert!(!dark, "近灰背景不应判为深色");
+        let out_img = image::load_from_memory(&B64.decode(&out).unwrap())
+            .unwrap()
+            .to_rgba8();
+        assert!(
+            out_img.get_pixel(32, 32)[3] > 200,
+            "黑色物品内部应保持不透明"
+        );
+        assert!(
+            out_img.get_pixel(19, 32)[3] > 200,
+            "物品暗色边缘（59 灰，落在羽化带）应保持不透明，不能被羽化成半透明黑"
+        );
+        assert!(
+            out_img.get_pixel(4, 4)[3] == 0,
+            "背景应被抠除"
+        );
+        eprintln!("gray_item: green={green} dark={dark} removed={removed:.2}");
+    }
+
+    /// 用户报「绿底把黑色抠成灰色半透明」：绿幕立绘里黑色头发/黑衣应保留为不透明前景，
+    /// 不能被色度键羽化带 (thr..thr_edge) 透明化成灰色半透明。
+    /// 此前实现：黑像素对绿底色度加权距离 ≈ 127，落在 (80, 170) 羽化带 → alpha≈0.54，
+    /// 且洪水填充穿透黑色区域，整片黑发被扣成灰半透明。
+    /// 修复：绿幕下 max(rgb) < 60 的像素当作前景边界，不透 + 不扩散。
+    fn make_green_bg_with_black_figure() -> String {
+        let mut img = RgbaImage::new(64, 64);
+        // 纯绿底
+        for p in img.pixels_mut() {
+            *p = Rgba([0, 255, 0, 255]);
+        }
+        // 中心一个黑色方块（模拟黑发/黑衣人物）
+        for y in 20..44 {
+            for x in 20..44 {
+                img.put_pixel(x, y, Rgba([10, 10, 10, 255]));
+            }
+        }
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, ImageFormat::Png).unwrap();
+        B64.encode(buf.into_inner())
+    }
+
+    #[test]
+    fn green_bg_preserves_black_figure() {
+        let b64 = make_green_bg_with_black_figure();
+        let (out, _removed, green, dark, _sweep) = cutout_with_stats(&b64, 40.0).expect("抠图应成功");
+        let out_img = image::load_from_memory(&B64.decode(&out).unwrap())
+            .unwrap()
+            .to_rgba8();
+        // 必须是绿幕路径（不是 dark-bg skip 路径）
+        assert!(green, "应识别为绿幕");
+        assert!(!dark, "不应被判为深色背景");
+        // 四角（绿底）应被抠掉
+        for (x, y) in [(0, 0), (63, 0), (0, 63), (63, 63)] {
+            assert!(
+                out_img.get_pixel(x, y)[3] < 16,
+                "绿底角落应透明: ({x},{y}) a={}",
+                out_img.get_pixel(x, y)[3]
+            );
+        }
+        // 中心黑色人物必须不透明（核心回归点）
+        let center_a = out_img.get_pixel(32, 32)[3];
+        assert!(
+            center_a > 200,
+            "绿底中央黑色人物应保留不透明（修复前会被羽化成半透明灰）：实际 alpha={center_a}"
+        );
+        // 黑色人物内部随机几个采样点也应不透明
+        for (x, y) in [(24, 24), (32, 24), (40, 24), (24, 32), (40, 32), (24, 40), (40, 40)] {
+            let a = out_img.get_pixel(x, y)[3];
+            assert!(
+                a > 200,
+                "黑色人物内部应保留不透明 ({x},{y}) alpha={a}"
+            );
+        }
+    }
+
+    /// 用户报「抠图把绿色扣成黑色/深绿」：AI 生成时蓬松头发/手指缝隙处有「发丝色 × 绿幕背景」的
+    /// 半透明混合色（典型如 rgb(5,44,34)：r 低、g 中低、b 接近 g）。修复前这些像素：
+    ///   1. flood 距离大 → 默认 alpha=1.0
+    ///   2. max(rgb)<60 → 旧 dark_fg 保护强制保留不透明（误判为前景）
+    ///   3. sweep 判据 g-max(r,b)>30 不命中（混合色 g-max ≈ 10）
+    /// → 抠图后保留为不透明墨绿残渣，视觉上接近黑色。
+    ///
+    /// 修复：绿幕下「暗色前景保护」仅保护 r≈g 或 g≤r 或 g≤b 的真暗前景；偏绿（g>r 或 g>b）
+    /// 的暗像素当作绿幕泄漏；sweep_trapped_green 对被完全包围且偏绿的暗像素彻底去绿 + alpha 置 0。
+    fn make_green_bg_with_dark_green_hair_gaps() -> String {
+        let mut img = RgbaImage::new(64, 64);
+        // 纯绿底
+        for p in img.pixels_mut() {
+            *p = Rgba([0, 255, 0, 255]);
+        }
+        // 中心「黑色头发方块」模拟黑发人物主体（r=g=b=10，纯黑）
+        for y in 20..44 {
+            for x in 20..44 {
+                img.put_pixel(x, y, Rgba([10, 10, 10, 255]));
+            }
+        }
+        // 在黑发内部加几个「暗青绿混合色」方块，模拟发丝边缘抗锯齿与绿幕的混合色
+        // （rgb(5,44,34)：r 低、g 中低、b 接近 g，是典型的「绿幕泄漏到前景内部」颜色）
+        for y in 30..34 {
+            for x in 30..34 {
+                img.put_pixel(x, y, Rgba([5, 44, 34, 255]));
+            }
+        }
+        // 再加一个真黑小斑（rgb(10,10,10)），应被保留为不透明前景
+        for y in 36..40 {
+            for x in 30..34 {
+                img.put_pixel(x, y, Rgba([10, 10, 10, 255]));
+            }
+        }
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, ImageFormat::Png).unwrap();
+        B64.encode(buf.into_inner())
+    }
+
+    #[test]
+    fn green_bg_keeps_real_dark_but_strips_green_leaked_hair_gaps() {
+        let b64 = make_green_bg_with_dark_green_hair_gaps();
+        let (out, _removed, green, dark, _sweep) =
+            cutout_with_stats(&b64, 40.0).expect("抠图应成功");
+        let out_img = image::load_from_memory(&B64.decode(&out).unwrap())
+            .unwrap()
+            .to_rgba8();
+        assert!(green, "应识别为绿幕");
+        assert!(!dark, "不应被判为深色背景");
+        // 四角（绿底）应被抠掉
+        for (x, y) in [(0, 0), (63, 0), (0, 63), (63, 63)] {
+            assert!(
+                out_img.get_pixel(x, y)[3] < 16,
+                "绿底角落应透明: ({x},{y}) a={}",
+                out_img.get_pixel(x, y)[3]
+            );
+        }
+        // 真黑前景（中心 r=g=b 黑块）必须不透明
+        for (x, y) in [(22, 22), (30, 22), (40, 22), (22, 30), (40, 30), (22, 40), (40, 40)] {
+            let a = out_img.get_pixel(x, y)[3];
+            assert!(
+                a > 200,
+                "绿底中心纯黑前景应保留不透明 ({x},{y}) alpha={a}"
+            );
+        }
+        // 真黑小斑（r=g=b=10）也应保留
+        for (x, y) in [(32, 37), (33, 38)] {
+            let a = out_img.get_pixel(x, y)[3];
+            assert!(
+                a > 200,
+                "真黑前景斑应保留不透明 ({x},{y}) alpha={a}"
+            );
+        }
+        // 关键回归：暗青绿混合色（绿幕泄漏到发丝缝隙）应被彻底抠掉，alpha < 32
+        // 这些像素被前景完全包围，sweep 应识别并把 alpha 置 0
+        for (x, y) in [(31, 31), (32, 31), (33, 31), (31, 33), (33, 33)] {
+            let a = out_img.get_pixel(x, y)[3];
+            assert!(
+                a < 32,
+                "暗青绿发丝缝隙应被抠为透明 ({x},{y}) alpha={a}"
+            );
+        }
+        // 且这些像素 RGB 的 G 应被压到 max(r,b)，不再是「深绿残留」（验证 sweep 彻底去绿）
+        for (x, y) in [(31, 31), (32, 31), (33, 31)] {
+            let p = out_img.get_pixel(x, y);
+            let max_rb = p[0].max(p[2]);
+            assert!(
+                p[1] <= max_rb + 1,
+                "暗青绿残渣应被彻底去绿（G 压到 max(r,b)）({x},{y}) rgb=({},{},{})",
+                p[0], p[1], p[2]
+            );
+        }
     }
 }

@@ -93,12 +93,24 @@ pub fn read_text_file(path: String) -> Result<Value, String> {
 }
 
 #[tauri::command]
-pub fn write_text_file(path: String, content: String) -> Result<(), String> {
-    let p = PathBuf::from(&path);
-    if let Some(parent) = p.parent() {
+/// 原子写文件：写同目录临时文件后 rename 覆盖目标。
+/// 中断/崩溃时目标文件要么是旧完整内容、要么是新的完整内容，不会留下半截损坏数据
+/// （assets.json / project_state.json / visual-bible.json 等被半截写入会导致下次解析失败）。
+fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
     }
-    std::fs::write(&p, content).map_err(|e| format!("写入失败: {e}"))
+    let tmp = path.with_extension(format!("{}.tmp", path.extension().and_then(|e| e.to_str()).unwrap_or("bin")));
+    std::fs::write(&tmp, bytes).map_err(|e| format!("写入临时文件失败: {e}"))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("替换文件失败: {e}")
+    })
+}
+
+#[tauri::command]
+pub fn write_text_file(path: String, content: String) -> Result<(), String> {
+    atomic_write(&PathBuf::from(&path), content.as_bytes())
 }
 
 #[tauri::command]
@@ -110,11 +122,7 @@ pub fn read_file_base64(path: String) -> Result<String, String> {
 #[tauri::command]
 pub fn write_file_base64(path: String, data_b64: String) -> Result<(), String> {
     let bytes = B64.decode(&data_b64).map_err(|e| format!("base64 解码失败: {e}"))?;
-    let p = PathBuf::from(&path);
-    if let Some(parent) = p.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
-    }
-    std::fs::write(&p, bytes).map_err(|e| format!("写入失败: {e}"))
+    atomic_write(&PathBuf::from(&path), &bytes)
 }
 
 #[tauri::command]
@@ -392,45 +400,61 @@ pub fn open_url(url: String) -> Result<(), String> {
 #[serde(rename_all = "camelCase")]
 pub struct CutoutResult {
     pub data_b64: String,
-    /// 抠图方式：ai（isnet-anime 分割）/ chroma（色度键）
+    /// 抠图方式：chroma（色度键）/ skip-dark（深色背景，保留原图）/ skip-overcut（疑似过激，保留原图）
     pub method: String,
 }
 
-/// 抠图：优先色度键（纯算法、0 下载，适合纯色背景），
-/// 色度键失败（背景不够纯/无法采样）时才尝试 AI 分割（isnet-anime，首次自动下载模型约 40MB）。
-/// 这样纯色背景立绘可零下载直接抠图；复杂背景才需要 AI 模型。
+/// 色度键输出中被置为全透明的像素占比达到该值，判定为“背景识别过激”。
+/// 仅对非绿幕背景生效：绿幕背景 removed 偏高是“抠干净”的正常结果（背景占比常达 60-75%）。
+/// 典型过激场景：AI 画了纯黑/纯深色背景，黑色前景到背景色距离≈0 被误抠，removed 异常偏高。
+/// 命中时保留原图，避免把主体黑色部分切掉。
+const CUTOUT_OVERCUT_THRESHOLD: f32 = 0.6;
+
+/// 抠图：纯算法色度键（零依赖、零下载，纯色/绿幕背景即可干净抠出）。
+/// 深色背景与疑似过激的结果一律保留原图——宁可有背景也不破坏主体，不下载任何分割模型。
 #[tauri::command]
 pub async fn cutout_image(
-    app: tauri::AppHandle,
     data_b64: String,
     threshold: f32,
 ) -> Result<CutoutResult, String> {
-    // ① 先试色度键：立绘背景多为纯色（提示词强制 solid background），色度键即可干净抠出
-    let chroma = crate::cutout::cutout(&data_b64, threshold);
-    if let Ok(out) = &chroma {
-        return Ok(CutoutResult {
-            data_b64: out.clone(),
-            method: "chroma".to_string(),
-        });
+    // 纯代码色度键：立绘/物品背景多为纯色（提示词强制 solid background），色度键即可干净抠出
+    let chroma = crate::cutout::cutout_with_stats(&data_b64, threshold);
+    match &chroma {
+        Ok((_, removed, bg_is_green, dark_bg, _sweep_count)) => {
+            // 绿幕背景：removed 高是成功（背景被干净抠掉）
+            if *bg_is_green {
+                return Ok(CutoutResult {
+                    data_b64: chroma.as_ref().unwrap().0.clone(),
+                    method: "chroma".to_string(),
+                });
+            }
+            // 深色背景（黑/墨蓝等）：色度键原理上无法区分黑发/黑衣服/深色物品与深色背景，
+            // 硬抠会把主体抠成半透明灰。保留原图，交回前端提示。
+            if *dark_bg {
+                eprintln!("[novelforge] 背景为深色，色度键无法区分主体，保留原图");
+                return Ok(CutoutResult {
+                    data_b64: data_b64.clone(),
+                    method: "skip-dark".to_string(),
+                });
+            }
+            if *removed < CUTOUT_OVERCUT_THRESHOLD {
+                return Ok(CutoutResult {
+                    data_b64: chroma.as_ref().unwrap().0.clone(),
+                    method: "chroma".to_string(),
+                });
+            }
+            // 非绿底疑似过激（黑色前景被误判为背景）：保留原图
+            eprintln!(
+                "[novelforge] 色度键疑似过激（非绿底 removed={:.1}%），保留原图",
+                removed * 100.0
+            );
+            Ok(CutoutResult {
+                data_b64: data_b64.clone(),
+                method: "skip-overcut".to_string(),
+            })
+        }
+        Err(msg) => Err(format!("色度键: {msg}")),
     }
-
-    // ② 色度键失败 → 尝试 AI 分割（模型未下载时首次自动下载）
-    let app2 = app.clone();
-    let data = data_b64.clone();
-    let ai = tauri::async_runtime::spawn_blocking(move || {
-        let model = crate::matte::ensure_model(&app2).ok()?;
-        crate::matte::ai_cutout(&data, &model)
-            .ok()
-            .map(|b| (b, "ai".to_string()))
-    })
-    .await
-    .map_err(|e| format!("AI 抠图线程异常: {e}"))?;
-    if let Some((data_b64, method)) = ai {
-        return Ok(CutoutResult { data_b64, method });
-    }
-
-    // ③ 都失败 → 返回色度键的错误信息（供前端提示）
-    Err(chroma.err().unwrap_or_else(|| "抠图失败".to_string()))
 }
 
 #[tauri::command]
@@ -515,6 +539,36 @@ pub fn build_zip(
     writer.finish().map_err(|e| format!("zip 收尾失败: {e}"))?;
 
     Ok(serde_json::json!({ "fileCount": file_count, "sizeBytes": total_size }))
+}
+
+#[cfg(test)]
+mod atomic_write_tests {
+    use super::atomic_write;
+    use std::io::Write;
+
+    #[test]
+    fn atomic_write_overwrites_and_no_tmp_left() {
+        let dir = std::env::temp_dir().join("novelforge_atomic_write_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("assets.json");
+
+        atomic_write(&f, b"{\"v\":1}").unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "{\"v\":1}");
+
+        // 覆盖已存在文件（Windows rename 语义）→ 应成功且内容更新
+        atomic_write(&f, b"{\"v\":2,\"more\":\"data\"}").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            "{\"v\":2,\"more\":\"data\"}"
+        );
+
+        // 不应残留临时文件
+        let leftovers = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().contains(".tmp")).count();
+        assert_eq!(leftovers, 0, "原子写残留临时文件");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]

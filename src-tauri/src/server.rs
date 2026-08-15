@@ -78,9 +78,16 @@ fn handle_request(root: &Path, request: tiny_http::Request) {
                 let mut buf = Vec::new();
                 if f.read_to_end(&mut buf).is_ok() {
                     body = buf;
-                    ctype = mime_guess::from_path(&candidate)
+                    let base = mime_guess::from_path(&candidate)
                         .first_or_octet_stream()
                         .to_string();
+                    // 文本类响应必须带 UTF-8 charset，否则浏览器 XHR/fetch 会按默认编码（本地为 GBK）解码，
+                    // 导致 WebGAL 剧本乱码 → 场景解析失败 → 背景/立绘不显示。场景 txt 均为 UTF-8。
+                    if base.starts_with("text/") && !base.to_lowercase().contains("charset") {
+                        ctype = format!("{base}; charset=utf-8");
+                    } else {
+                        ctype = base;
+                    }
                 } else {
                     body = b"read error".to_vec();
                     ctype = "text/plain".to_string();

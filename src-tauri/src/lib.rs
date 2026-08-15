@@ -1,6 +1,5 @@
 mod commands;
 pub mod cutout;
-mod matte;
 mod server;
 
 use include_dir::{include_dir, Dir};
