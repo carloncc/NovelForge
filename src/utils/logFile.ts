@@ -1,4 +1,4 @@
-import { setLogFileSink, type LogEntry } from "./logger";
+import { redactSensitive, setLogFileSink, type LogEntry } from "./logger";
 import { tauri } from "./tauri";
 
 /**
@@ -22,7 +22,7 @@ function format(entry: LogEntry): string {
   let data = "";
   if (entry.data !== undefined) {
     try {
-      data = " " + JSON.stringify(entry.data).slice(0, 800);
+      data = " " + JSON.stringify(redactSensitive(entry.data)).slice(0, 800);
     } catch {
       data = " " + String(entry.data).slice(0, 800);
     }
@@ -59,6 +59,11 @@ export async function installLogFileSink(): Promise<string> {
     const logsDir = `${configDir}/logs`;
     await tauri.mkdirAll(logsDir);
     logFilePath = `${logsDir}/novelforge.log`;
+    if (await tauri.pathExists(logFilePath)) {
+      const existing = (await tauri.readTextFile(logFilePath)).text;
+      const redacted = redactSensitive(existing) as string;
+      if (redacted !== existing) await tauri.writeTextFile(logFilePath, redacted);
+    }
     setLogFileSink((entry) => {
       // debug 过于嘈杂（每个文件读写都打一条），落盘只保留 info/warn/error，便于阅读
       if (entry.level === "debug") return;

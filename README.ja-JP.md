@@ -68,6 +68,12 @@ Tauri 2 + Vue 3 + WebGAL · 軽量・高速 · API は完全カスタマイズ
 
 ### アプリのダウンロード
 
+<p align="center">
+  <a href="https://github.com/carloncc/NovelForge/releases/latest"><img alt="Windows" src="https://img.shields.io/badge/Windows-exe-4c1d95?style=for-the-badge&logo=windows"></a>
+  <a href="https://github.com/carloncc/NovelForge/releases/latest"><img alt="macOS" src="https://img.shields.io/badge/macOS-dmg-1f2937?style=for-the-badge&logo=apple"></a>
+  <a href="https://github.com/carloncc/NovelForge/releases/latest"><img alt="Linux" src="https://img.shields.io/badge/Linux-AppImage-0ea5e9?style=for-the-badge&logo=linux"></a>
+</p>
+
 | プラットフォーム | 入手方法 |
 |---|---|
 | Windows / macOS / Linux | [最新リリース](https://github.com/carloncc/NovelForge/releases)（Rust/Node のインストール不要） |
@@ -141,13 +147,23 @@ pnpm tauri build
 
 ## スクリーンショット
 
+## スクリーンショット
+
+### 生成されたゲーム（サンプル小説、WebGAL エンジンで実際に動作中）
+
+| タイトル画面 | ストーリーシーン | 名場面 CG |
+|---|---|---|
+| ![Game title](docs/screenshots/game-title.png) | ![Game story](docs/screenshots/game-story.png) | ![Game CG](docs/screenshots/game-cg.png) |
+
+### NovelForge アプリ
+
 | 小説インポート | API 設定 | 生成 |
 |---|---|---|
 | ![Import](docs/screenshots/import.png) | ![Config](docs/screenshots/config.png) | ![Generate](docs/screenshots/generate.png) |
 
-| エクスポート | ゲームタイトル | ゲームストーリー |
-|---|---|---|
-| ![Export](docs/screenshots/export.png) | ![Title](docs/screenshots/game-title.png) | ![Story](docs/screenshots/game-story.png) |
+| エクスポート | ビジュアルバイブル |
+|---|---|
+| ![Export](docs/screenshots/export.png) | ![Visual Bible](docs/screenshots/visual-bible-novel_analysis-1280.png) |
 
 ## API 設定例
 

@@ -2,7 +2,7 @@
 import { computed, nextTick, ref, watch } from "vue";
 import { t } from "../i18n";
 import { open } from "@tauri-apps/plugin-dialog";
-import { projectState, pushLog, clearLogs, scheduleSave, restoreProject, getStageLastLevels, getLastActiveStage } from "../stores/project";
+import { projectState, pushLog, clearLogs, scheduleSave, restoreProject, flushPendingProjectSave, getStageLastLevels, getLastActiveStage } from "../stores/project";
 import { activeConfig, configState, addRecentOutputDir } from "../stores/config";
 import { Pipeline } from "../core/pipeline";
 import { resolveTemplateDir } from "../utils/template";
@@ -22,6 +22,7 @@ import {
   regenerateCharacterFigures,
   regenerateCharacterThreeView,
   imageTaskMatchesSelectionKey,
+  imageTaskIdentity,
   regenerateCharacterAction,
   regenerateItemImage,
   regenerateBackground,
@@ -43,6 +44,8 @@ import {
   resumeStagesAfterVisualApproval,
   visualBibleNeedsReview,
 } from "../core/visualBibleWorkflow";
+import { parseAssetMap } from "../core/assetMap";
+import { parseChapterScript } from "../core/dataValidation";
 
 const tab = ref<"run" | "cards" | "video" | "script" | "log" | "failed" | "asset" | "bible">("run");
 const error = ref("");
@@ -56,6 +59,8 @@ const currentScript = ref("");
 const videoStatus = ref<Record<string, boolean>>({});
 const copiedMsg = ref("");
 const logPanelRef = ref<HTMLElement | null>(null);
+const LOG_RENDER_LIMIT = 300;
+const visibleLogs = computed(() => projectState.logs.slice(-LOG_RENDER_LIMIT));
 
 const PIPELINE_STEPS = ["分章", "翻译", "提取", "剧本", "图像", "配音", "组装"];
 const pipelineSteps = computed(() => PIPELINE_STEPS.map((s) => t(s)));
@@ -137,6 +142,13 @@ const videoPoints = computed<(VideoSuggestion & { chapter: number; location: str
 
 const selectedStages = ref<Record<StageKey, boolean>>({ split: true, translate: true, extract: true, script: true, image: true, voice: true, assemble: true });
 const stageFeedback = ref<Partial<Record<StageKey, string>>>({});
+const outputDirDraft = ref("");
+
+watch(
+  () => projectState.outputDir,
+  (value) => { outputDirDraft.value = value; },
+  { immediate: true },
+);
 
 /* ---- 分阶段状态看板：各阶段 未运行/进行中/完成/失败 ---- */
 
@@ -148,6 +160,9 @@ const stageStatus = useStageStatus({
   getLogFailedStages: () => logFailedStages.value,
   getBusy: () => busy.value,
   getRunningStages: () => runningStages.value,
+  getResult: () => projectState.lastResult,
+  getOptions: () => projectState.options,
+  getTtsConfig: () => activeConfig("tts"),
 });
 
 /** 每个阶段失败任务数（用于徽标显示） */
@@ -382,27 +397,27 @@ async function regenMissingImages(): Promise<void> {
     styleAnchor: approvedBible ? false : ctx.styleAnchor !== false,
   });
   // 预检缺失：任务文件在 cache/images 下不存在（含 .png/.jpg/.webp 变体）
-  const missingIds = new Set<string>();
+  const missingTaskKeys = new Set<string>();
   for (const t of allTasks) {
     if (t.kind === "anchor") continue; // 锚点不在素材映射里，跳过
     const base = `${cacheRoot}/images/${t.fileName.replace(/\.png$/i, "")}`;
-    const hasFile = await Promise.any([
+    const variants = await Promise.all([
       tauri.pathExists(`${base}.png`).catch(() => false),
       tauri.pathExists(`${base}.jpg`).catch(() => false),
       tauri.pathExists(`${base}.jpeg`).catch(() => false),
       tauri.pathExists(`${base}.webp`).catch(() => false),
-    ]).catch(() => false);
-    if (!hasFile) missingIds.add(t.id);
+    ]);
+    if (!variants.some(Boolean)) missingTaskKeys.add(imageTaskIdentity(t));
   }
-  if (!missingIds.size) {
+  if (!missingTaskKeys.size) {
     pushLog({ step: "素材", message: "没有缺失的图片，无需补全", level: "info", at: Date.now() });
     return;
   }
-  assetBusy.value = `补全缺失图片（${missingIds.size} 张）`;
+  assetBusy.value = `补全缺失图片（${missingTaskKeys.size} 张）`;
   resetRegenState();
   try {
     const { signal, onProgress } = regenCtl();
-    const predicate = (t: ImageTask) => missingIds.has(t.id);
+    const predicate = (t: ImageTask) => missingTaskKeys.has(imageTaskIdentity(t));
     const results = await regenerateImages(ctx, predicate, undefined, signal, onProgress);
     pushLog({
       step: "素材",
@@ -464,7 +479,7 @@ async function loadAssetMapNow(clearAll = false): Promise<void> {
       return;
     }
     const { text } = await tauri.readTextFile(`${projectState.outputDir}/.novel2vn/assets.json`);
-    const next = JSON.parse(text) as AssetMap;
+    const next = parseAssetMap(JSON.parse(text));
     if (clearAll) {
       clearThumbCache();
     } else {
@@ -622,6 +637,7 @@ interface ExecuteOptions {
 
 async function execute(opts: ExecuteOptions): Promise<boolean> {
   error.value = "";
+  if (busy.value || assetBusy.value) return false;
   const novel = projectState.novel;
   if (!novel) {
     error.value = t("请先在「导入小说」页导入小说（或加载示例小说）");
@@ -677,6 +693,14 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
   }
   if (!projectState.outputDir) {
     projectState.outputDir = await tauri.getDefaultOutputDir().catch(() => "");
+  }
+  if (outputDirDraft.value && outputDirDraft.value !== projectState.outputDir) {
+    if (!(await flushPendingProjectSave())) {
+      error.value = t("当前项目保存失败，已取消切换输出目录");
+      return false;
+    }
+    projectState.outputDir = outputDirDraft.value;
+    configState.outputDir = outputDirDraft.value;
   }
   if (opts.clearLogsFirst) {
     clearLogs();
@@ -945,6 +969,7 @@ function regenChapter(idx: number): void {
 /* ==================== 素材 Tab 操作 ==================== */
 
 async function regenCtx(): Promise<RegenContext | null> {
+  if (busy.value || assetBusy.value) return null;
   const r = projectState.lastResult;
   if (!r) return null;
   const imageCfg = activeConfig("image");
@@ -983,6 +1008,7 @@ async function regenCtx(): Promise<RegenContext | null> {
 
 async function afterAssetRegen(label: string, resultsLength: number): Promise<void> {
   pushLog({ step: "素材", message: `${label}：已重新生成 ${resultsLength} 项，正在重新组装…`, level: "success", at: Date.now() });
+  assetBusy.value = "";
   await execute({ stages: ["assemble"] });
   await loadAssetMapNow(true);
 }
@@ -1165,6 +1191,7 @@ async function regenVoice(key: string): Promise<void> {
         at: Date.now(),
       },
     );
+    assetBusy.value = "";
     await execute({ stages: ["assemble"] });
   } catch (e) {
     pushLog({ step: "素材", message: `重新配音失败：${errMsg(e)}`, level: "error", at: Date.now() });
@@ -1184,6 +1211,7 @@ async function regenCharVoice(charId: string): Promise<void> {
     const { signal, onProgress } = regenCtl();
     const n = await regenerateCharacterVoice(ctx, charId, signal, onProgress);
     pushLog({ step: "素材", message: `角色「${charId}」全部配音已重新生成 ${n} 句`, level: "success", at: Date.now() });
+    assetBusy.value = "";
     await execute({ stages: ["assemble"] });
   } catch (e) {
     pushLog({ step: "素材", message: `重新配音失败：${errMsg(e)}`, level: "error", at: Date.now() });
@@ -1198,23 +1226,23 @@ async function regenCharVoice(charId: string): Promise<void> {
 
 async function browseOutputDir(): Promise<void> {
   if (!isTauri()) {
-    projectState.outputDir = await tauri.getDefaultOutputDir();
-    configState.outputDir = projectState.outputDir;
+    outputDirDraft.value = await tauri.getDefaultOutputDir();
     pushLog({ step: "项目", message: t("Web 版输出目录固定为虚拟目录 /app/exports"), level: "info", at: Date.now() });
     return;
   }
   const dir = await open({ directory: true, multiple: false });
   if (dir && typeof dir === "string") {
-    projectState.outputDir = dir;
-    configState.outputDir = dir;
+    outputDirDraft.value = dir;
   }
 }
 
 async function loadProjectState(): Promise<void> {
-  if (!projectState.outputDir) return;
-  await restoreProject(projectState.outputDir);
-  addRecentOutputDir(projectState.outputDir);
-  pushLog({ step: "项目", message: `已加载项目状态：${projectState.outputDir}`, level: "success", at: Date.now() });
+  const dir = outputDirDraft.value.trim();
+  if (!dir) return;
+  await restoreProject(dir);
+  configState.outputDir = dir;
+  addRecentOutputDir(dir);
+  pushLog({ step: "项目", message: `已加载项目状态：${dir}`, level: "success", at: Date.now() });
   await stageStatus.refresh();
 }
 
@@ -1230,7 +1258,17 @@ async function ensureLiveResultShape(outputDir: string): Promise<void> {
   try {
     if (!projectState.lastResult) {
       projectState.lastResult = {
-        meta: null as never,
+        meta: {
+          title: "",
+          gameKey: "",
+          chapterCount: 0,
+          charCount: 0,
+          sceneCount: 0,
+          lineCount: 0,
+          outputDir,
+          webgalVersion: "",
+          generatedAt: "",
+        },
         cards: { title: "", characters: [], scenes: [], items: [] },
         cost: { llmTokens: 0, imageCount: 0, ttsChars: 0, llmCostYuan: 0, imageCostYuan: 0, ttsCostYuan: 0 },
         chapters: [],
@@ -1253,7 +1291,7 @@ async function ensureLiveResultShape(outputDir: string): Promise<void> {
       for (const f of files) {
         try {
           const { text } = await tauri.readTextFile(f.path);
-          const sc = JSON.parse(text) as import("../core/types").ChapterScript;
+          const sc = parseChapterScript(JSON.parse(text));
           chapters[sc.chapter] = sc;
         } catch {
           /* 跳过损坏缓存 */
@@ -1413,7 +1451,7 @@ function fileExistsLabel(file: string | undefined): string {
         <p class="page-sub">{{ t("AI 管线：提取 → 剧本 → 图像 → 配音 → 组装。可整体跑，也可分阶段单独执行与重生成。") }}</p>
       </div>
       <div class="page-actions">
-        <button class="btn" :disabled="busy" @click="start">
+        <button class="btn" :disabled="busy || !!assetBusy" @click="start">
           <span v-if="busy" class="spinner" />
           {{ busy ? t("生成中…") : t("开始生成") }}
         </button>
@@ -1438,7 +1476,7 @@ function fileExistsLabel(file: string | undefined): string {
         <label class="field" style="flex: 2 1 340px; margin-bottom: 0">
           <span>{{ t("输出目录") }}</span>
           <div class="row">
-            <input type="text" v-model="projectState.outputDir" style="flex: 3" />
+            <input type="text" v-model="outputDirDraft" style="flex: 3" />
             <button class="btn secondary small" @click="browseOutputDir">{{ t("浏览…") }}</button>
             <button class="btn ghost small" @click="loadProjectState">{{ t("加载该项目") }}</button>
           </div>
@@ -1935,7 +1973,7 @@ function fileExistsLabel(file: string | undefined): string {
         <div v-for="ch in projectState.novel?.chapters ?? []" :key="ch.index" class="stage-row" style="margin-bottom: 8px">
           <div class="stage-row-label"><b>{{ ch.title }}</b></div>
           <input type="text" v-model="scriptChapterFeedback[ch.index]" :placeholder="t('意见（可选）：这一章节奏太慢，希望更快推进…')" />
-          <button class="btn small" :disabled="busy" @click="regenChapter(ch.index)">{{ t("重新生成此章") }}</button>
+          <button class="btn small" :disabled="busy || !!assetBusy" @click="regenChapter(ch.index)">{{ t("重新生成此章") }}</button>
         </div>
       </div>
       <div class="card" v-if="scriptFiles.length">
@@ -1987,7 +2025,7 @@ function fileExistsLabel(file: string | undefined): string {
           </div>
         </div>
         <div class="log-panel" ref="logPanelRef">
-          <div v-for="(l, i) in projectState.logs" :key="i" class="log-line" :class="l.level">
+          <div v-for="l in visibleLogs" :key="`${l.at}:${l.step}:${l.message}`" class="log-line" :class="l.level">
             <span class="time">{{ new Date(l.at).toLocaleTimeString() }}</span>
             <span class="step-badge">{{ l.step }}</span>
             <span>{{ l.message }}</span>

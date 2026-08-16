@@ -6,6 +6,8 @@ import {
   CONFIG_SCHEMA_VERSION,
   DEFAULT_CONCURRENCY_BY_CHANNEL,
   loadConfigFile,
+  configSecrets,
+  serializeConfigFile,
   UnsupportedConfigVersionError,
   type ConfigFile,
 } from "./configMigration";
@@ -123,9 +125,11 @@ export const configState = reactive<ConfigFile>({
 let configPersistenceBlocked = false;
 let lastPersistedContent = "";
 let pendingMigrationContent = "";
+let pendingMigrationSecrets: Record<string, string> = {};
 let migrationRetryTimer: number | undefined;
+let secretStoreUnavailable = false;
 export const configPersistenceError = ref("");
-void loadPersisted();
+export const configReady = loadPersisted();
 
 async function loadPersisted() {
   try {
@@ -135,15 +139,23 @@ async function loadPersisted() {
       createId: makeId,
       createVisionDefault: () => defaultApiConfig("vision"),
       writeConfig: (content) => tauri.writeConfig(content),
+      readSecrets: (ids) => tauri.readApiSecrets(ids),
+      writeSecrets: (secrets) => tauri.writeApiSecrets(secrets),
     });
     const parsed = loaded.config;
     if (loaded.migrationPending) {
       configPersistenceBlocked = true;
-      pendingMigrationContent = JSON.stringify(parsed);
+      pendingMigrationContent = serializeConfigFile(parsed);
+      pendingMigrationSecrets = configSecrets(parsed);
       configPersistenceError.value = `旧配置已恢复，但迁移结果暂时无法保存：${loaded.migrationSaveError?.message ?? "未知错误"}`;
       scheduleMigrationRetry();
     } else {
-      lastPersistedContent = JSON.stringify(parsed);
+      lastPersistedContent = serializeConfigFile(parsed);
+    }
+    if (loaded.secretStoreError) {
+      secretStoreUnavailable = true;
+      configPersistenceBlocked = true;
+      configPersistenceError.value = `系统凭据库暂时不可用：${loaded.secretStoreError.message}`;
     }
     if (parsed.presets.length) {
       configState.presets = parsed.presets;
@@ -153,10 +165,14 @@ async function loadPersisted() {
     configState.outputDir = parsed.outputDir || "";
     configState.recentOutputDirs = parsed.recentOutputDirs ?? [];
   } catch (error) {
+    configPersistenceBlocked = true;
     if (error instanceof UnsupportedConfigVersionError) {
-      configPersistenceBlocked = true;
       configPersistenceError.value = error.message;
       log.error("config", "配置文件来自更高版本，已停止写入以保护原配置", { error: error.message });
+    } else {
+      const message = error instanceof Error ? error.message : String(error);
+      configPersistenceError.value = `配置文件读取失败，已停止写入以保护原配置：${message}`;
+      log.error("config", "配置文件读取失败，已停止写入以保护原配置", { error: message });
     }
   }
 }
@@ -164,7 +180,7 @@ async function loadPersisted() {
 let saveTimer: number | undefined;
 
 function persistedConfigContent(): string {
-  return JSON.stringify({
+  return serializeConfigFile({
     configSchemaVersion: CONFIG_SCHEMA_VERSION,
     presets: configState.presets,
     activePresetId: configState.activePresetId,
@@ -185,6 +201,7 @@ async function retryMigrationPersistence(): Promise<void> {
   const migratedContent = pendingMigrationContent;
   if (!migratedContent) return;
   try {
+    await tauri.writeApiSecrets(pendingMigrationSecrets);
     await tauri.writeConfig(migratedContent);
   } catch (error) {
     configPersistenceError.value = `配置迁移仍无法保存：${error instanceof Error ? error.message : String(error)}`;
@@ -193,12 +210,14 @@ async function retryMigrationPersistence(): Promise<void> {
   }
 
   pendingMigrationContent = "";
+  pendingMigrationSecrets = {};
   lastPersistedContent = migratedContent;
-  configPersistenceBlocked = false;
-  configPersistenceError.value = "";
+  configPersistenceBlocked = secretStoreUnavailable;
+  configPersistenceError.value = secretStoreUnavailable ? configPersistenceError.value : "";
   const currentContent = persistedConfigContent();
   if (currentContent === lastPersistedContent) return;
   try {
+    await tauri.writeApiSecrets(configSecrets(configState));
     await tauri.writeConfig(currentContent);
     lastPersistedContent = currentContent;
   } catch (error) {
@@ -223,9 +242,12 @@ watch(
       const content = persistedConfigContent();
       if (content === lastPersistedContent) return;
       void tauri
-        .writeConfig(content)
+        .writeApiSecrets(configSecrets(configState))
+        .then(() => tauri.writeConfig(content))
         .then(() => { lastPersistedContent = content; })
-        .catch(() => {});
+        .catch((error) => {
+          configPersistenceError.value = `配置自动保存失败：${error instanceof Error ? error.message : String(error)}`;
+        });
     }, 500);
   },
   { deep: true },
@@ -259,6 +281,9 @@ export function removeConfig(kind: ChannelKey, id: string): void {
   const idx = list.findIndex((c) => c.id === id);
   if (idx < 0) return;
   list.splice(idx, 1);
+  void tauri.writeApiSecrets({ [id]: "" }).catch((error) => {
+    configPersistenceError.value = `删除系统凭据失败：${error instanceof Error ? error.message : String(error)}`;
+  });
   if (preset.active[kind] === id) {
     preset.active[kind] = list[0]?.id ?? "";
   }
@@ -274,7 +299,13 @@ export function removePreset(id: string): void {
   if (configState.presets.length <= 1) return;
   const idx = configState.presets.findIndex((p) => p.id === id);
   if (idx < 0) return;
+  const removedSecrets = Object.fromEntries(
+    Object.values(configState.presets[idx].channels).flat().map((config) => [config.id, ""]),
+  );
   configState.presets.splice(idx, 1);
+  void tauri.writeApiSecrets(removedSecrets).catch((error) => {
+    configPersistenceError.value = `删除系统凭据失败：${error instanceof Error ? error.message : String(error)}`;
+  });
   if (configState.activePresetId === id) {
     configState.activePresetId = configState.presets[0].id;
   }

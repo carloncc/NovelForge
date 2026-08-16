@@ -1,12 +1,8 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { defineAsyncComponent, onMounted, ref } from "vue";
 import ImportPage from "./pages/ImportPage.vue";
-import ConfigPage from "./pages/ConfigPage.vue";
-import GeneratePage from "./pages/GeneratePage.vue";
-import PreviewPage from "./pages/PreviewPage.vue";
-import ExportPage from "./pages/ExportPage.vue";
 import AboutDialog from "./components/AboutDialog.vue";
-import { configState } from "./stores/config";
+import { configReady, configState } from "./stores/config";
 import { projectState, restoreProject } from "./stores/project";
 import { tauri } from "./utils/tauri";
 import { installLogFileSink } from "./utils/logFile";
@@ -16,10 +12,10 @@ import { t, LANGS, currentLang, setLang } from "./i18n";
 
 const pages = [
   { id: "import", labelKey: "导入小说", comp: ImportPage },
-  { id: "config", labelKey: "API 配置", comp: ConfigPage },
-  { id: "generate", labelKey: "生成项目", comp: GeneratePage },
-  { id: "preview", labelKey: "预览", comp: PreviewPage },
-  { id: "export", labelKey: "导出", comp: ExportPage },
+  { id: "config", labelKey: "API 配置", comp: defineAsyncComponent(() => import("./pages/ConfigPage.vue")) },
+  { id: "generate", labelKey: "生成项目", comp: defineAsyncComponent(() => import("./pages/GeneratePage.vue")) },
+  { id: "preview", labelKey: "预览", comp: defineAsyncComponent(() => import("./pages/PreviewPage.vue")) },
+  { id: "export", labelKey: "导出", comp: defineAsyncComponent(() => import("./pages/ExportPage.vue")) },
 ];
 const current = ref("import");
 const aboutOpen = ref(false);
@@ -41,6 +37,7 @@ function onLangChange(e: Event): void {
 onMounted(async () => {
   const logPath = await installLogFileSink();
   log.info("app", "应用启动，日志已落盘", { logPath });
+  await configReady;
   if (configState.outputDir) {
     projectState.outputDir = configState.outputDir;
     await restoreProject(configState.outputDir);

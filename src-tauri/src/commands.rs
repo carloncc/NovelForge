@@ -5,10 +5,15 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tauri::Manager;
 
 use crate::{preview, server};
+
+const API_SECRET_SERVICE: &str = "com.novelforge.app.api";
+const HTTP_BODY_LIMIT: usize = 64 * 1024 * 1024;
+static ATOMIC_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -27,19 +32,54 @@ fn default_timeout() -> u64 {
     120
 }
 
+fn http_target(args: &HttpRequestArgs) -> Result<reqwest::Url, String> {
+    let target = reqwest::Url::parse(&args.url).map_err(|_| "无效的 HTTP 地址".to_string())?;
+    if !matches!(target.scheme(), "http" | "https") {
+        return Err("仅支持 HTTP/HTTPS 地址".to_string());
+    }
+    if args
+        .body
+        .as_ref()
+        .is_some_and(|body| body.len() > HTTP_BODY_LIMIT)
+    {
+        return Err("请求体超过 64MB 上限，已拒绝".to_string());
+    }
+    Ok(target)
+}
+
+async fn limited_response_bytes(mut response: reqwest::Response) -> Result<Vec<u8>, String> {
+    if response
+        .content_length()
+        .is_some_and(|size| size > HTTP_BODY_LIMIT as u64)
+    {
+        return Err("响应超过 64MB 上限，已拒绝".to_string());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| format!("读取响应失败: {e}"))?
+    {
+        if bytes.len() + chunk.len() > HTTP_BODY_LIMIT {
+            return Err("响应超过 64MB 上限，已拒绝".to_string());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
 #[tauri::command]
-pub async fn http_request(
-    args: HttpRequestArgs,
-) -> Result<Value, String> {
+pub async fn http_request(args: HttpRequestArgs) -> Result<Value, String> {
+    let target = http_target(&args)?;
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(args.timeout_secs.max(1)))
+        .timeout(Duration::from_secs(args.timeout_secs.clamp(1, 600)))
         .build()
         .map_err(|e| format!("HTTP 客户端初始化失败: {e}"))?;
 
     let method = reqwest::Method::from_bytes(args.method.to_uppercase().as_bytes())
         .map_err(|_| "不支持的 HTTP 方法".to_string())?;
 
-    let mut req = client.request(method, &args.url);
+    let mut req = client.request(method, target);
     for (k, v) in &args.headers {
         if k.to_lowercase() != "host" {
             req = req.header(k, v);
@@ -59,15 +99,12 @@ pub async fn http_request(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let bytes = resp.bytes().await.map_err(|e| format!("读取响应失败: {e}"))?;
-    if bytes.len() > 64 * 1024 * 1024 {
-        return Err(format!("响应超过 64MB 上限（实际 {}MB），已拒绝", bytes.len() / 1024 / 1024));
-    }
+    let bytes = limited_response_bytes(resp).await?;
 
     Ok(serde_json::json!({
         "status": status,
         "contentType": content_type,
-        "bodyBase64": B64.encode(&bytes),
+        "bodyBase64": B64.encode(bytes),
     }))
 }
 
@@ -100,7 +137,7 @@ fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
     }
-    let tmp = path.with_extension(format!("{}.tmp", path.extension().and_then(|e| e.to_str()).unwrap_or("bin")));
+    let tmp = atomic_write_temp_path(path);
     std::fs::write(&tmp, bytes).map_err(|e| format!("写入临时文件失败: {e}"))?;
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
@@ -169,6 +206,12 @@ pub fn copy_file(src: String, dst: String) -> Result<(), String> {
     }
     std::fs::copy(&src, &dp).map_err(|e| format!("复制失败: {e}"))?;
     Ok(())
+}
+
+fn atomic_write_temp_path(path: &std::path::Path) -> PathBuf {
+    let extension = path.extension().and_then(|value| value.to_str()).unwrap_or("bin");
+    let sequence = ATOMIC_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    path.with_extension(format!("{extension}.{}.{}.tmp", std::process::id(), sequence))
 }
 
 #[tauri::command]
@@ -297,7 +340,55 @@ pub fn write_config(app: tauri::AppHandle, content: String) -> Result<(), String
         .app_config_dir()
         .map_err(|e| format!("获取配置目录失败: {e}"))?;
     let file = dir.join("config.json");
-    std::fs::write(&file, content).map_err(|e| format!("写入配置失败: {e}"))
+    atomic_write(&file, content.as_bytes())
+}
+
+fn validate_secret_id(id: &str) -> Result<(), String> {
+    if id.is_empty()
+        || id.len() > 128
+        || !id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return Err("无效的凭据标识".to_string());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn read_api_secrets(ids: Vec<String>) -> Result<HashMap<String, String>, String> {
+    let mut secrets = HashMap::new();
+    for id in ids {
+        validate_secret_id(&id)?;
+        let entry = keyring::Entry::new(API_SECRET_SERVICE, &id)
+            .map_err(|e| format!("创建系统凭据项失败（{id}）：{e}"))?;
+        match entry.get_password() {
+            Ok(secret) => {
+                secrets.insert(id, secret);
+            }
+            Err(keyring::Error::NoEntry) => {}
+            Err(e) => return Err(format!("读取系统凭据失败（{id}）：{e}")),
+        }
+    }
+    Ok(secrets)
+}
+
+#[tauri::command]
+pub fn write_api_secrets(secrets: HashMap<String, String>) -> Result<(), String> {
+    for (id, secret) in secrets {
+        validate_secret_id(&id)?;
+        let entry = keyring::Entry::new(API_SECRET_SERVICE, &id)
+            .map_err(|e| format!("创建系统凭据项失败（{id}）：{e}"))?;
+        if secret.is_empty() {
+            if let Err(e) = entry.delete_credential() {
+                if !matches!(e, keyring::Error::NoEntry) {
+                    return Err(format!("删除系统凭据失败（{id}）：{e}"));
+                }
+            }
+        } else {
+            entry.set_password(&secret)
+                .map_err(|e| format!("写入系统凭据失败（{id}）：{e}"))?;
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -543,8 +634,8 @@ pub fn build_zip(
 
 #[cfg(test)]
 mod atomic_write_tests {
-    use super::atomic_write;
-    use std::io::Write;
+    use super::{atomic_write, atomic_write_temp_path, http_target, validate_secret_id, HttpRequestArgs};
+    use std::collections::HashMap;
 
     #[test]
     fn atomic_write_overwrites_and_no_tmp_left() {
@@ -569,12 +660,37 @@ mod atomic_write_tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn atomic_write_uses_unique_temporary_paths() {
+        let path = std::env::temp_dir().join("novelforge_atomic_unique.json");
+        assert_ne!(atomic_write_temp_path(&path), atomic_write_temp_path(&path));
+    }
+
+    #[test]
+    fn secret_ids_reject_unsafe_values() {
+        assert!(validate_secret_id("llm-config_1").is_ok());
+        assert!(validate_secret_id("").is_err());
+        assert!(validate_secret_id("../credential").is_err());
+        assert!(validate_secret_id(&"x".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn http_targets_reject_non_http_protocols() {
+        let args = HttpRequestArgs {
+            method: "GET".to_string(),
+            url: "file:///etc/passwd".to_string(),
+            headers: HashMap::new(),
+            body: None,
+            timeout_secs: 120,
+        };
+        assert!(http_target(&args).is_err());
+    }
 }
 
 #[cfg(test)]
 mod zip_tests {
     use super::build_zip;
-    use std::io::Write;
 
     #[test]
     fn zip_excludes_and_keeps_utf8_names() {

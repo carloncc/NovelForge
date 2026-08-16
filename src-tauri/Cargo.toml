@@ -1,6 +1,6 @@
 [package]
 name = "novelforge"
-version = "0.1.0"
+version = "0.2.0"
 description = "AI 视觉小说转换工具"
 edition = "2021"
 
@@ -28,6 +28,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 zip = "2"
 # 内嵌 WebGAL 引擎模板，使便携版 exe 无需外部 templates 目录即可单独运行
 include_dir = "0.7"
+keyring = { version = "3.6.3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 
 [profile.release]
 opt-level = "s"

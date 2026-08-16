@@ -4,7 +4,7 @@ import { tauri } from "../src/utils/tauri";
 import type { MaterialAsset, ProjectVisualBible } from "../src/core/types";
 import { writeFile } from "node:fs/promises";
 
-const DIR = `${process.cwd().replace(/\\/g, "/")}/tests/.tmp-persist`;
+const DIR = `${process.cwd().replace(/\\/g, "/")}/tests/.tmp-persist-${process.pid}`;
 const PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z8Z8AAAAASUVORK5CYII=";
 
 function assert(cond: boolean, msg: string): void {
@@ -159,8 +159,29 @@ async function main(): Promise<void> {
   }
 
   (globalThis as unknown as { window: { setTimeout: () => number } }).window = { setTimeout: () => 1 };
-  const { persistCurrentProjectState, projectState } = await import("../src/stores/project");
+  const { persistCurrentProjectState, projectState, restoreProject } = await import("../src/stores/project");
   projectState.outputDir = DIR;
+
+  await tauri.mkdirAll(`${DIR}/.novel2vn/cache`);
+  const cachedChapter = JSON.stringify({ chapter: 0, title: "cached", scenes: [] });
+  await tauri.writeTextFile(`${DIR}/.novel2vn/cache/script_ch1_a.json`, cachedChapter);
+  await tauri.writeTextFile(`${DIR}/.novel2vn/cache/script_ch1_z.json`, cachedChapter);
+  await tauri.writeTextFile(`${DIR}/.novel2vn/cache/script_ch2_a.json`, JSON.stringify({ chapter: 1, title: "cached 2", scenes: [] }));
+  await tauri.writeTextFile(`${DIR}/.novel2vn/cache/script_ch3_a.json`, JSON.stringify({ chapter: 2, title: [], scenes: {} }));
+  const originalReadTextFile = tauri.readTextFile;
+  let scriptCacheReads = 0;
+  tauri.readTextFile = async (path) => {
+    if (/\/cache\/script/.test(path)) scriptCacheReads++;
+    return originalReadTextFile(path);
+  };
+  try {
+    await restoreProject(DIR);
+  } finally {
+    tauri.readTextFile = originalReadTextFile;
+  }
+  assert(scriptCacheReads === 3, `project restore should inspect one script cache per chapter, got ${scriptCacheReads}`);
+  assert(projectState.lastResult?.chapters.length === 2, "structurally invalid chapter caches must be skipped");
+
   tauri.writeTextFile = async (path, content) => {
     if (path.endsWith("/.novel2vn/project_state.json")) throw new Error("visible project-state failure");
     return originalWriteTextFile(path, content);
@@ -176,7 +197,39 @@ async function main(): Promise<void> {
   const gone = await restoreProjectState(`${DIR}-missing`);
   assert(gone.novel === null && gone.materials.length === 0, "无状态目录应返回空");
 
+  projectState.novel = novel;
+  projectState.materials = materials;
+  await restoreProject(`${DIR}-missing`);
+  assert(projectState.novel === null, "加载空项目时不应保留上一个项目的小说");
+  assert(projectState.materials.length === 0, "加载空项目时不应保留上一个项目的素材");
+
+  const corruptDir = `${DIR}-corrupt`;
+  await tauri.mkdirAll(`${corruptDir}/.novel2vn`);
+  await tauri.writeTextFile(`${corruptDir}/.novel2vn/project_state.json`, "{broken");
+  projectState.novel = novel;
+  let corruptRejected = false;
+  try {
+    await restoreProject(corruptDir);
+  } catch {
+    corruptRejected = true;
+  }
+  assert(corruptRejected, "损坏的项目状态必须显式拒绝加载");
+  assert(projectState.novel?.fileName === novel.fileName, "加载损坏项目失败时必须保留当前项目");
+
+  const malformedDir = `${DIR}-malformed`;
+  await tauri.mkdirAll(`${malformedDir}/.novel2vn`);
+  await tauri.writeTextFile(`${malformedDir}/.novel2vn/project_state.json`, JSON.stringify({
+    materials: { unexpected: true },
+    outputDir: malformedDir,
+    options: {},
+  }));
+  const malformed = await restoreProjectState(malformedDir);
+  assert(Boolean(malformed.loadError), "结构错误但语法合法的项目状态必须拒绝加载");
+  assert(Array.isArray(malformed.materials) && malformed.materials.length === 0, "结构错误状态不得泄漏伪造的素材集合");
+
   await tauri.removePath(DIR);
+  await tauri.removePath(corruptDir);
+  await tauri.removePath(malformedDir);
   console.log("=== 状态持久化测试通过 ===");
 }
 main().catch((e) => {

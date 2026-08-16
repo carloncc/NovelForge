@@ -33,6 +33,52 @@ interface PersistedState {
   };
 }
 
+function persistedRecord(input: unknown, label: string): Record<string, unknown> {
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error(`${label} must be an object`);
+  return input as Record<string, unknown>;
+}
+
+function persistedMaterials(input: unknown): MaterialAsset[] {
+  const materials = input ?? [];
+  if (!Array.isArray(materials)) throw new Error("project state materials must be an array");
+  for (const materialInput of materials) {
+    const material = persistedRecord(materialInput, "project material");
+    const validKind = material.kind === "character" || material.kind === "item" || material.kind === "background";
+    if (typeof material.name !== "string" || typeof material.path !== "string" || !validKind || typeof material.mime !== "string") {
+      throw new Error("project state contains an invalid material");
+    }
+  }
+  return materials as MaterialAsset[];
+}
+
+function validatePersistedNovel(input: unknown): void {
+  if (input === undefined) return;
+  const novel = persistedRecord(input, "project novel");
+  if (!Array.isArray(novel.chapters)) throw new Error("project novel chapters must be an array");
+  for (const chapterInput of novel.chapters) {
+    const chapter = persistedRecord(chapterInput, "project novel chapter");
+    if (!Number.isInteger(chapter.index) || typeof chapter.title !== "string") throw new Error("project novel contains an invalid chapter");
+  }
+}
+
+function validatePersistedResult(input: unknown): void {
+  if (input === undefined) return;
+  const lastResult = persistedRecord(input, "project result");
+  persistedRecord(lastResult.meta, "project result meta");
+  persistedRecord(lastResult.cost, "project result cost");
+  const cards = persistedRecord(lastResult.cards, "project result cards");
+  if (!Array.isArray(cards.characters) || !Array.isArray(cards.scenes) || !Array.isArray(cards.items)) throw new Error("project result cards are invalid");
+}
+
+function parsePersistedState(input: unknown): PersistedState {
+  const state = persistedRecord(input, "project state");
+  const materials = persistedMaterials(state.materials);
+  if (state.options !== undefined) persistedRecord(state.options, "project options");
+  validatePersistedNovel(state.novel);
+  validatePersistedResult(state.lastResult);
+  return { ...state, materials } as unknown as PersistedState;
+}
+
 export function stateFile(outputDir: string): string {
   return `${outputDir}/.novel2vn/project_state.json`;
 }
@@ -99,6 +145,7 @@ export async function restoreProjectState(outputDir: string): Promise<{
   lastResult: PersistedState["lastResult"] | null;
   visualBible: ProjectVisualBible | null;
   warnings: string[];
+  loadError?: string;
 }> {
   const loadedBible = await loadVisualBible(outputDir);
   const empty = {
@@ -112,7 +159,7 @@ export async function restoreProjectState(outputDir: string): Promise<{
   try {
     if (!(await tauri.pathExists(stateFile(outputDir)))) return empty;
     const { text } = await tauri.readTextFile(stateFile(outputDir));
-    const persistedState = JSON.parse(text) as PersistedState;
+    const persistedState = parsePersistedState(JSON.parse(text));
 
     let novel: NovelDoc | null = null;
     const sourcePaths = persistedState.novel?.sourcePaths?.length
@@ -190,8 +237,11 @@ export async function restoreProjectState(outputDir: string): Promise<{
       visualBible,
       warnings,
     };
-  } catch {
-    return empty;
+  } catch (error) {
+    return {
+      ...empty,
+      loadError: error instanceof Error ? error.message : String(error),
+    };
   }
 }
 

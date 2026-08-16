@@ -1,6 +1,6 @@
 // 校验 4 语言字典与基准 key 集一致（缺翻/多翻检测）
 import { readFileSync } from "node:fs";
-const KEYS = readFileSync("scripts/i18n-keys.txt", "utf-8").split("\n").filter(Boolean);
+const KEYS = readFileSync("scripts/i18n-keys.txt", "utf-8").split("\n").map((key) => key.trimEnd()).filter(Boolean);
 const uniq = [...new Set(KEYS)].sort();
 const files = ["zh-TW", "en", "ja", "ko"];
 let failed = false;

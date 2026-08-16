@@ -5,9 +5,12 @@ import { renderChapter, renderStart } from "../src/core/render";
 import { assembleProject, gameKeyFor } from "../src/core/project";
 import { DEMO_NOVEL } from "../src/core/demoNovel";
 import { tauri } from "../src/utils/tauri";
+import { mkdtemp } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 async function main(): Promise<void> {
-  const out = "/tmp/novelforge-e2e/game";
+  const out = `${(await mkdtemp(join(tmpdir(), "novelforge-e2e-"))).replace(/\\/g, "/")}/game`;
   await tauri.removePath(out).catch(() => {});
 
   const chapters = splitChapters(DEMO_NOVEL, "星陨之城的守夜人");

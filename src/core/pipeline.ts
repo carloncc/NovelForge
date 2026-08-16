@@ -35,6 +35,8 @@ import { configIsUsable } from "../api/providers";
 import { concurrencyFor } from "../stores/configMigration";
 import { setLlmConcurrency } from "../api/openaiCompatible";
 import { assertVisualBibleApprovalStatus, assertVisualBibleReadyForImages } from "./visualBible";
+import { readAssetMap, updateAssetMap } from "./assetMap";
+import { parseChapterScript } from "./dataValidation";
 
 export interface PipelineInput {
   novel: NovelDoc;
@@ -268,7 +270,7 @@ export class Pipeline {
       for (const f of files) {
         try {
           const { text } = await tauri.readTextFile(f.path);
-          const sc = JSON.parse(text) as ChapterScript;
+          const sc = parseChapterScript(JSON.parse(text));
           chapters[sc.chapter] = sc;
         } catch {
           /* 单个缓存损坏跳过 */
@@ -281,7 +283,8 @@ export class Pipeline {
   }
 
   private async loadAssetMap(): Promise<AssetMap | null> {
-    return this.readCachedJson<AssetMap>(`${this.input.outputDir}/.novel2vn/assets.json`);
+    const file = `${this.input.outputDir}/.novel2vn/assets.json`;
+    return await tauri.pathExists(file) ? readAssetMap(this.input.outputDir) : null;
   }
 
   private async loadMeta(): Promise<ProjectMeta | null> {
@@ -289,33 +292,13 @@ export class Pipeline {
   }
 
   private async persistAssets(assets: RenderAssets): Promise<void> {
-    try {
-      // 先读磁盘已有映射，再合并本次结果，避免并发写或中断时互相覆盖丢失
-      let existing: AssetMap | null = null;
-      const assetsFile = `${this.input.outputDir}/.novel2vn/assets.json`;
-      try {
-        const existingMap = await this.readCachedJson<AssetMap>(assetsFile);
-        if (existingMap) existing = existingMap;
-      } catch {
-        /* 无旧映射 */
-      }
-      await tauri.writeTextFile(
-        assetsFile,
-        JSON.stringify(
-          {
-            bg: { ...(existing?.bg ?? {}), ...assets.bg },
-            cg: { ...(existing?.cg ?? {}), ...assets.cg },
-            figure: { ...(existing?.figure ?? {}), ...assets.figure },
-            item: { ...(existing?.item ?? {}), ...assets.item },
-            vocal: { ...(existing?.vocal ?? {}), ...assets.vocal },
-          },
-          null,
-          2,
-        ),
-      );
-    } catch {
-      /* 素材映射持久化失败不阻断 */
-    }
+    await updateAssetMap(this.input.outputDir, (existing) => {
+      Object.assign(existing.bg, assets.bg);
+      Object.assign(existing.cg, assets.cg);
+      Object.assign(existing.figure, assets.figure);
+      Object.assign(existing.item, assets.item);
+      Object.assign(existing.vocal, assets.vocal);
+    });
   }
 
   /** 卡片变化后使依赖卡片的缓存失效：剧本 + 立绘/物品图 */

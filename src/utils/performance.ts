@@ -10,12 +10,7 @@ export class ConcurrencyLimiter {
   /** 动态调整上限：增大立即生效（新任务直接进入），减小后运行数自然回落 */
   setMaxConcurrent(n: number): void {
     this.maxConcurrent = Math.max(1, n);
-    while (this.running < this.maxConcurrent) {
-      const next = this.queue.shift();
-      if (!next) break;
-      this.running++;
-      next();
-    }
+    this.drain();
   }
 
   get max(): number {
@@ -23,17 +18,29 @@ export class ConcurrencyLimiter {
   }
 
   async run<T>(operation: () => Promise<T>): Promise<T> {
-    while (this.running >= this.maxConcurrent) {
-      await new Promise<void>((resolve) => this.queue.push(resolve));
-    }
-
-    this.running++;
+    await this.acquire();
     try {
       return await operation();
     } finally {
       this.running--;
+      this.drain();
+    }
+  }
+
+  private async acquire(): Promise<void> {
+    if (this.running < this.maxConcurrent) {
+      this.running++;
+      return;
+    }
+    await new Promise<void>((resolve) => this.queue.push(resolve));
+  }
+
+  private drain(): void {
+    while (this.running < this.maxConcurrent) {
       const next = this.queue.shift();
-      if (next) next();
+      if (!next) return;
+      this.running++;
+      next();
     }
   }
 }

@@ -1,13 +1,15 @@
 import { lintProject } from "../src/core/lint";
 import { tauri } from "../src/utils/tauri";
-
-const DIR = "/tmp/novelforge-lint-test";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 function assert(cond: boolean, msg: string): void {
   if (!cond) throw new Error(msg);
 }
 
 async function main(): Promise<void> {
+  const DIR = (await mkdtemp(join(tmpdir(), "novelforge-lint-test-"))).replace(/\\/g, "/");
   await tauri.removePath(DIR).catch(() => {});
   // 构造项目：正常章节 + 一个引用缺失素材 + 一个坏语法 + 一个空章
   await tauri.mkdirAll(`${DIR}/game/scene`);

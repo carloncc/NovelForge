@@ -15,6 +15,37 @@ export interface LogEntry {
 
 const HISTORY_LIMIT = 5000;
 const history: LogEntry[] = [];
+const SENSITIVE_KEY = /api[_-]?key|authorization|token|secret|password/i;
+const REDACTED = "[REDACTED]";
+
+export function redactSensitive(value: unknown, seen = new WeakSet<object>()): unknown {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if ((trimmed.startsWith("{") || trimmed.startsWith("[")) && trimmed.length > 1) {
+      try {
+        return JSON.stringify(redactSensitive(JSON.parse(value)));
+      } catch {
+        // Not JSON; apply token-pattern redaction below.
+      }
+    }
+    return value
+      .replace(/("(?:api[_-]?key|authorization|token|secret|password)"\s*:\s*")[^"]*(")/gi, `$1${REDACTED}$2`)
+      .replace(/([?&](?:api[_-]?key|authorization|token|secret|password)=)[^&\s]+/gi, `$1${REDACTED}`)
+      .replace(/Bearer\s+[^\s"']+/gi, `Bearer ${REDACTED}`)
+      .replace(/\bsk-[A-Za-z0-9._-]{6,}/g, REDACTED);
+  }
+  if (Array.isArray(value)) return value.map((item) => redactSensitive(item, seen));
+  if (value && typeof value === "object") {
+    if (seen.has(value)) return "[Circular]";
+    seen.add(value);
+    const out: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      out[key] = SENSITIVE_KEY.test(key) ? REDACTED : redactSensitive(item, seen);
+    }
+    return out;
+  }
+  return value;
+}
 
 /** 可插拔的日志文件写入器（由应用启动时注册，写入磁盘，便于离线诊断） */
 export type LogFileSink = (entry: LogEntry) => void;
@@ -57,14 +88,14 @@ function stringify(data: unknown): string {
 }
 
 function push(level: LogLevel, scope: string, message: string, data?: unknown): void {
-  const entry: LogEntry = { at: Date.now(), level, scope, message, data };
+  const entry: LogEntry = { at: Date.now(), level, scope, message, data: redactSensitive(data) };
   if (history.length >= HISTORY_LIMIT) history.shift();
   history.push(entry);
   logFileSink?.(entry);
 
   if (!DEV) return;
   const time = new Date(entry.at).toISOString();
-  const suffix = data === undefined ? "" : ` ${stringify(truncate(data))}`;
+  const suffix = entry.data === undefined ? "" : ` ${stringify(truncate(entry.data))}`;
   const line = `[NovelForge][${time}][${level.toUpperCase()}][${scope}] ${message}${suffix}`;
   if (level === "error") console.error(line);
   else if (level === "warn") console.warn(line);

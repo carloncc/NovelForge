@@ -3,6 +3,7 @@ import { resolveImageModelCapabilities, routeImageReferences } from "../src/api/
 import { buildImageTasks, generateImages, resolveImageTaskReferences, runImageTask } from "../src/core/images";
 import {
   imageTaskMatchesSelectionKey,
+  imageTaskIdentity,
   regenerateCharacterFigures,
   regenerateCharacterThreeView,
   regenerateImages,
@@ -450,6 +451,22 @@ function testSelectionCascadeUsesExactTaskOwnership(): void {
   assert(imageTaskMatchesSelectionKey(aliceFigure, "threeview:alice"), "three-view selection should include target-owned figures");
   assert(imageTaskMatchesSelectionKey(exactThreeView, "threeview:alice"), "three-view selection should include only the exact target sheet");
   assert(!imageTaskMatchesSelectionKey(prefixCharacterFigure, "threeview:alice"), "three-view selection must not include prefix-related character IDs");
+
+}
+
+function normalFigureTask(): ImageTask {
+  return {
+    kind: "figure", id: "alice", characterId: "alice", emotion: "normal", prompt: "", fileName: "alice-normal.png", width: 1, height: 1, usage: "alice normal",
+  };
+}
+
+function testDefaultFigureSelectionMatchesNormalTask(): void {
+  assert(imageTaskMatchesSelectionKey(normalFigureTask(), "figure:alice:normal"), "default figure selection must match the character-owned normal task");
+}
+
+function testTaskIdentityDistinguishesAssetKinds(): void {
+  const normalFigure = normalFigureTask();
+  assert(imageTaskIdentity(normalFigure) !== imageTaskIdentity({ ...normalFigure, kind: "item" }), "task identity must distinguish asset kinds that share an ID");
 }
 
 async function testSingleRegenerationLoadsDependenciesFromAllTasks(): Promise<void> {
@@ -957,6 +974,8 @@ async function main(): Promise<void> {
   await testApprovedIdentityIsUsedWhenPoseGenerationIsDisabled();
   await testZeroReferenceModelRejectsApprovedIdentityBeforeRequest();
   testSelectionCascadeUsesExactTaskOwnership();
+  testDefaultFigureSelectionMatchesNormalTask();
+  testTaskIdentityDistinguishesAssetKinds();
   await testSingleRegenerationLoadsDependenciesFromAllTasks();
   await testCharacterFigureRegenerationUsesExactOwnership();
   await testCacheBindingForcesOnlyChangedCharacter();

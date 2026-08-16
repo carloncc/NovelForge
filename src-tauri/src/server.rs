@@ -30,9 +30,12 @@ impl ServerHandle {
 }
 
 pub fn start(root: &str) -> Result<ServerHandle, String> {
-    let root = PathBuf::from(root).canonicalize().map_err(|e| format!("目录无效: {e}"))?;
+    let root = PathBuf::from(root)
+        .canonicalize()
+        .map_err(|e| format!("目录无效: {e}"))?;
     let server = Arc::new(
-        Server::http("127.0.0.1:17892").map_err(|e| format!("启动预览服务器失败（端口 17892 被占用？）: {e}"))?,
+        Server::http("127.0.0.1:17892")
+            .map_err(|e| format!("启动预览服务器失败（端口 17892 被占用？）: {e}"))?,
     );
     let port = 17892;
     let stop_flag = Arc::new(AtomicUsize::new(0));
@@ -64,15 +67,18 @@ fn handle_request(root: &Path, request: tiny_http::Request) {
     let url = request.url().to_string();
     let path_part = url.split('?').next().unwrap_or("/");
     let decoded = percent_decode(path_part);
-    let rel = if decoded == "/" { "index.html".to_string() } else { decoded.trim_start_matches('/').to_string() };
+    let rel = if decoded == "/" {
+        "index.html".to_string()
+    } else {
+        decoded.trim_start_matches('/').to_string()
+    };
 
-    let candidate = root.join(&rel);
-    let safe = is_safe_path(root, &candidate);
+    let candidate = safe_file_path(root, Path::new(&rel));
 
     let body: Vec<u8>;
     let ctype: String;
 
-    if safe && candidate.is_file() {
+    if let Some(candidate) = candidate {
         match std::fs::File::open(&candidate) {
             Ok(mut f) => {
                 let mut buf = Vec::new();
@@ -107,6 +113,9 @@ fn handle_request(root: &Path, request: tiny_http::Request) {
     if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], ctype.as_bytes()) {
         response = response.with_header(h);
     }
+    if let Ok(h) = Header::from_bytes(&b"X-Content-Type-Options"[..], &b"nosniff"[..]) {
+        response = response.with_header(h);
+    }
     let _ = request.respond(response);
 }
 
@@ -128,33 +137,39 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
-fn is_safe_path(root: &Path, candidate: &Path) -> bool {
-    let mut cur = PathBuf::new();
-    let mut ok = true;
-    for comp in candidate.components() {
-        match comp {
-            Component::Normal(c) => {
-                cur.push(c);
-            }
-            Component::ParentDir => {
-                if !cur.pop() {
-                    ok = false;
-                    break;
-                }
-            }
-            Component::RootDir | Component::Prefix(_) => {
-                cur = PathBuf::new();
-                cur.push("/");
-            }
-            Component::CurDir => {}
-        }
+fn safe_file_path(root: &Path, relative: &Path) -> Option<PathBuf> {
+    if relative
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+    {
+        return None;
     }
-    if !ok {
-        return false;
-    }
-    let resolved = root.join(&cur);
-    resolved.starts_with(root)
+    let candidate = root.join(relative).canonicalize().ok()?;
+    candidate
+        .is_file()
+        .then_some(candidate)
+        .filter(|path| path.starts_with(root))
 }
 
 #[allow(dead_code)]
 struct _MutexGuardGuard(Mutex<()>);
+
+#[cfg(test)]
+mod tests {
+    use super::safe_file_path;
+    use std::fs;
+
+    #[test]
+    fn preview_path_stays_inside_root() {
+        let root = std::env::temp_dir().join(format!("novelforge-preview-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("index.html"), "ok").unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+
+        assert!(safe_file_path(&canonical_root, std::path::Path::new("index.html")).is_some());
+        assert!(safe_file_path(&canonical_root, std::path::Path::new("../outside.txt")).is_none());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+}

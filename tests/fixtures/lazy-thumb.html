@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Lazy thumbnail visibility test</title>
+  </head>
+  <body style="margin: 0">
+    <div id="app"></div>
+    <div style="height: 3000px"></div>
+    <script type="module">
+      import { createApp, h } from "vue";
+      import LazyThumb from "/src/components/LazyThumb.vue";
+      import { clearThumbCache } from "/src/composables/useAssetThumbs.ts";
+      import { tauri } from "/src/utils/tauri.ts";
+
+      const path = "/tests/lazy-thumb.png";
+      const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z8Z8AAAAASUVORK5CYII=";
+      await tauri.writeFileBase64(path, png);
+
+      let reads = 0;
+      const originalRead = tauri.readFileBase64;
+      tauri.readFileBase64 = async (...args) => {
+        reads += 1;
+        return originalRead(...args);
+      };
+
+      createApp({ render: () => h(LazyThumb, { path, alt: "test" }) }).mount("#app");
+      window.lazyThumbTest = {
+        clear: () => clearThumbCache([path]),
+        reads: () => reads,
+      };
+    </script>
+  </body>
+</html>

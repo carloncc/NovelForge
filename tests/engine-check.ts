@@ -1,9 +1,10 @@
 import { createServer } from "node:http";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { extname, join, normalize } from "node:path";
 import { chromium } from "playwright";
 
-const ROOT = process.argv[2] || "/tmp/novelforge-e2e/game";
+const ROOT = process.argv[2];
 const MIME: Record<string, string> = {
   ".html": "text/html",
   ".js": "application/javascript",
@@ -23,6 +24,8 @@ const MIME: Record<string, string> = {
 };
 
 async function main(): Promise<void> {
+  if (!ROOT) throw new Error("请传入待检查的游戏目录");
+  const artifactsDir = await mkdtemp(join(tmpdir(), "novelforge-engine-check-"));
   const server = createServer(async (req, res) => {
     const url = new URL(req.url || "/", "http://x");
     let p = normalize(decodeURIComponent(url.pathname));
@@ -61,7 +64,7 @@ async function main(): Promise<void> {
   await page.waitForTimeout(6000);
 
   const title = await page.title();
-  await page.screenshot({ path: "/tmp/novelforge-engine-title.png" });
+  await page.screenshot({ path: join(artifactsDir, "novelforge-engine-title.png") });
 
   // 进入剧情：先点击屏幕（PRESS THE SCREEN TO START），再点击「开始游戏」
   await page.mouse.click(640, 360).catch(() => {});
@@ -130,7 +133,7 @@ async function main(): Promise<void> {
     console.log("[流程图] 验证异常（跳过）");
   }
 
-  await page.screenshot({ path: "/tmp/novelforge-engine-shot.png" });
+  await page.screenshot({ path: join(artifactsDir, "novelforge-engine-shot.png") });
   console.log("页面标题:", title);
   console.log("内容命中:", foundDialogue);
   console.log("console errors:", errors.length);

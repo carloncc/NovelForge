@@ -21,10 +21,10 @@ console.log("表情差分开启:", kindsOn);
 if ((kindsOn.figure || 0) !== cards.characters.length * 5) throw new Error("表情差分立绘任务数不符");
 if ((kindsOn.threeview || 0) !== cards.characters.length) throw new Error("三视图任务数不符");
 if ((kindsOn.anchor || 0) !== 1) throw new Error("风格锚点任务数应为 1");
-const actionsTotal = cards.characters.reduce((n, c) => n + (c.actions?.length ?? 0), 0);
+const actionsTotal = cards.characters.reduce((n, c) => n + Math.min(c.actions?.length ?? 0, 2), 0);
 if ((kindsOn.action || 0) !== actionsTotal) throw new Error("动作任务数不符");
 
-// 动作数量不设上限：6 个动作应全部生成动作立绘任务
+// 默认每角色生成 2 个动作；手动重生成路径可显式放开上限。
 {
   const many = buildImageTasks([], {
     characters: [{ id: "hero", name: "主角", imagePrompt: "anime girl", actions: Array.from({ length: 6 }, (_, i) => ({ id: `a${i}`, name: `动作${i}`, prompt: `pose ${i}` })) }],
@@ -32,7 +32,13 @@ if ((kindsOn.action || 0) !== actionsTotal) throw new Error("动作任务数不�
     scenes: [],
   }, {});
   const actionCount = many.filter((t) => t.kind === "action").length;
-  if (actionCount !== 6) throw new Error(`动作数量不应被截断：应为 6，实际 ${actionCount}`);
+  if (actionCount !== 2) throw new Error(`默认动作应限制为 2 个，实际 ${actionCount}`);
+  const allActions = buildImageTasks([], {
+    characters: [{ id: "hero", name: "主角", imagePrompt: "anime girl", actions: Array.from({ length: 6 }, (_, i) => ({ id: `a${i}`, name: `动作${i}`, prompt: `pose ${i}` })) }],
+    items: [],
+    scenes: [],
+  }, { maxActionsPerCharacter: 0 });
+  if (allActions.filter((t) => t.kind === "action").length !== 6) throw new Error("手动选择动作时应允许生成全部动作");
 }
 
 // 表情差分关闭：每角色 1 张（三视图/动作不受影响）
@@ -106,5 +112,28 @@ if (!actionTask || actionTask.refFromTask !== "linche_threeview") throw new Erro
   check(greenCount >= 1, "立绘 prompt 应含纯绿幕背景约束（供色度键抠图）");
   check(figure!.prompt.includes("reference"), "立绘 prompt 应含参考图一致性提示");
   console.log("  ✓ 立绘/物品/三视图强制纯绿幕（剥除背景词，保留绿幕约束）");
+}
+
+// 背景图必须始终是纯环境底图；即使上游提供了 bgPrompt，也不能漏掉最终的无人约束。
+{
+  const chapter = {
+    ...scripts[0],
+    scenes: [{ ...scripts[0].scenes[0], bgPrompt: "anime train station at dusk" }],
+  };
+  const background = buildImageTasks([chapter], cards, { styleAnchor: false }).find((task) => task.kind === "background");
+  if (!background?.prompt.includes("environment-only background plate")) throw new Error("背景 prompt 必须明确为纯环境底图");
+  if (!background.prompt.includes("no people, no person, no characters")) throw new Error("背景 prompt 必须始终禁止人物主体");
+}
+
+// 深色物品需要与人物立绘相同强度的绿幕约束，避免黑色主体在抠图时进入羽化区。
+{
+  const item = buildImageTasks([], {
+    characters: [],
+    items: [{ id: "black-sword", name: "黑剑", imagePrompt: "black sword" }],
+    scenes: [],
+  }, {}).find((task) => task.kind === "item");
+  if (!item?.prompt.includes("dark and black parts of the object remain fully opaque")) {
+    throw new Error("物品 prompt 必须明确保护黑色主体的不透明度");
+  }
 }
 console.log("=== 图像任务构建验证通过 ===");

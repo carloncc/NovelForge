@@ -11,8 +11,9 @@ import type {
 import { saveProjectState, restoreProjectState } from "../utils/persist";
 import { tauri } from "../utils/tauri";
 import { log } from "../utils/logger";
-import { STEP_TO_STAGE } from "../composables/useStageStatus";
-import type { StageKey } from "../core/types";
+import { clearThumbCache } from "../composables/useAssetThumbs";
+import { STEP_TO_STAGE, type StageKey } from "../core/types";
+import { parseChapterScript } from "../core/dataValidation";
 
 export interface ProjectState {
   novel: NovelDoc | null;
@@ -27,30 +28,32 @@ export interface ProjectState {
   running: boolean;
 }
 
+const DEFAULT_OPTIONS: GenerationOptions = {
+  useImage: true,
+  useTts: false,
+  useVideoPoints: true,
+  useBgm: true,
+  figureEmotions: true,
+  figureActions: true,
+  characterPoses: true,
+  imageSelfCheck: false,
+  imageBudgetPerChapter: 0,
+  cgPerChapter: 0,
+  skipCache: false,
+  videoPointsPerChapter: 0,
+  characterIntroCard: true,
+  imageStyle: "",
+  imageSeed: 0,
+  styleAnchor: true,
+  scriptStyle: "",
+  language: "",
+};
+
 export const projectState = reactive<ProjectState>({
   novel: null,
   materials: [],
   outputDir: "",
-  options: {
-    useImage: true,
-    useTts: false,
-    useVideoPoints: true,
-    useBgm: true,
-    figureEmotions: true,
-    figureActions: true,
-    characterPoses: true,
-    imageSelfCheck: false,
-    imageBudgetPerChapter: 0,
-    cgPerChapter: 0,
-    skipCache: false,
-    videoPointsPerChapter: 0,
-    characterIntroCard: true,
-    imageStyle: "",
-    imageSeed: 0,
-    styleAnchor: true,
-    scriptStyle: "",
-    language: "",
-  },
+  options: { ...DEFAULT_OPTIONS },
   lastResult: null,
   visualBible: null,
   visualBibleWarnings: [],
@@ -61,53 +64,88 @@ export const projectState = reactive<ProjectState>({
 
 let saveTimer: number | undefined;
 
-export async function persistCurrentProjectState(): Promise<boolean> {
+interface ProjectSnapshot {
+  novel: NovelDoc | null;
+  materials: MaterialAsset[];
+  outputDir: string;
+  options: GenerationOptions;
+  lastResult: { meta: PipelineResult["meta"]; cards: PipelineResult["cards"]; cost: PipelineResult["cost"] } | null;
+  visualBible: ProjectVisualBible | null;
+}
+
+function snapshotProjectState(): ProjectSnapshot {
   const lastResult = projectState.lastResult;
+  return JSON.parse(JSON.stringify({
+    novel: projectState.novel,
+    materials: projectState.materials,
+    outputDir: projectState.outputDir,
+    options: projectState.options,
+    lastResult: lastResult ? { meta: lastResult.meta, cards: lastResult.cards, cost: lastResult.cost } : null,
+    visualBible: projectState.visualBible,
+  })) as ProjectSnapshot;
+}
+
+async function persistSnapshot(snapshot: ProjectSnapshot): Promise<boolean> {
+  if (!snapshot.outputDir) return true;
   try {
-    await saveProjectState({
-      novel: projectState.novel,
-      materials: projectState.materials,
-      outputDir: projectState.outputDir,
-      options: projectState.options,
-      lastResult: lastResult
-        ? { meta: lastResult.meta, cards: lastResult.cards, cost: lastResult.cost }
-        : null,
-      visualBible: projectState.visualBible,
-    });
+    await saveProjectState(snapshot);
     projectState.saveError = null;
     return true;
   } catch (error) {
     projectState.saveError = error instanceof Error ? error.message : String(error);
     log.error("store", "项目状态保存失败", {
-      outputDir: projectState.outputDir,
+      outputDir: snapshot.outputDir,
       error: projectState.saveError,
     });
     return false;
   }
 }
 
+export async function persistCurrentProjectState(): Promise<boolean> {
+  return persistSnapshot(snapshotProjectState());
+}
+
 export function scheduleSave(): void {
-  if (saveTimer) return;
+  if (saveTimer !== undefined) return;
   saveTimer = window.setTimeout(() => {
     saveTimer = undefined;
+    const snapshot = snapshotProjectState();
     log.debug("store", "持久化项目状态", {
-      hasNovel: !!projectState.novel,
-      materials: projectState.materials.length,
-      outputDir: projectState.outputDir,
+      hasNovel: !!snapshot.novel,
+      materials: snapshot.materials.length,
+      outputDir: snapshot.outputDir,
     });
-    void persistCurrentProjectState();
+    void persistSnapshot(snapshot);
   }, 800);
 }
 
+export async function flushPendingProjectSave(): Promise<boolean> {
+  if (saveTimer === undefined) return true;
+  clearTimeout(saveTimer);
+  saveTimer = undefined;
+  return persistCurrentProjectState();
+}
+
 export async function restoreProject(outputDir: string): Promise<void> {
+  const projectChanged = outputDir !== projectState.outputDir;
+  if (projectChanged && !(await flushPendingProjectSave())) {
+    throw new Error("当前项目保存失败，已取消切换项目");
+  }
   log.info("store", "恢复项目状态", { outputDir });
   const r = await restoreProjectState(outputDir);
+  if (r.loadError) throw new Error(`项目状态读取失败：${r.loadError}`);
+  if (projectChanged) {
+    clearThumbCache();
+    clearLogs();
+  }
+  projectState.outputDir = outputDir;
   projectState.visualBible = r.visualBible;
   projectState.visualBibleWarnings = r.warnings;
   for (const warning of r.warnings) log.warn("store", warning, { outputDir });
-  if (r.novel) projectState.novel = r.novel;
-  if (r.materials?.length) projectState.materials = r.materials;
-  if (r.options) projectState.options = { ...projectState.options, ...r.options };
+  projectState.novel = r.novel;
+  projectState.materials = r.materials;
+  projectState.options = { ...DEFAULT_OPTIONS, ...(r.options ?? {}) };
+  projectState.lastResult = null;
   if (r.lastResult) {
     const chapters = await loadCachedChapters(outputDir);
     const failedTasks = await loadFailedTasks(outputDir);
@@ -126,6 +164,7 @@ export async function restoreProject(outputDir: string): Promise<void> {
       failedTasks,
     };
   }
+  projectState.saveError = null;
 }
 
 // 从 .novel2vn/failed.json 恢复失败任务（中断/崩溃/重启后「失败项」仍可定位重试）
@@ -149,20 +188,26 @@ async function loadCachedChapters(outputDir: string): Promise<ChapterScript[]> {
   try {
     const cacheDir = `${outputDir}/.novel2vn/cache`;
     const entries = await tauri.listDir(cacheDir);
-    const files = entries
-      .filter((e) => !e.isDir && /^script(_demo)?_ch\d+_/.test(e.name))
-      .sort((a, b) => a.name.localeCompare(b.name));
-    const chapters: ChapterScript[] = [];
-    for (const f of files) {
-      try {
-        const { text } = await tauri.readTextFile(f.path);
-        const sc = JSON.parse(text) as ChapterScript;
-        chapters[sc.chapter] = sc;
-      } catch {
-        /* 单个缓存损坏跳过 */
-      }
+    const latestByChapter = new Map<number, (typeof entries)[number]>();
+    for (const entry of entries) {
+      if (entry.isDir) continue;
+      const match = entry.name.match(/^script(?:_demo)?_ch(\d+)_/);
+      if (!match) continue;
+      const chapterNumber = Number(match[1]);
+      const current = latestByChapter.get(chapterNumber);
+      if (!current || entry.name.localeCompare(current.name) > 0) latestByChapter.set(chapterNumber, entry);
     }
-    return chapters.filter(Boolean);
+    const loaded = await Promise.all([...latestByChapter.values()].map(async (file) => {
+      try {
+        const { text } = await tauri.readTextFile(file.path);
+        return parseChapterScript(JSON.parse(text));
+      } catch {
+        return undefined;
+      }
+    }));
+    return loaded
+      .filter((chapter): chapter is ChapterScript => chapter !== undefined)
+      .sort((a, b) => a.chapter - b.chapter);
   } catch {
     return [];
   }

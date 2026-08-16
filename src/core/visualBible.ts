@@ -7,7 +7,6 @@ import { buildImageTasks, stripBackground } from "./images";
 import { concurrencyFor } from "../stores/configMigration";
 import type {
   ApiConfig,
-  AssetMap,
   CharacterCard,
   ExtractionResult,
   ImageReference,
@@ -18,12 +17,12 @@ import type {
   VisualBibleCharacter,
   VisualBiblePendingInvalidation,
 } from "./types";
+import { updateAssetMap } from "./assetMap";
 
 const VISUAL_BIBLE_VERSION = 1 as const;
 const NOVEL_CHUNK_LIMIT = 12_000;
 const SUMMARY_BATCH_LIMIT = 12_000;
 const MAX_IMAGE_BASE64_LENGTH = 48_000_000;
-const DEFAULT_ASSET_MAP: AssetMap = { bg: {}, cg: {}, figure: {}, item: {}, vocal: {} };
 
 export interface VisualBibleLoadResult {
   visualBible: ProjectVisualBible | null;
@@ -1713,19 +1712,9 @@ export async function refreshVisualBibleFingerprint(
   return bible;
 }
 
-async function readAssetMap(outputDir: string): Promise<{ map: AssetMap; exists: boolean }> {
+async function assetMapExists(outputDir: string): Promise<boolean> {
   const path = `${normalizePath(outputDir).replace(/\/$/, "")}/.novel2vn/assets.json`;
-  if (!(await tauri.pathExists(path))) {
-    return { map: { ...DEFAULT_ASSET_MAP, bg: {}, cg: {}, figure: {}, item: {}, vocal: {} }, exists: false };
-  }
-  const { text } = await tauri.readTextFile(path);
-  return { map: { ...DEFAULT_ASSET_MAP, ...JSON.parse(text) as AssetMap }, exists: true };
-}
-
-async function writeAssetMap(outputDir: string, map: AssetMap, exists: boolean): Promise<void> {
-  if (!exists) return;
-  const path = `${normalizePath(outputDir).replace(/\/$/, "")}/.novel2vn/assets.json`;
-  await tauri.writeTextFile(path, JSON.stringify(map, null, 2));
+  return tauri.pathExists(path);
 }
 
 async function removeCachedImages(outputDir: string, predicate: (name: string) => boolean): Promise<void> {
@@ -1811,8 +1800,13 @@ function characterOwnedImageTasks(character: CharacterCard): { assetIds: Set<str
 
 async function invalidateGlobalCaches(outputDir: string): Promise<void> {
   await removeCachedImages(outputDir, () => true);
-  const assets = await readAssetMap(outputDir);
-  await writeAssetMap(outputDir, { bg: {}, cg: {}, figure: {}, item: {}, vocal: assets.map.vocal ?? {} }, assets.exists);
+  if (!(await assetMapExists(outputDir))) return;
+  await updateAssetMap(outputDir, (assets) => {
+    assets.bg = {};
+    assets.cg = {};
+    assets.figure = {};
+    assets.item = {};
+  });
 }
 
 async function invalidateCharacterCaches(
@@ -1821,11 +1815,12 @@ async function invalidateCharacterCaches(
 ): Promise<void> {
   const owned = characterOwnedImageTasks(character);
   await removeCachedImages(outputDir, (name) => owned.fileNames.has(name));
-  const assets = await readAssetMap(outputDir);
-  assets.map.figure = Object.fromEntries(
-    Object.entries(assets.map.figure).filter(([assetId]) => !owned.assetIds.has(assetId)),
-  );
-  await writeAssetMap(outputDir, assets.map, assets.exists);
+  if (!(await assetMapExists(outputDir))) return;
+  await updateAssetMap(outputDir, (assets) => {
+    assets.figure = Object.fromEntries(
+      Object.entries(assets.figure).filter(([assetId]) => !owned.assetIds.has(assetId)),
+    );
+  });
 }
 
 export async function invalidateGlobalVisualAssets(outputDir: string, bible: ProjectVisualBible): Promise<void> {

@@ -405,7 +405,7 @@ pub fn cutout_with_stats(
             let p = rgba.get_pixel(x, y);
             let r = p[0]; let g = p[1]; let b = p[2];
             let mx = r.max(g).max(b);
-            if mx < 60 && !(g > r) && !(g > b) {
+            if mx < 96 && !(g > r) && !(g > b) {
                 alpha_out[i] = 1.0;
                 continue;
             }
@@ -415,7 +415,7 @@ pub fn cutout_with_stats(
             // 避免落在羽化带 (thr..thr_edge) 被扣成半透明黑。
             let p = rgba.get_pixel(x, y);
             let mx = p[0].max(p[1]).max(p[2]);
-            if mx < 60 && dist_at(x, y) > thr {
+            if mx < 96 && dist_at(x, y) > thr {
                 alpha_out[i] = 1.0;
                 continue;
             }
@@ -457,7 +457,12 @@ pub fn cutout_with_stats(
             let p = rgba.get_pixel(x, y);
             let r = p[0]; let g = p[1]; let b = p[2];
             let mx = r.max(g).max(b);
-            if mx < 60 && (!green || (!(g > r) && !(g > b))) {
+            let dark_foreground = if green {
+                mx < 96 && !(g > r) && !(g > b)
+            } else {
+                mx < 96 && distance(&rgba, x, y, bg, false) > thr
+            };
+            if dark_foreground {
                 alpha_out[idx(x, y)] = 1.0;
             }
         }
@@ -1066,6 +1071,29 @@ mod tests {
                 "黑色人物内部应保留不透明 ({x},{y}) alpha={a}"
             );
         }
+    }
+
+    #[test]
+    fn green_bg_preserves_near_black_item_opaque() {
+        let mut img = RgbaImage::from_pixel(64, 64, Rgba([0, 255, 0, 255]));
+        for y in 18..46 {
+            for x in 18..46 {
+                img.put_pixel(x, y, Rgba([60, 60, 60, 255]));
+            }
+        }
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, ImageFormat::Png).unwrap();
+        let encoded = B64.encode(buf.into_inner());
+        let (out, _, green, _, _) = cutout_with_stats(&encoded, 40.0).expect("抠图应成功");
+        let out_img = image::load_from_memory(&B64.decode(&out).unwrap())
+            .unwrap()
+            .to_rgba8();
+
+        assert!(green, "应识别为绿幕");
+        assert!(
+            out_img.get_pixel(32, 32)[3] > 245,
+            "近黑色物品主体必须保持不透明"
+        );
     }
 
     /// 用户报「抠图把绿色扣成黑色/深绿」：AI 生成时蓬松头发/手指缝隙处有「发丝色 × 绿幕背景」的

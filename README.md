@@ -71,6 +71,12 @@ novel.txt ─▶ one click ─▶ sprites · expressions · CGs · backgrounds �
 
 ### Download the app
 
+<p align="center">
+  <a href="https://github.com/carloncc/NovelForge/releases/latest"><img alt="Download" src="https://img.shields.io/badge/Download%20for%20Windows-exe-4c1d95?style=for-the-badge&logo=windows"></a>
+  <a href="https://github.com/carloncc/NovelForge/releases/latest"><img alt="macOS" src="https://img.shields.io/badge/macOS-dmg-1f2937?style=for-the-badge&logo=apple"></a>
+  <a href="https://github.com/carloncc/NovelForge/releases/latest"><img alt="Linux" src="https://img.shields.io/badge/Linux-AppImage-0ea5e9?style=for-the-badge&logo=linux"></a>
+</p>
+
 | Platform | Where to get it |
 |---|---|
 | Windows / macOS / Linux | [Latest release](https://github.com/carloncc/NovelForge/releases) (no Rust/Node needed) |
@@ -145,13 +151,21 @@ Artifacts land in `src-tauri/target/release/bundle/` (Windows exe / macOS dmg / 
 
 ## Screenshots
 
+### Generated game (from a sample novel, running in the WebGAL engine)
+
+| Title screen | Story scene | Key-moment CG |
+|---|---|---|
+| ![Game title](docs/screenshots/game-title.png) | ![Game story](docs/screenshots/game-story.png) | ![Game CG](docs/screenshots/game-cg.png) |
+
+### The NovelForge app
+
 | Import novel | API config | Generate |
 |---|---|---|
 | ![Import](docs/screenshots/import.png) | ![Config](docs/screenshots/config.png) | ![Generate](docs/screenshots/generate.png) |
 
-| Export | Game title | Game story |
-|---|---|---|
-| ![Export](docs/screenshots/export.png) | ![Title](docs/screenshots/game-title.png) | ![Story](docs/screenshots/game-story.png) |
+| Export | Visual Bible |
+|---|---|
+| ![Export](docs/screenshots/export.png) | ![Visual Bible](docs/screenshots/visual-bible-novel_analysis-1280.png) |
 
 ## API Configuration Examples
 

@@ -68,6 +68,12 @@ Tauri 2 + Vue 3 + WebGAL · 가볍고 빠름 · API 완전 커스터마이즈
 
 ### 앱 다운로드
 
+<p align="center">
+  <a href="https://github.com/carloncc/NovelForge/releases/latest"><img alt="Windows" src="https://img.shields.io/badge/Windows-exe-4c1d95?style=for-the-badge&logo=windows"></a>
+  <a href="https://github.com/carloncc/NovelForge/releases/latest"><img alt="macOS" src="https://img.shields.io/badge/macOS-dmg-1f2937?style=for-the-badge&logo=apple"></a>
+  <a href="https://github.com/carloncc/NovelForge/releases/latest"><img alt="Linux" src="https://img.shields.io/badge/Linux-AppImage-0ea5e9?style=for-the-badge&logo=linux"></a>
+</p>
+
 | 플랫폼 | 받는 방법 |
 |---|---|
 | Windows / macOS / Linux | [최신 릴리스](https://github.com/carloncc/NovelForge/releases)(Rust/Node 설치 불필요) |
@@ -141,13 +147,23 @@ pnpm tauri build
 
 ## 스크린샷
 
+## 스크린샷
+
+### 생성된 게임(샘플 소설, WebGAL 엔진에서 실제 실행 중)
+
+| 타이틀 화면 | 스토리 장면 | 명장면 CG |
+|---|---|---|
+| ![Game title](docs/screenshots/game-title.png) | ![Game story](docs/screenshots/game-story.png) | ![Game CG](docs/screenshots/game-cg.png) |
+
+### NovelForge 앱
+
 | 소설 가져오기 | API 설정 | 생성 |
 |---|---|---|
 | ![Import](docs/screenshots/import.png) | ![Config](docs/screenshots/config.png) | ![Generate](docs/screenshots/generate.png) |
 
-| 내보내기 | 게임 타이틀 | 게임 스토리 |
-|---|---|---|
-| ![Export](docs/screenshots/export.png) | ![Title](docs/screenshots/game-title.png) | ![Story](docs/screenshots/game-story.png) |
+| 내보내기 | 비주얼 바이블 |
+|---|---|
+| ![Export](docs/screenshots/export.png) | ![Visual Bible](docs/screenshots/visual-bible-novel_analysis-1280.png) |
 
 ## API 설정 예시
 

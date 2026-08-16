@@ -76,6 +76,8 @@ pub fn run() {
             commands::app_config_dir,
             commands::read_config,
             commands::write_config,
+            commands::read_api_secrets,
+            commands::write_api_secrets,
             commands::resource_dir,
             commands::start_preview_server,
             commands::stop_preview_server,

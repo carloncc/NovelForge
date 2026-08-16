@@ -1,6 +1,22 @@
 import { chromium } from "playwright";
+import { createServer } from "node:http";
 
 const BASE = "http://localhost:5199";
+const upstream = createServer((req, res) => {
+  const chunks = [];
+  req.on("data", (chunk) => chunks.push(chunk));
+  req.on("end", () => {
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify({ ok: true, method: req.method, auth: req.headers.authorization ?? "", body: Buffer.concat(chunks).toString("utf8") }));
+  });
+});
+await new Promise((resolve, reject) => {
+  upstream.once("error", reject);
+  upstream.listen(0, "127.0.0.1", resolve);
+});
+const upstreamAddress = upstream.address();
+if (!upstreamAddress || typeof upstreamAddress === "string") throw new Error("local upstream did not bind");
+const UPSTREAM_URL = `http://127.0.0.1:${upstreamAddress.port}/echo`;
 const results = [];
 function check(name, ok, detail = "") {
   results.push({ name, ok, detail });
@@ -23,7 +39,7 @@ check("导航栏渲染", (await page.locator("body").innerText()).includes("导�
 check("无 JS 错误", errors.length === 0, errors.slice(0, 3).join(" | "));
 
 // 2. 页面内模块：虚拟 FS + 模板同步 + 代理 + 预览
-const smoke = await page.evaluate(async () => {
+const smoke = await page.evaluate(async (upstreamUrl) => {
   const out = {};
   try {
     // vfs 读写
@@ -48,13 +64,13 @@ const smoke = await page.evaluate(async () => {
     await tauri.tauri.writeConfig(JSON.stringify({ probe: 1 }));
     out.config = await tauri.tauri.readConfig();
 
-    // HTTP 代理（真实 MiniMax，无效 key 应透传 401/200+1004 错误体）
+    // HTTP 代理（本地回显服务，避免依赖外网供应商）
     try {
       const res = await tauri.tauri.http({
         method: "POST",
-        url: "https://api.minimaxi.com/v1/t2a_v2",
-        headers: { Authorization: "Bearer invalid", "Content-Type": "application/json" },
-        body: JSON.stringify({ model: "speech-2.8-hd" }),
+        url: upstreamUrl,
+        headers: { Authorization: "Bearer local-test", "Content-Type": "application/json" },
+        body: JSON.stringify({ probe: true }),
       });
       const text = new TextDecoder().decode(Uint8Array.from(atob(res.bodyBase64), (c) => c.charCodeAt(0)));
       out.proxy = text.slice(0, 80);
@@ -70,7 +86,7 @@ const smoke = await page.evaluate(async () => {
     out.fatal = e.message;
   }
   return out;
-});
+}, UPSTREAM_URL);
 
 check("vfs 写读", smoke.vfsRead === "hello-web", smoke.vfsRead);
 check("vfs 列目录", smoke.vfsList?.join(",") === "scene/", smoke.vfsList?.join(","));
@@ -79,9 +95,16 @@ check("模板目录存在", smoke.tplExists === true, "");
 check("模板列表", (smoke.tplList || []).length >= 4, smoke.tplList?.join(","));
 check("模板文件复制", smoke.copyOk === true, "");
 check("配置持久化", smoke.config === '{"probe":1}', smoke.config);
-check("HTTP 代理透传", smoke.proxy?.includes("status_code"), smoke.proxy?.slice(0, 60));
-check("预览上传 URL", smoke.previewUrl?.includes("/novelforge-preview/test/index.html"), smoke.previewUrl);
+check("HTTP 代理透传", smoke.proxy?.includes('"ok":true'), smoke.proxy?.slice(0, 60));
+check("预览上传 URL", smoke.previewUrl?.includes("/test/index.html"), smoke.previewUrl);
+check("预览与应用不同源", smoke.previewUrl && new URL(smoke.previewUrl).origin !== new URL(BASE).origin, smoke.previewUrl);
 check("冒烟无致命错误", !smoke.fatal, smoke.fatal ?? "");
+
+const unauthorized = await page.request.post(`${BASE}/__novelforge/proxy`, {
+  headers: { "Content-Type": "application/json" },
+  data: { method: "GET", url: UPSTREAM_URL },
+});
+check("代理拒绝无令牌请求", unauthorized.status() === 403, String(unauthorized.status()));
 
 // 3. 预览 URL 可访问
 if (smoke.previewUrl) {
@@ -122,4 +145,5 @@ check("抠图主体颜色保留", cutout.red > 200, `red=${cutout.red}`);
 const failed = results.filter((r) => !r.ok).length;
 console.log(`\n${results.length - failed}/${results.length} 通过`);
 await browser.close();
+await new Promise((resolve) => upstream.close(resolve));
 process.exit(failed ? 1 : 0);

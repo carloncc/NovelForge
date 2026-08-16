@@ -1,6 +1,5 @@
-import { withRetry } from "../src/api/openaiCompatible";
+import { retryDelayFor, withRetry } from "../src/api/openaiCompatible";
 import { classifyError } from "../src/utils/errorClassifier";
-import { retryDelayFor } from "../src/api/http";
 
 function assert(cond: boolean, msg: string): void {
   if (!cond) throw new Error(msg);

@@ -26,6 +26,7 @@ import { cutoutErrorHint } from "../utils/cutoutErrorHint";
 import { cacheDirFor, cacheHit } from "./cache";
 import { sanitizeId } from "./render";
 import { log as logger } from "../utils/logger";
+import { updateAssetMap } from "./assetMap";
 
 export interface ImageResultMap {
   bg: Record<string, string>;
@@ -67,7 +68,7 @@ const DEFAULT_NEGATIVE =
 const FIGURE_BG_SUFFIX =
   ", solid chroma key green #00FF00 background filling 100% of every exposed area including all gaps between hair strands, between fingers, between clothing folds, and around every body contour edge, the background in these gaps is the EXACT same pure #00FF00 green as the rest of the background, absolutely no volumetric shadow, no self-shadow, no depth darkening, no ambient occlusion, no contact shadow anywhere on the background, the character's silhouette must sit on flat uniform green with no darker green outline ring, on a solid chroma key green background, the background is pure #00FF00 green, completely uniform flat color filling 100% of the background area edge-to-edge, every single pixel of the background area is exactly the same green, absolutely no gradient, no pattern, no texture, no lighting variation, no other colors in the background, no white, no black, no gray, no dark, no light, no scenery, no floor, no objects, no shadow under character, no green elements on the character, character stands centered with green background visible on all four sides, full body visible from head to feet, no legs cut off";
 const ITEM_BG_SUFFIX =
-  ", on a solid chroma key green background, the background is pure #00FF00 green, completely uniform flat color filling 100% of the background area, every pixel of the background area is exactly the same green, no gradient, no pattern, no texture, no other colors, no white, no black, no gray, no reflection, no shadow, no text";
+  ", object isolated for transparent cutout, on a solid chroma key green background #00FF00 filling 100% of every exposed area including gaps and around the complete object silhouette, the background is exactly uniform pure green with no gradient, pattern, texture, reflection, floor, shadow or text, dark and black parts of the object remain fully opaque with their original colors, no gray transparency on the object, no people, no characters";
 /** 三视图绿幕背景后缀：三视图同样强制纯绿幕，与立绘/动作保持一致（作抠图与图生图参考）
  * 【发丝/缝隙反阴影加固】与 FIGURE_BG_SUFFIX 同源：禁止发丝间/手指间/衣缝间体积阴影。 */
 const THREEVIEW_GREEN_SUFFIX =
@@ -88,6 +89,10 @@ const THREEVIEW_REF_HINT =
 /** 背景/CG 风格锚定提示：参考图为画风基准，内容必须全新 */
 const STYLE_ANCHOR_HINT =
   ", same exact art style, line rendering, color palette, lighting and texture quality as the reference image, but an entirely different scene with different content";
+
+/** 背景任务的最终约束：只生成可叠加立绘的环境底图，禁止人物主体污染。 */
+const BACKGROUND_EMPTY_SUFFIX =
+  ", environment-only background plate for a visual-novel scene, no people, no person, no characters, no human figure, no faces, no portrait, no foreground subject, no humanoid silhouette, no body parts, no statues, no mannequins, no text";
 
 /** 对 style 参考图的描述做人物特征过滤：保留纯风格要素，去除人物相关词 */
 const STYLE_FILTER_WORDS =
@@ -188,6 +193,8 @@ export interface BuildImageTaskOptions {
   threeView?: boolean;
   /** 基于三视图生成角色动作立绘 */
   actions?: boolean;
+  /** 每个角色默认生成的动作数量；0 表示在手动重生成时包含全部动作 */
+  maxActionsPerCharacter?: number;
   /** 确定性种子基数：为每个任务分配 baseSeed+i 的固定种子（同一项目重跑结果稳定） */
   baseSeed?: number;
   /** 风格锚点：先生成画风基准图，背景/CG 以其为参考图统一画风 */
@@ -206,6 +213,7 @@ export function buildImageTasks(
   const useEmotions = opts.figureEmotions !== false;
   const threeView = opts.threeView !== false;
   const withActions = opts.actions !== false;
+  const maxActionsPerCharacter = opts.maxActionsPerCharacter ?? 2;
   const baseStyle = styleSuffix(opts.style);
   const style = opts.feedback ? `${baseStyle}, ${opts.feedback.trim().replace(/[。.]$/, "")}` : baseStyle;
   const useAnchor = opts.styleAnchor !== false;
@@ -282,7 +290,8 @@ export function buildImageTasks(
     }
     // ③ 动作立绘（基于三视图图生图；动作数量不限，按角色卡片提取）
     if (threeView && withActions && Array.isArray(char.actions)) {
-      for (const a of char.actions) {
+      const actions = maxActionsPerCharacter > 0 ? char.actions.slice(0, maxActionsPerCharacter) : char.actions;
+      for (const a of actions) {
         tasks.push({
           kind: "action",
           id: `${char.id}_act_${a.id}`,
@@ -318,7 +327,7 @@ export function buildImageTasks(
       tasks.push({
         kind: "background",
         id: scene.id,
-        prompt: (scene.bgPrompt || `${scene.location} ${scene.atmosphere}, anime background, no people`) + style + (useAnchor ? STYLE_ANCHOR_HINT : ""),
+        prompt: (scene.bgPrompt || `${scene.location} ${scene.atmosphere}, anime background`) + style + (useAnchor ? STYLE_ANCHOR_HINT : "") + BACKGROUND_EMPTY_SUFFIX,
         fileName: `bg_${sanitizeId(scene.id)}.png`,
         width: 1536,
         height: 1024,
@@ -601,23 +610,23 @@ export function promptLimitFromError(message: string): number {
 
 /**
  * 把超长绘图提示词压缩到 maxChars 以内：
- * 1. 绿幕/三视图等「背景约束后缀」整段优先保留（抠图质量依赖，头部给它让预算）；
+ * 1. 绿幕/三视图/无人背景等「背景约束后缀」整段优先保留（生成质量依赖，头部给它让预算）；
  * 2. 头部（主体描述）按逗号短语边界截断，去掉中间的风格长句；
  * 3. 极端受限（后缀都放不下）时只保留后缀尾部。
  */
 export function fitImagePrompt(prompt: string, maxChars: number): string {
   if (prompt.length <= maxChars) return prompt;
-  const greenIdx = prompt.search(/, solid chroma key green|, on a solid chroma key green|, three-view character reference sheet/i);
+  const constraintIdx = prompt.search(/, solid chroma key green|, on a solid chroma key green|, three-view character reference sheet|, environment-only background plate/i);
   let tail = "";
   let headLimit = maxChars;
-  if (greenIdx >= 0) {
-    tail = prompt.slice(greenIdx);
+  if (constraintIdx >= 0) {
+    tail = prompt.slice(constraintIdx);
     headLimit = maxChars - tail.length;
   }
   if (headLimit <= 160) {
     return tail ? tail.slice(-maxChars) : prompt.slice(0, maxChars);
   }
-  let head = (greenIdx >= 0 ? prompt.slice(0, greenIdx) : prompt).slice(0, headLimit);
+  let head = (constraintIdx >= 0 ? prompt.slice(0, constraintIdx) : prompt).slice(0, headLimit);
   const lastComma = head.lastIndexOf(", ");
   if (lastComma > headLimit * 0.5) head = head.slice(0, lastComma);
   head = head.replace(/[,;，；\s]+$/, "");
@@ -1065,75 +1074,13 @@ export async function generateImages(
     }
   };
 
-  // 每生成一张立即增量写入 assets.json：即使中途失败/中止，已生成的图也已落盘，
-  // 下次只需重跑缺失项，不必整体重新生成。写盘做 800ms 节流合并，
-  // 避免 N 张图 = N 次全量 read-parse-write（大项目写放大）。
-  let assetsPersistInFlight: Promise<void> | null = null;
-  let assetsFlushTimer: ReturnType<typeof setTimeout> | undefined;
-  /** 等待「包含当前记录的落盘」完成的回调队列：persistIncremental 返回的 Promise 在此 resolve */
-  let assetsFlushWaiters: Array<() => void> = [];
   const write = async (): Promise<void> => {
-    const assetsFile = `${projectOutputDir}/.novel2vn/assets.json`;
-    let existing: AssetMap | null = null;
-    try {
-      const { text } = await tauri.readTextFile(assetsFile);
-      existing = JSON.parse(text) as AssetMap;
-    } catch {
-      existing = null;
-    }
-    const next: AssetMap = {
-      bg: { ...(existing?.bg ?? {}), ...result.bg },
-      cg: { ...(existing?.cg ?? {}), ...result.cg },
-      figure: { ...(existing?.figure ?? {}), ...result.figure },
-      item: { ...(existing?.item ?? {}), ...result.item },
-      vocal: existing?.vocal ?? {},
-    };
-    try {
-      await tauri.writeTextFile(assetsFile, JSON.stringify(next, null, 2));
-    } catch {
-      /* 增量落盘失败不阻断生成 */
-    }
-  };
-  const resolveFlushWaiters = (): void => {
-    const waiters = assetsFlushWaiters;
-    assetsFlushWaiters = [];
-    for (const w of waiters) w();
-  };
-  /**
-   * 把 result 增量合并进 assets.json（800ms 合并窗口）。
-   * 返回 Promise：在「包含本次记录的落盘」完成后 resolve，调用方可 await 后再发进度事件，
-   * 保证前端 progress 回调读到的 assets.json 一定已包含刚完成的图。
-   */
-  const persistIncremental = (): Promise<void> => {
-    const whenWritten = new Promise<void>((resolve) => assetsFlushWaiters.push(resolve));
-    if (assetsFlushTimer === undefined) {
-      assetsFlushTimer = setTimeout(() => {
-        assetsFlushTimer = undefined;
-        assetsPersistInFlight = (assetsPersistInFlight ?? Promise.resolve())
-          .then(write)
-          .then(() => {
-            assetsPersistInFlight = null;
-            resolveFlushWaiters();
-          });
-      }, 800);
-    }
-    return whenWritten;
-  };
-  /** 立即把挂起的增量写 flush 落盘（generateImages 返回/中止前调用，避免尾部记录丢失）；
-   * 同时统一 resolve 所有等待者，避免挂起的 await persistIncremental() 永久等待。 */
-  const flushAssets = async (): Promise<void> => {
-    if (assetsFlushTimer !== undefined) {
-      globalThis.clearTimeout(assetsFlushTimer);
-      assetsFlushTimer = undefined;
-    }
-    // 链上一个写完成后再补一次最终写，确保挂起期间的 result 快照落盘
-    assetsPersistInFlight = (assetsPersistInFlight ?? Promise.resolve())
-      .then(write)
-      .then(() => {
-        assetsPersistInFlight = null;
-        resolveFlushWaiters();
-      });
-    await assetsPersistInFlight;
+    await updateAssetMap(projectOutputDir, (assets) => {
+      Object.assign(assets.bg, result.bg);
+      Object.assign(assets.cg, result.cg);
+      Object.assign(assets.figure, result.figure);
+      Object.assign(assets.item, result.item);
+    });
   };
 
   const runPass = async (pass: ImageTask[], anchorPath?: string) => {
@@ -1160,7 +1107,7 @@ export async function generateImages(
             // 先落盘 assets.json 再发进度事件：前端 progress 回调立即读 assets.json 时，
             // 新图映射已写入 → 素材页真正「生成一张显示一个」。
             // （旧顺序先 emitProgress 后 persistIncremental，前端读到旧数据导致中途不刷新）
-            await persistIncremental();
+            await write();
           }
           emitProgress(task);
         } catch (e) {
@@ -1251,8 +1198,6 @@ export async function generateImages(
   // 成功生成的图已落盘 → 下次 cacheHit 命中；缺失/失败的重新生成（补缺），不会全量重跑。
   // 修复：旧逻辑要求 failed.length===0 且未中止才写，导致任一失败或中止后整批图永远无法缓存复用，
   // 每次重跑项目都全量重新生成（用户报告「中断后必须全部重新生成」）。
-  // 写 marker 前先 flush 增量 assets.json，保证已生成图的映射完整落盘。
-  await flushAssets();
   if (approvedBible && cfg) {
     await tauri.writeTextFile(visualBibleCacheMarker, JSON.stringify(approvedCacheBinding));
   }
@@ -1334,7 +1279,6 @@ export async function reCutoutAsset(
   filePath: string,
   log: (ev: PipelineEvent) => void,
 ): Promise<string | null> {
-  const metaDir = `${outputDir}/.novel2vn`;
   const task: ImageTask = {
     kind: assetMapKey === "item" ? "item" : "figure",
     id: assetKey,
@@ -1345,21 +1289,7 @@ export async function reCutoutAsset(
   };
   try {
     const newPath = await ensureCutout(filePath, task, log);
-    // 更新 assets.json 中该 key 的映射
-    const assetsFile = `${metaDir}/assets.json`;
-    let map: AssetMap = { bg: {}, cg: {}, figure: {}, item: {}, vocal: {} };
-    try {
-      const { text } = await tauri.readTextFile(assetsFile);
-      map = JSON.parse(text) as AssetMap;
-    } catch {
-      /* 无旧映射 */
-    }
-    map[assetMapKey][assetKey] = newPath;
-    try {
-      await tauri.writeTextFile(assetsFile, JSON.stringify(map, null, 2));
-    } catch {
-      /* 忽略 */
-    }
+    await updateAssetMap(outputDir, (assets) => { assets[assetMapKey][assetKey] = newPath; });
     return newPath;
   } catch (e) {
     const msg = errMsg(e);

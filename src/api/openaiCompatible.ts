@@ -295,7 +295,7 @@ export async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
         throw e;
       }
       if (attempt >= retries) throw e;
-      const delay = attempt === 0 ? 1000 : Math.min(60_000, attempt * 10_000);
+      const delay = retryDelayFor(attempt);
       log.warn("api", `请求失败，${delay / 1000}s 后第 ${attempt + 1} 次重试`, {
         status: status ?? 0,
         message: String(e instanceof Error ? e.message : e).slice(0, 300),
@@ -304,6 +304,10 @@ export async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
     }
   }
   throw lastErr;
+}
+
+export function retryDelayFor(attempt: number): number {
+  return attempt === 0 ? 1000 : Math.min(60_000, Math.max(1, attempt) * 10_000);
 }
 
 export async function chatCompletion(

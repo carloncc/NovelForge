@@ -18,7 +18,21 @@ export function isWeb(): boolean {
 const PROXY_URL = "/__novelforge/proxy";
 const TEMPLATE_URL = "/__novelforge/template";
 const PREVIEW_URL = "/__novelforge/preview";
+const SESSION_URL = "/__novelforge/session";
 const TEMPLATE_ROOT = "/app/template";
+const WEB_RESPONSE_LIMIT = 64 * 1024 * 1024;
+let sessionTokenPromise: Promise<string> | undefined;
+
+function webSessionToken(): Promise<string> {
+  sessionTokenPromise ??= fetch(SESSION_URL, { method: "GET", credentials: "same-origin" })
+    .then(async (response) => {
+      if (!response.ok) throw new Error(`Web session unavailable ${response.status}`);
+      const data = await response.json() as { token?: string };
+      if (!data.token) throw new Error("Web session token missing");
+      return data.token;
+    });
+  return sessionTokenPromise;
+}
 
 function b64encode(data: Uint8Array): string {
   if (typeof Buffer !== "undefined") return Buffer.from(data).toString("base64");
@@ -47,14 +61,14 @@ export async function webHttp(args: {
   body?: string;
   timeoutSecs?: number;
 }): Promise<HttpResult> {
-  // 非 http(s) 的目标（如 file:）无法代理，直接直连尝试
   if (!/^https?:\/\//i.test(args.url)) {
-    return directFetch(args);
+    throw new Error("仅支持 HTTP/HTTPS API 地址");
   }
   try {
+    const token = await webSessionToken();
     const resp = await fetch(PROXY_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "X-NovelForge-Token": token },
       body: JSON.stringify({
         method: args.method,
         url: args.url,
@@ -63,10 +77,14 @@ export async function webHttp(args: {
         timeoutSecs: args.timeoutSecs ?? 120,
       }),
     });
-    if (!resp.ok) throw new Error(`代理不可用 ${resp.status}`);
+    if (!resp.ok) {
+      if ([400, 403, 413, 415].includes(resp.status)) throw new Error(`代理拒绝请求 ${resp.status}`);
+      throw new Error(`代理不可用 ${resp.status}`);
+    }
     const json = (await resp.json()) as { status: number; contentType: string; bodyBase64: string };
     return { status: json.status, contentType: json.contentType, bodyBase64: json.bodyBase64 };
   } catch (e) {
+    if (/代理拒绝请求/.test(errMsg(e))) throw e;
     log.warn("webRuntime", "同源代理失败，尝试直连", { url: args.url, error: errMsg(e) });
     return directFetch(args);
   }
@@ -88,7 +106,7 @@ async function directFetch(args: {
       body: args.body,
       signal: controller.signal,
     });
-    const buf = new Uint8Array(await resp.arrayBuffer());
+    const buf = await readLimitedWebResponse(resp);
     return {
       status: resp.status,
       contentType: resp.headers.get("content-type") || "",
@@ -190,6 +208,32 @@ export async function webCopyDirAll(src: string, dst: string): Promise<void> {
   await vfs.vfsCopyDirAll(src, dst);
 }
 
+async function readLimitedWebResponse(response: Response): Promise<Uint8Array> {
+  const declared = Number(response.headers.get("content-length") ?? 0);
+  if (Number.isFinite(declared) && declared > WEB_RESPONSE_LIMIT) throw new Error("HTTP response too large");
+  if (!response.body) return new Uint8Array();
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > WEB_RESPONSE_LIMIT) {
+      await reader.cancel();
+      throw new Error("HTTP response too large");
+    }
+    chunks.push(value);
+  }
+  const body = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
+}
+
 export async function webReplacePath(src: string, dst: string): Promise<void> {
   await vfs.vfsReplacePath(src, dst);
 }
@@ -205,6 +249,7 @@ export async function webRemovePath(path: string): Promise<void> {
 /* ============ 配置（localStorage 持久化） ============ */
 
 const CONFIG_KEY = "novelforge:config";
+const SECRET_KEY = "novelforge:api-secrets";
 
 export async function webReadConfig(): Promise<string> {
   return localStorage.getItem(CONFIG_KEY) ?? "{}";
@@ -212,6 +257,32 @@ export async function webReadConfig(): Promise<string> {
 
 export async function webWriteConfig(content: string): Promise<void> {
   localStorage.setItem(CONFIG_KEY, content);
+}
+
+export async function webReadApiSecrets(ids: string[]): Promise<Record<string, string>> {
+  let stored: Record<string, string> = {};
+  try {
+    stored = JSON.parse(sessionStorage.getItem(SECRET_KEY) ?? "{}") as Record<string, string>;
+  } catch {
+    sessionStorage.removeItem(SECRET_KEY);
+  }
+  return Object.fromEntries(
+    ids.filter((id) => Object.prototype.hasOwnProperty.call(stored, id)).map((id) => [id, stored[id]]),
+  );
+}
+
+export async function webWriteApiSecrets(secrets: Record<string, string>): Promise<void> {
+  let stored: Record<string, string> = {};
+  try {
+    stored = JSON.parse(sessionStorage.getItem(SECRET_KEY) ?? "{}") as Record<string, string>;
+  } catch {
+    stored = {};
+  }
+  for (const [id, secret] of Object.entries(secrets)) {
+    if (secret) stored[id] = secret;
+    else delete stored[id];
+  }
+  sessionStorage.setItem(SECRET_KEY, JSON.stringify(stored));
 }
 
 /* ============ 预览（zip 上传 → dev server 解压静态服务） ============ */
@@ -225,9 +296,10 @@ export async function webStartPreviewServer(root: string): Promise<{ url: string
   for (const f of files) entries[f.path] = new Uint8Array(f.data);
   const zipData = zipSync(entries);
   const name = root.split("/").filter(Boolean).pop() || "game";
+  const token = await webSessionToken();
   const resp = await fetch(PREVIEW_URL, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "X-NovelForge-Token": token },
     body: JSON.stringify({ name, zip: b64encode(zipData) }),
   });
   if (!resp.ok) throw new Error(`预览上传失败 ${resp.status}`);
@@ -355,7 +427,7 @@ export async function webCutoutImage(dataB64: string, threshold = 40): Promise<s
       return Math.sqrt(dr * dr + dg * dg + db * db);
     };
 
-    const DARK_FG_THRESH = 60;
+    const DARK_FG_THRESH = 96;
     const isDarkFg = (i: number) => {
       if (!green) return false;
       const r = px[i], g = px[i + 1], b = px[i + 2];

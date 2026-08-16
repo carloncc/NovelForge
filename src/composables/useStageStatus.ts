@@ -1,7 +1,10 @@
 import { computed, reactive } from "vue";
-import type { AssetMap, FailedTask, NovelDoc, StageKey } from "../core/types";
-import { STAGE_LABELS, STAGE_ORDER } from "../core/types";
+import type { ApiConfig, AssetMap, FailedTask, GenerationOptions, NovelDoc, PipelineResult, StageKey } from "../core/types";
+import { STAGE_ORDER, STEP_TO_STAGE } from "../core/types";
+import { buildImageTasks } from "../core/images";
+import { buildVoiceJobs } from "../core/voice";
 import { tauri } from "../utils/tauri";
+import { parseAssetMap } from "../core/assetMap";
 
 export type StageState = "idle" | "running" | "done" | "failed";
 
@@ -16,18 +19,10 @@ export interface StageStatusInput {
   getBusy: () => boolean;
   /** 当前正在执行的阶段 */
   getRunningStages: () => StageKey[];
+  getResult: () => PipelineResult | null;
+  getOptions: () => GenerationOptions;
+  getTtsConfig: () => ApiConfig | undefined;
 }
-
-/** 管线日志/失败的 step 标签 → StageKey */
-export const STEP_TO_STAGE: Record<string, StageKey> = {
-  [STAGE_LABELS.split]: "split",
-  [STAGE_LABELS.translate]: "translate",
-  [STAGE_LABELS.extract]: "extract",
-  [STAGE_LABELS.script]: "script",
-  [STAGE_LABELS.image]: "image",
-  [STAGE_LABELS.voice]: "voice",
-  [STAGE_LABELS.assemble]: "assemble",
-};
 
 export function useStageStatus(input: StageStatusInput) {
   /** base：由产物/缓存文件判定的「已完成」状态（异步 refresh 更新） */
@@ -49,23 +44,53 @@ export function useStageStatus(input: StageStatusInput) {
     }
   }
 
-  async function listDirCount(dir: string, match: (name: string) => boolean): Promise<number> {
+  async function listUniqueChapters(dir: string, chapterFromName: (name: string) => string | null): Promise<number> {
     try {
       const entries = await tauri.listDir(dir);
-      return entries.filter((e) => !e.isDir && match(e.name)).length;
+      const chapters = new Set<string>();
+      for (const entry of entries) {
+        if (entry.isDir) continue;
+        const chapter = chapterFromName(entry.name);
+        if (chapter) chapters.add(chapter);
+      }
+      return chapters.size;
     } catch {
       return 0;
     }
   }
 
-  async function hasAssetEntries(dir: string, pick: (a: AssetMap) => Record<string, string>): Promise<boolean> {
+  async function assetMap(dir: string): Promise<AssetMap | undefined> {
     try {
       const { text } = await tauri.readTextFile(`${dir}/.novel2vn/assets.json`);
-      const map = JSON.parse(text) as AssetMap;
-      return Object.keys(pick(map)).length > 0;
+      return parseAssetMap(JSON.parse(text));
     } catch {
-      return false;
+      return undefined;
     }
+  }
+
+  function allExpectedImagesExist(map: AssetMap, result: PipelineResult, options: GenerationOptions): boolean {
+    const tasks = buildImageTasks(result.chapters, result.cards, {
+      figurePerCharacter: 1,
+      cgPerChapter: 0,
+      maxPerChapter: 0,
+      figureEmotions: options.figureEmotions,
+      style: options.imageStyle,
+      threeView: options.characterPoses !== false,
+      actions: options.characterPoses !== false,
+      styleAnchor: options.styleAnchor !== false,
+    });
+    return tasks.every((task) => {
+      if (task.kind === "anchor") return true;
+      if (task.kind === "background") return Boolean(map.bg[task.id]);
+      if (task.kind === "cg") return Boolean(map.cg[task.id]);
+      if (task.kind === "item") return Boolean(map.item[task.id]);
+      return Boolean(map.figure[task.id]);
+    });
+  }
+
+  function allExpectedVoicesExist(map: AssetMap, result: PipelineResult, config: ApiConfig): boolean {
+    return buildVoiceJobs(config, result.chapters, result.cards.characters)
+      .every((job) => Boolean(map.vocal[job.key]));
   }
 
   /** 依据产物/缓存文件刷新「完成」状态 */
@@ -77,14 +102,14 @@ export function useStageStatus(input: StageStatusInput) {
       return;
     }
     const metaDir = `${dir}/.novel2vn`;
-    const [split, cards, meta] = await Promise.all([
+    const [split, cards, demoCards, meta] = await Promise.all([
       pathExists(`${metaDir}/split.json`),
       pathExists(`${metaDir}/cards.json`),
       pathExists(`${metaDir}/cards_demo.json`),
       pathExists(`${metaDir}/meta.json`),
     ]);
     base.split = split || (novel?.chapters.length ?? 0) > 1;
-    base.extract = cards;
+    base.extract = cards || demoCards;
     base.assemble = meta;
 
     const activeCount = novel?.chapters.filter((c) => c.enabled !== false).length ?? 0;
@@ -94,17 +119,26 @@ export function useStageStatus(input: StageStatusInput) {
     if (!lang) {
       base.translate = true;
     } else {
-      const translated = await listDirCount(`${metaDir}/translate`, (name) => name.startsWith(`translate_${lang}_ch`));
+      const translated = await listUniqueChapters(`${metaDir}/translate`, (name) => {
+        if (!name.startsWith(`translate_${lang}_ch`)) return null;
+        return name.match(/_ch(\d+)_/)?.[1] ?? null;
+      });
       base.translate = activeCount > 0 && translated >= activeCount;
     }
 
     // 剧本：script 缓存数量 ≥ 启用章节数
-    const scriptFiles = await listDirCount(`${metaDir}/cache`, (name) => /^script(_demo)?_ch\d+_/.test(name));
+    const scriptFiles = await listUniqueChapters(
+      `${metaDir}/cache`,
+      (name) => name.match(/^script(?:_demo)?_ch(\d+)_/)?.[1] ?? null,
+    );
     base.script = activeCount > 0 && scriptFiles >= activeCount;
 
-    // 图像 / 配音：assets.json 相应字段非空
-    base.image = await hasAssetEntries(dir, (a) => a.figure || a.bg || a.cg || a.item);
-    base.voice = await hasAssetEntries(dir, (a) => a.vocal);
+    const options = input.getOptions();
+    const result = input.getResult();
+    const assets = await assetMap(dir);
+    base.image = !options.useImage || Boolean(assets && result && allExpectedImagesExist(assets, result, options));
+    const ttsConfig = input.getTtsConfig();
+    base.voice = !options.useTts || Boolean(assets && result && ttsConfig && allExpectedVoicesExist(assets, result, ttsConfig));
   }
 
   /** 失败集合：failedTasks（按 step 映射）∪ 日志最后一条为 error 的阶段 */

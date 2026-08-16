@@ -1,7 +1,7 @@
 import type { ApiConfig } from "../src/core/types";
 import { chatVision, testVision, VisionApiError } from "../src/api/openaiCompatible";
 import { PROVIDERS, protocolForConfig } from "../src/api/providers";
-import { loadConfigFile, migrateConfigFile } from "../src/stores/configMigration";
+import { configSecrets, loadConfigFile, migrateConfigFile } from "../src/stores/configMigration";
 import { createApiPreset, defaultApiConfig } from "../src/stores/config";
 import { verifyImage } from "../src/core/selfcheck";
 import { tauri } from "../src/utils/tauri";
@@ -54,8 +54,8 @@ async function main(): Promise<void> {
     outputDir: "D:/exports",
   };
   const firstMigration = migrateConfigFile(legacy, () => "vision-new", () => defaultApiConfig("vision"));
-  assert(firstMigration.migrated, "旧配置应迁移到 schema v2");
-  assert(firstMigration.config.configSchemaVersion === 2, "迁移后应写入 schema v2");
+  assert(firstMigration.migrated, "旧配置应迁移到 schema v3");
+  assert(firstMigration.config.configSchemaVersion === 3, "迁移后应写入 schema v3");
   const migratedPreset = firstMigration.config.presets[0];
   assert(migratedPreset.channels.vision.length === 1, "每个旧配置组应创建一个图片识别配置");
   assert(migratedPreset.active.vision === "vision-new", "新图片识别配置应成为当前配置");
@@ -70,7 +70,7 @@ async function main(): Promise<void> {
   assert((migratedPreset.channels.llm[0].extra!.nested as { timeout: number }).timeout === 30, "修改图片识别 extra 不应影响文本配置");
 
   const secondMigration = migrateConfigFile(firstMigration.config, () => "should-not-run", () => defaultApiConfig("vision"));
-  assert(!secondMigration.migrated, "schema v2 配置不应重复迁移");
+  assert(!secondMigration.migrated, "schema v3 配置不应重复迁移");
   assert(secondMigration.config.presets[0].channels.vision.length === 1, "重复加载不得再次克隆图片识别配置");
   assert(secondMigration.config.presets[0].active.vision === "vision-new", "重复加载应保留当前图片识别配置");
 
@@ -106,36 +106,81 @@ async function main(): Promise<void> {
   assert(explicitV1.migrated && explicitV1.config.presets[0].active.vision === "v1-vision", "显式 schema v1 应执行同一迁移");
 
   assertThrows(
-    () => migrateConfigFile({ ...legacy, configSchemaVersion: 3 }, () => "never", () => defaultApiConfig("vision")),
+    () => migrateConfigFile({ ...legacy, configSchemaVersion: 4 }, () => "never", () => defaultApiConfig("vision")),
     "未来 schema 版本必须明确拒绝，不能降级改写",
   );
   const futureWrites: string[] = [];
   await assertRejects(
-    () => loadConfigFile(JSON.stringify({ ...legacy, configSchemaVersion: 3 }), {
+    () => loadConfigFile(JSON.stringify({ ...legacy, configSchemaVersion: 4 }), {
       createId: () => "never",
       createVisionDefault: () => defaultApiConfig("vision"),
       writeConfig: async (content) => { futureWrites.push(content); },
+      readSecrets: async () => ({}),
+      writeSecrets: async () => {},
     }),
     "未来 schema 加载必须失败",
   );
   assert(futureWrites.length === 0, "未来 schema 被拒绝时不得写回配置");
 
   const persistedWrites: string[] = [];
+  const persistedSecrets: Record<string, string>[] = [];
   const persistenceOptions = {
     createId: () => "persisted-vision",
     createVisionDefault: () => defaultApiConfig("vision"),
     writeConfig: async (content: string) => { persistedWrites.push(content); },
+    readSecrets: async () => ({
+      "llm-active": "sk-text",
+      "vision-new": "sk-text",
+      "image-1": "sk-image",
+      "tts-1": "sk-tts",
+    }),
+    writeSecrets: async (secrets: Record<string, string>) => { persistedSecrets.push(secrets); },
   };
   const loadedLegacy = await loadConfigFile(JSON.stringify(legacy), persistenceOptions);
-  assert(loadedLegacy.config.configSchemaVersion === 2 && persistedWrites.length === 1, "首次加载旧配置应立即持久化一次 v2");
+  assert(loadedLegacy.config.configSchemaVersion === 3 && persistedWrites.length === 1, "首次加载旧配置应立即持久化一次 v3");
+  assert(persistedSecrets.length === 1 && persistedSecrets[0]["llm-active"] === "sk-text", "迁移必须先把内联密钥写入安全存储");
+  assert(!persistedWrites[0].includes("sk-text") && !persistedWrites[0].includes("apiKey"), "持久化配置不得包含 API key 字段或值");
   assert(!loadedLegacy.migrationSaveError, "成功迁移不应返回保存错误");
   await loadConfigFile(persistedWrites[0], persistenceOptions);
   assert(persistedWrites.length === 1, "重新加载已持久化 v2 不得再次写入或克隆");
+
+  const currentSchemaWithInlineSecret = JSON.stringify({ ...firstMigration.config, presets: [legacyPreset()], configSchemaVersion: 3 });
+  const scrubbedWrites: string[] = [];
+  const scrubbedSecrets: Record<string, string>[] = [];
+  await loadConfigFile(currentSchemaWithInlineSecret, {
+    ...persistenceOptions,
+    writeConfig: async (content) => { scrubbedWrites.push(content); },
+    writeSecrets: async (secrets) => { scrubbedSecrets.push(secrets); },
+    readSecrets: async () => ({}),
+  });
+  assert(scrubbedWrites.length === 1 && !scrubbedWrites[0].includes("sk-text"), "当前 schema 中的内联密钥也必须立即从配置文件清除");
+  assert(scrubbedSecrets[0]?.["llm-active"] === "sk-text", "清除当前 schema 明文前必须先写入安全存储");
+
+  let repairedId = 0;
+  const duplicateIds = migrateConfigFile({
+    configSchemaVersion: 3,
+    presets: [{
+      id: "duplicate-preset",
+      name: "重复 ID",
+      channels: {
+        llm: [{ id: "shared", apiKey: "sk-llm" }],
+        vision: [],
+        image: [{ id: "shared", apiKey: "sk-image" }],
+        tts: [],
+      },
+      active: { llm: "shared", image: "shared" },
+    }],
+  }, () => `repaired-${++repairedId}`, () => defaultApiConfig("vision")).config;
+  const repairedConfigs = Object.values(duplicateIds.presets[0].channels).flat();
+  assert(new Set(repairedConfigs.map((apiConfig) => apiConfig.id)).size === repairedConfigs.length, "所有通道的 API 配置 ID 必须全局唯一");
+  assert(Object.keys(configSecrets(duplicateIds)).length === repairedConfigs.length, "修复重复 ID 后密钥映射不得互相覆盖");
 
   const rejectedPersistence = await loadConfigFile(JSON.stringify(legacy), {
     createId: () => "recovered-vision",
     createVisionDefault: () => defaultApiConfig("vision"),
     writeConfig: async () => { throw new Error("disk is read-only"); },
+    readSecrets: async () => ({}),
+    writeSecrets: async () => {},
   });
   assert(rejectedPersistence.config.presets[0].active.vision === "recovered-vision", "保存失败时仍应返回并应用已恢复的迁移配置");
   assert(rejectedPersistence.migrationPending && rejectedPersistence.migrationSaveError?.message.includes("read-only"), "保存失败必须显式返回待持久化状态和错误");

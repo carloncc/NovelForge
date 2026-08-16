@@ -68,6 +68,12 @@ Tauri 2 + Vue 3 + WebGAL · 轻量快速 · API 全自定义
 
 ### 下载应用
 
+<p align="center">
+  <a href="https://github.com/carloncc/NovelForge/releases/latest"><img alt="下载 Windows" src="https://img.shields.io/badge/Windows-exe-4c1d95?style=for-the-badge&logo=windows"></a>
+  <a href="https://github.com/carloncc/NovelForge/releases/latest"><img alt="macOS" src="https://img.shields.io/badge/macOS-dmg-1f2937?style=for-the-badge&logo=apple"></a>
+  <a href="https://github.com/carloncc/NovelForge/releases/latest"><img alt="Linux" src="https://img.shields.io/badge/Linux-AppImage-0ea5e9?style=for-the-badge&logo=linux"></a>
+</p>
+
 | 平台 | 获取方式 |
 |---|---|
 | Windows / macOS / Linux | [最新 Release](https://github.com/carloncc/NovelForge/releases)（无需安装 Rust/Node） |
@@ -141,13 +147,21 @@ pnpm tauri build
 
 ## 截图
 
+### 生成后的游戏（示例小说，WebGAL 引擎内实际运行）
+
+| 标题页 | 剧情场景 | 名场面 CG |
+|---|---|---|
+| ![游戏标题](docs/screenshots/game-title.png) | ![游戏剧情](docs/screenshots/game-story.png) | ![游戏 CG](docs/screenshots/game-cg.png) |
+
+### NovelForge 应用
+
 | 导入小说 | API 配置 | 生成项目 |
 |---|---|---|
 | ![导入](docs/screenshots/import.png) | ![配置](docs/screenshots/config.png) | ![生成](docs/screenshots/generate.png) |
 
-| 导出 | 游戏标题 | 游戏剧情 |
-|---|---|---|
-| ![导出](docs/screenshots/export.png) | ![标题](docs/screenshots/game-title.png) | ![剧情](docs/screenshots/game-story.png) |
+| 导出 | 视觉圣经 |
+|---|---|
+| ![导出](docs/screenshots/export.png) | ![视觉圣经](docs/screenshots/visual-bible-novel_analysis-1280.png) |
 
 ## API 配置示例
 

@@ -169,9 +169,8 @@ function toggleChapter(i: number): void {
 
 // 最近项目
 async function openRecent(dir: string): Promise<void> {
-  projectState.outputDir = dir;
-  configState.outputDir = dir;
   await restoreProject(dir);
+  configState.outputDir = dir;
 }
 
 function loadRecentTitles(dir: string): string {

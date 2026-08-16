@@ -4,10 +4,12 @@ import { demoScriptAll } from "../src/core/script";
 import { splitChapters } from "../src/core/chapters";
 import { DEMO_NOVEL } from "../src/core/demoNovel";
 import { tauri } from "../src/utils/tauri";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 async function main() {
-  const work = "/tmp/novelforge-mat";
+  const work = (await mkdtemp(join(tmpdir(), "novelforge-mat-"))).replace(/\\/g, "/");
   await tauri.removePath(work).catch(() => {});
   const chapters = splitChapters(DEMO_NOVEL, "星陨之城的守夜人");
   const cards = demoExtract(DEMO_NOVEL, "星陨之城的守夜人");

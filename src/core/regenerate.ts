@@ -1,6 +1,5 @@
 import type {
   ApiConfig,
-  AssetMap,
   ChapterScript,
   ExtractionResult,
   ImageTask,
@@ -13,6 +12,7 @@ import { setImageConcurrency } from "../api/openaiCompatible";
 import { buildVoiceJobs, runVoiceJob } from "./voice";
 import { concurrencyFor } from "../stores/configMigration";
 import { tauri } from "../utils/tauri";
+import { updateAssetMap } from "./assetMap";
 
 /** 单个素材重生成的共享上下文 */
 export interface RegenContext {
@@ -61,30 +61,15 @@ function metaDirFor(outputDir: string): string {
 
 /** 把单个素材重新生成的结果合并进 assets.json，供「组装」阶段读取 */
 async function mergeAssetMap(outputDir: string, results: RegenImageResult[]): Promise<void> {
-  const file = `${metaDirFor(outputDir)}/assets.json`;
-  let map: AssetMap = { bg: {}, cg: {}, figure: {}, item: {}, vocal: {} };
-  try {
-    const { text } = await tauri.readTextFile(file);
-    map = JSON.parse(text) as AssetMap;
-  } catch {
-    /* 无旧映射 */
-  }
-  for (const r of results) {
-    const target =
-      r.task.kind === "background"
-        ? map.bg
-        : r.task.kind === "cg"
-          ? map.cg
-          : r.task.kind === "figure" || r.task.kind === "threeview" || r.task.kind === "action"
-            ? map.figure
-            : map.item;
-    target[r.task.id] = r.path;
-  }
-  try {
-    await tauri.writeTextFile(file, JSON.stringify(map, null, 2));
-  } catch {
-    /* 忽略 */
-  }
+  await updateAssetMap(outputDir, (map) => {
+    for (const regenerated of results) {
+      const target = regenerated.task.kind === "background" ? map.bg
+        : regenerated.task.kind === "cg" ? map.cg
+        : regenerated.task.kind === "figure" || regenerated.task.kind === "threeview" || regenerated.task.kind === "action" ? map.figure
+        : map.item;
+      target[regenerated.task.id] = regenerated.path;
+    }
+  });
 }
 
 /**
@@ -106,6 +91,7 @@ export async function regenerateImages(
     figureEmotions: ctx.figureEmotions ?? true,
     threeView: ctx.threeView !== false,
     actions: ctx.actions !== false,
+    maxActionsPerCharacter: 0,
     style: approvedBible?.styleDescription ?? ctx.style,
     feedback,
     baseSeed: ctx.imageSeed,
@@ -223,7 +209,7 @@ export function imageTaskMatchesSelectionKey(task: ImageTask, key: string): bool
         || ((task.kind === "figure" || task.kind === "action") && task.characterId === characterId);
     }
     case "figure":
-      return task.kind === "figure" && task.id === (parts.length >= 3 ? `${parts[1]}_${parts[2]}` : parts[1]);
+      return task.kind === "figure" && task.id === (parts[2] === "normal" ? parts[1] : parts.length >= 3 ? `${parts[1]}_${parts[2]}` : parts[1]);
     case "action":
       return task.kind === "action" && task.id === `${parts[1]}_act_${parts[2]}`;
     case "item":
@@ -338,20 +324,11 @@ export function regenerateCg(
 }
 
 async function mergeVocal(outputDir: string, key: string, path: string): Promise<void> {
-  const file = `${metaDirFor(outputDir)}/assets.json`;
-  let map: AssetMap = { bg: {}, cg: {}, figure: {}, item: {}, vocal: {} };
-  try {
-    const { text } = await tauri.readTextFile(file);
-    map = JSON.parse(text) as AssetMap;
-  } catch {
-    /* 无旧映射 */
-  }
-  map.vocal[key] = path;
-  try {
-    await tauri.writeTextFile(file, JSON.stringify(map, null, 2));
-  } catch {
-    /* 忽略 */
-  }
+  await updateAssetMap(outputDir, (map) => { map.vocal[key] = path; });
+}
+
+export function imageTaskIdentity(task: ImageTask): string {
+  return `${task.kind}:${task.id}:${task.fileName}`;
 }
 
 /** 重新生成某一句对白的配音 */

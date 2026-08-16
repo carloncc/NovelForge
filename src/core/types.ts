@@ -307,6 +307,16 @@ export const STAGE_LABELS: Record<StageKey, string> = {
 
 export const STAGE_ORDER: StageKey[] = ["split", "translate", "extract", "script", "image", "voice", "assemble"];
 
+export const STEP_TO_STAGE: Record<string, StageKey> = {
+  [STAGE_LABELS.split]: "split",
+  [STAGE_LABELS.translate]: "translate",
+  [STAGE_LABELS.extract]: "extract",
+  [STAGE_LABELS.script]: "script",
+  [STAGE_LABELS.image]: "image",
+  [STAGE_LABELS.voice]: "voice",
+  [STAGE_LABELS.assemble]: "assemble",
+};
+
 /** 可选的目标语言（把小说翻译成该语言后再提取/剧本/生成） */
 export const LANGUAGES: { code: string; label: string }[] = [
   { code: "zh_CN", label: "简体中文" },

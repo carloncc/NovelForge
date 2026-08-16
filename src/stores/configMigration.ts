@@ -1,6 +1,6 @@
 import type { ApiConfig, ApiPreset, ChannelKey } from "../core/types";
 
-export const CONFIG_SCHEMA_VERSION = 2 as const;
+export const CONFIG_SCHEMA_VERSION = 3 as const;
 
 /** 各通道默认并发数：文本/图像/配音都是批量生成（各自独立，互不影响）；识别默认串行 */
 export const DEFAULT_CONCURRENCY_BY_CHANNEL: Record<ChannelKey, number> = {
@@ -36,12 +36,15 @@ export interface ConfigLoadOptions {
   createId: () => string;
   createVisionDefault: ConfigFactory;
   writeConfig: (content: string) => Promise<void>;
+  readSecrets: (ids: string[]) => Promise<Record<string, string>>;
+  writeSecrets: (secrets: Record<string, string>) => Promise<void>;
 }
 
 export interface ConfigLoadResult {
   config: ConfigFile;
   migrationPending: boolean;
   migrationSaveError?: Error;
+  secretStoreError?: Error;
 }
 
 export class UnsupportedConfigVersionError extends Error {
@@ -150,16 +153,18 @@ export function migrateConfigFile(
 ): ConfigMigrationResult {
   const root = recordOrEmpty(input);
   const version = root.configSchemaVersion;
-  if (version !== undefined && version !== 1 && version !== CONFIG_SCHEMA_VERSION) {
+  if (version !== undefined && version !== 1 && version !== 2 && version !== CONFIG_SCHEMA_VERSION) {
     throw new UnsupportedConfigVersionError(version);
   }
-  const shouldMigrate = version === undefined || version === 1;
+  const shouldAddVision = version === undefined || version === 1;
+  const shouldMigrate = version !== CONFIG_SCHEMA_VERSION;
   const presets = Array.isArray(root.presets)
-    ? root.presets.map((preset) => normalizePreset(preset, shouldMigrate, createId, createVisionDefault))
+    ? root.presets.map((preset) => normalizePreset(preset, shouldAddVision, createId, createVisionDefault))
     : [];
+  const repairedDuplicateIds = repairDuplicateConfigIds(presets, createId);
 
   return {
-    migrated: shouldMigrate,
+    migrated: shouldMigrate || repairedDuplicateIds,
     config: {
       configSchemaVersion: CONFIG_SCHEMA_VERSION,
       presets,
@@ -172,17 +177,84 @@ export function migrateConfigFile(
   };
 }
 
-export async function loadConfigFile(raw: string, options: ConfigLoadOptions): Promise<ConfigLoadResult> {
-  const migration = migrateConfigFile(JSON.parse(raw), options.createId, options.createVisionDefault);
-  if (!migration.migrated) return { config: migration.config, migrationPending: false };
-  try {
-    await options.writeConfig(JSON.stringify(migration.config));
-    return { config: migration.config, migrationPending: false };
-  } catch (error) {
-    return {
-      config: migration.config,
-      migrationPending: true,
-      migrationSaveError: error instanceof Error ? error : new Error(String(error)),
-    };
+function repairDuplicateConfigIds(presets: ApiPreset[], createId: () => string): boolean {
+  const seen = new Set<string>();
+  let repaired = false;
+  for (const preset of presets) {
+    for (const kind of ["llm", "vision", "image", "tts"] as const) {
+      for (const apiConfig of preset.channels[kind]) {
+        if (!seen.has(apiConfig.id)) {
+          seen.add(apiConfig.id);
+          continue;
+        }
+        const duplicateId = apiConfig.id;
+        do apiConfig.id = createId(); while (seen.has(apiConfig.id));
+        seen.add(apiConfig.id);
+        if (preset.active[kind] === duplicateId) preset.active[kind] = apiConfig.id;
+        repaired = true;
+      }
+    }
   }
+  return repaired;
+}
+
+function apiConfigs(config: ConfigFile): ApiConfig[] {
+  return config.presets.flatMap((preset) => Object.values(preset.channels).flat());
+}
+
+export function serializeConfigFile(config: ConfigFile): string {
+  const persisted = JSON.parse(JSON.stringify(config)) as Record<string, unknown>;
+  const presets = persisted.presets as Array<{ channels: Record<string, Array<Record<string, unknown>>> }>;
+  for (const preset of presets) {
+    for (const configs of Object.values(preset.channels)) {
+      for (const apiConfig of configs) delete apiConfig.apiKey;
+    }
+  }
+  return JSON.stringify(persisted);
+}
+
+export function configSecrets(config: ConfigFile): Record<string, string> {
+  return Object.fromEntries(apiConfigs(config).map((apiConfig) => [apiConfig.id, apiConfig.apiKey ?? ""]));
+}
+
+export async function loadConfigFile(raw: string, options: ConfigLoadOptions): Promise<ConfigLoadResult> {
+  const parsed = JSON.parse(raw);
+  const migration = migrateConfigFile(parsed, options.createId, options.createVisionDefault);
+  let migrationSaveError: Error | undefined;
+  if (migration.migrated || containsInlineApiKey(parsed)) {
+    try {
+      await options.writeSecrets(configSecrets(migration.config));
+      await options.writeConfig(serializeConfigFile(migration.config));
+    } catch (error) {
+      migrationSaveError = error instanceof Error ? error : new Error(String(error));
+    }
+  }
+
+  let secretStoreError: Error | undefined;
+  try {
+    const configs = apiConfigs(migration.config);
+    const stored = await options.readSecrets(configs.map((apiConfig) => apiConfig.id));
+    for (const apiConfig of configs) {
+      if (Object.prototype.hasOwnProperty.call(stored, apiConfig.id)) apiConfig.apiKey = stored[apiConfig.id];
+    }
+  } catch (error) {
+    secretStoreError = error instanceof Error ? error : new Error(String(error));
+  }
+
+  return {
+    config: migration.config,
+    migrationPending: Boolean(migrationSaveError),
+    migrationSaveError,
+    secretStoreError,
+  };
+}
+
+function containsInlineApiKey(input: unknown): boolean {
+  const root = recordOrEmpty(input);
+  if (!Array.isArray(root.presets)) return false;
+  return root.presets.some((presetInput) => {
+    const channels = recordOrEmpty(recordOrEmpty(presetInput).channels);
+    return Object.values(channels).some((configs) => Array.isArray(configs)
+      && configs.some((apiConfig) => Object.prototype.hasOwnProperty.call(recordOrEmpty(apiConfig), "apiKey")));
+  });
 }
