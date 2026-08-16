@@ -1,0 +1,159 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2a1a5e"/>
+      <stop offset="0.5" stop-color="#6d28d9"/>
+      <stop offset="1" stop-color="#c026d3"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.42" r="0.62">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="hair" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#e879f9"/>
+      <stop offset="1" stop-color="#a855f7"/>
+    </linearGradient>
+    <linearGradient id="bookL" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#e9d5ff"/>
+    </linearGradient>
+    <linearGradient id="bookR" x1="1" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#fce7f3"/>
+    </linearGradient>
+    <linearGradient id="quill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fde68a"/>
+      <stop offset="1" stop-color="#f59e0b"/>
+    </linearGradient>
+    <filter id="soft" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="6"/>
+    </filter>
+  </defs>
+
+  <!-- 背景圆角方形 -->
+  <rect x="0" y="0" width="1024" height="1024" rx="224" fill="url(#bg)"/>
+  <rect x="0" y="0" width="1024" height="1024" rx="224" fill="url(#glow)"/>
+
+  <!-- 装饰性星尘/火花 -->
+  <g fill="#ffe9a8">
+    <circle cx="150" cy="220" r="10" opacity="0.95"/>
+    <circle cx="878" cy="200" r="8" opacity="0.9"/>
+    <circle cx="196" cy="760" r="7" opacity="0.8"/>
+    <circle cx="840" cy="800" r="9" opacity="0.85"/>
+    <circle cx="512" cy="140" r="8" opacity="0.9"/>
+  </g>
+
+  <!-- 四角星火花（二次元闪亮效果） -->
+  <g fill="#fff6d8">
+    <path d="M220 300 l10 -26 l10 26 l-26 -10 l26 10 Z" opacity="0.95"/>
+    <path d="M810 300 l9 -22 l9 22 l-22 -9 l22 9 Z" opacity="0.9"/>
+    <path d="M180 520 l8 -20 l8 20 l-20 -8 l20 8 Z" opacity="0.85"/>
+    <path d="M848 520 l7 -18 l7 18 l-18 -7 l18 7 Z" opacity="0.8"/>
+    <path d="M512 190 l7 -18 l7 18 l-18 -7 l18 7 Z" opacity="0.95"/>
+    <path d="M262 660 l6 -15 l6 15 l-15 -6 l15 6 Z" opacity="0.8"/>
+    <path d="M762 660 l6 -15 l6 15 l-15 -6 l15 6 Z" opacity="0.8"/>
+  </g>
+
+  <!-- 光晕圆环 -->
+  <circle cx="512" cy="470" r="252" fill="none" stroke="#ffffff" stroke-opacity="0.18" stroke-width="4"/>
+  <circle cx="512" cy="470" r="268" fill="none" stroke="#ffffff" stroke-opacity="0.1" stroke-width="3"/>
+
+  <!-- 摊开的魔法书 -->
+  <g transform="translate(512,640)">
+    <path d="M-190 -18 C-120 -64 -58 -70 0 -44 C58 -70 120 -64 190 -18 C170 60 96 120 0 128 C-96 120 -170 60 -190 -18 Z" fill="#7c3aed" opacity="0.9"/>
+    <path d="M-178 -12 C-112 -52 -56 -60 0 -38 C56 -60 112 -52 178 -12 C160 52 92 108 0 116 C-92 108 -160 52 -178 -12 Z" fill="url(#bookL)"/>
+    <path d="M0 -38 C56 -60 112 -52 178 -12 L178 -12 C160 52 92 108 0 116 Z" fill="url(#bookR)"/>
+    <!-- 书脊 -->
+    <rect x="-8" y="-40" width="16" height="158" rx="6" fill="#f9a8d4"/>
+    <!-- 书页文字线条 -->
+    <g stroke="#c4b5fd" stroke-width="6" stroke-linecap="round" opacity="0.9">
+      <line x1="-150" y1="-4" x2="-60" y2="-18"/>
+      <line x1="-150" y1="22" x2="-40" y2="8"/>
+      <line x1="-150" y1="48" x2="-70" y2="36"/>
+      <line x1="150" y1="-4" x2="60" y2="-18"/>
+      <line x1="150" y1="22" x2="40" y2="8"/>
+      <line x1="150" y1="48" x2="70" y2="36"/>
+    </g>
+  </g>
+
+  <!-- 魔法羽毛笔 -->
+  <g transform="rotate(-28 512 470)">
+    <path d="M512 300 C536 360 548 400 552 470 C556 540 548 580 512 620 L508 620 C476 580 468 540 472 470 C476 400 488 360 512 300 Z" fill="url(#quill)"/>
+    <path d="M512 300 C500 352 496 420 498 470 L512 470 Z" fill="#fde68a" opacity="0.9"/>
+    <path d="M512 620 C516 640 516 652 512 660 C508 652 508 640 512 620 Z" fill="#f59e0b"/>
+  </g>
+
+  <!-- 星星/魔法光点绕笔 -->
+  <g fill="#ffffff" opacity="0.95">
+    <circle cx="600" cy="360" r="7"/>
+    <circle cx="636" cy="470" r="5"/>
+    <circle cx="400" cy="350" r="5"/>
+  </g>
+
+  <!-- ===== 可爱的 Q 版动漫少女（双马尾） ===== -->
+  <g transform="translate(512,236)">
+    <!-- 双马尾（后侧） -->
+    <g fill="url(#hair)">
+      <ellipse cx="-118" cy="104" rx="72" ry="150" transform="rotate(-28 -118 104)"/>
+      <ellipse cx="118" cy="104" rx="72" ry="150" transform="rotate(28 118 104)"/>
+    </g>
+    <g fill="#c084fc" opacity="0.85">
+      <ellipse cx="-118" cy="104" rx="72" ry="150" transform="rotate(-28 -118 104)"/>
+      <ellipse cx="118" cy="104" rx="72" ry="150" transform="rotate(28 118 104)"/>
+    </g>
+    <!-- 蝴蝶结发饰 -->
+    <g transform="translate(-118,4)">
+      <ellipse cx="-18" cy="0" rx="26" ry="16" fill="#f472b6"/>
+      <ellipse cx="18" cy="0" rx="26" ry="16" fill="#f472b6"/>
+      <circle cx="0" cy="0" r="9" fill="#fb7185"/>
+    </g>
+    <g transform="translate(118,4)">
+      <ellipse cx="-18" cy="0" rx="26" ry="16" fill="#f472b6"/>
+      <ellipse cx="18" cy="0" rx="26" ry="16" fill="#f472b6"/>
+      <circle cx="0" cy="0" r="9" fill="#fb7185"/>
+    </g>
+    <!-- 后发 -->
+    <ellipse cx="0" cy="60" rx="118" ry="140" fill="url(#hair)"/>
+    <!-- 脸部 -->
+    <ellipse cx="0" cy="40" rx="108" ry="100" fill="#ffe3d0"/>
+    <!-- 刘海 -->
+    <g fill="url(#hair)">
+      <path d="M-108 20 C-104 -64 -48 -86 0 -84 C48 -86 104 -64 108 20 C64 -6 36 -22 0 -22 C-36 -22 -64 -6 -108 20 Z"/>
+      <path d="M-108 20 C-80 6 -48 0 -16 6 C-30 -12 -66 -14 -108 20 Z" opacity="0.9"/>
+      <path d="M108 20 C80 6 48 0 16 6 C30 -12 66 -14 108 20 Z" opacity="0.9"/>
+    </g>
+    <!-- 侧发 -->
+    <path d="M-108 18 C-122 60 -114 96 -96 108 C-92 70 -98 40 -108 18 Z" fill="url(#hair)"/>
+    <path d="M108 18 C122 60 114 96 96 108 C92 70 98 40 108 18 Z" fill="url(#hair)"/>
+    <!-- 呆毛 -->
+    <path d="M-4 -84 C-22 -116 6 -124 12 -104 C16 -92 8 -86 -4 -84 Z" fill="url(#hair)"/>
+    <!-- 眼睛 -->
+    <g>
+      <ellipse cx="-46" cy="36" rx="26" ry="32" fill="#ffffff"/>
+      <ellipse cx="46" cy="36" rx="26" ry="32" fill="#ffffff"/>
+      <ellipse cx="-46" cy="38" rx="19" ry="25" fill="#7c3aed"/>
+      <ellipse cx="46" cy="38" rx="19" ry="25" fill="#7c3aed"/>
+      <ellipse cx="-46" cy="36" rx="13" ry="17" fill="#4c1d95"/>
+      <ellipse cx="46" cy="36" rx="13" ry="17" fill="#4c1d95"/>
+      <circle cx="-53" cy="28" r="6" fill="#ffffff"/>
+      <circle cx="39" cy="28" r="6" fill="#ffffff"/>
+      <circle cx="-41" cy="46" r="4" fill="#ffffff" opacity="0.8"/>
+      <circle cx="51" cy="46" r="4" fill="#ffffff" opacity="0.8"/>
+    </g>
+    <!-- 腮红 -->
+    <ellipse cx="-74" cy="64" rx="14" ry="8" fill="#fb7185" opacity="0.5"/>
+    <ellipse cx="74" cy="64" rx="14" ry="8" fill="#fb7185" opacity="0.5"/>
+    <!-- 嘴 -->
+    <path d="M-8 62 Q0 74 8 62 Q0 68 -8 62 Z" fill="#d97706"/>
+    <!-- 小虎牙/可爱表情 -->
+    <path d="M-4 52 L-4 60 L2 56 Z" fill="#ffffff"/>
+  </g>
+
+  <!-- 顶部小皇冠/书页顶饰 -->
+  <g transform="translate(512,110)">
+    <path d="M-40 26 L-52 -10 L-20 6 L0 -22 L20 6 L52 -10 L40 26 Z" fill="#fbbf24"/>
+    <circle cx="-52" cy="-14" r="7" fill="#fde68a"/>
+    <circle cx="52" cy="-14" r="7" fill="#fde68a"/>
+    <circle cx="0" cy="-26" r="7" fill="#fde68a"/>
+  </g>
+</svg>
