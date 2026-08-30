@@ -326,8 +326,8 @@ This software is provided "as is" without warranty of any kind. By using NovelFo
 ## Credits & License
 
 - [WebGAL](https://github.com/OpenWebGAL/WebGAL) — visual novel engine (MPL-2.0); see [THIRD_PARTY_NOTICE](./THIRD_PARTY_NOTICE)
-- NovelForge itself is licensed under a [Non-Commercial License](./LICENSE): free to use, modify, and redistribute, but **not for commercial purposes**
-- **Exported content exemption**: the games, scripts, novels, images, and other content you generate or export with NovelForge **belong to you** and may be used and sold commercially without restriction
+- NovelForge itself is licensed under the [GNU GPL v3](./LICENSE) — free to use, modify, and redistribute; modified versions must be open-sourced under the same license
+- **Exported content**: the games, scripts, novels, images, and other content you generate or export with NovelForge belong to you and are not covered by NovelForge's license
 - Published works must retain the WebGAL copyright notice; game content belongs to the creator
 
 ## Roadmap

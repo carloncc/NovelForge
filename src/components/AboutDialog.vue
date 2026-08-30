@@ -47,7 +47,7 @@ async function openExternal(url: string): Promise<void> {
         <div class="about-section">
           <h4>{{ t("技术") }}</h4>
           <p class="small">
-            Non-Commercial ·
+            GPL-3.0 ·
             <a href="https://github.com/carloncc/NovelForge/blob/main/LICENSE" @click.prevent="openExternal('https://github.com/carloncc/NovelForge/blob/main/LICENSE')">License</a>
             · {{ t("引擎致谢") }}：
             <a href="https://github.com/OpenWebGAL/WebGAL" @click.prevent="openExternal('https://github.com/OpenWebGAL/WebGAL')">WebGAL</a>（MPL-2.0）

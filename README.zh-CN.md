@@ -322,8 +322,8 @@ cd src-tauri && cargo test
 ## 致谢与许可
 
 - [WebGAL](https://github.com/OpenWebGAL/WebGAL) —— 视觉小说引擎（MPL-2.0），详见 [THIRD_PARTY_NOTICE](./THIRD_PARTY_NOTICE)
-- NovelForge 本体采用[非商用许可](./LICENSE)：可自由使用、修改、分发，但**不得商用**
-- **导出内容豁免**：你使用 NovelForge 生成/导出的游戏、剧本、小说、图片等内容**归你所有**，可自由商用，不受本许可限制
+- NovelForge 本体采用 [GNU GPL v3](./LICENSE) 许可：可自由使用、修改、分发；修改后的版本须以相同许可开源
+- **导出内容**：你使用 NovelForge 生成/导出的游戏、剧本、小说、图片等内容**归你所有**，不受 NovelForge 许可约束
 - 使用 NovelForge 发布作品时须保留 WebGAL 版权声明；游戏内容版权归创作者所有
 
 ## Roadmap

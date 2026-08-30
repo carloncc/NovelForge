@@ -2,7 +2,7 @@
   "name": "novelforge",
   "private": true,
   "version": "0.2.0",
-  "license": "SEE LICENSE IN LICENSE",
+  "license": "GPL-3.0-or-later",
   "type": "module",
   "scripts": {
     "dev": "vite",
