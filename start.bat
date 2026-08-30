@@ -1,38 +1,37 @@
 @echo off
-chcp 65001 >nul
 setlocal enabledelayedexpansion
 set "ROOT=%~dp0"
 cd /d "%ROOT%"
 
 echo.
 echo ==========================================
-echo   NovelForge å¯åŠ¨ / æ‰“åŒ…è„šæœ¬
+echo   NovelForge Æô¶¯ / ´ò°ü½Å±¾
 echo ==========================================
 echo.
 
 :menu
 echo.
-echo è¯·é€‰æ‹©æ“ä½œ:
-echo   [1] å¯åŠ¨å¼€å‘çŽ¯å¢ƒ (pnpm tauri dev)
-echo   [2] æ‰“åŒ…å®‰è£…ç¨‹åº (tauri build)
-echo   [3] ä»…ç¼–è¯‘,ä¸æ‰“åŒ… (tauri build --no-bundle)
-echo   [4] å®‰è£…ä¾èµ– (pnpm install)
-echo   [q] é€€å‡º
+echo ÇëÑ¡Ôñ²Ù×÷:
+echo   [1] Æô¶¯¿ª·¢»·¾³ (pnpm tauri dev)
+echo   [2] ´ò°ü°²×°³ÌÐò (tauri build)
+echo   [3] ½ö±àÒë,²»´ò°ü (tauri build --no-bundle)
+echo   [4] °²×°ÒÀÀµ (pnpm install)
+echo   [q] ÍË³ö
 echo.
-set /p choice=è¯·è¾“å…¥æ•°å­—åŽå›žè½¦:
+set /p choice=ÇëÊäÈëÊý×Öºó»Ø³µ:
 if "%choice%"=="1" goto dev
 if "%choice%"=="2" goto package
 if "%choice%"=="3" goto build
 if "%choice%"=="4" goto install
 if /i "%choice%"=="q" goto end
-echo æ— æ•ˆè¾“å…¥,è¯·é‡è¯•.
+echo ÎÞÐ§ÊäÈë,ÇëÖØÊÔ.
 goto menu
 
 :dev
 call :check_deps || goto :end
 call :ensure_install
 echo.
-echo å¯åŠ¨å¼€å‘çŽ¯å¢ƒ, Ctrl+C é€€å‡º...
+echo Æô¶¯¿ª·¢»·¾³, Ctrl+C ÍË³ö...
 pnpm tauri dev
 goto end
 
@@ -40,11 +39,11 @@ goto end
 call :check_deps || goto :end
 call :ensure_install
 echo.
-echo æ­£åœ¨æ‰“åŒ…å®‰è£…ç¨‹åº...
+echo ÕýÔÚ´ò°ü°²×°³ÌÐò...
 pnpm tauri build
 if errorlevel 1 goto fail
 echo.
-echo [OK] æ‰“åŒ…å®Œæˆ! äº§ç‰©ä½äºŽ: src-tauri\target\release\bundle\
+echo [OK] ´ò°üÍê³É! ²úÎïÎ»ÓÚ: src-tauri\target\release\bundle\
 start "" "src-tauri\target\release\bundle"
 goto end
 
@@ -52,54 +51,54 @@ goto end
 call :check_deps || goto :end
 call :ensure_install
 echo.
-echo æ­£åœ¨ç¼–è¯‘(ä¸æ‰“åŒ…)...
+echo ÕýÔÚ±àÒë(²»´ò°ü)...
 pnpm tauri build --no-bundle
 if errorlevel 1 goto fail
 echo.
-echo [OK] ç¼–è¯‘å®Œæˆ! exe ä½äºŽ: src-tauri\target\release\NovelForge.exe
+echo [OK] ±àÒëÍê³É! exe Î»ÓÚ: src-tauri\target\release\NovelForge.exe
 goto end
 
 :install
 call :check_deps || goto :end
 call :ensure_install
 echo.
-echo [OK] ä¾èµ–å®‰è£…å®Œæˆ.
+echo [OK] ÒÀÀµ°²×°Íê³É.
 goto end
 
 :check_deps
 where pnpm >nul 2>nul
 if errorlevel 1 (
-    echo [ERROR] æœªæ‰¾åˆ° pnpm, è¯·å…ˆå®‰è£…: npm install -g pnpm
+    echo [ERROR] Î´ÕÒµ½ pnpm, ÇëÏÈ°²×°: npm install -g pnpm
     exit /b 1
 )
 where cargo >nul 2>nul
 if errorlevel 1 (
-    echo [ERROR] æœªæ‰¾åˆ° cargo, è¯·å…ˆå®‰è£… Rust: https://rustup.rs
+    echo [ERROR] Î´ÕÒµ½ cargo, ÇëÏÈ°²×° Rust: https://rustup.rs
     exit /b 1
 )
 where node >nul 2>nul
 if errorlevel 1 (
-    echo [ERROR] æœªæ‰¾åˆ° node, è¯·å…ˆå®‰è£… Node.js
+    echo [ERROR] Î´ÕÒµ½ node, ÇëÏÈ°²×° Node.js
     exit /b 1
 )
 exit /b 0
 
 :ensure_install
 if not exist node_modules (
-    echo é¦–æ¬¡è¿è¡Œ, å®‰è£…å‰ç«¯ä¾èµ–...
+    echo Ê×´ÎÔËÐÐ, °²×°Ç°¶ËÒÀÀµ...
     call pnpm install
     if errorlevel 1 (
-        echo [ERROR] ä¾èµ–å®‰è£…å¤±è´¥.
+        echo [ERROR] ÒÀÀµ°²×°Ê§°Ü.
         exit /b 1
     )
 ) else (
-    echo node_modules å·²å­˜åœ¨, è·³è¿‡å®‰è£….
+    echo node_modules ÒÑ´æÔÚ, Ìø¹ý°²×°.
 )
 exit /b 0
 
 :fail
 echo.
-echo [ERROR] æ‰§è¡Œå¤±è´¥, è¯·æŸ¥çœ‹ä¸Šæ–¹é”™è¯¯ä¿¡æ¯.
+echo [ERROR] Ö´ÐÐÊ§°Ü, Çë²é¿´ÉÏ·½´íÎóÐÅÏ¢.
 goto end
 
 :end

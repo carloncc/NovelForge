@@ -10,6 +10,7 @@ import { renderConfig, type WebgalLanguage } from "../core/render";
 import { errMsg } from "../utils/errors";
 import { log } from "../utils/logger";
 import { t } from "../i18n";
+import PageHead from "../components/PageHead.vue";
 import type { ExportSettings } from "../core/types";
 
 const message = ref("");
@@ -165,23 +166,25 @@ const lintSummary = computed(() => {
   if (!r) return null;
   return { errors: r.errors.length, warnings: r.warnings.length };
 });
+
+async function openExternal(url: string): Promise<void> {
+  try {
+    await tauri.openUrl(url);
+  } catch (e) {
+    setMsg(`打开链接失败：${errMsg(e)}`, false);
+  }
+}
 </script>
 
 <template>
   <div class="inner">
-    <div class="page-head">
-      <div>
-        <div class="page-title">{{ t("导出") }}</div>
-        <p class="page-sub">{{ t("标准 WebGAL 项目三端分发：网页版 zip / PC exe / 手机 APK") }}</p>
-      </div>
-      <div class="page-actions">
-        <button class="btn secondary" @click="openFolder">{{ t("打开项目文件夹") }}</button>
-        <button class="btn" :disabled="packing" @click="packZip">
-          <span v-if="packing" class="spinner" />
-          {{ packing ? t("打包中…") : t("打包网页版 zip") }}
-        </button>
-      </div>
-    </div>
+    <PageHead :title="t('导出')" :sub="t('标准 WebGAL 项目三端分发：网页版 zip / PC exe / 手机 APK')">
+      <button class="btn secondary" @click="openFolder">{{ t("打开项目文件夹") }}</button>
+      <button class="btn" :disabled="packing" @click="packZip">
+        <span v-if="packing" class="spinner" />
+        {{ packing ? t("打包中…") : t("打包网页版 zip") }}
+      </button>
+    </PageHead>
 
     <div class="card" v-if="projectState.lastResult">
       <div class="card-head">
@@ -194,16 +197,16 @@ const lintSummary = computed(() => {
         <span style="color: var(--primary); font-weight: 600">{{ projectState.lastResult.meta.title }}</span>
         · {{ projectState.lastResult.meta.chapterCount }} {{ t("章") }} · {{ projectState.lastResult.meta.sceneCount }} {{ t("场景") }} · {{ projectState.lastResult.meta.lineCount }} {{ t("句") }}
       </p>
-      <p style="color: var(--text-dim); font-size: 12.5px; margin-top: 4px"><code>{{ projectState.lastResult.meta.outputDir }}</code></p>
+      <p class="hint" style="margin-top: 4px"><code>{{ projectState.lastResult.meta.outputDir }}</code></p>
     </div>
     <div v-else class="card">
-      <p style="color: var(--text-faint)">{{ t("尚未生成项目") }}</p>
+      <p class="faint">{{ t("尚未生成项目") }}</p>
     </div>
 
     <div class="card">
       <div class="card-head"><h3>{{ t("导出设置") }}</h3></div>
-      <div class="row">
-        <label class="field grow-2">
+      <div class="field-grid">
+        <label class="field">
           <span>{{ t("游戏标题") }}</span>
           <input type="text" v-model="settings.title" />
         </label>
@@ -220,7 +223,7 @@ const lintSummary = computed(() => {
             <option value="ja">{{ t("日本語") }}</option>
           </select>
         </label>
-        <div>
+        <div class="flex items-end">
           <button class="btn secondary" @click="applySettings">{{ t("应用设置") }}</button>
         </div>
       </div>
@@ -237,66 +240,66 @@ const lintSummary = computed(() => {
         </div>
       </div>
       <template v-if="lintReport">
-        <p style="font-size: 13px; margin-bottom: var(--space-3)">
+        <p class="mb-3">
           <span v-if="!lintReport.errors.length" class="tag ok">{{ t("✓ 通过") }}</span>
           <span v-if="lintReport.warnings.length" class="tag warn">{{ t("警告") }} {{ lintReport.warnings.length }}</span>
           <span v-if="lintReport.errors.length" class="tag err">{{ t("错误") }} {{ lintReport.errors.length }}</span>
-          <span style="color: var(--text-dim); font-size: 12px; margin-left: 8px">
+          <span class="hint" style="margin-left: 8px">
             {{ lintReport.summary.scenes }} {{ t("场景") }} / {{ lintReport.summary.lines }} {{ t("句") }} / {{ t("缺失素材") }} {{ lintReport.summary.missingAssets }}
           </span>
         </p>
-        <div v-if="lintReport.errors.length || lintReport.warnings.length" style="display: flex; flex-direction: column; gap: 6px; max-height: 260px; overflow: auto">
-          <div v-for="(iss, i) in [...lintReport.errors, ...lintReport.warnings]" :key="i" style="font-size: 12.5px; padding: 7px 10px; border-radius: 6px" :style="iss.level === 'error' ? 'background: var(--err-soft); color: var(--err)' : 'background: var(--warn-soft); color: var(--warn)'">
+        <div v-if="lintReport.errors.length || lintReport.warnings.length" class="lint-list">
+          <div v-for="(iss, i) in [...lintReport.errors, ...lintReport.warnings]" :key="i" class="lint-item" :class="iss.level === 'error' ? 'error' : 'warn'">
             <b>{{ iss.scope }}</b>：{{ iss.message }}
           </div>
         </div>
       </template>
-      <p v-else style="color: var(--text-faint); font-size: 12.5px">{{ t("检查剧本语法、素材引用完整性、空章节与流程图可达性") }}</p>
+      <p v-else class="faint small">{{ t("检查剧本语法、素材引用完整性、空章节与流程图可达性") }}</p>
     </div>
 
-    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: var(--space-4)">
-      <div class="card" style="margin-bottom: 0">
-        <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 10px">
-          <span style="width: 36px; height: 36px; border-radius: 9px; background: var(--gradient); display: flex; align-items: center; justify-content: center">
+    <div class="dist-grid">
+      <div class="card mb-0">
+        <div class="dist-head">
+          <span class="dist-icon web">
             <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15V19C21 20.1 20.1 21 19 21H5C3.9 21 3 20.1 3 19V15M7 10L12 15L17 10M12 15V3" /></svg>
           </span>
           <div>
-            <div style="font-weight: 600">{{ t("网页版 zip") }}</div>
-            <div style="font-size: 11.5px; color: var(--text-dim)">{{ t("手机/PC 浏览器即玩 · 自动排除缓存") }}</div>
+            <div class="dist-title">{{ t("网页版 zip") }}</div>
+            <div class="dist-desc">{{ t("手机/PC 浏览器即玩 · 自动排除缓存") }}</div>
           </div>
         </div>
-        <button class="btn" style="width: 100%" :disabled="packing || !projectState.lastResult" @click="packZip">
+        <button class="btn w-full" :disabled="packing || !projectState.lastResult" @click="packZip">
           <span v-if="packing" class="spinner" /> {{ t("打包 zip") }}
         </button>
       </div>
 
-      <div class="card" style="margin-bottom: 0">
-        <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 10px">
-          <span style="width: 36px; height: 36px; border-radius: 9px; background: linear-gradient(135deg, #2563eb, #60a5fa); display: flex; align-items: center; justify-content: center">
+      <div class="card mb-0">
+        <div class="dist-head">
+          <span class="dist-icon pc">
             <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" /><path d="M8 21h8M12 17v4" /></svg>
           </span>
           <div>
-            <div style="font-weight: 600">{{ t("PC 端 exe") }}</div>
-            <div style="font-size: 11.5px; color: var(--text-dim)">{{ t("WebGAL Terre 一键导出") }}</div>
+            <div class="dist-title">{{ t("PC 端 exe") }}</div>
+            <div class="dist-desc">{{ t("WebGAL Terre 一键导出") }}</div>
           </div>
         </div>
-        <a href="https://www.openwebgal.com/zh-cn/download/" target="_blank" class="btn secondary" style="width: 100%; text-decoration: none">{{ t("下载 Terre 编辑器") }}</a>
+        <button class="btn secondary w-full" @click="openExternal('https://www.openwebgal.com/zh-cn/download/')">{{ t("下载 Terre 编辑器") }}</button>
       </div>
 
-      <div class="card" style="margin-bottom: 0">
-        <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 10px">
-          <span style="width: 36px; height: 36px; border-radius: 9px; background: linear-gradient(135deg, #059669, #34d399); display: flex; align-items: center; justify-content: center">
+      <div class="card mb-0">
+        <div class="dist-head">
+          <span class="dist-icon apk">
             <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="2" width="14" height="20" rx="2" /><path d="M12 18h.01" /></svg>
           </span>
           <div>
-            <div style="font-weight: 600">{{ t("手机端 APK") }}</div>
-            <div style="font-size: 11.5px; color: var(--text-dim)">{{ t("官方 APK 构建工具") }}</div>
+            <div class="dist-title">{{ t("手机端 APK") }}</div>
+            <div class="dist-desc">{{ t("官方 APK 构建工具") }}</div>
           </div>
         </div>
-        <a href="https://github.com/OpenWebGAL/webgal-apk-build-tool" target="_blank" class="btn secondary" style="width: 100%; text-decoration: none">{{ t("APK 构建指引") }}</a>
+        <button class="btn secondary w-full" @click="openExternal('https://github.com/OpenWebGAL/webgal-apk-build-tool')">{{ t("APK 构建指引") }}</button>
       </div>
     </div>
 
-    <p v-if="message" style="color: var(--ok); font-size: 12.5px; margin-top: var(--space-3)">{{ message }}</p>
+    <p v-if="message" class="mt-3" style="color: var(--ok); font-size: 12.5px">{{ message }}</p>
   </div>
 </template>

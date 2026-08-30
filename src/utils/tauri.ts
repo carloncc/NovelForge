@@ -25,8 +25,34 @@ export interface HttpResult {
   bodyBase64: string;
 }
 
+export interface HttpRequest {
+  method: string;
+  url: string;
+  headers?: Record<string, string>;
+  body?: string;
+  bodyBase64?: string;
+  timeoutSecs?: number;
+}
+
 export function isTauri(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
+/** AI 抠图模型下载/安装状态（Tauri 与 web 运行时共用） */
+export interface CutoutModelStatus {
+  modelId: string;
+  state: "idle" | "downloading" | "done" | "error";
+  bytes: number;
+  total: number;
+  error: string | null;
+  installed: boolean;
+}
+
+export interface CutoutModelDownloadRequest {
+  modelId: string;
+  filename: string;
+  url: string;
+  md5?: string;
 }
 
 function base64ToBuffer(b64: string): Uint8Array {
@@ -102,6 +128,7 @@ async function httpFallback(args: {
   url: string;
   headers?: Record<string, string>;
   body?: string;
+  bodyBase64?: string;
   timeoutSecs?: number;
 }): Promise<HttpResult> {
   if (isWebRuntime()) return (await webRuntime()).webHttp(args);
@@ -111,7 +138,7 @@ async function httpFallback(args: {
     const resp = await fetch(args.url, {
       method: args.method,
       headers: args.headers,
-      body: args.body,
+      body: args.bodyBase64 ? base64ToBuffer(args.bodyBase64) : args.body,
       signal: controller.signal,
     });
     const buf = new Uint8Array(await resp.arrayBuffer());
@@ -214,7 +241,7 @@ function safeCallArgs(name: string, args: unknown): unknown {
   if (name === "writeConfig" || name === "writeApiSecrets") return "[REDACTED]";
   if (name === "http" && args && typeof args === "object") {
     const request = args as Record<string, unknown>;
-    return truncate({ method: request.method, url: request.url, timeoutSecs: request.timeoutSecs });
+    return truncate({ method: request.method, url: request.url, timeoutSecs: request.timeoutSecs, binaryBodySize: typeof request.bodyBase64 === "string" ? request.bodyBase64.length : 0 });
   }
   if (name === "writeFileBase64") {
     const value = args as { path?: string; dataB64?: string };
@@ -257,6 +284,7 @@ export const tauri = {
     url: string;
     headers?: Record<string, string>;
     body?: string;
+    bodyBase64?: string;
     timeoutSecs?: number;
   }): Promise<HttpResult> => {
     if (isTauri()) return invoke("http_request", { args });
@@ -442,5 +470,27 @@ export const tauri = {
     } catch {
       return true; // 读取失败 → 放行（后续生成/缓存逻辑兜底）
     }
+  }),
+  cutoutModelStatus: wrap("cutoutModelStatus", (modelId: string, filename: string): Promise<CutoutModelStatus> => {
+    if (isTauri()) return invoke("model_download_status", { modelId, filename }).then((r) => r as CutoutModelStatus);
+    if (isWebRuntime()) return webRuntime().then((web) => web.webCutoutModelStatus(modelId, filename));
+    return Promise.resolve({ modelId, state: "idle", bytes: 0, total: 0, error: null, installed: false });
+  }),
+  cutoutModelDownload: wrap("cutoutModelDownload", (req: CutoutModelDownloadRequest): Promise<CutoutModelStatus> => {
+    if (isTauri()) {
+      return invoke("model_download_start", {
+        modelId: req.modelId,
+        filename: req.filename,
+        url: req.url,
+        md5: req.md5 ?? "",
+      }).then((r) => r as CutoutModelStatus);
+    }
+    if (isWebRuntime()) return webRuntime().then((web) => web.webCutoutModelDownload(req));
+    return Promise.reject(new Error("当前环境不支持模型下载"));
+  }),
+  cutoutModelRemove: wrap("cutoutModelRemove", (modelId: string, filename: string): Promise<void> => {
+    if (isTauri()) return invoke("model_remove", { modelId, filename }).then(() => undefined);
+    if (isWebRuntime()) return webRuntime().then((web) => web.webCutoutModelRemove(modelId, filename));
+    return Promise.resolve();
   }),
 };

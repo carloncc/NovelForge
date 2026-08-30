@@ -1,4 +1,4 @@
-import type { ApiConfig, ApiPreset, ChannelKey } from "../core/types";
+import type { ApiConfig, ApiPreset, ChannelKey, VoiceProfile } from "../core/types";
 
 export const CONFIG_SCHEMA_VERSION = 3 as const;
 
@@ -17,12 +17,25 @@ export function concurrencyFor(cfg: ApiConfig | undefined, kind: ChannelKey): nu
   return DEFAULT_CONCURRENCY_BY_CHANNEL[kind];
 }
 
+/** AI 抠图设置：启用开关 + 所选模型（模型列表见 core/cutout/models.ts） */
+export interface CutoutSettings {
+  enabled: boolean;
+  modelId: string;
+}
+
+export const DEFAULT_CUTOUT_SETTINGS: CutoutSettings = {
+  enabled: true,
+  modelId: "isnet-anime",
+};
+
 export interface ConfigFile {
   configSchemaVersion: typeof CONFIG_SCHEMA_VERSION;
   presets: ApiPreset[];
   activePresetId: string;
   outputDir?: string;
   recentOutputDirs?: string[];
+  voiceProfiles: VoiceProfile[];
+  cutout?: CutoutSettings;
 }
 
 export interface ConfigMigrationResult {
@@ -153,7 +166,7 @@ export function migrateConfigFile(
 ): ConfigMigrationResult {
   const root = recordOrEmpty(input);
   const version = root.configSchemaVersion;
-  if (version !== undefined && version !== 1 && version !== 2 && version !== CONFIG_SCHEMA_VERSION) {
+  if (version !== undefined && version !== 1 && version !== 2 && version !== 3 && version !== CONFIG_SCHEMA_VERSION) {
     throw new UnsupportedConfigVersionError(version);
   }
   const shouldAddVision = version === undefined || version === 1;
@@ -173,8 +186,45 @@ export function migrateConfigFile(
       recentOutputDirs: Array.isArray(root.recentOutputDirs)
         ? root.recentOutputDirs.filter((dir): dir is string => typeof dir === "string")
         : [],
+      voiceProfiles: normalizeVoiceProfiles(root.voiceProfiles),
+      cutout: normalizeCutoutSettings(root.cutout),
     },
   };
+}
+
+function normalizeCutoutSettings(input: unknown): CutoutSettings {
+  const record = recordOrEmpty(input);
+  const modelId = typeof record.modelId === "string" && record.modelId.trim()
+    ? record.modelId
+    : DEFAULT_CUTOUT_SETTINGS.modelId;
+  const enabled = typeof record.enabled === "boolean" ? record.enabled : DEFAULT_CUTOUT_SETTINGS.enabled;
+  return { enabled, modelId };
+}
+
+function normalizeVoiceProfiles(input: unknown): VoiceProfile[] {
+  if (!Array.isArray(input)) return [];
+  return input.flatMap((candidate) => {
+    const profile = recordOrEmpty(candidate);
+    if (
+      typeof profile.id !== "string" || !profile.id ||
+      typeof profile.name !== "string" || !profile.name ||
+      typeof profile.ttsConfigId !== "string" || !profile.ttsConfigId ||
+      typeof profile.voiceId !== "string" || !profile.voiceId
+    ) return [];
+    return [{
+      id: profile.id,
+      name: profile.name,
+      provider: "minimax",
+      ttsConfigId: profile.ttsConfigId,
+      voiceId: profile.voiceId,
+      status: profile.status === "creating" || profile.status === "error" ? profile.status : "ready",
+      referenceAudioPath: typeof profile.referenceAudioPath === "string" ? profile.referenceAudioPath : undefined,
+      consentConfirmedAt: typeof profile.consentConfirmedAt === "string" ? profile.consentConfirmedAt : undefined,
+      error: typeof profile.error === "string" ? profile.error : undefined,
+      revision: typeof profile.revision === "number" && profile.revision >= 1 ? Math.floor(profile.revision) : 1,
+      createdAt: typeof profile.createdAt === "string" ? profile.createdAt : new Date(0).toISOString(),
+    } satisfies VoiceProfile];
+  });
 }
 
 function repairDuplicateConfigIds(presets: ApiPreset[], createId: () => string): boolean {

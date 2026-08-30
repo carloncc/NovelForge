@@ -5,7 +5,7 @@
  * 下载官方 WebGAL 网页版包 → 解压 → 裁剪 demo 内容 → src-tauri/templates/webgal
  */
 import { createWriteStream } from "node:fs";
-import { mkdir, readdir, rm, stat } from "node:fs/promises";
+import { copyFile, mkdir, readdir, rm, stat } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -51,9 +51,45 @@ async function exists(p) {
   }
 }
 
+/** 鉴赏室页面随模板一起分发（web 模式 / include_dir 内嵌共用这一份），幂等确保存在 */
+async function ensureAppreciation() {
+  const src = join(ROOT, "src", "gameExtra", "appreciation.html");
+  const dest = join(TARGET, "appreciation.html");
+  if (await exists(src) && (!(await exists(dest)) || (await stat(src)).mtimeMs !== (await stat(dest)).mtimeMs)) {
+    await copyFile(src, dest);
+    console.log("鉴赏室页面已同步：appreciation.html");
+  }
+}
+
+/**
+ * 游戏界面定制（标题画面 / 文本框 / 选项 / 全局主题）随模板一起分发。
+ * 源文件位于 src/gameExtra/game-ui/，保证模板重下载后定制不丢失。
+ */
+const GAME_UI_COPIES = [
+  ["src/gameExtra/game-ui/userStyleSheet.css", "game/userStyleSheet.css"],
+  ["src/gameExtra/game-ui/UI/Title/title.scss", "game/template/UI/Title/title.scss"],
+  ["src/gameExtra/game-ui/Stage/TextBox/textbox.scss", "game/template/Stage/TextBox/textbox.scss"],
+  ["src/gameExtra/game-ui/Stage/Choose/choose.scss", "game/template/Stage/Choose/choose.scss"],
+];
+
+async function ensureGameUi() {
+  for (const [relSrc, relDest] of GAME_UI_COPIES) {
+    const src = join(ROOT, relSrc);
+    const dest = join(TARGET, relDest);
+    if (!(await exists(src))) continue;
+    await mkdir(dirname(dest), { recursive: true });
+    if (!(await exists(dest)) || (await stat(src)).mtimeMs !== (await stat(dest)).mtimeMs) {
+      await copyFile(src, dest);
+      console.log(`游戏界面定制已同步：${relDest}`);
+    }
+  }
+}
+
 async function main() {
   const index = join(TARGET, "index.html");
   if (await exists(index)) {
+    await ensureAppreciation();
+    await ensureGameUi();
     console.log(`引擎模板已存在：${TARGET}`);
     return;
   }
@@ -118,6 +154,8 @@ async function main() {
   }
   await rm(zip, { force: true });
 
+  await ensureAppreciation();
+  await ensureGameUi();
   console.log(`引擎模板就绪：${TARGET}`);
 }
 

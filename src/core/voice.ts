@@ -4,7 +4,7 @@ import { tauri } from "../utils/tauri";
 import { errMsg } from "../utils/errors";
 import { cacheDirFor, cacheHit } from "./cache";
 import { sceneVocalKey } from "./render";
-import { voiceLibraryFor } from "../stores/config";
+import { ttsConfigById, voiceLibraryFor, voiceProfileById } from "../stores/config";
 import { log as logger } from "../utils/logger";
 
 export interface VoiceJob {
@@ -13,6 +13,17 @@ export interface VoiceJob {
   text: string;
   voice: string;
   charId: string;
+  ttsConfigId?: string;
+  cloned: boolean;
+}
+
+function voiceFingerprint(voice: string, configId?: string): string {
+  let hash = 2166136261;
+  for (const character of `${configId ?? "default"}:${voice}`) {
+    hash ^= character.codePointAt(0) ?? 0;
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
 }
 
 export function buildVoiceJobs(
@@ -23,10 +34,12 @@ export function buildVoiceJobs(
   const library = voiceLibraryFor(cfg);
   const fallbackVoice = library[0] || "default";
   const charById = new Map(characters.map((c) => [c.id, c]));
-  const voiceName = (charId: string): string => {
+  const voiceName = (charId: string): { voice: string; ttsConfigId?: string; cloned: boolean } => {
     const char = charById.get(charId);
+    const profile = voiceProfileById(char?.voiceProfileId);
+    if (profile) return { voice: profile.voiceId, ttsConfigId: profile.ttsConfigId, cloned: true };
     const v = char?.voiceName || char?.id || "default";
-    return library.includes(v) ? v : fallbackVoice;
+    return { voice: library.includes(v) ? v : fallbackVoice, cloned: false };
   };
   const jobs: VoiceJob[] = [];
   for (const chapter of chapters) {
@@ -35,12 +48,15 @@ export function buildVoiceJobs(
       scene.lines.forEach((line, i) => {
         if (line.type !== "dialogue") return;
         const key = sceneVocalKey(chapter.chapter, scene.id, i);
+        const selected = voiceName(line.characterId);
         jobs.push({
           key,
-          file: `v_${key}.mp3`,
+          file: `v_${key}_${voiceFingerprint(selected.voice, selected.ttsConfigId)}.mp3`,
           text: line.text.slice(0, 500),
-          voice: voiceName(line.characterId),
+          voice: selected.voice,
           charId: line.characterId,
+          ttsConfigId: selected.ttsConfigId,
+          cloned: selected.cloned,
         });
       });
       // 分支选择台词（与渲染层的序号公式一致）
@@ -48,12 +64,15 @@ export function buildVoiceJobs(
         choice.lines.forEach((line, j) => {
           if (line.type !== "dialogue") return;
           const key = sceneVocalKey(chapter.chapter, scene.id, scene.lines.length + 1000 * (b + 1) + j);
+          const selected = voiceName(line.characterId);
           jobs.push({
             key,
-            file: `v_${key}.mp3`,
+            file: `v_${key}_${voiceFingerprint(selected.voice, selected.ttsConfigId)}.mp3`,
             text: line.text.slice(0, 500),
-            voice: voiceName(line.characterId),
+            voice: selected.voice,
             charId: line.characterId,
+            ttsConfigId: selected.ttsConfigId,
+            cloned: selected.cloned,
           });
         });
       });
@@ -72,7 +91,9 @@ export async function runVoiceJob(
 ): Promise<string | null> {
   const cacheDir = cacheDirFor(cacheRoot, "vocal");
   await tauri.mkdirAll(cacheDir);
-  const library = voiceLibraryFor(cfg);
+  const jobConfig = job.ttsConfigId ? ttsConfigById(job.ttsConfigId) : cfg;
+  if (!jobConfig) throw new Error(`声音 ${job.voice} 绑定的 TTS 配置不存在`);
+  const library = voiceLibraryFor(jobConfig);
   const fallbackVoice = library[0] || "default";
   if (!force) {
     const cached = await cacheHit(cacheDir, job.file);
@@ -80,7 +101,7 @@ export async function runVoiceJob(
   }
   log({ step: "配音", message: `配音中：${job.voice} 「${job.text.slice(0, 20)}…」`, level: "info", at: Date.now() });
   const speak = async (voice: string): Promise<string> => {
-    const res = await ttsSpeech(cfg, job.text, voice);
+    const res = await ttsSpeech(jobConfig, job.text, voice);
     const ext = res.mime.includes("ogg") ? "ogg" : res.mime.includes("opus") ? "opus" : res.mime.includes("wav") ? "wav" : "mp3";
     const file = job.file.replace(/\.mp3$/, `.${ext}`);
     const path = `${cacheDir}/${file}`;
@@ -90,7 +111,7 @@ export async function runVoiceJob(
   try {
     return await speak(job.voice);
   } catch (e) {
-    if (job.voice !== fallbackVoice) {
+    if (!job.cloned && job.voice !== fallbackVoice) {
       log({
         step: "配音",
         message: `音色 ${job.voice} 失败，回退默认音色重试：${errMsg(e).slice(0, 100)}`,

@@ -125,20 +125,3 @@ export const ERROR_CLASS_ICON: Record<ErrorClass, string> = {
   aborted: "⏹",
   unknown: "❌",
 };
-
-/** 是否值得自动改写提示词后重试（仅内容审查） */
-export function isPromptRewriteable(e: unknown, status?: number): boolean {
-  return classifyError(e, status) === "content_moderation";
-}
-
-/** 是否应该退避重试（网络/限流） */
-export function isBackoffRetryable(e: unknown, status?: number): boolean {
-  const cls = classifyError(e, status);
-  return cls === "network" || cls === "rate_limit";
-}
-
-/** 是否应该直接失败不重试（鉴权/参数/中止/未知中的硬错） */
-export function isHardFailure(e: unknown, status?: number): boolean {
-  const cls = classifyError(e, status);
-  return cls === "auth" || cls === "invalid_param" || cls === "aborted";
-}

@@ -126,7 +126,7 @@ pnpm tauri build
 | | 说明 |
 |---|---|
 | 📖 **一站式全自动管线** | 分章 → 多语翻译 → 卡片提取 → 剧本（自动 CG 演出/物品特写/登场资料卡/视频推荐位）→ 图像 → 配音 → 标准 WebGAL 组装 |
-| 🎨 **无背景立绘** | 自动抠图（AI 分割，模型首次自动下载缓存；离线自动回退改进版色度键：连通 flood-fill + 去绿边 + 羽化） |
+| 🎨 **无背景立绘** | 自动抠图：可选 AI 分割模型（ISNet 动漫/通用、BiRefNet、U2-Net，配置页手动下载、模型本机推理不上传）；未装模型或推理失败时自动回退改进版色度键（连通 flood-fill + 去绿边 + 羽化） |
 | 🎨 **画风一致性** | 全项目「风格锚点图」+ 固定种子 + 统一负面提示词 + 链式图生图（三视图 → 立绘 → 表情/动作），多模态自检按参考图核对角色一致 |
 | 📖 **视觉圣经门禁** | 批量生图前必须确认「视觉圣经」：选风格来源（上传参考图由视觉通道分析 / LLM 分析整本小说生成风格示例）+ 每个主角三视图（正/侧/背）。单独重生成某角色三视图不牵连他人；任何输入变化都会使批准失效 |
 | 😊 **表情差分** | 每角色 5 种表情立绘（normal 图做参考保持一致），对话按情绪自动切换 |
@@ -202,7 +202,7 @@ Web 版与桌面版功能一致，浏览器内自动启用等价实现：
 | 本地文件系统 | IndexedDB 虚拟文件系统（数据持久化在浏览器） |
 | Rust HTTP 客户端（无 CORS 限制） | dev 服务器代理转发（`/__novelforge/proxy`） |
 | 内嵌本地预览服务器 | 前端 zip 打包上传 → dev 服务器解压静态服务（同源 iframe） |
-| Rust rembg 抠图 | canvas 连通 flood-fill 色度键抠图（白/黑底自动去背景） |
+| AI 抠图模型（ONNX 分割，onnxruntime-web）+ 色度键回退 | 同左（模型经 `/__novelforge/model` 中间件下载到 `public/models`） |
 | WebGAL 引擎模板随包携带 | dev 服务器按需同步 `src-tauri/templates/webgal` 到 IndexedDB |
 | 系统文件选择对话框 | 浏览器 `<input type="file">` |
 | 导出 zip 到磁盘 | 导出 zip 自动触发浏览器下载 |
@@ -322,7 +322,8 @@ cd src-tauri && cargo test
 ## 致谢与许可
 
 - [WebGAL](https://github.com/OpenWebGAL/WebGAL) —— 视觉小说引擎（MPL-2.0），详见 [THIRD_PARTY_NOTICE](./THIRD_PARTY_NOTICE)
-- NovelForge 本体采用 [MIT](./LICENSE) 许可
+- NovelForge 本体采用[非商用许可](./LICENSE)：可自由使用、修改、分发，但**不得商用**
+- **导出内容豁免**：你使用 NovelForge 生成/导出的游戏、剧本、小说、图片等内容**归你所有**，可自由商用，不受本许可限制
 - 使用 NovelForge 发布作品时须保留 WebGAL 版权声明；游戏内容版权归创作者所有
 
 ## Roadmap

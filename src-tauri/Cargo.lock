@@ -2107,6 +2107,7 @@ dependencies = [
  "base64 0.22.1",
  "chardetng",
  "encoding_rs",
+ "futures-util",
  "image",
  "include_dir",
  "keyring",

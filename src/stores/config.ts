@@ -1,15 +1,17 @@
 import { reactive, ref, watch } from "vue";
-import type { ApiConfig, ApiPreset, ChannelKey } from "../core/types";
+import type { ApiConfig, ApiPreset, ChannelKey, VoiceProfile } from "../core/types";
 import { tauri } from "../utils/tauri";
 import { getTemplate } from "../api/templates";
 import {
   CONFIG_SCHEMA_VERSION,
   DEFAULT_CONCURRENCY_BY_CHANNEL,
+  DEFAULT_CUTOUT_SETTINGS,
   loadConfigFile,
   configSecrets,
   serializeConfigFile,
   UnsupportedConfigVersionError,
   type ConfigFile,
+  type CutoutSettings,
 } from "./configMigration";
 import { log } from "../utils/logger";
 
@@ -121,6 +123,8 @@ export const configState = reactive<ConfigFile>({
   activePresetId: initialPreset.id,
   outputDir: "",
   recentOutputDirs: [],
+  voiceProfiles: [],
+  cutout: { ...DEFAULT_CUTOUT_SETTINGS },
 });
 let configPersistenceBlocked = false;
 let lastPersistedContent = "";
@@ -164,6 +168,8 @@ async function loadPersisted() {
     configState.configSchemaVersion = CONFIG_SCHEMA_VERSION;
     configState.outputDir = parsed.outputDir || "";
     configState.recentOutputDirs = parsed.recentOutputDirs ?? [];
+    configState.voiceProfiles = parsed.voiceProfiles ?? [];
+    configState.cutout = parsed.cutout ?? { ...DEFAULT_CUTOUT_SETTINGS };
   } catch (error) {
     configPersistenceBlocked = true;
     if (error instanceof UnsupportedConfigVersionError) {
@@ -186,6 +192,8 @@ function persistedConfigContent(): string {
     activePresetId: configState.activePresetId,
     outputDir: configState.outputDir,
     recentOutputDirs: configState.recentOutputDirs,
+    voiceProfiles: configState.voiceProfiles,
+    cutout: configState.cutout,
   });
 }
 
@@ -232,12 +240,14 @@ watch(
       activePresetId: configState.activePresetId,
       outputDir: configState.outputDir,
       recentOutputDirs: configState.recentOutputDirs,
+      voiceProfiles: configState.voiceProfiles,
+      cutout: configState.cutout,
     }),
   () => {
     if (configPersistenceBlocked) return;
     if (persistedConfigContent() === lastPersistedContent) return;
     if (saveTimer) return;
-    saveTimer = window.setTimeout(() => {
+    saveTimer = (typeof window === "undefined" ? globalThis.setTimeout : window.setTimeout)(() => {
       saveTimer = undefined;
       const content = persistedConfigContent();
       if (content === lastPersistedContent) return;
@@ -248,7 +258,7 @@ watch(
         .catch((error) => {
           configPersistenceError.value = `配置自动保存失败：${error instanceof Error ? error.message : String(error)}`;
         });
-    }, 500);
+    }, 500) as unknown as number;
   },
   { deep: true },
 );
@@ -266,6 +276,25 @@ export function activeConfig(kind: ChannelKey): ApiConfig | undefined {
     if (found) return found;
   }
   return preset.channels[kind][0];
+}
+
+export function ttsConfigById(id: string): ApiConfig | undefined {
+  return configState.presets.flatMap((preset) => preset.channels.tts).find((config) => config.id === id);
+}
+
+export function voiceProfileById(id: string | undefined): VoiceProfile | undefined {
+  return id ? configState.voiceProfiles.find((profile) => profile.id === id) : undefined;
+}
+
+export function upsertVoiceProfile(profile: VoiceProfile): void {
+  const index = configState.voiceProfiles.findIndex((current) => current.id === profile.id);
+  if (index < 0) configState.voiceProfiles.push(profile);
+  else configState.voiceProfiles[index] = profile;
+}
+
+export function removeVoiceProfile(id: string): VoiceProfile | undefined {
+  const index = configState.voiceProfiles.findIndex((profile) => profile.id === id);
+  return index < 0 ? undefined : configState.voiceProfiles.splice(index, 1)[0];
 }
 
 export function addConfig(kind: ChannelKey): void {

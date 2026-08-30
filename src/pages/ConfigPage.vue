@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import {
   activePreset,
   addConfig,
@@ -15,11 +15,117 @@ import { templatesForCapability } from "../api/templates";
 import { errMsg } from "../utils/errors";
 import { log } from "../utils/logger";
 import { t } from "../i18n";
+import PageHead from "../components/PageHead.vue";
 import { knownImageModelCapabilities } from "../api/providers";
 import { resolveContextLength, inputCharBudget } from "../api/providers";
 import { DEFAULT_CONCURRENCY_BY_CHANNEL } from "../stores/configMigration";
 import type { ApiConfig, ChannelKey, ImageModelCapabilities } from "../core/types";
 import type { DiscoveredModel } from "../api/providers";
+import { CUTOUT_MODELS, findCutoutModel, type CutoutModel } from "../core/cutout/models";
+import { cutoutModelStatus, downloadCutoutModelAndWait, removeCutoutModel, type CutoutModelStatus } from "../core/cutout/download";
+import { tauri, isTauri } from "../utils/tauri";
+
+const cutoutModels = CUTOUT_MODELS;
+const cutoutStatus = ref<CutoutModelStatus | null>(null);
+const cutoutBusy = ref(false);
+const cutoutError = ref("");
+const cutoutModelDir = ref("");
+let cutoutPollTimer: number | undefined;
+
+const currentCutoutModel = computed<CutoutModel>(() => findCutoutModel(configState.cutout?.modelId ?? "isnet-anime"));
+
+const cutoutStatusText = computed(() => {
+  const status = cutoutStatus.value;
+  const model = currentCutoutModel.value;
+  if (!status) return t("查询模型状态…");
+  if (status.state === "downloading") {
+    const progress = status.total
+      ? `${(status.bytes / 1048576).toFixed(1)} / ${(status.total / 1048576).toFixed(1)} MB（${Math.min(100, Math.round((status.bytes / status.total) * 100))}%）`
+      : t("准备中…");
+    return t("正在下载模型「{name}」… {progress}", { name: model.label, progress });
+  }
+  if (status.state === "error") return t("模型「{name}」下载失败：{error}", { name: model.label, error: status.error ?? "" });
+  if (status.installed) return t("模型「{name}」（{size} MB）已安装，可直接用于 AI 抠图", { name: model.label, size: model.sizeMB });
+  return t("模型「{name}」（{size} MB）未安装，手动下载后可启用 AI 抠图", { name: model.label, size: model.sizeMB });
+});
+
+const cutoutStatusClass = computed(() => {
+  const status = cutoutStatus.value;
+  if (!status) return "";
+  if (status.state === "downloading") return "working";
+  if (status.state === "error") return "err";
+  if (status.installed) return "ok";
+  return "";
+});
+
+async function refreshCutoutStatus(): Promise<void> {
+  const status = await cutoutModelStatus(currentCutoutModel.value);
+  cutoutStatus.value = status;
+  if (status.state === "downloading") scheduleCutoutPoll();
+  else stopCutoutPoll();
+}
+
+function scheduleCutoutPoll(): void {
+  if (cutoutPollTimer !== undefined) return;
+  cutoutPollTimer = window.setInterval(() => { void refreshCutoutStatus(); }, 1000);
+}
+
+function stopCutoutPoll(): void {
+  if (cutoutPollTimer !== undefined) {
+    window.clearInterval(cutoutPollTimer);
+    cutoutPollTimer = undefined;
+  }
+}
+
+async function downloadCurrentModel(): Promise<void> {
+  const model = currentCutoutModel.value;
+  cutoutBusy.value = true;
+  cutoutError.value = "";
+  log.info("page", "开始下载 AI 抠图模型", { modelId: model.id, sizeMB: model.sizeMB });
+  try {
+    await downloadCutoutModelAndWait(model, (status) => { cutoutStatus.value = status; });
+    cutoutStatus.value = await cutoutModelStatus(model);
+    log.info("page", "AI 抠图模型下载完成", { modelId: model.id });
+  } catch (error) {
+    cutoutError.value = errMsg(error);
+    log.error("page", "AI 抠图模型下载失败", { modelId: model.id, error: errMsg(error) });
+  } finally {
+    cutoutBusy.value = false;
+    stopCutoutPoll();
+    await refreshCutoutStatus();
+  }
+}
+
+async function removeCurrentModel(): Promise<void> {
+  const model = currentCutoutModel.value;
+  cutoutBusy.value = true;
+  cutoutError.value = "";
+  try {
+    await removeCutoutModel(model);
+    log.info("page", "已删除 AI 抠图模型", { modelId: model.id });
+  } catch (error) {
+    cutoutError.value = errMsg(error);
+  } finally {
+    cutoutBusy.value = false;
+    await refreshCutoutStatus();
+  }
+}
+
+watch(
+  () => configState.cutout?.modelId,
+  () => {
+    cutoutError.value = "";
+    void refreshCutoutStatus();
+  },
+);
+
+onMounted(async () => {
+  await refreshCutoutStatus();
+  if (isTauri()) {
+    cutoutModelDir.value = `${(await tauri.appConfigDir().catch(() => ""))}/models`;
+  }
+});
+onUnmounted(stopCutoutPoll);
 
 function defaultConcurrency(kind: ChannelKey): number {
   return DEFAULT_CONCURRENCY_BY_CHANNEL[kind] ?? 3;
@@ -222,18 +328,12 @@ watch(
 
 <template>
   <div class="inner">
-    <div v-if="configPersistenceError" class="notice danger" style="margin-bottom: var(--space-4)">
+    <div v-if="configPersistenceError" class="notice danger mb-4">
       {{ configPersistenceError }}。{{ t("为保护原配置，问题解决前不会自动覆盖配置文件。") }}
     </div>
-    <div class="page-head">
-      <div>
-        <div class="page-title">{{ t("API 配置") }}</div>
-        <p class="page-sub">{{ t("文本、图片识别、图片生成、语音四通道独立配置，可保存多套配置切换") }}</p>
-      </div>
-      <div class="page-actions">
-        <button class="btn secondary" @click="addPreset">{{ t("＋ 新建配置组") }}</button>
-      </div>
-    </div>
+    <PageHead :title="t('API 配置')" :sub="t('文本、图片识别、图片生成、语音四通道独立配置，可保存多套配置切换')">
+      <button class="btn secondary" @click="addPreset">{{ t("＋ 新建配置组") }}</button>
+    </PageHead>
 
     <div class="card preset-bar">
       <span class="preset-bar-label">{{ t("配置组") }}</span>
@@ -249,13 +349,13 @@ watch(
           {{ p.name }}
         </button>
       </div>
-      <button v-if="configState.presets.length > 1" class="btn danger small" style="margin-left: auto" @click="removePreset(configState.activePresetId)">{{ t("删除该组") }}</button>
+      <button v-if="configState.presets.length > 1" class="btn danger small ml-auto" @click="removePreset(configState.activePresetId)">{{ t("删除该组") }}</button>
     </div>
 
     <div class="cfg-grid">
-      <div v-for="ch in channels" :key="ch.key" class="card cfg-channel" style="margin-bottom: 0">
+      <div v-for="ch in channels" :key="ch.key" class="card cfg-channel mb-0">
         <div class="card-head cfg-channel-head">
-          <div style="display: flex; align-items: center; gap: 10px">
+          <div class="flex items-center gap-2">
             <span class="cfg-channel-icon">
               <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path :d="ch.icon" /></svg>
             </span>
@@ -278,7 +378,7 @@ watch(
           </div>
 
           <div v-if="ch.key === 'image' || ch.key === 'tts'" class="cfg-row">
-            <label class="field" style="flex: 1; margin-bottom: 0">
+            <label class="field grow mb-0">
               <span>{{ t("服务商模板（通用适配器，可选）") }}</span>
               <select
                 :value="cfg.adapter ?? ''"
@@ -289,7 +389,7 @@ watch(
                 <option value="__custom__" disabled>{{ t("── 自定义模板见下方高级选项 ──") }}</option>
               </select>
             </label>
-            <button class="btn ghost small" style="align-self: flex-end" @click="toggleCustom(ch.key + ':' + cfg.id)">
+            <button class="btn ghost small" @click="toggleCustom(ch.key + ':' + cfg.id)">
               {{ customOpen[ch.key + ':' + cfg.id] ? t("收起高级") : t("高级") }}
             </button>
           </div>
@@ -326,44 +426,46 @@ watch(
             </label>
           </div>
 
-          <div v-if="ch.key === 'llm' || ch.key === 'image' || ch.key === 'tts'" class="cfg-row">
-            <label class="field" style="max-width: 260px; margin-bottom: 0" :title="t('该 API 批量生成任务同时执行的请求数。每个 API 独立配置，互不影响。')">
-              <span>{{ t("并发数（该 API 批量生成）") }}</span>
-              <input
-                type="number"
-                min="1"
-                max="100"
-                :value="cfg.concurrency ?? defaultConcurrency(ch.key)"
-                @change="(e: any) => { cfg.concurrency = Math.max(1, Math.min(100, Number((e.target as HTMLInputElement).value) || 1)); }"
-              />
-            </label>
-          </div>
-
-          <div v-if="ch.key === 'llm' || ch.key === 'vision'" class="cfg-row">
-            <label class="field grow-2">
-              <span>{{ t("上下文长度 token（留空 = 自动探测，留空时填默认 128000）") }}</span>
-              <input
-                type="number"
-                min="1024"
-                step="1024"
-                :value="(cfg.extra!.contextLength as number | string | undefined) ?? ''"
-                :placeholder="t('例如 128000；自动探测到时会显示当前值')"
-                @change="
-                  (e: any) => {
-                    const v = (e.target as HTMLInputElement).value.trim();
-                    cfg.extra!.contextLength = v === '' ? undefined : Number(v);
-                  }
-                "
-              />
-            </label>
-            <label class="field">
-              <span>{{ t("当前解析值") }}</span>
-              <div class="cfg-context-resolved">
-                <code>{{ resolveContextLength(cfg).toLocaleString() }}</code>
-                <span class="cfg-context-budget">{{ t("输入预算") }}：{{ inputCharBudget(cfg).toLocaleString() }} {{ t("字符") }}</span>
-              </div>
-            </label>
-          </div>
+          <details class="cfg-details">
+            <summary>{{ t("高级参数") }}</summary>
+            <div v-if="ch.key === 'llm' || ch.key === 'image' || ch.key === 'tts'" class="cfg-row mt-2">
+              <label class="field cfg-narrow mb-0" :title="t('该 API 批量生成任务同时执行的请求数。每个 API 独立配置，互不影响。')">
+                <span>{{ t("并发数（该 API 批量生成）") }}</span>
+                <input
+                  type="number"
+                  min="1"
+                  max="100"
+                  :value="cfg.concurrency ?? defaultConcurrency(ch.key)"
+                  @change="(e: any) => { cfg.concurrency = Math.max(1, Math.min(100, Number((e.target as HTMLInputElement).value) || 1)); }"
+                />
+              </label>
+            </div>
+            <div v-if="ch.key === 'llm' || ch.key === 'vision'" class="cfg-row">
+              <label class="field grow-2">
+                <span>{{ t("上下文长度 token（留空 = 自动探测，留空时填默认 128000）") }}</span>
+                <input
+                  type="number"
+                  min="1024"
+                  step="1024"
+                  :value="(cfg.extra!.contextLength as number | string | undefined) ?? ''"
+                  :placeholder="t('例如 128000；自动探测到时会显示当前值')"
+                  @change="
+                    (e: any) => {
+                      const v = (e.target as HTMLInputElement).value.trim();
+                      cfg.extra!.contextLength = v === '' ? undefined : Number(v);
+                    }
+                  "
+                />
+              </label>
+              <label class="field">
+                <span>{{ t("当前解析值") }}</span>
+                <div class="cfg-context-resolved">
+                  <code>{{ resolveContextLength(cfg).toLocaleString() }}</code>
+                  <span class="cfg-context-budget">{{ t("输入预算") }}：{{ inputCharBudget(cfg).toLocaleString() }} {{ t("字符") }}</span>
+                </div>
+              </label>
+            </div>
+          </details>
 
           <div class="cfg-test-row">
             <button class="btn small cfg-test-btn" :class="testing?.key === ch.key && testing?.id === cfg.id ? 'is-loading' : 'ghost'" :disabled="!!testing" @click="runTest(ch.key, cfg)">
@@ -382,7 +484,7 @@ watch(
 
           <details v-if="ch.key === 'tts'" class="cfg-details">
             <summary>{{ t("音色列表") }}</summary>
-            <label class="field" style="margin-top: 8px">
+            <label class="field mt-2">
               <span>{{ t("可用音色（每行一个；AI 提取时从中挑选，失败自动回退第一个）") }}</span>
               <textarea
                 :value="(cfg.extra!.voiceLibrary as string[] | undefined)?.join('\n') ?? ''"
@@ -399,10 +501,10 @@ watch(
           </details>
           <details v-if="ch.key === 'image'" class="cfg-details">
             <summary>{{ t("图片模型能力") }}</summary>
-            <div v-if="knownImageModelCapabilities(cfg.model)" class="notice" style="margin-top: 8px">
+            <div v-if="knownImageModelCapabilities(cfg.model)" class="notice mt-2">
               {{ t("已知模型能力：最多") }} {{ knownImageModelCapabilities(cfg.model)!.maxReferenceImages }} {{ t("张参考图，编码") }} {{ knownImageModelCapabilities(cfg.model)!.referenceEncoding }}
             </div>
-            <div v-else class="cfg-row" style="margin-top: 8px">
+            <div v-else class="cfg-row mt-2">
               <label class="field">
                 <span>{{ t("参考图数量（0–3）") }}</span>
                 <input
@@ -434,7 +536,7 @@ watch(
           </details>
           <details v-if="customOpen[ch.key + ':' + cfg.id]" class="cfg-details">
             <summary>{{ t("自定义适配器模板（JSON，优先级高于服务商模板）") }}</summary>
-            <label class="field" style="margin-top: 8px">
+            <label class="field mt-2">
               <span>{{ t("适配器模板（字段：id/name/capability/mode/endpoint/requestMap/response/poll/voices/rawResponse，见项目文档）") }}</span>
               <textarea
                 :value="(cfg.extra!.customTemplate as string | undefined) ?? ''"
@@ -465,6 +567,56 @@ watch(
         <div v-if="!activePreset().channels[ch.key].length" class="empty" style="padding: var(--space-4) 0">
           <p>{{ t("暂无") }} {{ ch.label }} {{ t("配置，点击右上角「＋ 添加」") }}</p>
         </div>
+      </div>
+    </div>
+
+    <div class="card mt-4">
+      <div class="card-head">
+        <div class="flex items-center gap-2">
+          <span class="cfg-channel-icon">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z M9 12a3 3 0 1 1 6 0 3 3 0 0 1-6 0Z M14 5l1.5-2M11 19l-1.5 2M18 8l2-1M6 16l-2 1" /></svg>
+          </span>
+          <div>
+            <div class="cfg-channel-title">{{ t("AI 抠图模型") }}</div>
+            <div class="cfg-channel-desc">{{ t("生成立绘/物品时优先用所选模型抠出透明底；未安装时降级色度键。模型在本机运行，需手动下载。") }}</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="cfg-row">
+        <label class="field grow-2 mb-0">
+          <span>{{ t("抠图模型") }}</span>
+          <select
+            :value="configState.cutout?.modelId ?? 'isnet-anime'"
+            @change="(e: any) => { configState.cutout!.modelId = (e.target as HTMLSelectElement).value; }"
+          >
+            <option v-for="m in cutoutModels" :key="m.id" :value="m.id">{{ m.label }}（{{ m.sizeMB }} MB）— {{ m.description }}</option>
+          </select>
+        </label>
+      </div>
+      <div class="cfg-row">
+        <label class="check">
+          <input
+            type="checkbox"
+            :checked="configState.cutout?.enabled ?? true"
+            @change="(e: any) => { configState.cutout!.enabled = (e.target as HTMLInputElement).checked; }"
+          />
+          {{ t("生成立绘/物品时使用 AI 抠图") }}
+        </label>
+      </div>
+      <div class="cfg-row">
+        <span class="cutout-status" :class="cutoutStatusClass">{{ cutoutStatusText }}</span>
+      </div>
+      <div class="cfg-row">
+        <button class="btn secondary small" :disabled="cutoutBusy || cutoutStatus?.installed" @click="downloadCurrentModel">
+          <span v-if="cutoutBusy" class="spinner" />
+          {{ cutoutStatus?.installed ? t("已安装") : t("下载模型") }}
+        </button>
+        <button v-if="cutoutStatus?.installed" class="btn danger small" :disabled="cutoutBusy" @click="removeCurrentModel">{{ t("删除模型") }}</button>
+        <span v-if="cutoutError" class="cfg-model-error">{{ cutoutError }}</span>
+      </div>
+      <div v-if="cutoutModelDir" class="cfg-row">
+        <span class="cutout-dir">{{ t("模型目录") }}：<code>{{ cutoutModelDir }}</code></span>
       </div>
     </div>
   </div>

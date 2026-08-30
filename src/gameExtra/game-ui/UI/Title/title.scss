@@ -1,0 +1,114 @@
+.Title_main {
+  width: 100%;
+  height: 100%;
+  position: absolute;
+  z-index: 13;
+}
+
+.Title_buttonList {
+  font-family: "资源圆体", "WebgalUI", sans-serif;
+  display: flex;
+  position: absolute;
+  left: 0;
+  min-width: 34%;
+  height: 100%;
+  justify-content: center;
+  align-items: flex-start;
+  flex-flow: column;
+  padding-left: 140px;
+  background: linear-gradient(
+    90deg,
+    rgba(8, 10, 18, 0.55) 0%,
+    rgba(8, 10, 18, 0.28) 42%,
+    rgba(8, 10, 18, 0) 100%
+  );
+  transition: background 0.75s;
+}
+
+.Title_button {
+  position: relative;
+  font-weight: bold;
+  text-align: left;
+  flex: 0 1 auto;
+  cursor: pointer;
+  padding: 0.9em 2.6em 0.9em 1.3em;
+  margin: 10px 0;
+  transition: transform 0.22s ease, background-color 0.22s ease,
+    border-color 0.22s ease, box-shadow 0.22s ease;
+  background: rgba(20, 24, 36, 0.5);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 12px 46px 46px 12px;
+  transform: none;
+  overflow: hidden;
+  text-shadow: none;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+
+  &::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 4px;
+    background: linear-gradient(180deg, #a78bfa 0%, #8b5cf6 100%);
+    opacity: 0;
+    transition: opacity 0.22s ease;
+  }
+
+  &:hover {
+    transform: translateX(8px);
+    background: rgba(34, 40, 60, 0.72);
+    border-color: rgba(167, 139, 250, 0.5);
+    text-shadow: none;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+  }
+
+  &:hover::before {
+    opacity: 1;
+  }
+}
+
+.Title_button_text {
+  position: relative;
+  z-index: 1;
+  display: inline-block;
+  padding: 0.06em 0.4em 0.1em 0.2em;
+  font-size: 175%;
+  font-family: '资源圆体', -apple-system, BlinkMacSystemFont, Segoe UI, Roboto,
+    Oxygen, Ubuntu, Cantarell, Fira Sans, Droid Sans, Helvetica Neue, sans-serif;
+  letter-spacing: 0.14em;
+  line-height: 1.2;
+  transform-origin: left center;
+  transition: transform 0.22s ease;
+  color: #ffffff;
+  white-space: nowrap;
+  text-shadow: 0 2px 8px rgba(0, 0, 0, 0.55);
+}
+
+.Title_button_text_outer {
+  display: none;
+}
+
+.Title_button_text_inner {
+  display: none;
+}
+
+.Title_backup_background {
+  width: 100%;
+  height: 100%;
+  position: absolute;
+  z-index: 13;
+  background: radial-gradient(
+    120% 120% at 22% 0%,
+    #1c2336 0%,
+    #0e1120 55%,
+    #07090f 100%
+  );
+}
+
+.Title_button_disabled {
+  cursor: not-allowed !important;
+  opacity: 0.45;
+}

@@ -1,21 +1,57 @@
-MIT License
+NovelForge Non-Commercial License
+=================================
 
 Copyright (c) 2026 carloncc
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+本文档为 NovelForge（“本软件”）的唯一许可协议，替代 MIT 许可。
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+一、授权范围（允许）
+-------------------
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+在遵守本协议第二、三条规定的前提下，你获得以下自由：
+
+1. 使用：为学习、研究、个人使用或内部使用目的，使用本软件的全部或部分功能。
+2. 修改：修改、改进本软件的源代码，或基于本软件进行二次开发。
+3. 复制与分发：以任何媒介复制、分发本软件及其修改版本（含源代码与编译产物），
+   但必须保留本许可协议全文及上述版权声明，不得删除或遮盖任何署名信息。
+
+二、使用限制（禁止）
+-------------------
+
+1. 非商用：不得将本软件（含其修改版本、编译产物、二次开发成果）直接或间接
+   用于任何商业目的。商业目的包括但不限于：
+   - 出售、出租、许可本软件或其修改版本并从中获利；
+   - 将本软件作为付费服务（SaaS、云服务、托管服务等）的组成部分对外提供；
+   - 将本软件或其修改版本整合进盈利性产品或项目中直接销售；
+   - 利用本软件替他人提供收费的代做、代运营、定制开发服务。
+2. 上述禁止不适用于：因使用本软件而产生的、属于用户自身的内容成果（见第三条）。
+
+三、导出内容豁免（Important）
+-----------------------------
+
+1. 你使用本软件生成、导出的内容（包括但不限于：生成的视觉小说游戏项目、
+   游戏剧本、剧情文本、小说、图片、角色设定、视频、音频等）——以下统称
+   “导出内容”——**归你所有，不受本协议非商用条款限制**。
+2. 你可以自由使用、发布、出售、商用导出内容，无需另行取得许可，无需向
+   本软件作者支付费用。
+3. 但若导出内容中包含第三方素材（如 WebGAL 引擎及其版权声明、第三方字体、
+   第三方 API 生成物等），你仍需遵守相应第三方的许可与条款。
+
+四、免责声明
+------------
+
+本软件按“现状”提供，不作任何明示或默示的担保，包括但不限于对适销性、
+特定用途适用性及非侵权性的担保。在任何情况下，作者或版权持有人均不对
+因使用本软件或其导出内容而产生的任何索赔、损害赔偿或其他责任负责，
+无论基于合同、侵权或其他原因。
+
+五、其他
+--------
+
+1. 本软件所依赖或打包的第三方组件（如 WebGAL 引擎等）分别适用其自身许可，
+   详见 THIRD_PARTY_NOTICE。
+2. 对本协议的任何解释与争议，以中文版本为准。
+
+---
+
+For the English version of this license, see README.md or contact the author.

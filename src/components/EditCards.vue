@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import type { CharacterCard, ExtractionResult, ItemCard, SceneCard } from "../core/types";
-import { activeConfig, voiceLibraryFor } from "../stores/config";
+import { activeConfig, configState, voiceLibraryFor } from "../stores/config";
 import { tauri, isTauri } from "../utils/tauri";
 import { vfsWriteFileBase64 } from "../utils/vfsWeb";
 import { projectState } from "../stores/project";
@@ -11,6 +11,8 @@ import { errMsg } from "../utils/errors";
 import { recognizeCharacter } from "../core/recognize";
 import { configIsUsable } from "../api/providers";
 import { t } from "../i18n";
+import { createMiniMaxVoiceProfile, importVoiceProfile } from "../core/voiceProfiles";
+import Disclosure from "./Disclosure.vue";
 
 const props = defineProps<{ cards: ExtractionResult }>();
 const emit = defineEmits<{ saved: [cards: ExtractionResult] }>();
@@ -24,6 +26,9 @@ const openChar = ref<string | null>(null);
 const openItem = ref<string | null>(null);
 const openScene = ref<string | null>(null);
 const charRecognizing = ref<string | null>(null);
+const voiceFileInput = ref<HTMLInputElement | null>(null);
+const voiceFileTarget = ref<CharacterCard | null>(null);
+const voiceBusy = ref<string | null>(null);
 
 async function recognizeChar(c: CharacterCard): Promise<void> {
   if (!c.referenceImage) {
@@ -64,6 +69,63 @@ watch(
 );
 
 const voices = computed(() => voiceLibraryFor(activeConfig("tts")));
+const voiceProfiles = computed(() => configState.voiceProfiles.filter((profile) => profile.status === "ready"));
+
+async function importCharacterVoice(card: CharacterCard): Promise<void> {
+  const config = activeConfig("tts");
+  if (!config) { savedMsg.value = t("请先配置 TTS"); return; }
+  const voiceId = window.prompt("MiniMax voice_id");
+  if (!voiceId?.trim()) return;
+  try {
+    const profile = await importVoiceProfile({ name: `${card.name} 声音`, configId: config.id, voiceId });
+    card.voiceProfileId = profile.id;
+    card.voiceName = undefined;
+    savedMsg.value = `已绑定克隆声音：${profile.name}`;
+  } catch (error) { savedMsg.value = `导入声音失败：${errMsg(error)}`; }
+}
+
+async function chooseVoiceReference(card: CharacterCard): Promise<void> {
+  if (!isTauri()) { voiceFileTarget.value = card; voiceFileInput.value?.click(); return; }
+  const picked = await open({ multiple: false, filters: [{ name: "参考声音", extensions: ["wav", "mp3", "m4a", "ogg", "flac"] }] });
+  if (typeof picked === "string") await createVoiceFromPath(card, picked);
+}
+
+function audioMime(fileName: string): string {
+  const extension = fileName.split(".").pop()?.toLowerCase();
+  return ({ mp3: "audio/mpeg", m4a: "audio/mp4", ogg: "audio/ogg", flac: "audio/flac", wav: "audio/wav" } as Record<string, string>)[extension ?? ""] || "application/octet-stream";
+}
+
+async function createVoiceFromPath(card: CharacterCard, path: string): Promise<void> {
+  const config = activeConfig("tts");
+  if (!config) { savedMsg.value = t("请先配置 TTS"); return; }
+  if (!window.confirm("我确认拥有该参考声音的使用授权，且允许将其上传到所选供应商。")) return;
+  voiceBusy.value = card.id;
+  try {
+    const audioB64 = await tauri.readFileBase64(path);
+    const fileName = path.split(/[\\/]/).pop() || "voice.wav";
+    const profile = await createMiniMaxVoiceProfile({ name: `${card.name} 声音`, configId: config.id, fileName, mime: audioMime(fileName), audioB64, consent: true });
+    card.voiceProfileId = profile.id; card.voiceName = undefined;
+    savedMsg.value = `已创建并绑定克隆声音：${profile.name}`;
+  } catch (error) { savedMsg.value = `创建声音失败：${errMsg(error)}`; }
+  finally { voiceBusy.value = null; }
+}
+
+async function onVoiceFile(e: Event): Promise<void> {
+  const input = e.target as HTMLInputElement;
+  const file = input.files?.[0]; input.value = "";
+  const card = voiceFileTarget.value; voiceFileTarget.value = null;
+  if (!file || !card) return;
+  if (file.size > 12 * 1024 * 1024) { savedMsg.value = "参考音频不能超过 12MB"; return; }
+  const audioB64 = await fileToBase64(file);
+  const config = activeConfig("tts");
+  if (!config || !window.confirm("我确认拥有该参考声音的使用授权，且允许将其上传到所选供应商。")) return;
+  voiceBusy.value = card.id;
+  try {
+    const profile = await createMiniMaxVoiceProfile({ name: `${card.name} 声音`, configId: config.id, fileName: file.name, mime: file.type || "audio/mpeg", audioB64, consent: true });
+    card.voiceProfileId = profile.id; card.voiceName = undefined; savedMsg.value = `已创建并绑定克隆声音：${profile.name}`;
+  } catch (error) { savedMsg.value = `创建声音失败：${errMsg(error)}`; }
+  finally { voiceBusy.value = null; }
+}
 
 async function pickReferenceImage(card: CharacterCard): Promise<void> {
   if (!isTauri()) {
@@ -155,145 +217,140 @@ function removeCostume(c: CharacterCard, idx: number): void {
 
 <template>
   <div class="card">
-    <div class="row" style="justify-content: space-between; margin-bottom: 12px">
-      <h3 style="margin-bottom: 0">{{ t("角色卡编辑（") }}{{ local.characters.length }}{{ t("）") }}</h3>
-      <div class="row" style="flex: none">
+    <input ref="voiceFileInput" type="file" accept="audio/*" style="display: none" @change="onVoiceFile" />
+    <div class="flex items-center justify-between mb-3">
+      <h3 class="mb-0">{{ t("角色卡编辑（") }}{{ local.characters.length }}{{ t("）") }}</h3>
+      <div class="flex gap-2 flex-none">
         <button class="btn small" :disabled="busy" @click="save">{{ t("保存卡片") }}</button>
         <button class="btn secondary small" @click="reset">{{ t("放弃修改") }}</button>
       </div>
     </div>
-    <p v-if="savedMsg" style="color: var(--ok); font-size: 12px; margin-bottom: 8px">{{ savedMsg }}</p>
-    <p style="color: var(--text-dim); font-size: 12px; margin-bottom: 10px">
+    <p v-if="savedMsg" class="small mb-2" style="color: var(--ok)">{{ savedMsg }}</p>
+    <p class="hint mb-2">
       {{ t("修改角色外貌/服装/音色后保存：剧本与立绘会在下次生成时自动重新生成；背景/CG 保留。") }}
     </p>
 
-    <div v-for="c in local.characters" :key="c.id" style="border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px; overflow: hidden">
-      <div
-        class="row"
-        style="cursor: pointer; padding: 10px 14px; justify-content: space-between"
-        @click="openChar = openChar === c.id ? null : c.id"
-      >
-        <span>
-          <span style="color: var(--accent-2); font-weight: 600">{{ c.name }}</span>
-          <span v-if="c.isNpc" class="tag" style="margin-left: 6px">{{ t("NPC") }}</span>
-          <span style="color: var(--text-dim); font-size: 12px; margin-left: 8px">{{ c.id }}</span>
-        </span>
-        <span style="color: var(--text-dim); font-size: 12px">{{ openChar === c.id ? "▲" : "▼" }}</span>
+    <Disclosure
+      v-for="c in local.characters"
+      :key="c.id"
+      :title="c.name"
+      :badge="c.isNpc ? t('NPC') : undefined"
+      :subtitle="c.id"
+      :open="openChar === c.id"
+      @update:open="(v) => (openChar = v ? c.id : null)"
+    >
+      <div class="row">
+        <label class="field"><span>{{ t("姓名") }}</span><input type="text" v-model="c.name" /></label>
+        <label class="field"><span>{{ t("主题色") }}</span><input type="text" v-model="c.color" placeholder="#3b5bdb" /></label>
       </div>
-      <div v-if="openChar === c.id" style="padding: 12px 14px; border-top: 1px solid var(--border)">
-        <div class="row">
-          <label class="field"><span>{{ t("姓名") }}</span><input type="text" v-model="c.name" /></label>
-          <label class="field"><span>{{ t("主题色") }}</span><input type="text" v-model="c.color" placeholder="#3b5bdb" /></label>
-        </div>
-        <label class="field"><span>{{ t("外貌") }}</span><input type="text" v-model="c.appearance" /></label>
-        <label class="field"><span>{{ t("服装") }}</span><input type="text" v-model="c.clothing" /></label>
-        <label class="field"><span>{{ t("性格") }}</span><input type="text" v-model="c.personality" /></label>
-        <div class="row">
-          <label class="field grow-2">
-            <span>{{ t("音色描述") }}</span>
-            <input type="text" v-model="c.voiceDesc" />
-          </label>
-          <label class="field">
-            <span>{{ t("TTS 音色（可输入或选择）") }}</span>
-            <input type="text" list="novelforge-voices" v-model="c.voiceName" />
-            <datalist id="novelforge-voices">
-              <option v-for="v in voices" :key="v" :value="v" />
-            </datalist>
-          </label>
-        </div>
-        <label class="field">
-          <span>{{ t("立绘提示词（imagePrompt）") }}</span>
-          <textarea v-model="c.imagePrompt" rows="3" />
+      <label class="field"><span>{{ t("外貌") }}</span><input type="text" v-model="c.appearance" /></label>
+      <label class="field"><span>{{ t("服装") }}</span><input type="text" v-model="c.clothing" /></label>
+      <label class="field"><span>{{ t("性格") }}</span><input type="text" v-model="c.personality" /></label>
+      <div class="row">
+        <label class="field grow-2">
+          <span>{{ t("音色描述") }}</span>
+          <input type="text" v-model="c.voiceDesc" />
         </label>
-        <div class="field" style="margin-top: 10px">
-          <span style="display: flex; align-items: center; justify-content: space-between">
-            <span>{{ t("服装差分（数量不限，按剧情添加）") }}</span>
-            <button class="btn ghost small" @click="addCostume(c)">＋ {{ t("添加服装") }}</button>
-          </span>
-          <div v-for="(ct, ci) in c.costumes || []" :key="ct.id" style="border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; margin-top: 8px">
-            <div class="row" style="align-items: center; gap: 8px">
-              <input type="text" v-model="ct.name" style="flex: 1; font-size: 12.5px" :placeholder="t('服装名（如 日常服/礼服/战斗服）')" />
-              <input type="text" v-model="ct.id" style="flex: 0.8; font-size: 12px; font-family: monospace" placeholder="casual" />
-              <button class="btn danger small" @click="removeCostume(c, ci)">{{ t("删除") }}</button>
-            </div>
-            <textarea v-model="ct.prompt" rows="2" style="margin-top: 6px; font-size: 12px" :placeholder="t('该服装的英文图像提示词（人物外貌一致 + 服装描述）')" />
+        <label class="field">
+          <span>{{ t("TTS 音色（可输入或选择）") }}</span>
+          <input type="text" list="novelforge-voices" v-model="c.voiceName" />
+          <datalist id="novelforge-voices">
+            <option v-for="v in voices" :key="v" :value="v" />
+          </datalist>
+        </label>
+      </div>
+      <div class="field">
+        <span>克隆声音（可跨项目复用）</span>
+        <select v-model="c.voiceProfileId" @change="c.voiceName = undefined">
+          <option :value="undefined">使用上方预设音色</option>
+          <option v-for="profile in voiceProfiles" :key="profile.id" :value="profile.id">{{ profile.name }}（{{ profile.voiceId }}）</option>
+        </select>
+        <div class="row mt-2">
+          <button class="btn secondary small" :disabled="voiceBusy === c.id" @click="chooseVoiceReference(c)">{{ voiceBusy === c.id ? "创建中..." : "上传参考音频创建" }}</button>
+          <button class="btn ghost small" :disabled="voiceBusy === c.id" @click="importCharacterVoice(c)">导入已有 voice_id</button>
+        </div>
+        <span class="faint small">创建时使用当前 TTS 配置；失败不会自动换成其他人物声音。</span>
+      </div>
+      <label class="field">
+        <span>{{ t("立绘提示词（imagePrompt）") }}</span>
+        <textarea v-model="c.imagePrompt" rows="3" />
+      </label>
+      <div class="field mt-2">
+        <span class="flex items-center justify-between">
+          <span>{{ t("服装差分（数量不限，按剧情添加）") }}</span>
+          <button class="btn ghost small" @click="addCostume(c)">＋ {{ t("添加服装") }}</button>
+        </span>
+        <div v-for="(ct, ci) in c.costumes || []" :key="ct.id" class="costume-item">
+          <div class="row items-center gap-2">
+            <input type="text" v-model="ct.name" class="grow small" :placeholder="t('服装名（如 日常服/礼服/战斗服）')" />
+            <input type="text" v-model="ct.id" class="small" style="flex: 0.8; font-family: var(--mono)" placeholder="casual" />
+            <button class="btn danger small" @click="removeCostume(c, ci)">{{ t("删除") }}</button>
           </div>
-          <p v-if="!c.costumes?.length" style="color: var(--text-faint); font-size: 12px; margin-top: 6px">{{ t("未添加服装差分（可仅用默认服装）") }}</p>
+          <textarea v-model="ct.prompt" rows="2" class="mt-2 small" :placeholder="t('该服装的英文图像提示词（人物外貌一致 + 服装描述）')" />
         </div>
-        <label class="field">
-          <span>{{ t("三视图提示词（threeViewPrompt，可选）") }}</span>
-          <textarea v-model="c.threeViewPrompt" rows="3" :placeholder="t('留空则由立绘提示词自动推导')" />
-        </label>
-        <div class="row">
-          <span style="font-size: 12px; color: var(--text-dim)">{{ t("参考图（图生图保持一致）：") }}</span>
-          <span v-if="c.referenceImage" class="tag ok">{{ t("已设置") }}</span>
-          <span v-else class="tag">{{ t("未设置") }}</span>
-          <button class="btn secondary small" @click="pickReferenceImage(c)">{{ t("从素材库选择…") }}</button>
-          <button v-if="c.referenceImage" class="btn danger small" @click="c.referenceImage = undefined">{{ t("清除") }}</button>
-          <input v-if="!isTauri()" ref="refImgInput" type="file" accept="image/*" style="display: none" @change="onRefImgFile" />
-        </div>
-        <div class="row" style="margin-top: 8px">
-          <button class="btn small" :disabled="charRecognizing === c.id || !c.referenceImage" @click="recognizeChar(c)">
-            <span v-if="charRecognizing === c.id" class="spinner" />
-            {{ charRecognizing === c.id ? t("AI 识别中…") : t("用参考图 AI 识别角色（生成描述/提示词）") }}
-          </button>
-          <span v-if="c.referenceImage" style="font-size: 11.5px; color: var(--text-faint)">{{ t("AI 会按参考图生成外貌/服装/性格/立绘与三视图提示词，填入上方字段") }}</span>
-        </div>
+        <p v-if="!c.costumes?.length" class="faint small mt-2">{{ t("未添加服装差分（可仅用默认服装）") }}</p>
       </div>
-    </div>
+      <label class="field">
+        <span>{{ t("三视图提示词（threeViewPrompt，可选）") }}</span>
+        <textarea v-model="c.threeViewPrompt" rows="3" :placeholder="t('留空则由立绘提示词自动推导')" />
+      </label>
+      <div class="row">
+        <span class="hint">{{ t("参考图（图生图保持一致）：") }}</span>
+        <span v-if="c.referenceImage" class="tag ok">{{ t("已设置") }}</span>
+        <span v-else class="tag">{{ t("未设置") }}</span>
+        <button class="btn secondary small" @click="pickReferenceImage(c)">{{ t("从素材库选择…") }}</button>
+        <button v-if="c.referenceImage" class="btn danger small" @click="c.referenceImage = undefined">{{ t("清除") }}</button>
+        <input v-if="!isTauri()" ref="refImgInput" type="file" accept="image/*" style="display: none" @change="onRefImgFile" />
+      </div>
+      <div class="row mt-2">
+        <button class="btn small" :disabled="charRecognizing === c.id || !c.referenceImage" @click="recognizeChar(c)">
+          <span v-if="charRecognizing === c.id" class="spinner" />
+          {{ charRecognizing === c.id ? t("AI 识别中…") : t("用参考图 AI 识别角色（生成描述/提示词）") }}
+        </button>
+        <span v-if="c.referenceImage" class="faint small">{{ t("AI 会按参考图生成外貌/服装/性格/立绘与三视图提示词，填入上方字段") }}</span>
+      </div>
+    </Disclosure>
   </div>
 
   <div class="card">
-    <h3 style="margin-bottom: 12px">{{ t("物品卡编辑（") }}{{ local.items.length }}{{ t("）") }}</h3>
-    <div v-for="it in local.items" :key="it.id" style="border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px; overflow: hidden">
-      <div
-        class="row"
-        style="cursor: pointer; padding: 10px 14px; justify-content: space-between"
-        @click="openItem = openItem === it.id ? null : it.id"
-      >
-        <span>
-          <span style="color: var(--accent-2); font-weight: 600">{{ it.name }}</span>
-          <span style="color: var(--text-dim); font-size: 12px; margin-left: 8px">{{ it.id }}</span>
-        </span>
-        <span style="color: var(--text-dim); font-size: 12px">{{ openItem === it.id ? "▲" : "▼" }}</span>
-      </div>
-      <div v-if="openItem === it.id" style="padding: 12px 14px; border-top: 1px solid var(--border)">
-        <label class="field"><span>{{ t("名称") }}</span><input type="text" v-model="it.name" /></label>
-        <label class="field"><span>{{ t("外观") }}</span><input type="text" v-model="it.appearance" /></label>
-        <label class="field"><span>{{ t("剧情意义") }}</span><input type="text" v-model="it.note" /></label>
-        <label class="field">
-          <span>{{ t("物品图提示词") }}</span>
-          <textarea v-model="it.imagePrompt" rows="2" />
-        </label>
-      </div>
-    </div>
+    <h3 class="mb-3">{{ t("物品卡编辑（") }}{{ local.items.length }}{{ t("）") }}</h3>
+    <Disclosure
+      v-for="it in local.items"
+      :key="it.id"
+      :title="it.name"
+      :subtitle="it.id"
+      :open="openItem === it.id"
+      @update:open="(v) => (openItem = v ? it.id : null)"
+    >
+      <label class="field"><span>{{ t("名称") }}</span><input type="text" v-model="it.name" /></label>
+      <label class="field"><span>{{ t("外观") }}</span><input type="text" v-model="it.appearance" /></label>
+      <label class="field"><span>{{ t("剧情意义") }}</span><input type="text" v-model="it.note" /></label>
+      <label class="field">
+        <span>{{ t("物品图提示词") }}</span>
+        <textarea v-model="it.imagePrompt" rows="2" />
+      </label>
+    </Disclosure>
   </div>
 
   <div class="card">
-    <h3 style="margin-bottom: 12px">{{ t("场景卡编辑（") }}{{ local.scenes.length }}{{ t("）") }}</h3>
-    <div v-for="s in local.scenes" :key="s.id" style="border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px; overflow: hidden">
-      <div
-        class="row"
-        style="cursor: pointer; padding: 10px 14px; justify-content: space-between"
-        @click="openScene = openScene === s.id ? null : s.id"
-      >
-        <span>
-          <span style="color: var(--accent-2); font-weight: 600">{{ s.location }}</span>
-          <span style="color: var(--text-dim); font-size: 12px; margin-left: 8px">{{ s.id }}</span>
-        </span>
-        <span style="color: var(--text-dim); font-size: 12px">{{ openScene === s.id ? "▲" : "▼" }}</span>
+    <h3 class="mb-3">{{ t("场景卡编辑（") }}{{ local.scenes.length }}{{ t("）") }}</h3>
+    <Disclosure
+      v-for="s in local.scenes"
+      :key="s.id"
+      :title="s.location"
+      :subtitle="s.id"
+      :open="openScene === s.id"
+      @update:open="(v) => (openScene = v ? s.id : null)"
+    >
+      <div class="row">
+        <label class="field"><span>{{ t("地点") }}</span><input type="text" v-model="s.location" /></label>
+        <label class="field"><span>{{ t("氛围") }}</span><input type="text" v-model="s.atmosphere" /></label>
+        <label class="field"><span>{{ t("时间") }}</span><input type="text" v-model="s.time" /></label>
       </div>
-      <div v-if="openScene === s.id" style="padding: 12px 14px; border-top: 1px solid var(--border)">
-        <div class="row">
-          <label class="field"><span>{{ t("地点") }}</span><input type="text" v-model="s.location" /></label>
-          <label class="field"><span>{{ t("氛围") }}</span><input type="text" v-model="s.atmosphere" /></label>
-          <label class="field"><span>{{ t("时间") }}</span><input type="text" v-model="s.time" /></label>
-        </div>
-        <label class="field">
-          <span>{{ t("背景图提示词") }}</span>
-          <textarea v-model="s.imagePrompt" rows="2" />
-        </label>
-      </div>
-    </div>
+      <label class="field">
+        <span>{{ t("背景图提示词") }}</span>
+        <textarea v-model="s.imagePrompt" rows="2" />
+      </label>
+    </Disclosure>
   </div>
 </template>

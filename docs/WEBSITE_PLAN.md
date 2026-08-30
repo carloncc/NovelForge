@@ -19,7 +19,7 @@
 1. **Products 区改为静态产品卡片**（移除"正在加载"JS 占位），NovelForge 卡片：
    - logo + 标题「NovelForge · AI 小说 → 视觉小说」
    - 一句话：导入小说，一键生成可玩视觉小说（立绘 / 表情 / CG / 配音 / BGM），导出 PC / APK / 网页
-   - 亮点 tag ×3：无需编程 · 自备 API key · 开源 MIT
+   - 亮点 tag ×3：无需编程 · 自备 API key · 开源（非商用许可）
    - 按钮 ×3：`体验产品`（→ /novelforge）· `GitHub`（→ carloncc/NovelForge）· `在线演示`
 2. **Hero CTA 改向**：「开始使用」→ /novelforge 或在线演示；hero 下加产品主视觉（`/demo/novelforge-generate.png` 已存在）
 3. **footer 修链**：GitHub → `https://github.com/carloncc/NovelForge`
@@ -41,9 +41,9 @@ hero: "One click from novel to visual novel." + 生成界面截图
 API 兼容表: DeepSeek / 硅基流动 / Ollama / OpenAI / Kimi / MiniMax / 阿里百炼 / Gemini / Stability
 FAQ 5 条:
   需要 API key 吗？—— 演示模式无需，完整生成需自备 key
-  免费吗？—— 开源 MIT，API 费用自担
-  生成质量如何？—— 与所选模型能力相关，支持风格锚点/三视图保证一致性
-  能商用/分发吗？—— 可以，保留 WebGAL 版权声明即可（链接免责声明）
+   免费吗？—— 开源（非商用许可），API 费用自担
+   生成质量如何？—— 与所选模型能力相关，支持风格锚点/三视图保证一致性
+   能商用/分发吗？—— 软件本身不可商用（非商用许可）；但你生成/导出的游戏内容归你所有，可自由商用，保留 WebGAL 版权声明即可（链接免责声明）
   支持哪些平台？—— Win / macOS / Linux + 浏览器 Web 版
 免责声明块（与 README 一致）
 CTA: 去 GitHub ⭐ / 在线体验

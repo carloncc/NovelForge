@@ -12,6 +12,7 @@ import { splitChapters } from "../core/chapters";
 import { errMsg } from "../utils/errors";
 import { log } from "../utils/logger";
 import { t } from "../i18n";
+import PageHead from "../components/PageHead.vue";
 
 const error = ref("");
 const importing = ref(false);
@@ -180,20 +181,14 @@ function loadRecentTitles(dir: string): string {
 
 <template>
   <div class="inner">
-    <div class="page-head">
-      <div>
-        <div class="page-title">{{ t("导入小说") }}</div>
-        <p class="page-sub">{{ t("选择 txt 小说文件（可多选，自动合并；导入时不分章，生成时由 AI 分章）；可导入自定义素材（AI 优先使用）") }}</p>
-      </div>
-      <div class="page-actions">
-        <button class="btn secondary" @click="loadDemo">{{ t("加载示例") }}</button>
-        <button class="btn" :disabled="importing" @click="pickNovel">
-          <span v-if="importing" class="spinner" />
-          {{ importing ? t("读取中…") : t("选择小说 txt（可多选）") }}
-        </button>
-        <input v-if="!isTauri()" ref="novelInput" type="file" accept=".txt,text/plain" multiple style="display: none" @change="onNovelFile" />
-      </div>
-    </div>
+    <PageHead :title="t('导入小说')" :sub="t('选择 txt 小说文件（可多选，自动合并；导入时不分章，生成时由 AI 分章）；可导入自定义素材（AI 优先使用）')">
+      <button class="btn secondary" @click="loadDemo">{{ t("加载示例") }}</button>
+      <button class="btn" :disabled="importing" @click="pickNovel">
+        <span v-if="importing" class="spinner" />
+        {{ importing ? t("读取中…") : t("选择小说 txt（可多选）") }}
+      </button>
+      <input v-if="!isTauri()" ref="novelInput" type="file" accept=".txt,text/plain" multiple style="display: none" @change="onNovelFile" />
+    </PageHead>
 
     <div class="card">
       <div class="card-head">
@@ -202,12 +197,12 @@ function loadRecentTitles(dir: string): string {
           <button v-if="projectState.novel" class="btn secondary small" @click="pickNovel">{{ t("重新导入") }}</button>
         </div>
       </div>
-      <p v-if="error" style="color: var(--err); margin-top: 10px">{{ error }}</p>
-      <p v-if="projectState.novel" style="color: var(--text-dim)">
+      <p v-if="error" class="err-text mt-2">{{ error }}</p>
+      <p v-if="projectState.novel" class="muted">
         {{ projectState.novel.fileName }} · {{ t("编码") }} {{ projectState.novel.encoding }} · {{ t("共") }}
         {{ projectState.novel.fullText.length.toLocaleString() }} {{ t("字") }}
       </p>
-      <p v-else style="color: var(--text-faint)">{{ t("尚未导入小说") }}</p>
+      <p v-else class="faint">{{ t("尚未导入小说") }}</p>
     </div>
 
     <div class="card" v-if="projectState.novel">
@@ -233,7 +228,7 @@ function loadRecentTitles(dir: string): string {
                 <input
                   type="text"
                   :value="ch.title"
-                  style="background: transparent; border: none; padding: 2px 0"
+                  class="title-input"
                   @change="(e: any) => updateChapterTitle(i, (e.target as HTMLInputElement).value)"
                 />
               </td>
@@ -253,22 +248,18 @@ function loadRecentTitles(dir: string): string {
           <input v-if="!isTauri()" ref="materialInput" type="file" accept="image/*" multiple style="display: none" @change="onMaterialFiles" />
         </div>
       </div>
-      <p style="color: var(--text-dim); font-size: 12.5px; margin-bottom: var(--space-4)">
+      <p class="hint mb-4">
         {{ t("人物参考图 / 物品图 / 背景图。文件名含「人/角色/char」归人物、「物/item/剑」归物品、其余归背景。") }}
         {{ t("管线优先使用你的素材，缺失才由 AI 生成；可在下方手动改类型与映射。") }}
       </p>
-      <div v-if="projectState.materials.length" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: var(--space-3)">
-        <div
-          v-for="m in projectState.materials"
-          :key="m.path"
-          style="border: 1px solid var(--border); border-radius: var(--radius-sm); padding: var(--space-3); background: var(--bg-hover)"
-        >
-          <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px">
-            <span style="font-size: 12.5px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap">{{ m.name }}</span>
+      <div v-if="projectState.materials.length" class="mat-grid">
+        <div v-for="m in projectState.materials" :key="m.path" class="mat-card">
+          <div class="mat-head">
+            <span class="mat-name">{{ m.name }}</span>
             <button class="btn danger small" @click="removeMaterial(m.path)">{{ t("移除") }}</button>
           </div>
-          <div style="display: flex; gap: 8px; margin-top: 8px">
-            <select :value="m.kind" @change="(e: any) => (m.kind = (e.target as HTMLSelectElement).value as any)" style="padding: 4px 8px; font-size: 12px; flex: 1">
+          <div class="mat-row">
+            <select :value="m.kind" @change="(e: any) => (m.kind = (e.target as HTMLSelectElement).value as any)" style="flex: 1">
               <option value="character">{{ t("人物") }}</option>
               <option value="item">{{ t("物品") }}</option>
               <option value="background">{{ t("背景") }}</option>
@@ -276,7 +267,7 @@ function loadRecentTitles(dir: string): string {
             <input
               type="text"
               :value="m.extra?.mapTo ?? ''"
-              style="padding: 4px 8px; font-size: 12px; flex: 1.4"
+              style="flex: 1.4"
               :placeholder="t('映射到（角色/物品 id）')"
               @change="
                 (e: any) => {
@@ -288,8 +279,8 @@ function loadRecentTitles(dir: string): string {
           </div>
         </div>
       </div>
-      <p v-else style="color: var(--text-faint); font-size: 12.5px">{{ t("暂无素材") }}</p>
-      <p v-if="projectState.lastResult" style="color: var(--text-dim); font-size: 12px; margin-top: var(--space-3)">
+      <p v-else class="faint small">{{ t("暂无素材") }}</p>
+      <p v-if="projectState.lastResult" class="hint mt-3">
         {{ t("可映射 id：角色") }} {{ projectState.lastResult.cards.characters.map((c) => c.id).join("、") }} · {{ t("物品") }} {{ projectState.lastResult.cards.items.map((c) => c.id).join("、") }}
       </p>
     </div>
@@ -298,17 +289,11 @@ function loadRecentTitles(dir: string): string {
       <div class="card-head">
         <h3>{{ t("最近项目") }}</h3>
       </div>
-      <div style="display: flex; flex-direction: column; gap: 6px">
-        <div
-          v-for="dir in configState.recentOutputDirs"
-          :key="dir"
-          style="display: flex; align-items: center; gap: var(--space-3); padding: 8px var(--space-3); border: 1px solid var(--border); border-radius: var(--radius-sm); cursor: pointer; transition: background var(--dur) var(--ease)"
-          @mouseenter="($event.currentTarget as HTMLElement).style.background = 'var(--bg-hover)'"
-          @mouseleave="($event.currentTarget as HTMLElement).style.background = ''"
-        >
-          <span style="flex: 1; font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap" @click="openRecent(dir)">
+      <div class="flex-col gap-2">
+        <div v-for="dir in configState.recentOutputDirs" :key="dir" class="recent-item">
+          <span class="grow small text-ellipsis" @click="openRecent(dir)">
             <span style="font-weight: 600; color: var(--primary)">{{ loadRecentTitles(dir) }}</span>
-            <span style="color: var(--text-faint); margin-left: 8px">{{ dir }}</span>
+            <span class="faint ml-2">{{ dir }}</span>
           </span>
           <button class="btn secondary small" @click="openRecent(dir)">{{ t("打开") }}</button>
           <button class="btn ghost small" @click="removeRecentOutputDir(dir)">{{ t("移除") }}</button>

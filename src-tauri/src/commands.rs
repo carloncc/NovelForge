@@ -24,6 +24,8 @@ pub struct HttpRequestArgs {
     pub headers: HashMap<String, String>,
     #[serde(default)]
     pub body: Option<String>,
+    #[serde(default)]
+    pub body_base64: Option<String>,
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
 }
@@ -37,11 +39,9 @@ fn http_target(args: &HttpRequestArgs) -> Result<reqwest::Url, String> {
     if !matches!(target.scheme(), "http" | "https") {
         return Err("仅支持 HTTP/HTTPS 地址".to_string());
     }
-    if args
-        .body
-        .as_ref()
-        .is_some_and(|body| body.len() > HTTP_BODY_LIMIT)
-    {
+    let encoded_size = args.body.as_ref().map_or(0, String::len)
+        + args.body_base64.as_ref().map_or(0, String::len);
+    if encoded_size > HTTP_BODY_LIMIT * 2 {
         return Err("请求体超过 64MB 上限，已拒绝".to_string());
     }
     Ok(target)
@@ -85,7 +85,13 @@ pub async fn http_request(args: HttpRequestArgs) -> Result<Value, String> {
             req = req.header(k, v);
         }
     }
-    if let Some(body) = &args.body {
+    if let Some(body_base64) = &args.body_base64 {
+        let body = B64.decode(body_base64).map_err(|_| "HTTP binary request body is not valid Base64".to_string())?;
+        if body.len() > HTTP_BODY_LIMIT {
+            return Err("HTTP request body exceeds the 64MB limit".to_string());
+        }
+        req = req.body(body);
+    } else if let Some(body) = &args.body {
         if !body.is_empty() {
             req = req.body(body.clone());
         }
@@ -682,6 +688,7 @@ mod atomic_write_tests {
             url: "file:///etc/passwd".to_string(),
             headers: HashMap::new(),
             body: None,
+            body_base64: None,
             timeout_secs: 120,
         };
         assert!(http_target(&args).is_err());

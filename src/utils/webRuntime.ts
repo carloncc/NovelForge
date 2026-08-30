@@ -6,7 +6,7 @@
  * - 抠图：canvas 四角 flood-fill 去背景
  */
 import { zipSync } from "fflate";
-import type { FsEntry, HttpResult } from "./tauri";
+import type { CutoutModelDownloadRequest, CutoutModelStatus, FsEntry, HttpResult } from "./tauri";
 import * as vfs from "./vfsWeb";
 import { log, truncate } from "./logger";
 import { errMsg } from "./errors";
@@ -19,6 +19,7 @@ const PROXY_URL = "/__novelforge/proxy";
 const TEMPLATE_URL = "/__novelforge/template";
 const PREVIEW_URL = "/__novelforge/preview";
 const SESSION_URL = "/__novelforge/session";
+const MODEL_URL = "/__novelforge/model";
 const TEMPLATE_ROOT = "/app/template";
 const WEB_RESPONSE_LIMIT = 64 * 1024 * 1024;
 let sessionTokenPromise: Promise<string> | undefined;
@@ -59,6 +60,7 @@ export async function webHttp(args: {
   url: string;
   headers?: Record<string, string>;
   body?: string;
+  bodyBase64?: string;
   timeoutSecs?: number;
 }): Promise<HttpResult> {
   if (!/^https?:\/\//i.test(args.url)) {
@@ -74,6 +76,7 @@ export async function webHttp(args: {
         url: args.url,
         headers: args.headers ?? {},
         body: args.body ?? "",
+        bodyBase64: args.bodyBase64,
         timeoutSecs: args.timeoutSecs ?? 120,
       }),
     });
@@ -95,6 +98,7 @@ async function directFetch(args: {
   url: string;
   headers?: Record<string, string>;
   body?: string;
+  bodyBase64?: string;
   timeoutSecs?: number;
 }): Promise<HttpResult> {
   const controller = new AbortController();
@@ -103,7 +107,7 @@ async function directFetch(args: {
     const resp = await fetch(args.url, {
       method: args.method,
       headers: args.headers,
-      body: args.body,
+      body: args.bodyBase64 ? b64decode(args.bodyBase64) : args.body,
       signal: controller.signal,
     });
     const buf = await readLimitedWebResponse(resp);
@@ -323,6 +327,42 @@ export async function webBuildZip(
   const zipData = zipSync(entries);
   await vfs.vfsWriteFile(zipPath, zipData as unknown as ArrayBuffer);
   return { fileCount: files.length, sizeBytes: zipData.byteLength };
+}
+
+/* ============ 抠图（canvas 四角 flood-fill 去背景） ============ */
+
+/* ============ AI 抠图模型下载（dev/preview server 的 /__novelforge/model 中间件） ============ */
+
+export async function webCutoutModelStatus(modelId: string, filename: string): Promise<CutoutModelStatus> {
+  const fallback: CutoutModelStatus = { modelId, state: "idle", bytes: 0, total: 0, error: null, installed: false };
+  try {
+    const resp = await fetch(`${MODEL_URL}/status?model=${encodeURIComponent(modelId)}`, { method: "GET" });
+    if (!resp.ok) return fallback;
+    return (await resp.json()) as CutoutModelStatus;
+  } catch {
+    return fallback;
+  }
+}
+
+export async function webCutoutModelDownload(req: CutoutModelDownloadRequest): Promise<CutoutModelStatus> {
+  const token = await webSessionToken();
+  const resp = await fetch(`${MODEL_URL}/install`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-NovelForge-Token": token },
+    body: JSON.stringify(req),
+  });
+  if (!resp.ok) throw new Error(`模型下载启动失败 ${resp.status}`);
+  return (await resp.json()) as CutoutModelStatus;
+}
+
+export async function webCutoutModelRemove(modelId: string, filename: string): Promise<void> {
+  const token = await webSessionToken();
+  const resp = await fetch(`${MODEL_URL}/remove?model=${encodeURIComponent(modelId)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-NovelForge-Token": token },
+    body: JSON.stringify({}),
+  });
+  if (!resp.ok) throw new Error(`模型删除失败 ${resp.status}`);
 }
 
 /* ============ 抠图（canvas 四角 flood-fill 去背景） ============ */

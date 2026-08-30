@@ -1,4 +1,4 @@
-﻿import type {
+import type {
   AssetMap,
   ChapterScript,
   CharacterCard,
@@ -23,6 +23,7 @@ import { errMsg } from "../utils/errors";
 import { classifyError } from "../utils/errorClassifier";
 import { sanitizePrompt, appendSafeStyleSuffix } from "../utils/promptRewriter";
 import { cutoutErrorHint } from "../utils/cutoutErrorHint";
+import { configState } from "../stores/config";
 import { cacheDirFor, cacheHit } from "./cache";
 import { sanitizeId } from "./render";
 import { log as logger } from "../utils/logger";
@@ -41,13 +42,30 @@ function nameContains(name: string, keywords: string[]): boolean {
 
 const FIGURE_EMOTIONS = ["normal", "happy", "sad", "angry", "surprised"];
 
+// 情绪提示词：必须足够明确（五官/眉/嘴），否则模型会把不同情绪画成雷同的笑脸
 const EMOTION_PROMPT_SUFFIX: Record<string, string> = {
-  normal: "",
-  happy: ", smiling joyfully with bright expression",
-  sad: ", sad sorrowful expression, eyes downcast",
-  angry: ", angry fierce expression, glaring eyes",
-  surprised: ", shocked surprised expression, wide eyes",
+  normal: ", calm neutral expression, mouth closed, looking straight ahead, standing upright straight, symmetric front-facing pose, feet planted on the ground, arms relaxed at sides",
+  happy: ", joyful bright smile with teeth showing, eyes slightly squinted with happiness, genuinely cheerful laughing expression, radiant happy face",
+  sad: ", clearly sad crying expression, eyebrows tilted up, mouth frowning downward, watery teary eyes, absolutely no smile, sorrowful distressed face",
+  angry: ", clearly angry irritated expression, furrowed sharp angry eyebrows, glaring narrowed eyes, tight frowning mouth, absolutely no smile, fierce annoyed face",
+  surprised: ", shocked surprised expression, eyes wide open, mouth open in surprise, raised eyebrows, absolutely no smile",
 };
+
+// 非 happy 情绪时，把基础提示里的"笑"类正面表情词清掉，避免模型仍按基础画笑脸
+const SMILE_FACE_WORDS = /\b(smiling|smile|grinning|grin|chuckle|laughing|laugh|cheerful|joyful|cheery|gleeful|radiant|merry|happy)\b/gi;
+// normal（标准站姿）时，把基础提示里的常见动态姿势/手势词清掉，保证立正站姿
+const NORMAL_POSE_WORDS = /\b(one hand raised|hand raised in a \w+ wave|waving|waves|waved|waving one hand|pointing|thumbs up|peace sign|hand on hip|hands on hips|winking|giving a wave)\b/gi;
+
+function emotionPrompt(base: string, emo: string): string {
+  let p = stripBackground(base);
+  if (emo === "happy") return p + (EMOTION_PROMPT_SUFFIX[emo] ?? "");
+  p = p.replace(SMILE_FACE_WORDS, " ");
+  if (emo === "normal") p = p.replace(NORMAL_POSE_WORDS, " ");
+  return p.replace(/\s{2,}/g, " ").trim() + (EMOTION_PROMPT_SUFFIX[emo] ?? "");
+}
+
+// 动作立绘：追加可读性提示，避免模型把指定动作画糊/画没
+const ACTION_CLARITY_HINT = ", clearly performing the described hand gesture and body action, legible readable pose, full body visible";
 
 // 统一画风：保证同一项目内所有立绘/背景/CG 视觉风格一致（同一个"维度"）
 const DEFAULT_STYLE =
@@ -261,7 +279,7 @@ export function buildImageTasks(
         id: isNormal ? char.id : `${char.id}_${emo}`,
         characterId: char.id,
         emotion: emo,
-        prompt: stripBackground(char.imagePrompt) + (EMOTION_PROMPT_SUFFIX[emo] ?? "") + REF_HINT + style + FIGURE_BG_SUFFIX,
+        prompt: emotionPrompt(char.imagePrompt, emo) + REF_HINT + style + FIGURE_BG_SUFFIX,
         refFromTask: isNormal ? (threeView ? `${char.id}_threeview` : undefined) : char.id,
         fileName: `figure_${sanitizeId(char.id)}_${emo}.png`,
         width: 1024,
@@ -297,7 +315,7 @@ export function buildImageTasks(
           id: `${char.id}_act_${a.id}`,
           characterId: char.id,
           actionId: a.id,
-          prompt: stripBackground(a.prompt) + REF_HINT + style + FIGURE_BG_SUFFIX,
+          prompt: stripBackground(a.prompt) + ACTION_CLARITY_HINT + REF_HINT + style + FIGURE_BG_SUFFIX,
           refFromTask: `${char.id}_threeview`,
           fileName: `figure_${sanitizeId(char.id)}_act_${sanitizeId(a.id)}.png`,
           width: 1024,
@@ -382,11 +400,21 @@ export async function ensureCutout(
   task: ImageTask,
   log: (ev: PipelineEvent) => void,
 ): Promise<string> {
-  // 立绘/动作/物品抠出无背景透明底（优先 AI 抠图，可识别任意背景；失败降级保留原图）。
+  // 立绘/动作/物品抠出无背景透明底（优先 AI 抠图，可识别任意背景；失败降级色度键/保留原图）。
   // 三视图/背景/CG 不在此处调用（保持自然背景）。
   try {
     const b64 = await tauri.readFileBase64(path);
     if (await tauri.hasTransparency(b64)) return path;
+    const aiResult = await tryAiCutout(b64, task, log);
+    if (aiResult) {
+      const pngPath = path.replace(/\.(jpg|jpeg)$/i, ".png");
+      await tauri.writeFileBase64(pngPath, aiResult);
+      if (pngPath !== path) {
+        await tauri.removePath(path).catch(() => {});
+      }
+      log({ step: "图像", message: `无背景立绘（AI 抠图）：${task.usage}`, level: "info", at: Date.now() });
+      return pngPath;
+    }
     const res = await tauri.cutoutImage(b64, 40);
     // 深色背景（黑/墨蓝等）：色度键无法区分黑发/黑衣服/深色物品与深色背景，硬抠会把主体抠成半透明灰。
     // 保留原图（宁可有背景也不伤主体），提示用户可改用 AI 抠图或重新生成绿幕立绘。
@@ -418,6 +446,51 @@ export async function ensureCutout(
       at: Date.now(),
     });
     return path;
+  }
+}
+
+/** AI 抠图（可选模型，手动下载）：未启用/模型未安装/推理失败均返回 null，由调用方降级。 */
+let aiCutoutHintLogged = false;
+
+async function tryAiCutout(
+  b64: string,
+  task: ImageTask,
+  log: (ev: PipelineEvent) => void,
+): Promise<string | null> {
+  const settings = configState.cutout;
+  if (!settings?.enabled) return null;
+  const { findCutoutModel, cutoutModelStatus, aiCutoutImage } = await import("./cutout");
+  const model = findCutoutModel(settings.modelId);
+  let status: { installed: boolean };
+  try {
+    status = await cutoutModelStatus(model);
+  } catch {
+    return null;
+  }
+  if (!status.installed) {
+    // 只提示一次，避免批量生成时刷屏
+    if (!aiCutoutHintLogged) {
+      aiCutoutHintLogged = true;
+      log({
+        step: "图像",
+        message: `AI 抠图模型「${model.label}」（${model.sizeMB} MB）未安装，已用色度键抠图：${task.usage}（可到「API 配置」页下载模型）`,
+        level: "info",
+        at: Date.now(),
+      });
+    }
+    return null;
+  }
+  try {
+    const result = await aiCutoutImage(b64, model.id, { despill: true });
+    return result.dataB64;
+  } catch (error) {
+    log({
+      step: "图像",
+      message: `AI 抠图失败（${errMsg(error).slice(0, 160)}），降级色度键：${task.usage}`,
+      level: "warn",
+      at: Date.now(),
+    });
+    return null;
   }
 }
 

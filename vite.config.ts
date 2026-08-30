@@ -2,11 +2,22 @@ import { defineConfig, type Plugin, type Connect } from "vite";
 import vue from "@vitejs/plugin-vue";
 import { unzipSync } from "fflate";
 import { readFile, readdir, mkdir, writeFile, stat, rm } from "node:fs/promises";
+import { createReadStream } from "node:fs";
 import { join, dirname, normalize, extname, relative, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer, type Server as HttpServer } from "node:http";
 import { randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
+import { installModel, installedModelFile, modelPath } from "./scripts/web-model-downloader.mjs";
+import { findCutoutModel, cutoutModelRemoteUrl } from "./src/core/cutout/models";
+
+interface ModelInstallState {
+  modelId: string | null;
+  state: "idle" | "downloading" | "done" | "error";
+  bytes: number;
+  total: number;
+  error: string | null;
+}
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const TEMPLATE_DIR = join(ROOT, "src-tauri", "templates", "webgal");
@@ -21,6 +32,111 @@ const PREVIEW_FILE_SIZE_LIMIT = 256 * 1024 * 1024;
 const PREVIEW_REQUEST_LIMIT = Math.ceil(PREVIEW_ZIP_LIMIT * 4 / 3) + 1024 * 1024;
 let previewServer: HttpServer | undefined;
 let previewPort = 0;
+
+/** AI 抠图模型后台下载状态（web 运行时，/__novelforge/model 中间件） */
+let modelInstallState: ModelInstallState = { modelId: null, state: "idle", bytes: 0, total: 0, error: null };
+
+function modelStatusFor(modelId: string): ModelInstallState & { installed: boolean } {
+  const active = modelInstallState.modelId === modelId;
+  return {
+    modelId,
+    state: active ? modelInstallState.state : "idle",
+    bytes: active ? modelInstallState.bytes : 0,
+    total: active ? modelInstallState.total : 0,
+    error: active ? modelInstallState.error : null,
+    installed: installedModelFile(findCutoutModel(modelId).filename),
+  };
+}
+
+/** 后台下载模型（不阻塞响应）；重复下载同一模型时直接返回当前状态 */
+function spawnModelInstall(modelId: string): void {
+  const model = findCutoutModel(modelId);
+  if (modelInstallState.modelId === model.id && modelInstallState.state === "downloading") return;
+  if (installedModelFile(model.filename)) {
+    modelInstallState = { modelId: model.id, state: "done", bytes: 0, total: 0, error: null };
+    return;
+  }
+  modelInstallState = { modelId: model.id, state: "downloading", bytes: 0, total: 0, error: null };
+  void installModel(
+    { filename: model.filename, url: cutoutModelRemoteUrl(model), md5: model.md5 ?? "" },
+    { onProgress: ({ bytes, total }) => { modelInstallState.bytes = bytes; modelInstallState.total = total; } },
+  )
+    .then(() => {
+      modelInstallState.state = "done";
+      modelInstallState.error = null;
+      console.log(`[model-download] 模型 ${model.id} 安装完成`);
+    })
+    .catch((error: unknown) => {
+      modelInstallState.state = "error";
+      modelInstallState.error = error instanceof Error ? error.message : String(error);
+      console.error(`[model-download] 模型 ${model.id} 安装失败：${modelInstallState.error}`);
+    });
+}
+
+async function handleModelRequest(req: Connect.IncomingMessage, res: Connect.ServerResponse): Promise<void> {
+  const u = new URL(req.url ?? "/", "http://localhost");
+  const pathname = u.pathname.replace(/^\/__novelforge\/model/, "") || "/";
+  const modelId = u.searchParams.get("model") ?? "";
+  const model = findCutoutModel(modelId);
+
+  if (pathname === "/status") {
+    sendJson(res, 200, modelStatusFor(model.id));
+    return;
+  }
+  if (pathname === "/install") {
+    if (!authorize(req, res)) return;
+    let raw: string;
+    try {
+      raw = await readBody(req, 64 * 1024);
+    } catch (error) {
+      sendJson(res, 413, { error: (error as Error).message });
+      return;
+    }
+    let payload: { modelId?: string };
+    try {
+      payload = JSON.parse(raw);
+    } catch {
+      sendJson(res, 400, { error: "bad request" });
+      return;
+    }
+    const target = findCutoutModel(payload.modelId ?? "");
+    spawnModelInstall(target.id);
+    sendJson(res, 200, modelStatusFor(target.id));
+    return;
+  }
+  if (pathname === "/remove") {
+    if (!authorize(req, res)) return;
+    try {
+      await rm(modelPath(model.filename), { force: true });
+      await rm(`${modelPath(model.filename)}.part`, { force: true });
+    } catch {
+      /* 忽略删除失败 */
+    }
+    if (modelInstallState.modelId === model.id) {
+      modelInstallState = { modelId: null, state: "idle", bytes: 0, total: 0, error: null };
+    }
+    sendJson(res, 200, { ok: true });
+    return;
+  }
+  if (pathname === "/file") {
+    const file = modelPath(model.filename);
+    try {
+      await stat(file);
+    } catch {
+      res.statusCode = 404;
+      res.end("model not found");
+      return;
+    }
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "application/octet-stream");
+    res.setHeader("Content-Length", (await stat(file)).size);
+    res.setHeader("Cache-Control", "no-cache");
+    createReadStream(file).pipe(res);
+    return;
+  }
+  res.statusCode = 404;
+  res.end("not found");
+}
 
 const MIME: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
@@ -141,7 +257,7 @@ async function handleProxy(req: Connect.IncomingMessage, res: Connect.ServerResp
     sendJson(res, 413, { error: (error as Error).message });
     return;
   }
-  let payload: { method?: string; url?: string; headers?: Record<string, string>; body?: string; timeoutSecs?: number };
+  let payload: { method?: string; url?: string; headers?: Record<string, string>; body?: string; bodyBase64?: string; timeoutSecs?: number };
   try {
     payload = JSON.parse(raw);
   } catch {
@@ -160,10 +276,13 @@ async function handleProxy(req: Connect.IncomingMessage, res: Connect.ServerResp
     try {
       const blockedHeaders = /^(host|connection|content-length|transfer-encoding|cookie|keep-alive|proxy-authenticate|proxy-authorization|te|trailer|upgrade)$/i;
       const headers = Object.fromEntries(Object.entries(payload.headers ?? {}).filter(([name]) => !blockedHeaders.test(name)));
+      const requestBody = typeof payload.bodyBase64 === "string"
+        ? Buffer.from(payload.bodyBase64, "base64")
+        : payload.body || undefined;
       const resp = await fetch(target, {
         method: payload.method ?? "GET",
         headers,
-        body: payload.body || undefined,
+        body: requestBody,
         signal: controller.signal,
         redirect: "manual",
       });
@@ -345,6 +464,9 @@ function webPlugin(): Plugin {
       }
       if (!authorize(req, res)) return;
       void handlePreviewUpload(req, res);
+    });
+    server.middlewares.use("/__novelforge/model", (req, res) => {
+      void handleModelRequest(req, res);
     });
     server.httpServer?.once("close", () => {
       previewServer?.close();

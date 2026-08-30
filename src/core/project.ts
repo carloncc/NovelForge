@@ -6,6 +6,7 @@ import { basename, joinPath, normalizePath } from "../utils/path";
 import { log } from "../utils/logger";
 import { errMsg } from "../utils/errors";
 import { ConcurrencyLimiter } from "../utils/performance";
+import { brandUrl, brandFooterHtml } from "../utils/branding";
 
 export interface AssembleInput {
   outputDir: string;
@@ -71,6 +72,8 @@ export async function assembleProject(input: AssembleInput): Promise<{ gameDir: 
       input.log(`跳过引擎文件 ${f}（模板中不存在）`);
     }
   }
+  // 导出游戏内注入品牌水印（官网推广；地址运行时拼装，源码无明文）
+  await injectBrandFooter(normalizedOutputDir);
   await copyDirIfExists(
     joinPath(normalizedTemplateDir, "assets"),
     joinPath(normalizedOutputDir, "assets")
@@ -222,8 +225,9 @@ async function writeAppreciation(outputDir: string, input: AssembleInput): Promi
   const js = `window.APPRECIATION_DATA = ${JSON.stringify(data)};\n`;
   try {
     await tauri.writeTextFile(joinPath(outputDir, "appreciation-data.js"), js);
-    // 鉴赏页模板随项目分发（与 index.html 平级，浏览器直接打开即可）
-    const tpl = joinPath(process.cwd(), "src/gameExtra/appreciation.html");
+    // 鉴赏页模板随模板目录分发（与 index.html 平级，浏览器直接打开即可）。
+    // 旧实现用 process.cwd()+"/src/gameExtra/appreciation.html"，打包后 cwd 非源码目录导致从未复制。
+    const tpl = joinPath(input.templateDir, "appreciation.html");
     await tauri.copyFile(tpl, joinPath(outputDir, "appreciation.html"));
   } catch (e) {
     input.log(`鉴赏室资源写入失败（不影响游戏本体）：${errMsg(e).slice(0, 80)}`);
@@ -385,10 +389,26 @@ async function writeVideoPlan(
   await tauri.writeTextFile(joinPath(outputDir, "video_plan.txt"), lines.join("\n"));
 }
 
+/** 向导出的 index.html 注入品牌水印（官网推广） */
+async function injectBrandFooter(outputDir: string): Promise<void> {
+  const indexPath = joinPath(outputDir, "index.html");
+  try {
+    const { text } = await tauri.readTextFile(indexPath);
+    if (text.includes("novelforge-brand")) return; // 幂等：已注入过则跳过
+    const footer = brandFooterHtml();
+    const injected = text.includes("</body>") ? text.replace("</body>", `${footer}\n</body>`) : text + footer;
+    await tauri.writeTextFile(indexPath, injected);
+  } catch {
+    /* index.html 缺失或不可写则跳过，不影响游戏本体 */
+  }
+}
+
 async function writeExportGuide(outputDir: string, title: string): Promise<void> {
   const lines = [
     `「${title}」导出说明（NovelForge 生成）`,
     "==============================================",
+    "",
+    `本游戏由 NovelForge（AI 视觉小说工坊）生成 · 官网：${brandUrl()}`,
     "",
     "1) 网页版（手机/PC 浏览器即玩，零成本）",
     "   整个文件夹即完整网页游戏。部署到任意静态托管（GitHub Pages / Vercel / 服务器 / 网盘），",

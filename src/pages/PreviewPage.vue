@@ -5,6 +5,7 @@ import { tauri } from "../utils/tauri";
 import { t } from "../i18n";
 import { errMsg } from "../utils/errors";
 import { log } from "../utils/logger";
+import PageHead from "../components/PageHead.vue";
 
 const url = ref("");
 const starting = ref(false);
@@ -68,31 +69,25 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="inner">
-    <div class="page-head">
-      <div>
-        <div class="page-title">{{ t("预览") }}</div>
-        <p class="page-sub">{{ t("内嵌 WebGAL 引擎实时试玩（本地服务器，所见即所得）") }}</p>
-      </div>
-      <div class="page-actions">
-        <button class="btn" :disabled="starting" @click="startPreview">
-          <span v-if="starting" class="spinner" />
-          {{ t("启动/刷新") }}
-        </button>
-        <button class="btn secondary" :disabled="!url" @click="openAppreciation">{{ t("鉴赏室") }}</button>
-        <button class="btn secondary" :disabled="!url" @click="openInBrowser">{{ t("系统浏览器打开") }}</button>
-        <button class="btn danger" :disabled="!url" @click="stopPreview">{{ t("停止") }}</button>
-      </div>
-    </div>
+    <PageHead :title="t('预览')" :sub="t('内嵌 WebGAL 引擎实时试玩（本地服务器，所见即所得）')">
+      <button class="btn" :disabled="starting" @click="startPreview">
+        <span v-if="starting" class="spinner" />
+        {{ t("启动/刷新") }}
+      </button>
+      <button class="btn secondary" :disabled="!url" @click="openAppreciation">{{ t("鉴赏室") }}</button>
+      <button class="btn secondary" :disabled="!url" @click="openInBrowser">{{ t("系统浏览器打开") }}</button>
+      <button class="btn danger" :disabled="!url" @click="stopPreview">{{ t("停止") }}</button>
+    </PageHead>
 
     <div class="card" style="padding: var(--space-3)">
-      <div style="display: flex; align-items: center; gap: var(--space-3); font-size: 12.5px">
-        <span style="color: var(--text-dim); flex-shrink: 0">{{ t("项目：") }}</span>
-        <code style="flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap">{{ previewDir || t("（未生成）") }}</code>
+      <div class="flex items-center gap-3" style="font-size: 12.5px">
+        <span class="muted shrink-0">{{ t("项目：") }}</span>
+        <code class="grow text-ellipsis">{{ previewDir || t("（未生成）") }}</code>
       </div>
-      <p v-if="error" style="color: var(--err); margin-top: 8px">{{ error }}</p>
+      <p v-if="error" class="err-text mt-2">{{ error }}</p>
     </div>
 
-    <div v-if="url" style="margin-top: var(--space-4)">
+    <div v-if="url" class="mt-4">
       <iframe :key="reloadKey" class="preview-frame" :src="url" />
     </div>
     <div v-else class="card empty">

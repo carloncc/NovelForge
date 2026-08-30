@@ -130,7 +130,7 @@ Artifacts land in `src-tauri/target/release/bundle/` (Windows exe / macOS dmg / 
 | | Description |
 |---|---|
 | 📖 **All-in-one pipeline** | Chapter split → multi-language translation → card extraction → script (auto CG staging, item close-ups, debut intro cards, video slots) → images → TTS → standard WebGAL assembly |
-| 🎨 **Background-free sprites** | Auto cutout (AI segmentation, model auto-downloaded and cached; offline-safe chroma-key fallback with connected flood-fill + edge feathering) |
+| 🎨 **Background-free sprites** | Auto cutout with selectable AI segmentation models (ISNet anime/general, BiRefNet, U2-Net — downloaded manually in settings, inference runs locally); falls back to an improved chroma-key (connected flood-fill + edge feathering) when no model is installed or inference fails |
 | 🎨 **Style consistency** | Project-wide style anchor image + fixed seed + shared negative prompt + chain image-to-image (three-view → sprite → expressions/actions), with multimodal self-checks that verify character consistency against reference images |
 | 📖 **Visual Bible gate** | Before batch image generation, a "Visual Bible" must be approved: pick a style source (uploaded reference analyzed by the vision model, or a style sample generated from a full-novel analysis) plus three-view sheets (front/side/back) for every protagonist. Re-generating one character's three-view does not affect others. Any change invalidates approval |
 | 😊 **Expression variants** | 5 expressions per character (normal sprite used as reference for consistency); dialogue auto-switches by emotion |
@@ -206,7 +206,7 @@ The web build has the same features as the desktop app, backed by browser-native
 | Local filesystem | IndexedDB virtual filesystem (persisted in the browser) |
 | Rust HTTP client (no CORS limits) | Dev-server proxy relay (`/__novelforge/proxy`) |
 | Embedded preview server | Frontend zips the game → dev server extracts and serves it (same-origin iframe) |
-| Rust rembg cutout | Canvas connected flood-fill chroma-key cutout (white/black background removal) |
+| AI cutout model (ONNX segmentation, onnxruntime-web) + chroma-key fallback | Same (model downloaded via the `/__novelforge/model` middleware into `public/models`) |
 | Bundled WebGAL engine template | On-demand sync of `src-tauri/templates/webgal` into IndexedDB |
 | Native file dialogs | Browser `<input type="file">` |
 | Export zip to disk | Export zip auto-downloads |
@@ -326,7 +326,8 @@ This software is provided "as is" without warranty of any kind. By using NovelFo
 ## Credits & License
 
 - [WebGAL](https://github.com/OpenWebGAL/WebGAL) — visual novel engine (MPL-2.0); see [THIRD_PARTY_NOTICE](./THIRD_PARTY_NOTICE)
-- NovelForge itself is [MIT](./LICENSE) licensed
+- NovelForge itself is licensed under a [Non-Commercial License](./LICENSE): free to use, modify, and redistribute, but **not for commercial purposes**
+- **Exported content exemption**: the games, scripts, novels, images, and other content you generate or export with NovelForge **belong to you** and may be used and sold commercially without restriction
 - Published works must retain the WebGAL copyright notice; game content belongs to the creator
 
 ## Roadmap

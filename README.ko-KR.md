@@ -326,7 +326,8 @@ cd src-tauri && cargo test
 ## 크레딧 및 라이선스
 
 - [WebGAL](https://github.com/OpenWebGAL/WebGAL) — 비주얼 노벨 엔진(MPL-2.0), [THIRD_PARTY_NOTICE](./THIRD_PARTY_NOTICE) 참조
-- NovelForge 본체는 [MIT](./LICENSE) 라이선스
+- NovelForge 본체는 [비상업용 라이선스](./LICENSE) : 자유롭게 사용·수정·재배포할 수 있으나, **상업적 이용은 금지**입니다
+- **내보낸 콘텐츠 면제**: NovelForge로 생성·내보낸 게임·시나리오·소설·이미지 등 콘텐츠는 **귀하의 소유**이며, 제한 없이 상업적 이용·판매할 수 있습니다
 - 게시물에는 WebGAL 저작권 표시를 유지해야 합니다. 게임 콘텐츠 저작권은 창작자에게 귀속됩니다
 
 ## Roadmap

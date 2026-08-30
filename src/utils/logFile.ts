@@ -83,18 +83,3 @@ export async function installLogFileSink(): Promise<string> {
     return "";
   }
 }
-
-/** 读取当前日志文件内容 */
-export async function readLogFile(): Promise<string> {
-  if (!logFilePath) return "";
-  try {
-    const result = await tauri.readTextFile(logFilePath);
-    return result.text;
-  } catch {
-    return "";
-  }
-}
-
-export function getLogFilePath(): string {
-  return logFilePath;
-}

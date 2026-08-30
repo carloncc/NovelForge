@@ -327,7 +327,8 @@ cd src-tauri && cargo test
 ## クレジットとライセンス
 
 - [WebGAL](https://github.com/OpenWebGAL/WebGAL) —— ビジュアルノベルエンジン（MPL-2.0）、[THIRD_PARTY_NOTICE](./THIRD_PARTY_NOTICE) 参照
-- NovelForge 本体は [MIT](./LICENSE) ライセンス
+- NovelForge 本体は[非商用ライセンス](./LICENSE)：自由に使用・改変・再配布できますが、**商用利用は禁止**です
+- **エクスポートコンテンツの免除**：NovelForge で生成・エクスポートしたゲーム・シナリオ・小説・画像などのコンテンツは**あなたの所有物**となり、制限なく商用利用・販売できます
 - 公開作品には WebGAL の著作権表示を残す必要があります。ゲームコンテンツの著作権は作者に帰属します
 
 ## Roadmap

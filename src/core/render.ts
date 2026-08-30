@@ -265,10 +265,13 @@ export function renderChapter(
 
     const bgFile = opts.assets.bg[scene.id];
     if (bgFile) {
-      out.push(`changeBg:${getBaseName(bgFile)} -next;`);
-      // 景深对焦入场：先虚化后聚焦，制造电影感场景切换
-      out.push(`setTransform:{"blur":12} -target=bg-main -duration=0 -next;`);
-      out.push(`setTransform:{"blur":0} -target=bg-main -duration=1000 -next;`);
+      // 场景切换：干净利落的交叉淡化（WebGAL changeBg 自带透明度淡入，500ms 即完成），
+      // 叠加轻微推近（Ken Burns 运镜）制造电影感，符合主流 galgame 的 dissolve 过渡。
+      // 注意不要在此叠加 blur 聚焦——changeBg 已含淡入，双重动画叠加是"生硬"的来源。
+      out.push(`changeBg:${getBaseName(bgFile)} -duration=500 -ease=easeInOut -next;`);
+      if (useActions) {
+        out.push(`setTransform:{"scale":{"x":1.04,"y":1.04}} -target=bg-main -duration=3000 -next;`);
+      }
     }
     // 环境音效（SE）：按场景氛围匹配播放（用户可用同名文件覆盖内置音效）
     const se = detectSe(scene);
@@ -300,12 +303,12 @@ export function renderChapter(
       out.push(`changeFigure:none -right${clearExit} -next;`);
       stageSlot.clear();
       stageOrder.length = 0;
-      out.push(`changeBg:${getBaseName(cgFile)} -next;`);
+      out.push(`changeBg:${getBaseName(cgFile)} -duration=400 -ease=easeInOut -next;`);
       // 名场面特写运镜：缓慢推近 CG，强化冲击力
       out.push(`setTransform:{"scale":{"x":1.08,"y":1.08}} -target=bg-main -duration=2500 -next;`);
       out.push(`unlockCg:${getBaseName(cgFile)} -name=${esc(cg.title || cg.description || "CG")};`);
       out.push(`:${esc(cg.description || cg.title)};`);
-      out.push(`changeBg:${bgFile ? getBaseName(bgFile) : "none"} -next;`);
+      out.push(`changeBg:${bgFile ? getBaseName(bgFile) : "none"} -duration=500 -ease=easeInOut -next;`);
     }
 
     const eventIdxByTrigger = new Map<number, number>();

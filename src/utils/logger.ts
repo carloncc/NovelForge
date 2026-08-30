@@ -1,7 +1,7 @@
 /**
  * 统一日志工具：结构化、分级、带时间戳。
  * - 开发环境（import.meta.env.DEV）下输出到 console
- * - 所有环境都会记录到内存历史缓冲（getLogHistory / dumpLogHistory），便于 UI 或调试导出
+ * - 所有环境都会记录到内存历史缓冲（dumpLogHistory），便于 UI 或调试导出
  */
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
@@ -125,14 +125,6 @@ export const log = {
   },
 };
 
-export function getLogHistory(): readonly LogEntry[] {
-  return history;
-}
-
-export function clearLogHistory(): void {
-  history.length = 0;
-}
-
 /** 导出内存日志为纯文本（供调试/复制） */
 export function dumpLogHistory(): string {
   return history
@@ -142,23 +134,4 @@ export function dumpLogHistory(): string {
       return `[${time}][${e.level.toUpperCase()}][${e.scope}] ${e.message}${suffix}`;
     })
     .join("\n");
-}
-
-/** 记录一段异步操作：进入时打 debug，成功/失败分别打日志 */
-export async function traced<T>(
-  scope: string,
-  message: string,
-  fn: () => Promise<T>,
-): Promise<T> {
-  const done = log.time(scope, message);
-  log.debug(scope, `开始：${message}`);
-  try {
-    const result = await fn();
-    done("成功");
-    return result;
-  } catch (e) {
-    done(`失败：${e instanceof Error ? e.message : String(e)}`);
-    log.error(scope, `${message} 失败`, { error: e instanceof Error ? e.message : e });
-    throw e;
-  }
 }

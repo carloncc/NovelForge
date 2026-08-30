@@ -71,6 +71,8 @@ export interface CharacterCard {
   personality: string;
   voiceDesc: string;
   voiceName?: string;
+  /** Global cloned-voice profile. When present it takes precedence over voiceName. */
+  voiceProfileId?: string;
   imagePrompt: string;
   /** 三视图（正/侧/背）角色设定图 prompt；用于生成三视图参考图，并作为立绘/表情/动作的图生图参考 */
   threeViewPrompt?: string;
@@ -87,6 +89,22 @@ export interface CharacterCard {
   /** Project-local character reference path used by current code. */
   referenceImagePath?: string;
   color: string;
+}
+
+export type VoiceProfileStatus = "ready" | "creating" | "error";
+
+export interface VoiceProfile {
+  id: string;
+  name: string;
+  provider: "minimax";
+  ttsConfigId: string;
+  voiceId: string;
+  status: VoiceProfileStatus;
+  referenceAudioPath?: string;
+  consentConfirmedAt?: string;
+  error?: string;
+  revision: number;
+  createdAt: string;
 }
 
 export type VisualBibleStatus = "draft" | "approved" | "stale";

@@ -291,5 +291,22 @@
   applyLang(lang);
 })();
 </script>
+
+<footer id="brandFooter" style="position:fixed;left:12px;bottom:10px;z-index:10;font-size:12px;opacity:.75;">
+  <a id="brandLink" href="#" rel="noopener" style="color:var(--accent);text-decoration:none;"></a>
+</footer>
+<script>
+// 官网地址由字符码运行时拼装，避免源码明文（防止被搜索替换移除）
+(function () {
+  var codes = [104,116,116,112,115,58,47,47,119,119,119,46,102,111,114,103,101,112,101,97,107,110,111,119,46,99,111,109];
+  var link = document.getElementById("brandLink");
+  if (link) {
+    var url = String.fromCharCode.apply(null, codes);
+    link.href = url;
+    link.setAttribute("target", "_blank");
+    link.textContent = "由 NovelForge 制作 · " + url.replace(/^https?:\/\//, "");
+  }
+})();
+</script>
 </body>
 </html>
