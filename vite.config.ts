@@ -434,8 +434,46 @@ function ensurePreviewServer(): Promise<void> {
   });
 }
 
+/** onnxruntime-web 运行时资源：绕过 vite 模块转换按静态文件原样返回。
+ * ort 推理时会动态 import() /onnx/*.mjs 胶水模块；public 文件被当作模块加载时
+ * vite dev 会报“public 文件不应从源码 import”。此中间件提前接管 /onnx/ 请求。
+ * （生产构建仍走 public 目录拷贝后的静态托管，行为不变。） */
+async function handleOnnxAsset(req: Connect.IncomingMessage, res: Connect.ServerResponse): Promise<void> {
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    res.statusCode = 405;
+    res.end();
+    return;
+  }
+  const u = new URL(req.url ?? "/", "http://localhost");
+  const rel = u.pathname.replace(/^\/onnx\//, "");
+  if (rel === "" || !/^[\w.-]+$/.test(rel)) {
+    res.statusCode = 400;
+    res.end("bad path");
+    return;
+  }
+  const file = join(ROOT, "public", "onnx", rel);
+  try {
+    const buf = await readFile(file);
+    res.statusCode = 200;
+    res.setHeader("Content-Type", MIME[extname(file)] ?? "application/octet-stream");
+    res.setHeader("Content-Length", buf.length);
+    res.setHeader("Cache-Control", "no-cache");
+    if (req.method === "HEAD") {
+      res.end();
+    } else {
+      res.end(buf);
+    }
+  } catch {
+    res.statusCode = 404;
+    res.end("not found");
+  }
+}
+
 function webPlugin(): Plugin {
   const mount = (server: { middlewares: Connect.Server }) => {
+    server.middlewares.use("/onnx/", (req, res) => {
+      void handleOnnxAsset(req, res);
+    });
     server.middlewares.use("/__novelforge/proxy", (req, res) => {
       if (req.method !== "POST") {
         res.statusCode = 405;

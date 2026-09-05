@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, ref, watch, onBeforeUnmount } from "vue";
 import type { CharacterCard, ExtractionResult, ItemCard, SceneCard } from "../core/types";
 import { activeConfig, configState, voiceLibraryFor } from "../stores/config";
 import { tauri, isTauri } from "../utils/tauri";
@@ -12,6 +12,7 @@ import { recognizeCharacter } from "../core/recognize";
 import { configIsUsable } from "../api/providers";
 import { t } from "../i18n";
 import { createMiniMaxVoiceProfile, importVoiceProfile } from "../core/voiceProfiles";
+import { minimaxVoiceLabel } from "../core/minimaxVoices";
 import Disclosure from "./Disclosure.vue";
 
 const props = defineProps<{ cards: ExtractionResult }>();
@@ -29,6 +30,13 @@ const charRecognizing = ref<string | null>(null);
 const voiceFileInput = ref<HTMLInputElement | null>(null);
 const voiceFileTarget = ref<CharacterCard | null>(null);
 const voiceBusy = ref<string | null>(null);
+const invalidateScript = ref(false);
+const recordingChar = ref<string | null>(null);
+const recorderRef = ref<MediaRecorder | null>(null);
+const recordStreamRef = ref<MediaStream | null>(null);
+const recordChunksRef = ref<Blob[]>([]);
+const recordingSec = ref(0);
+let recordTimer: number | undefined;
 
 async function recognizeChar(c: CharacterCard): Promise<void> {
   if (!c.referenceImage) {
@@ -70,6 +78,27 @@ watch(
 
 const voices = computed(() => voiceLibraryFor(activeConfig("tts")));
 const voiceProfiles = computed(() => configState.voiceProfiles.filter((profile) => profile.status === "ready"));
+
+/** 预设音色下拉项：官方音色显示中文名，克隆/设计音色标注来源 */
+const voiceOptions = computed(() => {
+  const ttsCfg = activeConfig("tts");
+  const isMiniMax = !!ttsCfg && (ttsCfg.adapter === "minimax-tts" || /minimaxi?\.com/i.test(ttsCfg.baseUrl));
+  return voices.value.map((id) => ({
+    id,
+    label: isMiniMax ? `${minimaxVoiceLabel(id)}（${id}）` : id,
+  }));
+});
+
+/** 按性别过滤音色：female 角色只显示女声音色，male 只显示男声；无法判别的显示全部 */
+function voiceOptionsForGender(card: CharacterCard): typeof voiceOptions.value {
+  if (card.gender !== "female" && card.gender !== "male") return voiceOptions.value;
+  const female = card.gender === "female";
+  return voiceOptions.value.filter((v) => {
+    const m = /^female|女/.test(v.id);
+    const ml = /^male|男/.test(v.id);
+    return female ? m : ml;
+  });
+}
 
 async function importCharacterVoice(card: CharacterCard): Promise<void> {
   const config = activeConfig("tts");
@@ -125,6 +154,88 @@ async function onVoiceFile(e: Event): Promise<void> {
     card.voiceProfileId = profile.id; card.voiceName = undefined; savedMsg.value = `已创建并绑定克隆声音：${profile.name}`;
   } catch (error) { savedMsg.value = `创建声音失败：${errMsg(error)}`; }
   finally { voiceBusy.value = null; }
+}
+
+/** 停止当前录音，释放媒体流与计时器 */
+function stopRecordingNow(): void {
+  if (recordTimer !== undefined) { window.clearInterval(recordTimer); recordTimer = undefined; }
+  if (recorderRef.value && recorderRef.value.state !== "inactive") {
+    try { recorderRef.value.stop(); } catch { /* 已停止 */ }
+  }
+  recordStreamRef.value?.getTracks().forEach((track) => track.stop());
+  recordStreamRef.value = null;
+}
+
+/** 播放视频时点击录音：捕获系统正在播放的声音（共享屏幕/窗口音频），用于生成克隆音色 */
+async function startSystemAudioRecording(card: CharacterCard): Promise<void> {
+  const config = activeConfig("tts");
+  if (!config) { savedMsg.value = t("请先配置 TTS"); return; }
+  if (!window.confirm("我将捕获系统正在播放的声音（会弹出选择共享屏幕/窗口的提示，请勾选「分享音频」）。我确认拥有该声音的使用授权。")) return;
+  try {
+    // 捕获系统音频：getDisplayMedia 的 audio 轨道（Chrome/Edge/WebView2 支持）
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const stream = await (navigator.mediaDevices as any).getDisplayMedia({
+      video: { width: 320, height: 240 },
+      audio: true,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any);
+    const audioTrack = stream.getAudioTracks()[0];
+    if (!audioTrack) {
+      stream.getTracks().forEach((track: MediaStreamTrack) => track.stop());
+      throw new Error("未捕获到系统音频（请在选择共享内容时勾选「分享音频」）");
+    }
+    // 只要音频轨；视频轨仅供满足捕获要求，立即停止
+    const audioOnly = new MediaStream([audioTrack]);
+    recordStreamRef.value = audioOnly;
+    recordChunksRef.value = [];
+    recordingChar.value = card.id;
+    recordingSec.value = 0;
+    const recorder = new MediaRecorder(audioOnly);
+    recorderRef.value = recorder;
+    recorder.ondataavailable = (ev) => { if (ev.data.size) recordChunksRef.value.push(ev.data); };
+    recorder.start();
+    recordTimer = window.setInterval(() => { recordingSec.value++; }, 1000);
+    savedMsg.value = `正在录音（${card.name}）：请播放参考视频，完成后点「停止并克隆」`;
+  } catch (e) {
+    savedMsg.value = `录音启动失败：${errMsg(e)}`;
+  }
+}
+
+/** 停止录音并作为参考音频克隆（10s~5min，符合 MiniMax 要求） */
+async function stopRecordingAndClone(card: CharacterCard): Promise<void> {
+  const config = activeConfig("tts");
+  if (!config) { savedMsg.value = t("请先配置 TTS"); return; }
+  const recorder = recorderRef.value;
+  if (!recorder) return;
+  const cardId = recordingChar.value;
+  recordingChar.value = null;
+  const secs = recordingSec.value;
+  if (recordTimer !== undefined) { window.clearInterval(recordTimer); recordTimer = undefined; }
+  const chunks = recordChunksRef.value;
+  stopRecordingNow();
+  if (secs < 10) { savedMsg.value = `录音时长不足（${secs}s），MiniMax 要求至少 10 秒`; return; }
+  if (secs > 300) { savedMsg.value = `录音过长（${secs}s），请控制在 5 分钟内`; return; }
+  if (!chunks.length) { savedMsg.value = "未录制到音频"; return; }
+  const blob = new Blob(chunks, { type: recorder.mimeType || "audio/webm" });
+  const audioB64 = await blobToBase64(blob);
+  const isWav = recorder.mimeType.includes("wav");
+  const mime = isWav ? "audio/wav" : recorder.mimeType || "audio/webm";
+  const fileName = `record_${Date.now()}.${isWav ? "wav" : "webm"}`;
+  voiceBusy.value = cardId ?? card.id;
+  try {
+    const profile = await createMiniMaxVoiceProfile({ name: `${card.name} 录音`, configId: config.id, fileName, mime, audioB64, consent: true });
+    card.voiceProfileId = profile.id; card.voiceName = undefined; savedMsg.value = `已用录音创建并绑定克隆声音：${profile.name}`;
+  } catch (error) { savedMsg.value = `创建声音失败：${errMsg(error)}`; }
+  finally { voiceBusy.value = null; }
+}
+
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result ?? "").split(",")[1] ?? "");
+    reader.onerror = () => reject(new Error(t("文件读取失败")));
+    reader.readAsDataURL(blob);
+  });
 }
 
 async function pickReferenceImage(card: CharacterCard): Promise<void> {
@@ -185,7 +296,7 @@ async function save(): Promise<void> {
     await saveEditedCards(projectState.outputDir, local.value, (m, level = "info") => {
       savedMsg.value = m;
       void level;
-    });
+    }, invalidateScript.value);
     emit("saved", local.value);
   } catch (e) {
     savedMsg.value = `保存失败：${errMsg(e)}`;
@@ -213,6 +324,10 @@ function removeCostume(c: CharacterCard, idx: number): void {
   c.costumes?.splice(idx, 1);
   if (!c.costumes?.length) c.costumes = undefined;
 }
+
+onBeforeUnmount(() => {
+  stopRecordingNow();
+});
 </script>
 
 <template>
@@ -221,13 +336,17 @@ function removeCostume(c: CharacterCard, idx: number): void {
     <div class="flex items-center justify-between mb-3">
       <h3 class="mb-0">{{ t("角色卡编辑（") }}{{ local.characters.length }}{{ t("）") }}</h3>
       <div class="flex gap-2 flex-none">
+        <label class="opt-item" style="margin: 0" :title="t('勾选后保存会清空剧本缓存，下次生成全部章节重新写剧本（白烧较多 token）；仅改了台词相关内容时才需要')">
+          <input type="checkbox" v-model="invalidateScript" />
+          {{ t("同时重写剧本") }}
+        </label>
         <button class="btn small" :disabled="busy" @click="save">{{ t("保存卡片") }}</button>
         <button class="btn secondary small" @click="reset">{{ t("放弃修改") }}</button>
       </div>
     </div>
     <p v-if="savedMsg" class="small mb-2" style="color: var(--ok)">{{ savedMsg }}</p>
     <p class="hint mb-2">
-      {{ t("修改角色外貌/服装/音色后保存：剧本与立绘会在下次生成时自动重新生成；背景/CG 保留。") }}
+      {{ t("修改外貌/服装/音色后保存：立绘会在下次生成时重新生成；剧本缓存默认保留（仅外貌/音色改动不会重跑全部剧本）。背景/CG 保留。") }}
     </p>
 
     <Disclosure
@@ -241,6 +360,13 @@ function removeCostume(c: CharacterCard, idx: number): void {
     >
       <div class="row">
         <label class="field"><span>{{ t("姓名") }}</span><input type="text" v-model="c.name" /></label>
+        <label class="field"><span>{{ t("性别") }}</span>
+          <select v-model="c.gender">
+            <option :value="undefined">{{ t("自动识别") }}</option>
+            <option value="male">{{ t("男") }}</option>
+            <option value="female">{{ t("女") }}</option>
+          </select>
+        </label>
         <label class="field"><span>{{ t("主题色") }}</span><input type="text" v-model="c.color" placeholder="#3b5bdb" /></label>
       </div>
       <label class="field"><span>{{ t("外貌") }}</span><input type="text" v-model="c.appearance" /></label>
@@ -252,11 +378,11 @@ function removeCostume(c: CharacterCard, idx: number): void {
           <input type="text" v-model="c.voiceDesc" />
         </label>
         <label class="field">
-          <span>{{ t("TTS 音色（可输入或选择）") }}</span>
-          <input type="text" list="novelforge-voices" v-model="c.voiceName" />
-          <datalist id="novelforge-voices">
-            <option v-for="v in voices" :key="v" :value="v" />
-          </datalist>
+          <span>{{ t("TTS 音色") }}</span>
+          <select v-model="c.voiceName" @change="c.voiceProfileId = undefined">
+            <option v-if="!c.voiceName" :value="undefined" disabled>{{ t("选择音色…") }}</option>
+            <option v-for="v in voiceOptionsForGender(c)" :key="v.id" :value="v.id">{{ v.label }}</option>
+          </select>
         </label>
       </div>
       <div class="field">
@@ -269,7 +395,22 @@ function removeCostume(c: CharacterCard, idx: number): void {
           <button class="btn secondary small" :disabled="voiceBusy === c.id" @click="chooseVoiceReference(c)">{{ voiceBusy === c.id ? "创建中..." : "上传参考音频创建" }}</button>
           <button class="btn ghost small" :disabled="voiceBusy === c.id" @click="importCharacterVoice(c)">导入已有 voice_id</button>
         </div>
-        <span class="faint small">创建时使用当前 TTS 配置；失败不会自动换成其他人物声音。</span>
+        <div class="row mt-2">
+          <button
+            v-if="recordingChar !== c.id"
+            class="btn danger small"
+            :disabled="voiceBusy === c.id"
+            @click="startSystemAudioRecording(c)"
+          >🎙 {{ t("录音（捕获正在播放的声音）") }}</button>
+          <template v-else>
+            <button class="btn danger small" @click="stopRecordingAndClone(c)" :disabled="voiceBusy === c.id">
+              {{ voiceBusy === c.id ? "创建中..." : `停止并克隆（${recordingSec}s）` }}
+            </button>
+            <button class="btn ghost small" @click="stopRecordingNow(); recordingChar = null; savedMsg = '已取消录音'">取消</button>
+          </template>
+        </div>
+        <span v-if="recordingChar === c.id" class="hint small">正在录音：请播放参考视频，系统会捕获其声音；至少 10 秒、最长 5 分钟。</span>
+        <span class="faint small">创建时使用当前 TTS 配置；失败不会自动换成其他人物声音。AI 提取时默认从上方音色列表挑选。</span>
       </div>
       <label class="field">
         <span>{{ t("立绘提示词（imagePrompt）") }}</span>

@@ -3,7 +3,7 @@
 //! - 断点续传（.part 文件 + Range 头）
 //! - 连接失败重试（指数退避，12 次封顶，可重试状态码 408/429/5xx）
 //! - md5 完整性校验（失败重下，3 轮）
-//! 模型文件保存在应用配置目录 models/ 下，经 model:// 自定义协议供前端 fetch。
+//! 模型文件保存在程序目录（resource_dir）models/ 下，经 model:// 自定义协议供前端 fetch。
 
 use once_cell::sync::OnceCell;
 use serde::Serialize;
@@ -49,16 +49,54 @@ pub struct ModelStatus {
     pub installed: bool,
 }
 
-/// 初始化模型目录（应用配置目录/models），首次启动 setup 时调用
+/// 初始化模型目录（程序目录/models），首次启动 setup 时调用
 pub fn init_models_dir<R: tauri::Runtime>(app: &impl Manager<R>) -> Result<PathBuf, String> {
     let dir = app
         .path()
-        .app_config_dir()
-        .map_err(|e| format!("获取应用配置目录失败: {e}"))?
+        .resource_dir()
+        .map_err(|e| format!("获取程序目录失败: {e}"))?
         .join("models");
     fs::create_dir_all(&dir).map_err(|e| format!("创建模型目录失败: {e}"))?;
+    migrate_old_models_dir(app, &dir);
     let _ = MODELS_DIR.set(dir.clone());
     Ok(dir)
+}
+
+/// 历史版本把模型放在应用配置目录（%APPDATA%）models/。新目录为空时把旧文件搬过去，
+/// 避免老用户已安装的模型失效（跨盘移动失败则退化为复制后删除）。
+fn migrate_old_models_dir<R: tauri::Runtime>(app: &impl Manager<R>, new_dir: &Path) {
+    let empty = fs::read_dir(new_dir)
+        .map(|mut it| it.next().is_none())
+        .unwrap_or(true);
+    if !empty {
+        return;
+    }
+    let Ok(old_dir) = app.path().app_config_dir().map(|d| d.join("models")) else {
+        return;
+    };
+    if !old_dir.is_dir() {
+        return;
+    }
+    let entries: Vec<_> = match fs::read_dir(&old_dir) {
+        Ok(it) => it.filter_map(|e| e.ok()).map(|e| e.path()).collect(),
+        Err(_) => return,
+    };
+    if entries.is_empty() {
+        return;
+    }
+    let mut copied = Vec::new();
+    for entry in &entries {
+        let Some(name) = entry.file_name() else { continue };
+        if fs::copy(entry, new_dir.join(&name)).is_ok() {
+            copied.push(entry.clone());
+        }
+    }
+    if copied.len() == entries.len() {
+        let _ = fs::remove_dir_all(&old_dir);
+        println!("[novelforge] 已把旧模型目录迁移到: {}", new_dir.display());
+    } else {
+        eprintln!("[novelforge] 警告: 旧模型迁移不完整，请手动处理 {}", old_dir.display());
+    }
 }
 
 pub fn models_dir() -> Option<&'static PathBuf> {

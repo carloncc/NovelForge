@@ -115,13 +115,173 @@ async function detectBatch(
   return { marks, discard };
 }
 
+const BEAT_SYSTEM = `你是网文改编分镜助手。用户会给你一批从同一章节中顺序截取的「内容块」（[块N] 标记开头），该章节太长，需要按剧情断点切成几段。
+请找出适合切分的断点：场景切换、时间跳跃、视角转换、战斗开始/结束、大事件转折处优先；不要在对话中途、连续动作中途切开。
+每段目标 15000～25000 字（按下限凑，宁可段少勿碎）。
+
+只输出 JSON，不要输出任何其他文字，格式：
+{"segments": [{"start": 1, "title": "夜探"}, {"start": 57, "title": "反杀"}]}
+- segments：按出现顺序；start 是该段起始块的数字 N（第一段 start 必须为 1）；title 是该段 2～10 字的短标题（从剧情提炼，不要用"第一部分"这类机械名）。
+- 若这批内容一气呵成不适合切分，segments 只含一个 start 为批首块号的元素。`;
+
+interface BeatSegment {
+  start: number;
+  title: string;
+}
+
+/** 超长章节的剧情断点切分（章内无标题可用时，替代机械按字数硬切） */
+async function detectBeatCuts(
+  cfg: ApiConfig,
+  blocks: string[],
+  batchStart: number,
+  onUsage?: (pt: number, ct: number) => void,
+): Promise<BeatSegment[]> {
+  const preview = blocks.map((b, i) => `[块${batchStart + i}] ${b.slice(0, 800)}`).join("\n\n");
+  const model = await chatJson<unknown>(cfg, BEAT_SYSTEM, `以下是这批内容块：\n\n${preview}`, {
+    maxTokens: 2000,
+    temperature: 0.1,
+    onUsage,
+  });
+  const list = Array.isArray(model)
+    ? (model as unknown[])
+    : Array.isArray((model as { segments?: unknown })?.segments)
+      ? ((model as { segments?: unknown[] }).segments as unknown[])
+      : [];
+  const segs: BeatSegment[] = [];
+  for (const item of list) {
+    const obj = item as { start?: unknown; title?: unknown };
+    const n = Number(obj?.start);
+    const title = typeof obj?.title === "string" ? obj.title.trim().slice(0, 10) : "";
+    if (Number.isFinite(n) && n >= batchStart && n < batchStart + blocks.length) {
+      segs.push({ start: n, title: title || `段${segs.length + 1}` });
+    }
+  }
+  segs.sort((a, b) => a.start - b.start);
+  return segs.filter((s, i) => i === 0 || s.start !== segs[i - 1].start);
+}
+
 const BATCH = 40; // 每批候选块数量
 // AI 分章并发数由文本 API 配置决定（concurrency 参数）；文本请求体较大，并发由该 API 的请求级限流器兜底，
 // 避免同时向文本 API 发大量请求触发网关限流/连接失败。
 
+/** 过小章节合并阈值：低于此字数的章节（插图/后记/特典碎章等）不再独占一章 */
+export const MIN_CHAPTER_CHARS = 3000;
+
+/** AI 分章统计（可选 out 参数，递归累加） */
+export interface SplitStats {
+  /** 丢弃的杂项块数 */
+  discarded?: number;
+  /** 参与识别的块数 */
+  blocks?: number;
+  /** 碎章合并数 */
+  mergedTiny?: number;
+}
+
+/**
+ * 碎章合并：小于 minChars 的章节并入相邻章节（优先并入前一章；首章并入后一章并保留后者标题）。
+ * 解决"插图/后记/特典独占一章"这类机械感；纯函数，可单测。
+ */
+export function mergeTinyChapters(chapters: ChapterInfo[], minChars = MIN_CHAPTER_CHARS): { chapters: ChapterInfo[]; merged: number } {
+  const out = chapters.map((c) => ({ ...c }));
+  let merged = 0;
+  for (let i = 0; i < out.length; i++) {
+    if (out.length <= 1) break;
+    if (out[i].text.length >= minChars) continue;
+    if (i === 0) {
+      out[1].text = `${out[0].text}\n\n${out[1].text}`;
+      out[1].charCount = out[1].text.length;
+      out.splice(0, 1);
+      i = -1; // 下标变化，全量重扫
+    } else {
+      out[i - 1].text = `${out[i - 1].text}\n\n${out[i].text}`;
+      out[i - 1].charCount = out[i - 1].text.length;
+      out.splice(i, 1);
+      i -= 1; // 配合 for 的 i++，下一轮复查被前移的新住户
+    }
+    merged++;
+  }
+  out.forEach((c, i) => (c.index = i));
+  return { chapters: out, merged };
+}
+
+/**
+ * 剧情断点切分：超长章节内找不到小标题时，按场景/事件断点切段（替代机械按字数硬切）。
+ * 返回的标题形如"父标题·短标题"，起不出名时用"父标题·上/中/下"。
+ */
+export async function aiSplitBeats(
+  cfg: ApiConfig,
+  text: string,
+  parentTitle: string,
+  maxChapterChars = 40000,
+  onUsage?: (pt: number, ct: number) => void,
+  concurrency = 3,
+): Promise<ChapterInfo[]> {
+  const blocks = splitBlocks(text);
+  if (blocks.length <= 1) return hardSplitBySentences(text, maxChapterChars);
+  // 分批找断点（与分章同并发模型）
+  const cuts = new Set<number>();
+  const titles = new Map<number, string>();
+  const queue: number[] = [];
+  for (let i = 0; i < blocks.length; i += BATCH) queue.push(i);
+  const workers = Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
+    while (queue.length) {
+      const start0 = queue.shift()!;
+      const batchBlocks = blocks.slice(start0, start0 + BATCH);
+      const segs = await detectBeatCuts(cfg, batchBlocks, start0 + 1, onUsage);
+      for (const s of segs) {
+        if (s.start === start0 + 1) {
+          if (!titles.has(s.start)) titles.set(s.start, s.title);
+          continue;
+        }
+        cuts.add(s.start);
+        if (!titles.has(s.start)) titles.set(s.start, s.title);
+      }
+      // 批首块恒为段起点（保证覆盖）
+      if (!titles.has(start0 + 1)) titles.set(start0 + 1, "");
+    }
+  });
+  await Promise.all(workers);
+  const bounds = [1, ...[...cuts].filter((c) => c > 1 && c <= blocks.length).sort((a, b) => a - b)];
+  // 断点过密（平均每段不足 3000 字）说明模型在碎切，只保留让每段尽量达标的稀疏子集
+  const target = Math.max(15000, Math.floor(maxChapterChars / 2));
+  const sparse: number[] = [1];
+  let acc = 0;
+  const blockLen = (i: number): number => blocks[i - 1]?.length ?? 0;
+  for (let k = 1; k < bounds.length; k++) {
+    let segLen = 0;
+    for (let b = bounds[k - 1]; b < bounds[k]; b++) segLen += blockLen(b);
+    acc += segLen;
+    if (acc >= target) {
+      sparse.push(bounds[k]);
+      acc = 0;
+    }
+  }
+  const use = sparse.length > 1 ? sparse : bounds;
+  const chapters: ChapterInfo[] = [];
+  const suffix = ["上", "中", "下", "四", "五", "六", "七", "八", "九", "十"];
+  for (let i = 0; i < use.length; i++) {
+    const start = use[i];
+    const end = i + 1 < use.length ? use[i + 1] : blocks.length + 1;
+    const segText = blocks.slice(start - 1, end - 1).join("\n\n").trim();
+    if (!segText) continue;
+    const beat = (titles.get(start) || "").trim();
+    const title = beat ? `${parentTitle}·${beat}` : `${parentTitle}·${suffix[chapters.length] ?? chapters.length + 1}`;
+    if (segText.length > maxChapterChars) {
+      // 单段仍超限（巨型单块极少见）：退化为按句硬切，标题顺延
+      const hard = hardSplitBySentences(segText, maxChapterChars);
+      hard.forEach((h, j) => chapters.push({ ...h, index: -1, title: j === 0 ? title : `${title}（${j + 1}）` }));
+    } else {
+      chapters.push({ index: -1, title, text: segText, charCount: segText.length });
+    }
+  }
+  if (!chapters.length) return hardSplitBySentences(text, maxChapterChars);
+  chapters.forEach((c, i) => (c.index = i));
+  return chapters;
+}
+
 /**
  * AI 分章：输入未切章全文，输出章节列表。
- * demo（无 LLM）时回退到简单规则：按固定块数切分。
+ * demo（无 API key 时）回退到简单规则：按固定块数切分。
  */
 export async function aiSplitChapters(
   cfg: ApiConfig,
@@ -130,6 +290,7 @@ export async function aiSplitChapters(
   maxChapterChars = 40000,
   feedback?: string,
   concurrency = 3,
+  stats?: SplitStats,
 ): Promise<ChapterInfo[]> {
   const blocks = splitBlocks(fullText);
   if (blocks.length <= 1) {
@@ -191,6 +352,10 @@ export async function aiSplitChapters(
     chapterCount: uniqueMarks.length,
     discardCount: discardSet.size,
   });
+  if (stats) {
+    stats.discarded = (stats.discarded ?? 0) + discardSet.size;
+    stats.blocks = (stats.blocks ?? 0) + blocks.length;
+  }
 
   // 用标题块作为边界切分正文；跳过被标记丢弃的杂项块
   const isDiscarded = (idx: number): boolean => discardSet.has(idx);
@@ -220,18 +385,39 @@ export async function aiSplitChapters(
     }
   }
 
-  // 章节内容可能仍超长（如整卷放在一章），若超过上限则继续对超长章递归切分
+  // 章节内容可能仍超长（如整卷放在一章）：优先递归找内层小标题；
+  // 章内无标题可用（递归只产出机械"第X部分"）时，改用剧情断点切分，不断在对话中途与连续动作中途
   const result: ChapterInfo[] = [];
   for (const ch of chapters) {
     if (ch.text.length > maxChapterChars) {
-      const sub = await aiSplitChapters(cfg, ch.text, onUsage, maxChapterChars, feedback, concurrency);
-      result.push(...sub.map((s, i) => ({ ...s, index: result.length + i, title: `${ch.title} ${i + 1}` })));
+      const sub = await aiSplitChapters(cfg, ch.text, onUsage, maxChapterChars, feedback, concurrency, stats);
+      const mechanical = sub.length > 1 && sub.every((s) => /^第\d+部分$/.test(s.title));
+      if (mechanical) {
+        log.info("split", `超长章无内层标题，改用剧情断点切分：${ch.title}`, { chars: ch.text.length });
+        const beats = await aiSplitBeats(cfg, ch.text, ch.title, maxChapterChars, onUsage, concurrency);
+        result.push(...beats.map((s, i) => ({ ...s, index: result.length + i })));
+      } else {
+        result.push(
+          ...sub.map((s, i) => ({
+            ...s,
+            index: result.length + i,
+            // 递归找到真实小标题则保留；机械名才挂父标题序号
+            title: /^第\d+部分$/.test(s.title) ? `${ch.title} ${i + 1}` : s.title,
+          })),
+        );
+      }
     } else {
       result.push(ch);
     }
   }
   result.forEach((c, i) => (c.index = i));
-  return result;
+  // 碎章合并：插图/后记/特典等不足 MIN_CHAPTER_CHARS 的章节并入相邻章节，不再独占一章
+  const merged = mergeTinyChapters(result, MIN_CHAPTER_CHARS);
+  if (merged.merged > 0) {
+    log.info("split", `碎章合并：${merged.merged} 个过小章节已并入相邻章节`, {});
+    if (stats) stats.mergedTiny = (stats.mergedTiny ?? 0) + merged.merged;
+  }
+  return merged.chapters;
 }
 
 /** 回退分章：按近似字数把全文切分成若干章 */

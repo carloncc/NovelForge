@@ -21,6 +21,8 @@ export interface RenderOptions {
   figureEmotions?: boolean;
   /** 人物动作：入场/退场动画、情绪动作、剧情镜头震动；默认开启 */
   figureActions?: boolean;
+  /** 环境音效音量（0-100，默认 35）：旧硬编码 25 偏小，快进/手机外放下几乎听不见 */
+  seVolume?: number;
 }
 
 export function sanitizeId(id: string): string {
@@ -227,20 +229,20 @@ export function renderChapter(
       const vocalFile = opts.assets.vocal[vocalKey];
       const vocalArg = vocalFile ? ` -${getBaseName(vocalFile)}` : "";
       out.push(`${name}:${esc(line.text)}${vocalArg};`);
-    } else if (line.monologue) {
-      if (useActions && isDramatic(line.text)) {
-        out.push(`setAnimation:shake -target=bg-main -next;`);
-        out.push(`setTransform:{"blur":5} -target=bg-main -duration=700 -next;`);
-        out.push(`setTransform:{"blur":0} -target=bg-main -duration=900 -next;`);
-      }
-      out.push(`intro:${esc(line.text)} -hold;`);
     } else {
+      // 旁白与内心独白统一走普通旁白行：intro: 指令不带语音播放，
+      // 之前独白渲染成 intro:…-v.mp3 导致引擎忽略语音后缀、独白全程无声。
+      // 改回 ':' 旁白行后与配音任务同 key，语音正常播放（独白仍可用文本样式区分）。
       if (useActions && isDramatic(line.text)) {
         out.push(`setAnimation:shake -target=bg-main -next;`);
         out.push(`setTransform:{"blur":5} -target=bg-main -duration=700 -next;`);
         out.push(`setTransform:{"blur":0} -target=bg-main -duration=900 -next;`);
       }
-      out.push(`:${esc(line.text)};`);
+      // 旁白同样带配音，避免整段静默
+      const narVocalKey = sceneVocalKey(chapter.chapter, scene.id, idx);
+      const narVocalFile = opts.assets.vocal[narVocalKey];
+      const narVocalArg = narVocalFile ? ` -${getBaseName(narVocalFile)}` : "";
+      out.push(`:${esc(line.text)}${narVocalArg};`);
     }
   };
 
@@ -251,7 +253,10 @@ export function renderChapter(
     // BGM：匹配到的音乐文件则播放（并解锁鉴赏）；无匹配则淡出停止，避免串场
     const bgmFile = opts.assets.bgm?.[scene.id];
     if (bgmFile) {
-      out.push(`bgm:${getBaseName(bgmFile)} -next;`);
+      // 起播带淡入（-enter），与停止时的淡出对称，避免硬切出戏；同曲连续场景不重播
+      if (bgmFile !== lastBgm) {
+        out.push(`bgm:${getBaseName(bgmFile)} -enter=1000 -next;`);
+      }
       if (!bgmUnlocked.has(bgmFile)) {
         bgmUnlocked.add(bgmFile);
         const bgmName = getBaseName(bgmFile).replace(/\.(mp3|ogg|wav|m4a|opus)$/i, "");
@@ -277,7 +282,8 @@ export function renderChapter(
     const se = detectSe(scene);
     if (se && se !== lastSe) {
       lastSe = se;
-      out.push(`playEffect:se_${se}.wav -volume=25 -next;`);
+      const seVolume = opts.seVolume ?? 35;
+      out.push(`playEffect:se_${se}.wav -volume=${seVolume} -next;`);
     }
 
     // 视频推荐位：有用户放置的视频文件则播放，否则注释占位（不执行）
@@ -295,7 +301,7 @@ export function renderChapter(
     // 直接用 scene.id 查不到会导致 CG 演出整段被跳过；scene.cgFile 是生成阶段写入的捷径，两者都兜底。
     const cgFile = scene.cgFile || opts.assets.cg[`${chapter.chapter}_${scene.id}`] || opts.assets.cg[scene.id];
     const cg = scene.cgEvent;
-    if (cg && cgFile) {
+    if (cgFile) {
       // CG 整幅插画演出：先清空立绘（避免人物与 CG 同屏叠加），播 CG 后恢复原立绘状态
       const useActions = opts.figureActions !== false;
       const clearExit = useActions ? " -exit=exit" : "";
@@ -303,11 +309,14 @@ export function renderChapter(
       out.push(`changeFigure:none -right${clearExit} -next;`);
       stageSlot.clear();
       stageOrder.length = 0;
+      // CG 后舞台实际已空，必须同步清立绘文件记忆，否则 CG 后同文件角色会被误判“未换装”而跳过 changeFigure，导致人物消失
+      lastFigureFile.clear();
       out.push(`changeBg:${getBaseName(cgFile)} -duration=400 -ease=easeInOut -next;`);
       // 名场面特写运镜：缓慢推近 CG，强化冲击力
       out.push(`setTransform:{"scale":{"x":1.08,"y":1.08}} -target=bg-main -duration=2500 -next;`);
-      out.push(`unlockCg:${getBaseName(cgFile)} -name=${esc(cg.title || cg.description || "CG")};`);
-      out.push(`:${esc(cg.description || cg.title)};`);
+      // 有 cgEvent 用事件标题/描述，无事件（旧图残留/手动放图）也解锁，避免鉴赏室漏 CG
+      out.push(`unlockCg:${getBaseName(cgFile)} -name=${esc(cg?.title || cg?.description || scene.location || "CG")};`);
+      out.push(`:${esc(cg?.description || cg?.title || `${scene.location} ${scene.atmosphere || ""}`.trim() || "名场面")};`);
       out.push(`changeBg:${bgFile ? getBaseName(bgFile) : "none"} -duration=500 -ease=easeInOut -next;`);
     }
 

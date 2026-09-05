@@ -74,6 +74,7 @@ export function useStageStatus(input: StageStatusInput) {
       cgPerChapter: 0,
       maxPerChapter: 0,
       figureEmotions: options.figureEmotions,
+      detail: options.figureDetail ?? "full",
       style: options.imageStyle,
       threeView: options.characterPoses !== false,
       actions: options.characterPoses !== false,

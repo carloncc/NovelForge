@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use tiny_http::{Header, Response, Server};
+use tiny_http::{Header, Server};
 
 pub struct ServerHandle {
     /// 持有 Arc<Server> 防止监听 socket 被提前 drop
@@ -65,6 +65,11 @@ pub fn start(root: &str) -> Result<ServerHandle, String> {
 
 fn handle_request(root: &Path, request: tiny_http::Request) {
     let url = request.url().to_string();
+    let range_header: Option<String> = request
+        .headers()
+        .iter()
+        .find(|h| h.field.as_str() == "Range")
+        .map(|h| h.value.as_str().to_string());
     let path_part = url.split('?').next().unwrap_or("/");
     let decoded = percent_decode(path_part);
     let rel = if decoded == "/" {
@@ -77,13 +82,14 @@ fn handle_request(root: &Path, request: tiny_http::Request) {
 
     let body: Vec<u8>;
     let ctype: String;
+    let mut status: u16 = 200;
+    let mut content_range: Option<String> = None;
 
     if let Some(candidate) = candidate {
         match std::fs::File::open(&candidate) {
             Ok(mut f) => {
                 let mut buf = Vec::new();
                 if f.read_to_end(&mut buf).is_ok() {
-                    body = buf;
                     let base = mime_guess::from_path(&candidate)
                         .first_or_octet_stream()
                         .to_string();
@@ -93,6 +99,24 @@ fn handle_request(root: &Path, request: tiny_http::Request) {
                         ctype = format!("{base}; charset=utf-8");
                     } else {
                         ctype = base;
+                    }
+                    // Range 断点续播：大 vocalmp3 / video mp4 快进 seek 必需，否则浏览器只能从头播，
+                    // “快进不断音频”的体感会被放大。单区间 bytes=start-end / bytes=start- / bytes=-suffix。
+                    if let Some(range_value) = range_header.as_deref() {
+                        if let Some((start, end)) = parse_range(range_value, buf.len() as u64) {
+                            let end = end.min(buf.len() as u64 - 1);
+                            if start <= end && (end as usize) < buf.len() {
+                                content_range = Some(format!("bytes {}-{}/{}", start, end, buf.len()));
+                                body = buf[start as usize..=end as usize].to_vec();
+                                status = 206;
+                            } else {
+                                body = buf;
+                            }
+                        } else {
+                            body = buf;
+                        }
+                    } else {
+                        body = buf;
                     }
                 } else {
                     body = b"read error".to_vec();
@@ -109,14 +133,49 @@ fn handle_request(root: &Path, request: tiny_http::Request) {
         ctype = "text/plain".to_string();
     }
 
-    let mut response = Response::from_data(body);
+    let mut response = tiny_http::Response::from_data(body);
+    response = response.with_status_code(status);
     if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], ctype.as_bytes()) {
         response = response.with_header(h);
     }
     if let Ok(h) = Header::from_bytes(&b"X-Content-Type-Options"[..], &b"nosniff"[..]) {
         response = response.with_header(h);
     }
+    // 声明断点续播能力，浏览器音频/视频标签才会发 Range 快进
+    if let Ok(h) = Header::from_bytes(&b"Accept-Ranges"[..], &b"bytes"[..]) {
+        response = response.with_header(h);
+    }
+    if let Some(cr) = content_range {
+        if let Ok(h) = Header::from_bytes(&b"Content-Range"[..], cr.as_bytes()) {
+            response = response.with_header(h);
+        }
+    }
     let _ = request.respond(response);
+}
+
+/// 解析 `bytes=start-end` 单区间；返回 (start, end inclusive)。非法返回 None。
+fn parse_range(value: &str, total: u64) -> Option<(u64, u64)> {
+    let value = value.trim();
+    let spec = value.strip_prefix("bytes=")?;
+    let (start_str, end_str) = spec.split_once('-')?;
+    if start_str.is_empty() {
+        // bytes=-N：取尾部 N 字节
+        let suffix: u64 = end_str.parse().ok()?;
+        if suffix == 0 || total == 0 {
+            return None;
+        }
+        let suffix = suffix.min(total);
+        return Some((total - suffix, total - 1));
+    }
+    let start: u64 = start_str.parse().ok()?;
+    if start >= total {
+        return None;
+    }
+    if end_str.is_empty() {
+        return Some((start, total - 1));
+    }
+    let end: u64 = end_str.parse().ok()?;
+    Some((start, end))
 }
 
 fn percent_decode(s: &str) -> String {
@@ -156,7 +215,7 @@ struct _MutexGuardGuard(Mutex<()>);
 
 #[cfg(test)]
 mod tests {
-    use super::safe_file_path;
+    use super::{parse_range, safe_file_path};
     use std::fs;
 
     #[test]
@@ -171,5 +230,14 @@ mod tests {
         assert!(safe_file_path(&canonical_root, std::path::Path::new("../outside.txt")).is_none());
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parse_range_single_interval() {
+        assert_eq!(parse_range("bytes=0-99", 200), Some((0, 99)));
+        assert_eq!(parse_range("bytes=100-", 200), Some((100, 199)));
+        assert_eq!(parse_range("bytes=-50", 200), Some((150, 199)));
+        assert_eq!(parse_range("bytes=500-", 200), None);
+        assert_eq!(parse_range("invalid", 200), None);
     }
 }

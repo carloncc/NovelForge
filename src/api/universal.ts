@@ -72,6 +72,10 @@ export interface UnifiedTtsInput {
   text: string;
   voice: string;
   format?: "mp3" | "ogg" | "wav" | "opus";
+  /** 每句语速（0.5-2），优先于全局配置 */
+  speed?: number;
+  /** 每句配音情绪，优先于全局配置 */
+  ttsEmotion?: string;
 }
 
 export interface UnifiedResult {
@@ -673,6 +677,7 @@ export async function unifiedTts(
   template: AdapterTemplate,
   input: UnifiedTtsInput,
 ): Promise<UnifiedResult> {
+  const extra = (cfg.extra ?? {}) as Record<string, unknown>;
   return callUnified({
     cfg,
     template,
@@ -680,7 +685,14 @@ export async function unifiedTts(
       text: input.text,
       model: cfg.model,
       voice: input.voice,
-      format: input.format ?? "mp3",
+      format: (typeof extra.ttsFormat === "string" && extra.ttsFormat) ? extra.ttsFormat : input.format ?? "mp3",
+      // 每句标注优先，其次全局配置；缺省语速 1.1（官方默认 1.0 对中文朗读偏慢、像念字）
+      emotion: typeof input.ttsEmotion === "string" && input.ttsEmotion
+        ? input.ttsEmotion
+        : typeof extra.emotion === "string" && extra.emotion ? extra.emotion : undefined,
+      speed: typeof input.speed === "number" ? input.speed : typeof extra.speed === "number" ? extra.speed : 1.1,
+      vol: typeof extra.vol === "number" ? extra.vol : 1,
+      pitch: typeof extra.pitch === "number" ? extra.pitch : 0,
     },
   });
 }

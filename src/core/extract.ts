@@ -13,13 +13,14 @@ const SYSTEM_PROMPT = `你是视觉小说制作人。从小说文本中提取制
    - clothing: 服装描述（颜色、款式）
    - personality: 性格特征
    - voiceDesc: 适合的音色描述（如"清冷的女声"）
-   - voiceName: TTS 音色标识，必须从下面"可用音色列表"中选择最接近的一个（如果没有完全匹配的，选最接近的；不要编造列表外的值）
-   - imagePrompt: 用于 AI 绘画生成立绘的完整英文 prompt，只描述人物本身（全身像、服装、发型、表情、姿态），禁止写任何背景/底色/场地/环境描述（系统会自动附加纯绿幕背景），风格统一为"动漫风格，精美立绘"
-   - threeViewPrompt: 用于生成该角色"三视图参考图"（正面/侧面/背面）的完整英文 prompt：同一角色设定、站姿自然、表情平静、全身可见，同样禁止写任何背景/底色描述（系统会自动附加纯绿幕背景）。此图会作为该角色所有立绘/表情/动作的图生图参考，务必与人物的 imagePrompt 描述完全一致
-   - actions: 该角色可能做出的经典动作（用于动作立绘，基于三视图图生图，数量不限，按角色特点给出；动作多的角色可以多给）：
-     - id: 简短英文标识（如 point/wave/cross/crouch/hold）
-     - name: 动作中文名（如 抬手、挥手、抱臂、蹲下、持剑）
-     - prompt: 该动作的完整英文 prompt，在保持人物外观（发型/服装/体型）完全一致的前提下描述动作姿态与表情，纯色背景，全身可见，动漫风格
+   - gender: 角色性别，填 "male"（男）或 "female"（女）
+   - voiceName: TTS 音色标识，必须从下面"可用音色列表"中选择最接近的一个，**且性别必须与角色的 gender 一致**（男性角色只能选男声音色，女性角色只能选女声音色；如果列表里没有匹配性别的，选该性别下最接近的；不要编造列表外的值）
+    - imagePrompt: 用于 AI 绘画生成立绘的完整英文 prompt，只描述人物本身（全身像、服装、发型、表情），姿态必须为自然放松站姿、双臂自然下垂，不要设计任何手势动作；禁止写任何背景/底色/场地/环境描述（系统会自动附加纯绿幕背景），风格统一为"动漫风格，精美立绘"
+    - threeViewPrompt: 用于生成该角色"三视图参考图"（正面/侧面/背面）的完整英文 prompt：同一角色设定、站姿自然、表情平静、全身可见，同样禁止写任何背景/底色描述（系统会自动附加纯绿幕背景）。此图会作为该角色所有立绘/表情/动作的图生图参考，务必与人物的 imagePrompt 描述完全一致
+    - actions: 该角色可能做出的经典自然动作（日常站姿/行走/坐姿/持物等真实姿态，用于动作立绘，基于三视图图生图，数量不限，按角色特点给出；不要设计夸张手势或凭空加手部动作）：
+      - id: 简短英文标识（如 point/wave/cross/crouch/hold）
+      - name: 动作中文名（如 抬手、挥手、抱臂、蹲下、持剑）
+      - prompt: 该动作的完整英文 prompt，在保持人物外观（发型/服装/体型）完全一致的前提下描述动作姿态与表情（表情类动作如撒娇/鼓脸/微笑只描述面部表情，身体保持自然站姿、不要加任何手部动作），纯色背景，全身可见，动漫风格
    - costumes: 该角色的服装差分（用于换装演出与鉴赏室），数量按剧情决定、不设上限；剧情中出现换装的场景（如日常服、礼服、战斗服、睡衣等）都要收录；至少包含剧情主要服装：
      - id: 简短英文标识（如 casual/formal/battle/pajama）
      - name: 服装中文名（如 日常服、礼服、战斗服）
@@ -52,8 +53,22 @@ export function normalizeExtractionResult(result: ExtractionResult, lib: string[
   result.items = result.items ?? [];
   result.title = result.title || title;
   for (const c of result.characters) {
+    if (c.gender !== "male" && c.gender !== "female") {
+      c.gender = /女|她|小姐|少女|母亲|奶奶|姐姐|妈妈|公主/i.test(c.appearance + c.name + c.personality) ? "female" : "male";
+    }
     if (!c.voiceName || !lib.includes(c.voiceName)) {
       c.voiceName = lib[0] || c.voiceName || "default";
+    }
+    // 性别兜底：AI 选的音色性别与角色不符时，从同性别音色里重选（无同性别则保持原值）
+    if (c.gender && c.voiceName) {
+      const wantFemale = c.gender === "female";
+      const voiceIsFemale = /^female|女/.test(c.voiceName);
+      const voiceIsMale = /^male|男/.test(c.voiceName);
+      const mismatch = (wantFemale && voiceIsMale) || (!wantFemale && voiceIsFemale);
+      if (mismatch) {
+        const sameGender = lib.find((id) => (wantFemale ? /^female|女/.test(id) : /^male|男/.test(id)));
+        if (sameGender) c.voiceName = sameGender;
+      }
     }
     // 动作列表归一化：只保留 id/name/prompt 都合法的项（数量不限，按剧情提取）
     if (Array.isArray(c.actions)) {
@@ -80,8 +95,15 @@ export async function extractFromNovel(
 ): Promise<ExtractionResult> {
   const lib = voiceLibraryFor(cfg);
   const fb = feedback ? `\n\n用户对上一版提取结果的修改意见（请严格参考并落实）：${feedback}` : "";
-  const user = `小说标题：${title}\n\n可用音色列表：${lib.join(", ")}${fb}\n\n以下是小说全文（按模型上下文动态截断，剩余部分将不被 LLM 看到）：\n${truncate(novelText, inputCharBudget(cfg))}`;
-  const outputTokens = Math.min(resolveContextLength(cfg), 240_000);
+  // 按性别标注音色，帮助 AI 给角色分配符合性别的音色（MiniMax 音色 ID 前缀含 male/female）
+  const genderedLib = lib
+    .map((id) => {
+      const g = /^male|^[a-z-]*男/.test(id) ? "（男）" : /^female|^[a-z-]*女/.test(id) ? "（女）" : "";
+      return `${id}${g}`;
+    })
+    .join(", ");
+  const user = `小说标题：${title}\n\n可用音色列表（已标注性别）：${genderedLib}\n\n请为每个角色挑选与其 gender 匹配性别的音色。${fb}\n\n以下是小说全文（按模型上下文动态截断，剩余部分将不被 LLM 看到）：\n${truncate(novelText, inputCharBudget(cfg))}`;
+  const outputTokens = Math.min(resolveContextLength(cfg), 32_768);
   const result = await chatJson<ExtractionResult>(cfg, SYSTEM_PROMPT, user, { maxTokens: outputTokens, onUsage });
   return normalizeExtractionResult(result, lib, title);
 }

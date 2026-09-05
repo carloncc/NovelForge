@@ -39,3 +39,30 @@ export function jsonKey(kind: string, key: string): string {
 export function slugify(s: string): string {
   return safeFilename(s, 60);
 }
+
+/** 短标题哈希（缓存文件名用，非加密） */
+export function titleHash(title: string): string {
+  let h = 5381;
+  for (const ch of title) {
+    h = ((h * 33) ^ ch.codePointAt(0)!) >>> 0;
+  }
+  return h.toString(36);
+}
+
+/** 剧本缓存键后半段（标题哈希＋正文全文指纹＋文风）。
+ * 正文必须取全文哈希：旧实现只取前 8000 字，超长章后半改动检测不到、误命中旧剧本。 */
+export function scriptCacheRest(title: string, text: string, styleFrag: string): string {
+  return `${titleHash(title)}_t${titleHash(text || "")}${styleFrag}`;
+}
+
+/** 剧本缓存文件名：与管线 scriptWorker 的 cacheFile 公式唯一对应，供管线内外复用 */
+export function scriptCacheFileName(
+  cacheDir: string,
+  demo: boolean,
+  chapterIndex: number,
+  title: string,
+  text: string,
+  styleFrag: string,
+): string {
+  return `${cacheDir}/${demo ? "script_demo" : "script"}_ch${chapterIndex + 1}_${scriptCacheRest(title, text, styleFrag)}.json`;
+}

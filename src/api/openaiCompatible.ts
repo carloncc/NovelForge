@@ -144,7 +144,7 @@ function b64ToUtf8(b64: string): string {
 const BUILTIN_CHANNEL_MODELS: Partial<Record<ProviderId, Partial<Record<ChannelKey, string[]>>>> = {
   minimax: {
     image: ["image-01", "image-01-live"],
-    tts: ["speech-2.8-hd", "speech-2.6-hd", "speech-01-hd", "speech-01-turbo"],
+    tts: ["speech-2.8-hd", "speech-2.8-turbo", "speech-2.6-hd", "speech-2.6-turbo", "speech-02-hd", "speech-02-turbo"],
   },
   siliconflow: {
     image: ["Qwen/Qwen-Image-Edit-2509", "black-forest-labs/FLUX.1-schnell", "Kwai-Kolors/Kolors"],
@@ -278,12 +278,17 @@ function extractProviderBaseError(data: unknown): string | null {
 }
 
 /**
- * 统一重试：错误分类驱动 + 递增间隔（首次 1s、二次 10s、之后每次 +10s，封顶 60s）。
+ * 统一重试：错误分类驱动 + 递增间隔（首次 1s、二次 10s、之后 +10s，封顶 60s）。
  * 硬失败（鉴权/参数/中止/内容审查）立即抛出；网络/限流/未知退避重试。
+ * 对不稳定中转代理（如 opencode.ai/zen）提供更充分的恢复机会：最多 4 次重试。
  */
-export async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
+export async function withRetry<T>(
+  fn: () => Promise<T>,
+  opts?: { retries?: number; delayFor?: (attempt: number) => number },
+): Promise<T> {
   let lastErr: unknown;
-  const retries = 2;
+  const retries = opts?.retries ?? 4;
+  const delayFor = opts?.delayFor ?? retryDelayFor;
   for (let attempt = 0; ; attempt++) {
     try {
       return await fn();
@@ -295,7 +300,7 @@ export async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
         throw e;
       }
       if (attempt >= retries) throw e;
-      const delay = retryDelayFor(attempt);
+      const delay = delayFor(attempt);
       log.warn("api", `请求失败，${delay / 1000}s 后第 ${attempt + 1} 次重试`, {
         status: status ?? 0,
         message: String(e instanceof Error ? e.message : e).slice(0, 300),
@@ -821,6 +826,7 @@ export async function ttsSpeech(
   text: string,
   voice: string,
   _timeoutSecs = 120,
+  perLine?: { speed?: number; ttsEmotion?: string },
 ): Promise<{ dataB64: string; mime: string }> {
   const tpl = resolveTemplate(cfg) ?? getTemplate("openai-tts")!;
   const done = log.time("api", `ttsSpeech ${cfg.model} ${voice}`);
@@ -834,10 +840,13 @@ export async function ttsSpeech(
     textHead: text.slice(0, 80),
   });
   try {
-    const r = await unifiedTts(cfg, tpl, { text, voice });
+    const r = await unifiedTts(cfg, tpl, { text, voice, speed: perLine?.speed, ttsEmotion: perLine?.ttsEmotion });
+    // MiniMax 支持 mp3/wav/flac：mime 按用户配置的输出格式修正，避免扩展名/类型判断错误
+    const fmt = ((cfg.extra as Record<string, unknown> | undefined)?.ttsFormat as string | undefined) ?? "";
+    const mime = fmt === "wav" ? "audio/wav" : fmt === "flac" ? "audio/flac" : r.mime;
     done(`b64len=${r.dataB64.length}`);
-    log.debug("api", "ttsSpeech 成功", { dataB64Len: r.dataB64.length, mime: r.mime });
-    return r;
+    log.debug("api", "ttsSpeech 成功", { dataB64Len: r.dataB64.length, mime });
+    return { dataB64: r.dataB64, mime };
   } catch (e) {
     log.error("api", "ttsSpeech 失败", { error: e instanceof Error ? e.message : e });
     throw e;

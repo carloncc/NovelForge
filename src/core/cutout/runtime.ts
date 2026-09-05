@@ -141,7 +141,7 @@ export class CutoutRuntime {
         this.session = await ort.InferenceSession.create(this.modelUrl, { executionProviders: ["wasm"] });
         backend = "wasm";
       } else {
-        throw new Error(`模型会话创建失败：${describeError(error).message ?? String(error)}`);
+        throw new Error(`模型会话创建失败（执行器 ${providers.join("/")}，模型地址 ${this.modelUrl}）：${describeError(error).message ?? String(error)}`);
       }
     }
     this.backend = backend;
@@ -181,7 +181,11 @@ export class CutoutRuntime {
           );
         }
         const ort = await this.importOrt();
-        this.session = await ort.InferenceSession.create(this.modelUrl, { executionProviders: ["wasm"] });
+        try {
+          this.session = await ort.InferenceSession.create(this.modelUrl, { executionProviders: ["wasm"] });
+        } catch (error) {
+          throw new Error(`模型会话创建失败（执行器 wasm，模型地址 ${this.modelUrl}）：${describeError(error).message ?? String(error)}`);
+        }
         this.backend = "wasm";
         return this.runInference(image);
       }

@@ -2,6 +2,7 @@ import type {
   ApiConfig,
   ChapterScript,
   ExtractionResult,
+  FigureDetail,
   ImageTask,
   MaterialAsset,
   PipelineEvent,
@@ -29,6 +30,8 @@ export interface RegenContext {
   style?: string;
   /** 是否生成表情差分（跟随生成页设置） */
   figureEmotions?: boolean;
+  /** 人物图详细度（跟随生成页设置；core 省图） */
+  figureDetail?: FigureDetail;
   /** 是否包含三视图（跟随生成页设置） */
   threeView?: boolean;
   /** 是否包含动作立绘（跟随生成页设置） */
@@ -89,6 +92,7 @@ export async function regenerateImages(
   const approvedBible = ctx.visualBible?.status === "approved" ? ctx.visualBible : undefined;
   const allTasks = buildImageTasks(ctx.chapters, ctx.cards, {
     figureEmotions: ctx.figureEmotions ?? true,
+    detail: ctx.figureDetail ?? "full",
     threeView: ctx.threeView !== false,
     actions: ctx.actions !== false,
     maxActionsPerCharacter: 0,
@@ -126,6 +130,9 @@ export async function regenerateImages(
   const total = tasks.length;
   let done = 0;
   const results: RegenImageResult[] = [];
+  // 单张失败只跳过该张、继续其余任务：此前任一任务抛错会导致 Promise.all 整体失败，
+  // 中断点之后的所有任务不再执行，"补全缺失"每次都剩下一批漏网。
+  const failed: string[] = [];
   // 每完成一张立即增量合并进 assets.json：批量重生成过程中素材页也能逐张看到新图。
   // 用串行链防并发 read-modify-write 丢失（多 worker 同时合并会互相覆盖）。
   let mergeChain: Promise<void> = Promise.resolve();
@@ -172,17 +179,29 @@ export async function regenerateImages(
       while (idx < layerTasks.length) {
         if (signal?.aborted()) return;
         const task = layerTasks[idx++];
-        const path = await runImageTask(ctx.cfg, task, cacheRoot, ctx.log, {
-          materials: ctx.materials,
-          force: true,
-          figureBase,
-          visualBible: approvedBible,
-          outputDir: ctx.outputDir,
-          verifyCfg: ctx.verifyCfg,
-          visionCfg: ctx.visionCfg,
-          safeRewriteCfg: ctx.safeRewriteCfg,
-          styleAnchorPath: anchorPath,
-        });
+        let path: string | null = null;
+        try {
+          path = await runImageTask(ctx.cfg, task, cacheRoot, ctx.log, {
+            materials: ctx.materials,
+            force: true,
+            figureBase,
+            visualBible: approvedBible,
+            outputDir: ctx.outputDir,
+            verifyCfg: ctx.verifyCfg,
+            visionCfg: ctx.visionCfg,
+            safeRewriteCfg: ctx.safeRewriteCfg,
+            styleAnchorPath: anchorPath,
+          });
+        } catch (e) {
+          // runImageTask 内部已记录失败详情；这里只记账并继续，不中断整批
+          failed.push(task.usage ?? task.fileName);
+          ctx.log({
+            step: "素材",
+            message: `已跳过失败任务，继续其余重生成：${task.usage ?? task.fileName}`,
+            level: "warn",
+            at: Date.now(),
+          });
+        }
         done++;
         if (path) {
           results.push({ task, path });
@@ -196,6 +215,14 @@ export async function regenerateImages(
       }
     };
     await Promise.all(Array.from({ length: Math.min(concurrency, layerTasks.length) }, () => worker()));
+  }
+  if (failed.length) {
+    ctx.log({
+      step: "素材",
+      message: `批量重生成结束，${failed.length} 个任务失败已跳过：${failed.slice(0, 8).join("、")}${failed.length > 8 ? "…" : ""}`,
+      level: "warn",
+      at: Date.now(),
+    });
   }
   return results;
 }
@@ -217,6 +244,7 @@ export function imageTaskMatchesSelectionKey(task: ImageTask, key: string): bool
     case "bg":
       return task.kind === "background" && task.id === parts[1];
     case "cg":
+      // 选择键为 1-based 显示章号（cg:1:s1），任务 id 为 0-based（0_s1），此处 -1 对齐
       return task.kind === "cg" && task.id === `${Number(parts[1]) - 1}_${parts[2]}`;
     default:
       return false;
@@ -311,7 +339,10 @@ export function regenerateBackground(
   return regenerateImages(ctx, (t) => t.kind === "background" && t.id === sceneId, feedback, signal, onProgress);
 }
 
-/** 重新生成某张 CG */
+/** 重新生成某张 CG
+ * @param chapterNo 0-based 章号（仅保留参数兼容，CG 键已改为纯 scene.id，不再含章节号）；
+ * 调用方若持有 1-based 显示章号需先 -1（GeneratePage.regenCgRow 已做 chapter-1）。
+ */
 export function regenerateCg(
   ctx: RegenContext,
   chapterNo: number,
@@ -320,7 +351,8 @@ export function regenerateCg(
   signal?: { aborted: () => boolean },
   onProgress?: (done: number, total: number, label: string) => void,
 ): Promise<RegenImageResult[]> {
-  return regenerateImages(ctx, (t) => t.kind === "cg" && t.id === `${chapterNo}_${sceneId}`, feedback, signal, onProgress);
+  void chapterNo;
+  return regenerateImages(ctx, (t) => t.kind === "cg" && t.id === sceneId, feedback, signal, onProgress);
 }
 
 async function mergeVocal(outputDir: string, key: string, path: string): Promise<void> {

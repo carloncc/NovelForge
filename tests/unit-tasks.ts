@@ -58,15 +58,35 @@ if (!bgAnchor.prompt.includes("same exact art style")) throw new Error("开启�
 const figAnchor = tasksOn.find((t) => t.kind === "figure" && t.emotion === "normal")!;
 if (figAnchor.prompt.includes("same exact art style")) throw new Error("立绘不应使用背景的画风锚定提示");
 
-// 固定种子：指定 baseSeed 时每个任务分配唯一稳定种子，锚点取 baseSeed 本身
+// 固定种子：指定 baseSeed 时每个任务按 id 派生唯一稳定种子（与任务顺序无关，增删任务不漂移）
 const tasksSeeded = buildImageTasks(scripts, cards, { baseSeed: 12345 });
 const seeds = tasksSeeded.map((t) => t.seed);
 if (seeds.some((s) => s === undefined)) throw new Error("baseSeed 已指定但存在无种子任务");
 if (new Set(seeds).size !== seeds.length) throw new Error("种子应有唯一性");
-const anchorSeed = tasksSeeded.find((t) => t.kind === "anchor")!.seed;
-if (anchorSeed !== 12345) throw new Error("锚点应使用 baseSeed 本身作为种子");
-const sorted = seeds.slice().sort((a, b) => a! - b!);
-if (sorted.some((s, i) => i > 0 && s! - sorted[i - 1]! !== 1)) throw new Error("种子应按任务顺序连续递增");
+if (seeds.some((s) => !Number.isInteger(s) || s! < 0 || s! >= 2147483647)) throw new Error("种子应在 31bit 范围内");
+// 重建稳定性：同输入同 id 同出现次序种子一致
+const againSeeded = buildImageTasks(scripts, cards, { baseSeed: 12345 });
+if (againSeeded.length !== tasksSeeded.length) throw new Error("同输入重建任务数应一致");
+for (let i = 0; i < againSeeded.length; i++) {
+  const t = againSeeded[i];
+  const o = tasksSeeded[i];
+  if (t.kind !== o.kind || t.id !== o.id || t.fileName !== o.fileName) throw new Error("同输入重建任务序列应一致");
+  if (o.seed !== t.seed) throw new Error(`任务 ${t.kind}:${t.id} 种子不稳定`);
+}
+// 顺序无关：只取第一章子集构建，既有任务种子不变（旧 baseSeed+i 语义下会全漂移）
+// （同 id 多次出现时按出现次序配对比较）
+const subsetSeeded = buildImageTasks([scripts[0]], cards, { baseSeed: 12345 });
+const pool = new Map<string, { seed: number | undefined }[]>();
+for (const o of tasksSeeded) {
+  const k = `${o.kind}:${o.id}:${o.fileName}`;
+  if (!pool.has(k)) pool.set(k, []);
+  pool.get(k)!.push(o);
+}
+for (const t of subsetSeeded) {
+  const k = `${t.kind}:${t.id}:${t.fileName}`;
+  const orig = pool.get(k)?.shift();
+  if (orig && orig.seed !== t.seed) throw new Error(`子集任务 ${t.kind}:${t.id} 种子漂移`);
+}
 
 // 图生图参考链：默认立绘引用三视图，表情引用默认立绘
 const emoTask = tasksOn.find((t) => t.kind === "figure" && t.emotion === "happy")!;

@@ -83,10 +83,12 @@ function main(): void {
   const cfg: ApiConfig = { id: "t", name: "t", baseUrl: "http://localhost", apiKey: "x", model: "m" };
   const jobs = buildVoiceJobs(cfg, [chapterWithChoice()], cards.characters);
   const branchKeys = jobs.map((j) => j.key);
-  // 主流程 2 句 + 分支 2 + 1 句 = 5 句对话配音
-  assert(branchKeys.length === 3, `配音任务数异常: ${branchKeys.length}`);
+  // 主流程 2 句（1 对话 + 1 旁白）+ 分支 3 句（2 对话 + 1 旁白）= 5 个配音任务（旁白按默认音色配音）
+  assert(branchKeys.length === 5, `配音任务数异常: ${branchKeys.length}`);
   assert(branchKeys.includes(sceneVocalKey(0, "s1", 0)), "主流程台词语音键缺失");
+  assert(branchKeys.includes(sceneVocalKey(0, "s1", 1)), "主流程旁白语音键缺失");
   assert(branchKeys.includes(sceneVocalKey(0, "s1", 2 + 1000 * 1 + 0)), "分支 1 语音键缺失");
+  assert(branchKeys.includes(sceneVocalKey(0, "s1", 2 + 1000 * 1 + 1)), "分支 1 旁白语音键缺失");
   assert(branchKeys.includes(sceneVocalKey(0, "s1", 2 + 1000 * 2 + 0)), "分支 2 语音键缺失");
 
   // 5) 无 choices 时正常渲染，不产生 choose/label

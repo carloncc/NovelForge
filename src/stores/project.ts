@@ -34,6 +34,7 @@ const DEFAULT_OPTIONS: GenerationOptions = {
   useVideoPoints: true,
   useBgm: true,
   figureEmotions: true,
+  figureDetail: "full",
   figureActions: true,
   characterPoses: true,
   imageSelfCheck: false,

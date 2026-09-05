@@ -25,6 +25,10 @@ const PATTERNS: Record<Exclude<ErrorClass, "unknown">, RegExp[]> = {
     /裸露|色情|情色|涩情|性化|未成年|成人内容|不当内容|防护限制|安全防护|violates? (our )?(safety|content|moderation)/i,
     /(explicit|sexual|adult|nude|nudity|pornographic).{0,30}(content|image|depiction|policy|not allowed)/i,
     /cannot (help|generate|produce).{0,30}(sexually|explicit|adult|sexualized)/i,
+    // 中文内容政策回执（如 OpenAI/Gemini 中文翻译“可能违反了我们的内容政策…判断有误…重试或修改提示语”）
+    /内容政策|内容准则|内容规范|内容安全策略|安全准则|社区准则/i,
+    /违反(了)?(我们|我方|平台)?(的)?(内容|安全|审核|发布|服务|社区)?(政策|准则|规范|规则|规定)/i,
+    /判断有误|重试或修改(提示|提示语|提示词|prompt)/i,
   ],
   rate_limit: [
     /\b429\b/i,

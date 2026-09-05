@@ -74,8 +74,9 @@ export async function lintProject(outputDir: string): Promise<LintReport> {
   const assetDirOf = (cmd: string): string | null => {
     if (cmd === "changeBg" || cmd === "unlockCg") return "background";
     if (cmd === "changeFigure") return "figure";
-    if (cmd === "bgm") return "bgm";
+    if (cmd === "bgm" || cmd === "unlockBgm") return "bgm";
     if (cmd === "playVideo") return "video";
+    if (cmd === "playEffect") return "vocal";
     return null;
   };
 
@@ -111,7 +112,8 @@ export async function lintProject(outputDir: string): Promise<LintReport> {
         if (cmd === "changeFigure") figureRefs++;
         if (cmd === "playVideo") videoRefs++;
         const assetDir = assetDirOf(cmd);
-        if (assetDir && cmd !== "unlockCg") {
+        // unlockCg/unlockBgm/playEffect 均需校验存在性；bgm:none / changeFigure:none 豁免
+        if (assetDir) {
           const fileName = line.slice(cmd.length + 1).split(" ")[0].replace(/;$/, "").toLowerCase();
           if (fileName !== "none" && !assetFiles[assetDir].has(fileName)) {
             report.summary.missingAssets++;
@@ -123,8 +125,8 @@ export async function lintProject(outputDir: string): Promise<LintReport> {
 
       if (LINE_RE.test(line)) {
         lineCount++;
-        // 对话语音参数 -xxx.mp3;
-        const vocalMatch = line.match(/ -([\w\u4e00-\u9fa5.-]+\.(mp3|ogg|opus|wav));$/);
+        // 对话语音参数 -xxx.mp3;（含 flac/m4a/opus/ogg/wav 全格式）
+        const vocalMatch = line.match(/ -([\w\u4e00-\u9fa5.-]+\.(mp3|ogg|opus|wav|flac|m4a));$/);
         if (vocalMatch) {
           vocalRefs++;
           const v = vocalMatch[1].toLowerCase();
@@ -132,6 +134,11 @@ export async function lintProject(outputDir: string): Promise<LintReport> {
             report.summary.missingAssets++;
             err(`素材(${f.name})`, `配音缺失：${v}（game/vocal/ 中不存在）`);
           }
+        }
+        // 超长台词告警：单句过长会导致 TTS 音频过长，快进时必被截断，建议拆句
+        const textPart = line.split(":").slice(1).join(":").replace(/ -[^ ]+\.(mp3|ogg|opus|wav|flac|m4a);$/, "");
+        if (textPart.length > 200) {
+          warn(`体验(${f.name})`, `超长台词（${textPart.length}字）快进易被截断，建议拆成短句`);
         }
         continue;
       }

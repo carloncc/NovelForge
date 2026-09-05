@@ -903,7 +903,7 @@ export async function regenerateCharacterDescription(
 1. 必须输出严格的 JSON，不要 markdown 代码块，不要任何其他文字
 2. 不要在 imagePrompt / threeViewPrompt 中写任何背景/底色/场地/环境描述（背景由系统统一附加纯绿幕 chroma key green，prompt 里写了反而会造成底色冲突）
 3. 描述该角色的发型/瞳色/服装/体型/气质，不要凭空添加小说里没有的元素
-4. 全身可见（full body visible），站姿自然，动漫风格
+4. 全身可见（full body visible），自然放松站姿、双臂自然下垂、不设计任何手势动作，动漫风格
 
 输出 JSON 字段：
 {
@@ -1016,7 +1016,6 @@ function isVisualBibleCharacter(rawCharacter: unknown): rawCharacter is VisualBi
     && Number.isInteger(candidate.revision) && candidate.revision! >= 0
     && (candidate.actionIds === undefined || (
       Array.isArray(candidate.actionIds)
-      && candidate.actionIds.length <= 4
       && candidate.actionIds.every((actionId) => typeof actionId === "string")
     ))
     && (candidate.sourceRevision === undefined || (Number.isInteger(candidate.sourceRevision) && candidate.sourceRevision >= 0))

@@ -85,11 +85,29 @@ async function ensureGameUi() {
   }
 }
 
+/**
+ * 配音中断定制：WebGAL 引擎默认 voiceInterruption=no，导致快进/跳句时旧语音完整播完、不中断。
+ * 这里把默认值改为 yes（新句开始即中断上一句语音），让生成的游戏更符合 galgame 习惯。
+ * 幂等：仅当文件中仍为 ud.no 时替换，重下载模板后自动重新应用。
+ */
+async function ensureVoiceInterruptionPatch() {
+  const entry = join(TARGET, "assets", "index-EZxLQxgv.js");
+  if (!(await exists(entry))) return;
+  const { readFile, writeFile } = await import("node:fs/promises");
+  let text = await readFile(entry, "utf8");
+  if (text.includes("voiceInterruption:ud.no")) {
+    text = text.replaceAll("voiceInterruption:ud.no", "voiceInterruption:ud.yes");
+    await writeFile(entry, text, "utf8");
+    console.log("配音中断定制已应用：voiceInterruption 默认 -> yes（快进时语音会被中断）");
+  }
+}
+
 async function main() {
   const index = join(TARGET, "index.html");
   if (await exists(index)) {
     await ensureAppreciation();
     await ensureGameUi();
+    await ensureVoiceInterruptionPatch();
     console.log(`引擎模板已存在：${TARGET}`);
     return;
   }
@@ -156,6 +174,7 @@ async function main() {
 
   await ensureAppreciation();
   await ensureGameUi();
+  await ensureVoiceInterruptionPatch();
   console.log(`引擎模板就绪：${TARGET}`);
 }
 

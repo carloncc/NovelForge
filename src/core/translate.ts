@@ -31,7 +31,7 @@ export async function translateChapter(
       { role: "system", content: SYSTEM_PROMPT },
       { role: "user", content: user },
     ],
-    { maxTokens: Math.min(resolveContextLength(cfg), 240_000), temperature: 0.3, onUsage },
+    { maxTokens: Math.min(resolveContextLength(cfg), 32_768), temperature: 0.3, onUsage },
   );
   const raw = (r.content || "").trim();
   const lines = raw.split("\n");

@@ -146,7 +146,7 @@ export async function assembleProject(input: AssembleInput): Promise<{ gameDir: 
   await copyAssets(input.assets, normalizedOutputDir);
 
   await copyBuiltinSe(normalizedOutputDir, input);
-  await writeAppreciation(normalizedOutputDir, input);
+  await writeAppreciation(normalizedOutputDir, input, bgmMap);
 
   await writeVideoPlan(normalizedOutputDir, input.chapters, videos);
   await writeExportGuide(normalizedOutputDir, title);
@@ -202,7 +202,7 @@ async function copyBuiltinSe(outputDir: string, input: AssembleInput): Promise<v
 }
 
 /** 鉴赏室：生成素材清单数据（appreciation-data.js）+ 复制鉴赏页（立绘换装/表情/缩放、CG 画廊、角色图鉴、BGM 试听） */
-async function writeAppreciation(outputDir: string, input: AssembleInput): Promise<void> {
+async function writeAppreciation(outputDir: string, input: AssembleInput, bgmMap: Record<string, string>): Promise<void> {
   const basename = (p?: string) => (p || "").split(/[\\/]/).pop() || "";
   const characters = input.cards.characters.map((c) => ({
     id: c.id,
@@ -217,7 +217,8 @@ async function writeAppreciation(outputDir: string, input: AssembleInput): Promi
     file: basename(p),
     name: basename(p).replace(/\.(png|jpg|jpeg|webp)$/i, ""),
   }));
-  const bgms = [...new Set(Object.values(input.assets.bgm || {}))].map((p) => ({
+  // BGM 鉴赏清单必须用实际 detectBgm 扫到的 bgmMap（input.assets.bgm 恒为空，旧实现导致鉴赏室无 BGM）
+  const bgms = [...new Set(Object.values(bgmMap))].map((p) => ({
     file: basename(p),
     name: basename(p).replace(/\.(mp3|ogg|wav|m4a|opus)$/i, ""),
   }));
@@ -323,6 +324,11 @@ function matchBgm(fileName: string, bgmDesc: string): boolean {
   return BGM_RULES.some(([re, words]) => re.test(fileName) && words.some((w) => bgmDesc.includes(w)));
 }
 
+/** 宽松匹配：文件名或描述任一命中同一规则即算命中，用于严格双条件 miss 后的兜底 */
+function matchBgmLoose(fileName: string, bgmDesc: string): boolean {
+  return BGM_RULES.some(([re, words]) => re.test(fileName) || words.some((w) => bgmDesc.includes(w)));
+}
+
 async function detectBgm(
   outputDir: string,
   chapters: ChapterScript[],
@@ -344,7 +350,10 @@ async function detectBgm(
   for (const chapter of chapters) {
     for (const scene of chapter.scenes) {
       if (!scene.bgm) continue;
-      const hit = files.find((f) => matchBgm(f, scene.bgm!));
+      // 三级回退：严格双条件 → 宽松单条件 → 首个文件，避免整场景静默无声
+      const hit = files.find((f) => matchBgm(f, scene.bgm!))
+        ?? files.find((f) => matchBgmLoose(f, scene.bgm!))
+        ?? files[0];
       if (hit) bgmMap[scene.id] = joinPath(bgmDir, hit);
     }
   }

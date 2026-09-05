@@ -50,13 +50,16 @@ export async function verifyImage(
     const reply = await chatVision(
       cfg,
       SYSTEM,
-      `应满足的要求：${expected.slice(0, 500)}${ref}\n\n请判断这张图是否符合。`,
+      `应满足的要求：${expected.slice(0, 1000)}${ref}\n\n请判断这张图是否符合。`,
       imageB64,
       { maxTokens: 200, onUsage: options.onUsage },
       references,
     );
-    const ok = /^符合/.test(reply.trim()) || !/(不符合|不满足|有问题|畸形|变形|不是同一|不同角色)/.test(reply);
-    return { ok, reason: reply.trim().slice(0, 200) };
+    const trimmed = reply.trim();
+    // 严格判定：必须明确以“符合”开头且不含否定/无法判断词；空回复、无法判断一律判不通过，避免假阳性放行畸形图
+    const ok = /^符合/.test(trimmed)
+      && !/(不符合|不满足|有问题|畸形|变形|不是同一|不同角色|无法判断|未知|看不清|不能确定)/.test(trimmed);
+    return { ok, reason: trimmed.slice(0, 200) };
   } catch (e) {
     if (e instanceof VisionApiError) throw e;
     const message = e instanceof Error ? e.message : String((e as { message?: unknown })?.message ?? e);

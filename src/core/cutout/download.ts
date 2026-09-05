@@ -1,6 +1,6 @@
 /**
  * 抠图模型下载 / 状态查询。
- * - Tauri 桌面版：Rust 命令下载到应用配置目录 models/，模型文件经 model:// 自定义协议供前端 fetch
+ * - Tauri 桌面版：Rust 命令下载到程序目录（resource_dir）models/，模型文件经 model:// 自定义协议供前端 fetch
  * - 浏览器版：dev/preview server 的 /__novelforge/model 中间件下载到 public/models，经 /__novelforge/model/file 读取
  */
 import { isTauri, tauri, type CutoutModelStatus } from "../../utils/tauri";
@@ -46,6 +46,18 @@ export async function removeCutoutModel(model: CutoutModel): Promise<void> {
   await tauri.cutoutModelRemove(model.id, model.filename);
 }
 
+/** 模型文件在本机上的期望位置（诊断用：未安装/加载失败时直接告诉用户去哪看） */
+export async function cutoutModelExpectedPath(model: CutoutModel): Promise<string> {
+  try {
+    if (isTauri()) {
+      const dir = await tauri.resourceDir().catch(() => "");
+      if (dir) return `${dir.replace(/\/+$/, "")}/models/${model.filename}`;
+    }
+  } catch {
+    /* 忽略，回退默认 */
+  }
+  return `public/models/${model.filename}`;
+}
 /**
  * 下载并等待完成（轮询状态）。onProgress 每轮进度回调（bytes/total 单位字节）。
  * 返回最终状态；下载失败抛错。

@@ -13,6 +13,7 @@ import type {
 } from "./types";
 import { chatJson } from "../api/openaiCompatible";
 import { resolveContextLength } from "../api/providers";
+import { log as logger } from "../utils/logger";
 import type { ApiConfig } from "./types";
 
 interface ScriptModel {
@@ -68,6 +69,8 @@ const SYSTEM_PROMPT = `你是视觉小说编剧。根据小说章节文本与角
    - bgm: 该场景氛围适合的背景音乐描述（中文，如"宁静的钢琴曲""肃杀的战鼓声"；没有合适氛围时留空字符串）
 4. lines 数组：按剧情顺序排列
    - dialogue: {type:"dialogue", characterId: 角色卡id, emotion:"normal|happy|sad|angry|surprised", text}
+   - 可选 ttsEmotion: 该句配音情绪（传给 TTS 合成，让声音更有表现力），按说话语气选：happy/sad/angry/calm/whisper/surprised；没有明显情绪就省略
+   - 可选 speed: 该句配音语速（0.5-2，默认 1.1 更像人；激动/紧张略快如 1.2-1.3，悲伤/低沉略慢如 0.9-1.0），没有明显语气差异就省略
    - 可选 action: 当该句台词有明显动作姿态（抬手指、拔剑、挥手、抱臂、蹲下等）时，从该角色的"动作列表"(见角色卡)中选最贴切的一个填 action: "动作id"；没有合适的动作就省略该字段
    - narration: {type:"narration", text}
    - 内心独白: {type:"narration", monologue:true, text}（数量要少，每章最多 2 条）
@@ -84,8 +87,17 @@ const SYSTEM_PROMPT = `你是视觉小说编剧。根据小说章节文本与角
    - 每个选项 {id: 短标识, prompt: 选项按钮文本（简洁有力，2-8 字）, lines: 该选项后的短暂分支剧情（1-4 句 dialogue/narration，格式与 lines 相同）}
    - 分支剧情必须自然收束，玩家选择后最终都会汇合回主线继续，不要写 end / jump / 跳转指令
    - 没有真正的抉择时刻就不要写 choices，宁可全线性也不强行加
-9. 每章最后可以安排到下一章的自然收束，不要写 end 指令。
-10. 只输出 JSON，不要输出任何文字。`;
+ 9. 每章最后可以安排到下一章的自然收束，不要写 end 指令。
+10. 只输出 JSON，不要输出任何文字。
+11. 台词完整性（硬约束，优先级高于精简）：
+    - 原文「」内的每一句对话都必须原样保留，一句不许删、一句不许合并，短句/语气词（嗯、诶、真的……？等）同样不许丢；
+    - 只允许压缩旁白，禁止改写对话文字（仅允许统一标点）；
+    - 内心独白按原文比例保留，不要机械砍到只剩 2 条。
+12. 说话人判定（硬约束）：
+    - 每个 dialogue 的 characterId 必须能在上下文中找到依据（引号前后的人名＋说/道/问/喊等动词，或明确的行为主体）；
+    - 引用中的第三人称点名不能倒置（例如台词含"对优斗来说"时，说话人绝不能是优斗本人）；
+    - 实在无法确定说话人时，写成 narration，禁止猜一个角色。
+13. 日记/书信/日志体章节：按日期条目顺序逐段改编，不得跨日期合并场景，不得打乱时间顺序。`;
 
 function buildCharacterContext(chars: CharacterCard[]): string {
   return chars
@@ -134,10 +146,12 @@ export async function scriptChapter(
     `\n章节正文：\n${chapter.text}`,
   ].join("\n");
 
-  // deepseek 等推理模型把 reasoning 计入 max_tokens；思考常达 2 万+ token。
-  // 按模型上下文给足预算，避免首轮截断触发多轮重试（每轮都是大请求，易撞网络失败）。
-  const scriptOutputTokens = Math.min(resolveContextLength(cfg), 240_000);
-  const model = await chatJson<ScriptModel>(cfg, SYSTEM_PROMPT, user, { maxTokens: scriptOutputTokens, onUsage });
+  // 剧本输出 token 上限：取模型上下文与 32k 的较小值。
+  // 注意不要随 contextLength 无限放大（用户配置 1M 上下文时若 max_tokens=240k，
+  // 多数代理会拒绝返回 400 Param Incorrect）；32k 足够容纳一章完整剧本 + 推理思考。
+  const scriptOutputTokens = Math.min(resolveContextLength(cfg), 32_768);
+  // 剧本请求体大、输出长：给足超时（默认 180s 对不稳定中转代理偏紧，放宽到 300s）
+  const model = await chatJson<ScriptModel>(cfg, SYSTEM_PROMPT, user, { maxTokens: scriptOutputTokens, onUsage, timeoutSecs: 300 });
 
   const resolveSceneId = makeSceneIdResolver(cards, chapter.index);
   const scenes: SceneJSON[] = (model.scenes || []).map((s, i) => {
@@ -197,6 +211,16 @@ export async function scriptChapter(
       prompt: (c.prompt || "继续").slice(0, 20),
       lines: (c.lines || []).filter((l) => typeof l?.text === "string" && l.text.trim().length > 0).slice(0, 6).map(mapLine),
     }));
+    // 截断告警：prompt 约定每场景≤1分支、每分支≤6句，超限静默丢剧情很难察觉，此处打日志提示
+    if ((s.choices || []).length > 3) {
+      logger.warn("script", "分支选项超限截断", { scene: s.id || i, total: (s.choices || []).length, kept: 3 });
+    }
+    for (const [ci, c] of (s.choices || []).entries()) {
+      if ((c.lines || []).length > 6) {
+        logger.warn("script", "分支台词超限截断", { scene: s.id || i, choice: ci, total: (c.lines || []).length, kept: 6 });
+        break;
+      }
+    }
 
     return {
       id: resolveSceneId(s, i),
@@ -488,4 +512,184 @@ export function demoScriptChapter(chapter: ChapterInfo, cards: ExtractionResult)
 
 export function demoScriptAll(chapters: ChapterInfo[], cards: ExtractionResult): ChapterScript[] {
   return chapters.map((c) => demoScriptChapter(c, cards));
+}
+
+/* ==================== 剧本保真自检（原文 ↔ 生成剧本二遍校验） ==================== */
+
+/** 说话动词：与演示模式 parseParagraph 同规则 */
+export const SPEECH_VERBS = /(说|道|答|喊|叹|笑|问|吩咐|回应|开口|沉声道|缓缓道)/;
+
+/** 原文「」引用计数 */
+export function countSourceQuotes(text: string): number {
+  const m = (text || "").match(/「[^」]*」/g);
+  return m ? m.length : 0;
+}
+
+/** 角色名别名：全名＋前二字＋后二字（原文常用简称，如 西园寺樱月→樱月、佐野优斗→优斗） */
+function nameAliases(name: string): string[] {
+  const out = new Set<string>();
+  const n = (name || "").trim();
+  if (n.length >= 2) out.add(n);
+  if (n.length > 2) {
+    out.add(n.slice(0, 2));
+    out.add(n.slice(-2));
+  }
+  return [...out];
+}
+
+export interface SpeakerIssue {
+  sceneIndex: number;
+  lineIndex: number;
+  text: string;
+  llmSpeakerId: string;
+  llmSpeakerName: string;
+  suggestedSpeakerId?: string;
+  suggestedSpeakerName?: string;
+  reason: "context-mismatch" | "third-person-self" | "not-in-source" | "order-suspect";
+  detail: string;
+}
+
+export interface ScriptVerifyResult {
+  originalQuoteCount: number;
+  dialogueCount: number;
+  keptRatio: number;
+  notFoundCount: number;
+  orderSuspectCount: number;
+  speakerIssues: SpeakerIssue[];
+}
+
+/**
+ * 拿原文逐句核对生成剧本：
+ * 1. 覆盖率：原文「」数 vs 剧本 dialogue 数；
+ * 2. 逐句定位：按顺序在原文中查找每句台词（全文→首12字→尾12字），找不到记 not-in-source，
+ *    只在游标之前找到记 order-suspect（疑似乱序/并句）；
+ * 3. 说话人：用引号前后 14 字人名＋说话动词启发式推断，与 LLM 的 characterId 不一致记 context-mismatch；
+ * 4. 第三人称自指：台词含"对{自己名字}来说"而说话人正是本人，记 third-person-self。
+ * 只做校验不改写，由调用方决定告警/重试。
+ */
+export function verifyScriptAgainstSource(
+  chapterText: string,
+  scenes: { lines: { type: string; characterId?: string; text: string }[] }[],
+  characters: { id: string; name: string }[],
+): ScriptVerifyResult {
+  const src = chapterText || "";
+  const aliasToId = new Map<string, string>();
+  const idToNames = new Map<string, string[]>();
+  for (const c of characters) {
+    const aliases = nameAliases(c.name);
+    idToNames.set(c.id, [c.name, ...aliases]);
+    for (const a of aliases) {
+      if (!aliasToId.has(a)) aliasToId.set(a, c.id);
+    }
+  }
+  const idToName = new Map(characters.map((c) => [c.id, c.name]));
+  const originalQuoteCount = countSourceQuotes(src);
+  let dialogueCount = 0;
+  let notFoundCount = 0;
+  let orderSuspectCount = 0;
+  const speakerIssues: SpeakerIssue[] = [];
+  let cursor = 0;
+
+  const guessFromContext = (pos: number, needleLen: number): string | undefined => {
+    const before = src.slice(Math.max(0, pos - 14), pos);
+    const after = src.slice(pos + needleLen, pos + needleLen + 14);
+    for (const [alias, id] of aliasToId) {
+      if (before.includes(alias)) return id;
+    }
+    for (const [alias, id] of aliasToId) {
+      if (after.startsWith(alias) && SPEECH_VERBS.test(after.slice(alias.length, alias.length + 6))) return id;
+    }
+    return undefined;
+  };
+
+  scenes.forEach((scene, si) => {
+    scene.lines.forEach((line, li) => {
+      if (line.type !== "dialogue") return;
+      dialogueCount++;
+      const text = line.text || "";
+      const speakerName = idToName.get(line.characterId || "") || line.characterId || "";
+      // 第三人称自指：先验规则，无需定位
+      const selfAliases = idToNames.get(line.characterId || "") ?? [speakerName];
+      for (const a of selfAliases) {
+        if (a.length >= 2 && text.includes(`对${a}来说`)) {
+          speakerIssues.push({
+            sceneIndex: si,
+            lineIndex: li,
+            text: text.slice(0, 60),
+            llmSpeakerId: line.characterId || "",
+            llmSpeakerName: speakerName,
+            reason: "third-person-self",
+            detail: `台词含"对${a}来说"却归属${speakerName}本人，疑似张冠李戴`,
+          });
+          break;
+        }
+      }
+      // 顺序扫描定位
+      let pos = text ? src.indexOf(text, cursor) : -1;
+      let needleLen = text.length;
+      if (pos < 0 && text.length > 12) {
+        const head = text.slice(0, 12);
+        pos = src.indexOf(head, cursor);
+        needleLen = head.length;
+      }
+      if (pos < 0 && text.length > 12) {
+        const tail = text.slice(-12);
+        pos = src.indexOf(tail, cursor);
+        needleLen = 0; // 尾部命中只用于说话人推断，不推进游标
+      }
+      if (pos < 0) {
+        const anywhere = text ? src.indexOf(text, 0) : -1;
+        if (anywhere >= 0 && anywhere < cursor) {
+          orderSuspectCount++;
+          pos = anywhere;
+          needleLen = 0;
+          speakerIssues.push({
+            sceneIndex: si,
+            lineIndex: li,
+            text: text.slice(0, 60),
+            llmSpeakerId: line.characterId || "",
+            llmSpeakerName: speakerName,
+            reason: "order-suspect",
+            detail: "台词只在已扫描过的位置找到，疑似乱序或跨段并句",
+          });
+        } else {
+          notFoundCount++;
+          speakerIssues.push({
+            sceneIndex: si,
+            lineIndex: li,
+            text: text.slice(0, 60),
+            llmSpeakerId: line.characterId || "",
+            llmSpeakerName: speakerName,
+            reason: "not-in-source",
+            detail: "原文中找不到该句，疑似改写/新增台词",
+          });
+          return;
+        }
+      }
+      const guessed = guessFromContext(pos, needleLen);
+      if (guessed && guessed !== line.characterId) {
+        speakerIssues.push({
+          sceneIndex: si,
+          lineIndex: li,
+          text: text.slice(0, 60),
+          llmSpeakerId: line.characterId || "",
+          llmSpeakerName: speakerName,
+          suggestedSpeakerId: guessed,
+          suggestedSpeakerName: idToName.get(guessed) || guessed,
+          reason: "context-mismatch",
+          detail: `原文上下文指向${idToName.get(guessed) || guessed}，剧本归属${speakerName}`,
+        });
+      }
+      if (needleLen > 0) cursor = pos + needleLen;
+    });
+  });
+
+  return {
+    originalQuoteCount,
+    dialogueCount,
+    keptRatio: originalQuoteCount > 0 ? dialogueCount / originalQuoteCount : 1,
+    notFoundCount,
+    orderSuspectCount,
+    speakerIssues,
+  };
 }

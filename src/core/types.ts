@@ -71,6 +71,8 @@ export interface CharacterCard {
   personality: string;
   voiceDesc: string;
   voiceName?: string;
+  /** 角色性别：AI 提取时按性别分配音色；male/female 用于从音色库过滤 */
+  gender?: "male" | "female";
   /** Global cloned-voice profile. When present it takes precedence over voiceName. */
   voiceProfileId?: string;
   imagePrompt: string;
@@ -200,6 +202,10 @@ export interface DialogueLine {
   emotion?: string;
   /** 台词对应的角色动作（引用角色卡的 actions 列表，如 "point"/"wave"）；渲染时切换对应动作立绘 */
   action?: string;
+  /** 配音语速（0.5-2，MiniMax 取值；缺省用全局 TTS 配置默认值）。AI 生成剧本时按语气自动标注 */
+  speed?: number;
+  /** 配音情绪（如 happy/sad/angry/calm/whisper/surprised），传给 TTS 合成；缺省用全局配置默认值 */
+  ttsEmotion?: string;
 }
 
 export interface NarrationLine {
@@ -305,6 +311,10 @@ export interface PipelineResult {
   chapters: ChapterScript[];
   /** AI 分章产生的章节列表（分章阶段运行时填充，供 UI 展示/勾选重跑） */
   splitChapters?: ChapterInfo[];
+  /** 本次运行的分章来源（ai＝AI 分章，fallback＝规则回退，legacy＝旧版缓存，import＝导入时规则切分） */
+  splitMethod?: "ai" | "fallback" | "legacy" | "import";
+  /** AI 分章丢弃的杂项块数 */
+  splitDiscarded?: number;
   assets: unknown;
   cost: CostStats;
   failedTasks: FailedTask[];
@@ -385,12 +395,16 @@ export interface NovelDoc {
   chapters: ChapterInfo[];
 }
 
+export type FigureDetail = "core" | "full";
+
 export interface GenerationOptions {
   useImage: boolean;
   useTts: boolean;
   useVideoPoints: boolean;
   useBgm: boolean;
   figureEmotions: boolean;
+  /** 人物图详细度：core=标准5表情＋无服装差分（省图省钱）；full=AI全量表情＋服装＋动作（默认，保持现状） */
+  figureDetail?: FigureDetail;
   /** 人物动作：入场/退场动画、情绪动作、剧情镜头震动 */
   figureActions: boolean;
   /** 角色三视图 + 动作立绘（先生成三视图，再基于它图生图生成默认/表情/动作立绘） */

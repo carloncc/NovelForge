@@ -4,6 +4,7 @@ import type {
   CharacterCard,
   ExtractionResult,
   FailedTask,
+  FigureDetail,
   ImageReference,
   ImageTask,
   ItemCard,
@@ -27,7 +28,7 @@ import { configState } from "../stores/config";
 import { cacheDirFor, cacheHit } from "./cache";
 import { sanitizeId } from "./render";
 import { log as logger } from "../utils/logger";
-import { updateAssetMap } from "./assetMap";
+import { readAssetMap, updateAssetMap } from "./assetMap";
 
 export interface ImageResultMap {
   bg: Record<string, string>;
@@ -42,30 +43,35 @@ function nameContains(name: string, keywords: string[]): boolean {
 
 const FIGURE_EMOTIONS = ["normal", "happy", "sad", "angry", "surprised"];
 
-// 情绪提示词：必须足够明确（五官/眉/嘴），否则模型会把不同情绪画成雷同的笑脸
+// 情绪提示词：必须足够明确（五官/眉/嘴），否则模型会把不同情绪画成雷同的笑脸；
+// 所有情绪统一约束自然站姿+手臂下垂，避免模型给表情加戏配怪手势。
+const NATURAL_POSE_GUARD = ", arms relaxed at sides, natural relaxed standing pose, no hand gestures";
 const EMOTION_PROMPT_SUFFIX: Record<string, string> = {
   normal: ", calm neutral expression, mouth closed, looking straight ahead, standing upright straight, symmetric front-facing pose, feet planted on the ground, arms relaxed at sides",
-  happy: ", joyful bright smile with teeth showing, eyes slightly squinted with happiness, genuinely cheerful laughing expression, radiant happy face",
-  sad: ", clearly sad crying expression, eyebrows tilted up, mouth frowning downward, watery teary eyes, absolutely no smile, sorrowful distressed face",
-  angry: ", clearly angry irritated expression, furrowed sharp angry eyebrows, glaring narrowed eyes, tight frowning mouth, absolutely no smile, fierce annoyed face",
-  surprised: ", shocked surprised expression, eyes wide open, mouth open in surprise, raised eyebrows, absolutely no smile",
+  happy: ", joyful bright smile with teeth showing, eyes slightly squinted with happiness, genuinely cheerful laughing expression, radiant happy face" + NATURAL_POSE_GUARD,
+  sad: ", clearly sad crying expression, eyebrows tilted up, mouth frowning downward, watery teary eyes, absolutely no smile, sorrowful distressed face" + NATURAL_POSE_GUARD,
+  angry: ", clearly angry irritated expression, furrowed sharp angry eyebrows, glaring narrowed eyes, tight frowning mouth, absolutely no smile, fierce annoyed face" + NATURAL_POSE_GUARD,
+  surprised: ", shocked surprised expression, eyes wide open, mouth open in surprise, raised eyebrows, absolutely no smile" + NATURAL_POSE_GUARD,
 };
 
 // 非 happy 情绪时，把基础提示里的"笑"类正面表情词清掉，避免模型仍按基础画笑脸
 const SMILE_FACE_WORDS = /\b(smiling|smile|grinning|grin|chuckle|laughing|laugh|cheerful|joyful|cheery|gleeful|radiant|merry|happy)\b/gi;
-// normal（标准站姿）时，把基础提示里的常见动态姿势/手势词清掉，保证立正站姿
-const NORMAL_POSE_WORDS = /\b(one hand raised|hand raised in a \w+ wave|waving|waves|waved|waving one hand|pointing|thumbs up|peace sign|hand on hip|hands on hips|winking|giving a wave)\b/gi;
+// 立绘人像只换表情不换姿势：所有情绪都清掉基础提示里的手势/动态姿势词，只保留自然站姿。
+// 此前只在 normal 时清理，happy 等情绪会把基础里的挥手/指物/比耶等手势带进来，配上表情就成了怪动作。
+const FIGURE_GESTURE_WORDS = /\b(one hand raised|hand raised in a \w+ wave|waving|waves|waved|waving one hand|pointing|thumbs up|peace sign|hand on hip|hands on hips|winking|giving a wave)\b/gi;
 
 function emotionPrompt(base: string, emo: string): string {
   let p = stripBackground(base);
-  if (emo === "happy") return p + (EMOTION_PROMPT_SUFFIX[emo] ?? "");
+  if (emo === "happy") return p.replace(FIGURE_GESTURE_WORDS, " ").replace(/\s{2,}/g, " ").trim() + (EMOTION_PROMPT_SUFFIX[emo] ?? "");
   p = p.replace(SMILE_FACE_WORDS, " ");
-  if (emo === "normal") p = p.replace(NORMAL_POSE_WORDS, " ");
+  p = p.replace(FIGURE_GESTURE_WORDS, " ");
   return p.replace(/\s{2,}/g, " ").trim() + (EMOTION_PROMPT_SUFFIX[emo] ?? "");
 }
 
-// 动作立绘：追加可读性提示，避免模型把指定动作画糊/画没
-const ACTION_CLARITY_HINT = ", clearly performing the described hand gesture and body action, legible readable pose, full body visible";
+// 动作立绘：只做 prompt 里明确写出的姿态要素，其余一律保持自然放松站姿。
+// 严禁模型自行脑补手势——此前的 "clearly performing the described hand gesture"
+// 会逼模型给纯表情动作（如撒娇鼓脸）凭空配一个举手，出来全是怪动作。
+const ACTION_CLARITY_HINT = ", perform only the pose elements explicitly described above, everything else in a natural relaxed standing pose with arms resting naturally at sides, do not invent any hand gestures, no raised hands, no waving, no pointing, no peace sign, no thumbs up, no hands on hips unless explicitly described, full body visible";
 
 // 统一画风：保证同一项目内所有立绘/背景/CG 视觉风格一致（同一个"维度"）
 const DEFAULT_STYLE =
@@ -205,6 +211,8 @@ export interface BuildImageTaskOptions {
   cgPerChapter?: number;
   maxPerChapter?: number;
   figureEmotions?: boolean;
+  /** 人物图详细度：core=标准5表情＋无服装差分（省图）；full=AI全量表情＋服装＋动作（默认） */
+  detail?: FigureDetail;
   style?: string;
   feedback?: string;
   /** 生成角色三视图（作后续立绘/表情/动作的图生图参考） */
@@ -217,6 +225,11 @@ export interface BuildImageTaskOptions {
   baseSeed?: number;
   /** 风格锚点：先生成画风基准图，背景/CG 以其为参考图统一画风 */
   styleAnchor?: boolean;
+  /**
+   * 章节过滤：只为这些章节（ChapterScript.chapter，0-based 连续编号）构建背景/CG 任务。
+   * 锚点/三视图/立绘/动作/物品是全项目级任务，不受影响（命中缓存直接复用，且情绪/动作 passes 需要立绘引用）。
+   */
+  chapterIndexes?: Set<number>;
 }
 
 export function buildImageTasks(
@@ -229,6 +242,7 @@ export function buildImageTasks(
   const cgPerChapter = opts.cgPerChapter ?? 0;
   const maxPerChapter = opts.maxPerChapter ?? 0;
   const useEmotions = opts.figureEmotions !== false;
+  const detail = opts.detail ?? "full";
   const threeView = opts.threeView !== false;
   const withActions = opts.actions !== false;
   const maxActionsPerCharacter = opts.maxActionsPerCharacter ?? 2;
@@ -270,8 +284,9 @@ export function buildImageTasks(
       });
     }
     // ② 立绘（默认姿态）→ 以三视图为参考图
-    // 表情不设上限：优先角色自定义表情集（AI 按剧情提取），缺省用标准 5 表情
-    const emotions = useEmotions ? (char.emotions?.length ? char.emotions : FIGURE_EMOTIONS) : ["normal"];
+    // core 档：只用标准 5 表情（忽略 AI 自定义大表情集，省图）；
+    // full 档：优先角色自定义表情集（AI 按剧情提取），缺省用标准 5 表情
+    const emotions = !useEmotions ? ["normal"] : detail === "core" ? FIGURE_EMOTIONS : (char.emotions?.length ? char.emotions : FIGURE_EMOTIONS);
     for (const emo of emotions) {
       const isNormal = emo === "normal";
       tasks.push({
@@ -287,9 +302,9 @@ export function buildImageTasks(
         usage: `立绘-${char.name}${isNormal ? "" : `（${emo}）`}`,
       });
     }
-    // ②b 服装差分立绘（基于三视图图生图；套数按剧情由 AI 决定，不设上限；
+    // ②b 服装差分立绘（基于三视图图生图；full 档才生成，core 档跳过以省图；
     //    每套只生成 normal 姿态作为换装底图，其余表情沿用当前服装）
-    if (threeView && Array.isArray(char.costumes)) {
+    if (threeView && detail !== "core" && Array.isArray(char.costumes)) {
       for (const ct of char.costumes) {
         tasks.push({
           kind: "figure",
@@ -339,6 +354,8 @@ export function buildImageTasks(
   }
 
   for (const chapter of chapters) {
+    // 单章节模式：只构建选中章节的背景/CG 任务，其余章节复用已有映射
+    if (opts.chapterIndexes && !opts.chapterIndexes.has(chapter.chapter)) continue;
     let count = 0;
     for (const scene of chapter.scenes) {
       if (maxPerChapter > 0 && count >= maxPerChapter) break;
@@ -357,11 +374,13 @@ export function buildImageTasks(
     for (const scene of chapter.scenes) {
       if (cgPerChapter > 0 && cgCount >= cgPerChapter) break;
       if (scene.cgEvent) {
+        // CG 键只用 scene.id（scene.id 已跨章唯一化）：旧键 cg_<章节号>_<scene> 导致
+        // 光章节重编号就全作废、全重生成；旧版文件/映射由 repairImageAssets 与分区兜底迁移。
         tasks.push({
           kind: "cg",
-          id: `${chapter.chapter}_${scene.id}`,
+          id: scene.id,
           prompt: scene.cgEvent.imagePrompt + style + (useAnchor ? STYLE_ANCHOR_HINT : ""),
-          fileName: `cg_${chapter.chapter}_${sanitizeId(scene.id)}.png`,
+          fileName: `cg_${sanitizeId(scene.id)}.png`,
           width: 1536,
           height: 1024,
           usage: `CG-${scene.cgEvent.title}`,
@@ -371,14 +390,32 @@ export function buildImageTasks(
     }
   }
 
-  // 确定性种子：baseSeed 已指定时，按任务顺序分配固定种子（锚点=baseSeed，其余依次 +1）
+  // 确定性种子：按任务 id 哈希派生（baseSeed + fnv1a(id)），与任务顺序无关——
+  // 增删角色/章节不再导致后续所有任务种子漂移，旧实现 baseSeed+i 顺序分配一动全变。
+  // 同 id 出现多次（如裸调 buildImageTasks 未做跨章去重时）按出现次序加盐，保证同输入下唯一且稳定；
+  // 管线内已做 dedupeSceneIdsAcrossChapters，实跑中 id 唯一、不触发加盐分支。
   if (opts.baseSeed !== undefined) {
-    tasks.forEach((t, i) => {
-      t.seed = opts.baseSeed! + i;
-    });
+    const seen = new Map<string, number>();
+    for (const t of tasks) {
+      const key = `${t.kind}:${t.id}`;
+      const n = (seen.get(key) ?? 0) + 1;
+      seen.set(key, n);
+      // 种子输入含 kind：background:s1 与 cg:s1 同 scene.id 不能同种子
+      t.seed = taskSeedForId(opts.baseSeed, n > 1 ? `${key}#${n}` : key);
+    }
   }
 
   return tasks;
+}
+
+/** 任务 id 稳定种子：FNV-1a 哈希后叠加基数，钳制到 31bit 正整数（各图片 API 通用范围） */
+export function taskSeedForId(baseSeed: number, taskId: string): number {
+  let h = 2166136261;
+  for (const ch of taskId) {
+    h ^= ch.codePointAt(0)!;
+    h = Math.imul(h, 16777619);
+  }
+  return (Math.floor(baseSeed) + (h >>> 0)) % 2147483647;
 }
 
 async function copyMaterial(mat: MaterialAsset, targetPath: string): Promise<void> {
@@ -403,9 +440,16 @@ export async function ensureCutout(
   // 立绘/动作/物品抠出无背景透明底（优先 AI 抠图，可识别任意背景；失败降级色度键/保留原图）。
   // 三视图/背景/CG 不在此处调用（保持自然背景）。
   try {
+    const mode = configState.cutout?.mode ?? "ai";
+    // 抠图方式=关闭：直接保留原图（日志明确标注，方便确认当前生效方式）
+    if (mode === "off") {
+      log({ step: "图像", message: `无背景立绘（未抠图，开关已关闭）：${task.usage}`, level: "info", at: Date.now() });
+      return path;
+    }
     const b64 = await tauri.readFileBase64(path);
     if (await tauri.hasTransparency(b64)) return path;
-    const aiResult = await tryAiCutout(b64, task, log);
+    // 抠图方式=色度键：跳过 AI 模型直走色度键；=AI 优先：先试 AI，失败降级色度键
+    const aiResult = mode === "ai" ? await tryAiCutout(b64, task, log) : null;
     if (aiResult) {
       const pngPath = path.replace(/\.(jpg|jpeg)$/i, ".png");
       await tauri.writeFileBase64(pngPath, aiResult);
@@ -458,8 +502,8 @@ async function tryAiCutout(
   log: (ev: PipelineEvent) => void,
 ): Promise<string | null> {
   const settings = configState.cutout;
-  if (!settings?.enabled) return null;
-  const { findCutoutModel, cutoutModelStatus, aiCutoutImage } = await import("./cutout");
+  if (settings?.mode !== "ai") return null;
+  const { findCutoutModel, cutoutModelStatus, aiCutoutImage, cutoutModelExpectedPath } = await import("./cutout");
   const model = findCutoutModel(settings.modelId);
   let status: { installed: boolean };
   try {
@@ -468,12 +512,13 @@ async function tryAiCutout(
     return null;
   }
   if (!status.installed) {
-    // 只提示一次，避免批量生成时刷屏
+    // 只提示一次，避免批量生成时刷屏；带上期望位置，目录对不上时一眼可见
     if (!aiCutoutHintLogged) {
       aiCutoutHintLogged = true;
+      const expected = await cutoutModelExpectedPath(model).catch(() => model.filename);
       log({
         step: "图像",
-        message: `AI 抠图模型「${model.label}」（${model.sizeMB} MB）未安装，已用色度键抠图：${task.usage}（可到「API 配置」页下载模型）`,
+        message: `AI 抠图模型「${model.label}」（${model.sizeMB} MB）未安装（期望位置：${expected}），已用色度键抠图：${task.usage}（可到「API 配置」页下载模型）`,
         level: "info",
         at: Date.now(),
       });
@@ -484,9 +529,14 @@ async function tryAiCutout(
     const result = await aiCutoutImage(b64, model.id, { despill: true });
     return result.dataB64;
   } catch (error) {
+    const raw = errMsg(error);
+    // dev 下 onnxruntime 胶水模块走 /onnx 中间件：报错里带这些关键字基本就是 dev 没重启
+    const devHint = /onnx|ort-wasm|\.jsep|should not be imported from source code/i.test(raw)
+      ? "（疑似 dev 服务器未重启：请 Ctrl+C 后重新启动再试）"
+      : "";
     log({
       step: "图像",
-      message: `AI 抠图失败（${errMsg(error).slice(0, 160)}），降级色度键：${task.usage}`,
+      message: `AI 抠图失败（模型「${model.label}」）：${raw.slice(0, 300)}${devHint}，降级色度键：${task.usage}`,
       level: "warn",
       at: Date.now(),
     });
@@ -1047,34 +1097,88 @@ export async function generateImages(
   visualBible?: ProjectVisualBible,
   visionCfg?: ApiConfig,
   safeRewriteCfg?: ApiConfig,
-): Promise<{ images: ImageResultMap; failed: FailedTask[] }> {
+  cgPerChapter = 0,
+  maxPerChapter = 0,
+  chapterScope?: Set<number>,
+  figureDetail: FigureDetail = "full",
+): Promise<{ images: ImageResultMap; failed: FailedTask[]; generated: number }> {
   const result: ImageResultMap = { bg: {}, cg: {}, figure: {}, item: {} };
   const failed: FailedTask[] = [];
+  /** 实际走 API 生成并产出的任务数（缓存命中、跳过、中断、用户素材本地拷贝不计） */
+  let generatedCount = 0;
+  /** 命中用户素材的待执行任务：走本地拷贝、免费，完成后不计入 generatedCount */
+  const materialFree = new Set<ImageTask>();
   // 图片请求限流跟随该 API 自己的并发配置：任务 worker 数与 API 实际并发一致，各 API 互不影响
   if (cfg) setImageConcurrency(cfg, concurrency);
   const approvedBible = visualBible?.status === "approved" ? visualBible : undefined;
   const projectOutputDir = cacheRoot.replace(/[\\/]\.novel2vn[\\/]cache[\\/]?$/, "");
-  const tasks = buildImageTasks(chapters, cards, {
-    figurePerCharacter: 1,
-    cgPerChapter: 0,
-    maxPerChapter: 0,
-    figureEmotions,
-    style: approvedBible?.styleDescription ?? style,
-    feedback,
-    threeView,
-    actions: withActions,
-    baseSeed,
-    styleAnchor: approvedBible ? false : styleAnchor,
-  });
-
-  await tauri.mkdirAll(cacheDirFor(cacheRoot, "images"));
-  const visualBibleCacheMarker = `${cacheDirFor(cacheRoot, "images")}/.visual-bible-fingerprint`;
+  const imageCacheDir = cacheDirFor(cacheRoot, "images");
+  const visualBibleCacheMarker = `${imageCacheDir}/.visual-bible-fingerprint`;
   const approvedCacheBinding = approvedBible ? cacheBindingForBible(approvedBible) : undefined;
   const storedCacheBinding = approvedBible
     ? await readCacheBinding(visualBibleCacheMarker, approvedBible, approvedCacheBinding!)
     : undefined;
   const globalCacheCurrent = !approvedBible
     || storedCacheBinding?.globalFingerprint === approvedCacheBinding?.globalFingerprint;
+
+  // 单章模式精简人物/物品构建：已有三视图/物品图成品、且圣经修订未变的角色/物品，
+  // 根本不建任务（而非建完再跳过）——400+ 任务的 stat 开销与"顺手生成计费"一并消除。
+  // 新角色（无三视图）、新物品、圣经修订、force/意见、全量模式不受影响。
+  let taskCards = cards;
+  if (chapterScope && !force && !feedback && globalCacheCurrent) {
+    const keepChars: CharacterCard[] = [];
+    let skippedChars = 0;
+    for (const c of cards.characters) {
+      const revised = !!approvedCacheBinding
+        && storedCacheBinding?.characterRevisions[c.id] !== approvedCacheBinding.characterRevisions[c.id];
+      let hasThree: string | null = null;
+      try {
+        hasThree = await cacheHit(imageCacheDir, `threeview_${sanitizeId(c.id)}.png`);
+      } catch {
+        hasThree = null;
+      }
+      if (!hasThree || revised) keepChars.push(c);
+      else skippedChars++;
+    }
+    const keepItems: ItemCard[] = [];
+    let skippedItems = 0;
+    for (const it of cards.items) {
+      let hasItem: string | null = null;
+      try {
+        hasItem = await cacheHit(imageCacheDir, `item_${sanitizeId(it.id)}.png`);
+      } catch {
+        hasItem = null;
+      }
+      if (!hasItem) keepItems.push(it);
+      else skippedItems++;
+    }
+    if (skippedChars > 0 || skippedItems > 0) {
+      taskCards = { ...cards, characters: keepChars, items: keepItems };
+      log({
+        step: "图像",
+        message: `单章模式：${skippedChars} 个角色的人物基础图、${skippedItems} 个物品图已有成品，本次不构建任务（未重生成、0 计费）`,
+        level: "info",
+        at: Date.now(),
+      });
+    }
+  }
+
+  const tasks = buildImageTasks(chapters, taskCards, {
+    figurePerCharacter: 1,
+    cgPerChapter,
+    maxPerChapter,
+    figureEmotions,
+    detail: figureDetail,
+    style: approvedBible?.styleDescription ?? style,
+    feedback,
+    threeView,
+    actions: withActions,
+    baseSeed,
+    styleAnchor: approvedBible ? false : styleAnchor,
+    chapterIndexes: chapterScope,
+  });
+
+  await tauri.mkdirAll(cacheDirFor(cacheRoot, "images"));
   const imageForceFor = (task: ImageTask): boolean => {
     if (force || !globalCacheCurrent) return true;
     if (!task.characterId || !approvedCacheBinding) return false;
@@ -1101,30 +1205,7 @@ export async function generateImages(
     concurrency,
   });
 
-  // 实时进度：total 为任务总数，done 为已完成（含缓存/失败）；每个任务完成后发一条进度事件
-  const total = tasks.length;
-  let done = 0;
-  const emitProgress = (task: ImageTask, extra = ""): void => {
-    done++;
-    const label = (task.usage ?? task.fileName) + extra;
-    log({
-      step: "图像",
-      message: `进度 ${done}/${total}：${label}`,
-      level: "info",
-      at: Date.now(),
-      progress: { done, total, label },
-    });
-  };
-
-  // 五阶段执行（链式图生图保证形象/画风一致）：
-  // 风格锚点 → 三视图 → 默认立绘+背景/CG/物品（背景/CG 以锚点为参考）→ 表情差分（以默认立绘为参考）→ 动作（以三视图为参考）
-  const leadingPass = tasks.filter((t) => t.kind === "threeview");
-  // 默认立绘的 emotion 为 "normal"，必须归入首轮，否则表情差分没有参考图（曾导致角色形象漂移）
-  const firstPass = tasks.filter(
-    (t) => (t.kind === "figure" && (!t.emotion || t.emotion === "normal")) || t.kind === "background" || t.kind === "cg" || t.kind === "item",
-  );
-  const emotionPass = tasks.filter((t) => t.kind === "figure" && t.emotion && t.emotion !== "normal");
-  const actionPass = tasks.filter((t) => t.kind === "action");
+  // 实时进度与分 pass 定义见下方静默预分区之后（进度只统计实际执行的任务）
 
   // 任务 key 覆盖计数：同一 id 多次产出（scene.id 重复等）会互相覆盖 → 记录差异让用户可察觉
   let overwriteCount = 0;
@@ -1156,6 +1237,123 @@ export async function generateImages(
     });
   };
 
+  // 静默预分区：纯文件缓存命中的任务直接记入结果，不走执行/进度/写盘链路。
+  // 解决"点一次图像重生成，全书 N 张图挨个走一遍进度"——命中只是本地文件存在性＋尺寸检查，
+  // 不产生 API 调用。force/用户素材/圣经三视图/尺寸不符等情况仍进 pending，由 runImageTask 原逻辑处理。
+  // （imageCacheDir 见函数开头，单章精简已复用）
+  const pending: ImageTask[] = [];
+  let cacheReused = 0;
+  for (const task of tasks) {
+    if (imageForceFor(task)) {
+      pending.push(task);
+      continue;
+    }
+    let hit: string | null = null;
+    try {
+      const c = await cacheHit(imageCacheDir, task.fileName);
+      if (c && task.width > 0 && task.height > 0) {
+        hit = (await tauri.imageSizeMatches(c, task.width, task.height).catch(() => true)) ? c : null;
+      } else {
+        hit = c;
+      }
+    } catch {
+      hit = null;
+    }
+    if (hit) {
+      record(task, hit);
+      cacheReused++;
+    } else {
+      // 用户素材本地拷贝免费：与 runImageTask 同判定（item＋已批准圣经＋有 API 时作参考图仍计费，其余拷贝免费）
+      const billableRef = !!cfg && task.kind === "item" && !!approvedBible;
+      if (!billableRef && findMaterial(materials, task)) materialFree.add(task);
+      pending.push(task);
+    }
+  }
+
+  // 旧版 CG 文件迁移（一次性）：旧命名 cg_<章节号>_<scene>.png → 新命名 cg_<scene>.png。
+  // scene.id 跨章唯一，可直接改名复用，避免改键后旧 CG 全被误判缺失而重生成。
+  if (pending.some((t) => t.kind === "cg")) {
+    try {
+      const entries = await tauri.listDir(imageCacheDir);
+      const legacy = entries.filter((e) => !e.isDir && /^cg_\d+_.+\.(png|jpg|jpeg|webp)$/i.test(e.name));
+      if (legacy.length) {
+        const pendingCg = new Map(pending.filter((t) => t.kind === "cg").map((t) => [t.fileName.replace(/\.(png|jpg|jpeg|webp)$/i, ""), t]));
+        for (const e of legacy) {
+          const base = e.name.replace(/\.(png|jpg|jpeg|webp)$/i, "");
+          const scenePart = base.replace(/^cg_\d+_/, "cg_");
+          const task = pendingCg.get(scenePart);
+          if (task) {
+            const target = `${imageCacheDir}/${task.fileName}`;
+            try {
+              await tauri.copyFile(e.path, target);
+              record(task, target);
+              cacheReused++;
+              pending.splice(pending.indexOf(task), 1);
+              log({ step: "图像", message: `旧版 CG 已迁移复用（免重生成）：${task.usage}`, level: "info", at: Date.now() });
+            } catch {
+              /* 迁移失败则正常生成 */
+            }
+          }
+        }
+      }
+    } catch {
+      /* 目录不存在等，忽略 */
+    }
+  }
+
+  // 实时进度：total 只统计实际执行的任务（每个恰好发一次进度）；纯缓存命中不发进度事件、不写盘、不刷素材页
+  const total = pending.length;
+  let done = 0;
+  const emitProgress = (task: ImageTask, extra = ""): void => {
+    done++;
+    const label = (task.usage ?? task.fileName) + extra;
+    log({
+      step: "图像",
+      message: `进度 ${done}/${total}：${label}`,
+      level: "info",
+      at: Date.now(),
+      progress: { done, total, label },
+    });
+  };
+
+  // 五阶段执行（链式图生图保证形象/画风一致），仅对未命中任务：
+  // 风格锚点 → 三视图 → 默认立绘+背景/CG/物品（背景/CG 以锚点为参考）→ 表情差分（以默认立绘为参考）→ 动作（以三视图为参考）
+  const leadingPass = pending.filter((t) => t.kind === "threeview");
+  // 默认立绘的 emotion 为 "normal"，必须归入首轮，否则表情差分没有参考图（曾导致角色形象漂移）
+  const firstPass = pending.filter(
+    (t) => (t.kind === "figure" && (!t.emotion || t.emotion === "normal")) || t.kind === "background" || t.kind === "cg" || t.kind === "item",
+  );
+  const emotionPass = pending.filter((t) => t.kind === "figure" && t.emotion && t.emotion !== "normal");
+  const actionPass = pending.filter((t) => t.kind === "action");
+
+  if (pending.length === 0) {
+    const figureTotal = tasks.filter((t) => t.kind === "figure" || t.kind === "threeview" || t.kind === "action").length;
+    log({
+      step: "图像",
+      message: `图像阶段完成：${cacheReused} 项全部命中缓存，无需生成（0 计费${figureTotal > 0 ? `；人物基础图 ${figureTotal} 张全部复用，未重生成` : ""}）`,
+      level: "success",
+      at: Date.now(),
+    });
+  } else if (cacheReused > 0) {
+    const parts: string[] = [];
+    const nBg = pending.filter((t) => t.kind === "background").length;
+    const nCg = pending.filter((t) => t.kind === "cg").length;
+    const nFig = pending.filter((t) => t.kind === "figure" || t.kind === "threeview" || t.kind === "action").length;
+    const nItem = pending.filter((t) => t.kind === "item").length;
+    const nAnchor = pending.filter((t) => t.kind === "anchor").length;
+    if (nBg) parts.push(`背景 ${nBg}`);
+    if (nCg) parts.push(`CG ${nCg}`);
+    if (nFig) parts.push(`人物图 ${nFig}`);
+    if (nItem) parts.push(`物品图 ${nItem}`);
+    if (nAnchor) parts.push(`风格锚点 ${nAnchor}`);
+    log({
+      step: "图像",
+      message: `缓存复用 ${cacheReused} 项${nFig === 0 ? "（人物基础图全部复用，未重生成）" : ""}，实际生成 ${pending.length} 项（${parts.join("、")}）…`,
+      level: "info",
+      at: Date.now(),
+    });
+  }
+
   const runPass = async (pass: ImageTask[], anchorPath?: string) => {
     let idx = 0;
     const worker = async () => {
@@ -1177,6 +1375,7 @@ export async function generateImages(
           });
           if (p) {
             record(task, p);
+            if (!materialFree.has(task)) generatedCount++;
             // 先落盘 assets.json 再发进度事件：前端 progress 回调立即读 assets.json 时，
             // 新图映射已写入 → 素材页真正「生成一张显示一个」。
             // （旧顺序先 emitProgress 后 persistIncremental，前端读到旧数据导致中途不刷新）
@@ -1210,7 +1409,7 @@ export async function generateImages(
 
   // 风格锚点先生成，供背景/CG 引用
   let anchorPath: string | undefined;
-  const anchorTask = tasks.find((t) => t.kind === "anchor");
+  const anchorTask = pending.find((t) => t.kind === "anchor");
   if (anchorTask) {
     const p = await runImageTask(cfg, anchorTask, cacheRoot, log, {
       materials,
@@ -1222,7 +1421,20 @@ export async function generateImages(
       negativePrompt: DEFAULT_NEGATIVE,
     });
     emitProgress(anchorTask);
-    if (p) anchorPath = p;
+    if (p) {
+      anchorPath = p;
+      generatedCount++;
+    }
+  } else {
+    // 锚点命中缓存：静默解析路径供背景/CG 引用，不执行、不发进度
+    const anchorDef = tasks.find((t) => t.kind === "anchor");
+    if (anchorDef) {
+      try {
+        anchorPath = (await cacheHit(imageCacheDir, anchorDef.fileName)) ?? undefined;
+      } catch {
+        anchorPath = undefined;
+      }
+    }
   }
   if (isAborted?.()) {
     log({ step: "图像", message: "已中止（后续图片任务不再继续，已生成的保留）", level: "warn", at: Date.now() });
@@ -1238,7 +1450,7 @@ export async function generateImages(
       scene.chapterOf = chapter.chapter;
       const bg = result.bg[scene.id];
       if (bg) scene.bgFile = bg;
-      const cg = result.cg[`${chapter.chapter}_${scene.id}`];
+      const cg = result.cg[scene.id];
       if (cg) scene.cgFile = cg;
     }
   }
@@ -1275,7 +1487,7 @@ export async function generateImages(
     await tauri.writeTextFile(visualBibleCacheMarker, JSON.stringify(approvedCacheBinding));
   }
 
-  return { images: result, failed };
+  return { images: result, failed, generated: generatedCount };
 }
 
 function cacheBindingForBible(bible: ProjectVisualBible): VisualBibleCacheBinding {
@@ -1370,4 +1582,172 @@ export async function reCutoutAsset(
     log({ step: "图像", message: `重新抠图失败：${assetKey}（${msg.slice(0, 220)}${hint ? " " + hint : ""}）`, level: "error", at: Date.now() });
     return null;
   }
+}
+
+export interface RepairImageReport {
+  /** 剪掉的过期映射条目（当前剧本/卡片不再引用） */
+  prunedRefs: number;
+  /** 迁移的旧版 CG（映射键＋文件改名复用） */
+  migratedCg: number;
+  /** 删除的孤儿图片文件 */
+  purgedFiles: number;
+  /** 剪掉的"映射有、文件无"条目（下次运行自动补生成） */
+  missingDropped: number;
+}
+
+const MANAGED_IMAGE_PREFIXES = ["bg_", "cg_", "figure_", "item_", "threeview_", "anchor_"];
+
+/** 图片产物结构修复（一键清理无效素材）：
+ * - 映射剪枝：只剪「调用方给出完整剧本/卡片」且能明确判定过期的条目；
+ *   bg/cg 以剧本场景为准，人物/物品以 buildImageTasks 重建的当前任务 id 为准；
+ *   未提供剧本/卡片的分区不剪（避免单章等不完整上下文误删）。
+ * - 旧版 CG 迁移：映射键 cg_<章>_<scene> → <scene>，文件同步改名。
+ * - 孤儿文件：images 目录下有管理前缀、但不被任何映射引用的文件删除。
+ * - 缺文件条目：映射指向的文件已不存在 → 删条目（下次运行自动补生成）。
+ * 图片/背景等其它产物不受影响。返回统计。 */
+export async function repairImageAssets(
+  outputDir: string,
+  opts: {
+    chapters?: ChapterScript[];
+    cards?: ExtractionResult;
+    figureEmotions?: boolean;
+    figureDetail?: FigureDetail;
+    threeView?: boolean;
+    withActions?: boolean;
+    cgPerChapter?: number;
+    maxPerChapter?: number;
+  },
+  log: (ev: PipelineEvent) => void,
+): Promise<RepairImageReport> {
+  const report: RepairImageReport = { prunedRefs: 0, migratedCg: 0, purgedFiles: 0, missingDropped: 0 };
+  const cacheRoot = `${outputDir.replace(/[\\/]+$/, "")}/.novel2vn/cache`;
+  const imageCacheDir = cacheDirFor(cacheRoot, "images");
+  await tauri.mkdirAll(imageCacheDir);
+  const map = await readAssetMap(outputDir);
+
+  // 期望 key 集合（仅当调用方给出完整上下文时才用于剪枝）
+  let bgKeep: Set<string> | null = null;
+  let cgKeep: Set<string> | null = null;
+  let figureKeep: Set<string> | null = null;
+  let itemKeep: Set<string> | null = null;
+  if (opts.chapters) {
+    bgKeep = new Set();
+    cgKeep = new Set();
+    for (const ch of opts.chapters) {
+      for (const s of ch.scenes) {
+        bgKeep.add(s.id);
+        if (s.cgEvent) cgKeep.add(s.id);
+      }
+    }
+  }
+  if (opts.cards) {
+    const tasks = buildImageTasks(opts.chapters ?? [], opts.cards, {
+      figurePerCharacter: 1,
+      cgPerChapter: opts.cgPerChapter ?? 0,
+      maxPerChapter: opts.maxPerChapter ?? 0,
+      figureEmotions: opts.figureEmotions,
+      detail: opts.figureDetail ?? "full",
+      threeView: opts.threeView,
+      actions: opts.withActions,
+    });
+    figureKeep = new Set(tasks.filter((t) => t.kind === "figure" || t.kind === "threeview" || t.kind === "action").map((t) => t.id));
+    itemKeep = new Set(tasks.filter((t) => t.kind === "item").map((t) => t.id));
+  }
+
+  const dropMissing = async (section: Record<string, string>): Promise<void> => {
+    for (const [k, p] of Object.entries(section)) {
+      try {
+        if (await tauri.pathExists(p)) continue;
+      } catch {
+        /* 查询失败视为缺失 */
+      }
+      delete section[k];
+      report.missingDropped++;
+    }
+  };
+
+  // 旧版 CG 映射键迁移：cg_<章>_<scene> → <scene>（场景仍存在才迁，否则按过期剪掉）
+  for (const [k, p] of Object.entries(map.cg)) {
+    const m = /^(\d+)_(.+)$/.exec(k);
+    if (!m) continue;
+    const sceneId = m[2];
+    if (cgKeep && !cgKeep.has(sceneId)) {
+      delete map.cg[k];
+      report.prunedRefs++;
+      continue;
+    }
+    if (map.cg[sceneId] === undefined) {
+      map.cg[sceneId] = p;
+      report.migratedCg++;
+    }
+    delete map.cg[k];
+  }
+
+  if (bgKeep) for (const k of Object.keys(map.bg)) if (!bgKeep.has(k)) { delete map.bg[k]; report.prunedRefs++; }
+  if (cgKeep) for (const k of Object.keys(map.cg)) if (!cgKeep.has(k) && !/^\d+_/.test(k)) { delete map.cg[k]; report.prunedRefs++; }
+  if (figureKeep) for (const k of Object.keys(map.figure)) if (!figureKeep.has(k)) { delete map.figure[k]; report.prunedRefs++; }
+  if (itemKeep) for (const k of Object.keys(map.item)) if (!itemKeep.has(k)) { delete map.item[k]; report.prunedRefs++; }
+
+  await dropMissing(map.bg);
+  await dropMissing(map.cg);
+  await dropMissing(map.figure);
+  await dropMissing(map.item);
+
+  // 旧版 CG 文件改名：cg_<章>_<scene>.* → cg_<scene>.*（目标已存在则直接删旧文件）
+  try {
+    const entries = await tauri.listDir(imageCacheDir);
+    for (const e of entries) {
+      if (e.isDir) continue;
+      const m = /^cg_\d+_(.+\.(png|jpg|jpeg|webp))$/i.exec(e.name);
+      if (!m) continue;
+      const target = `${imageCacheDir}/cg_${m[1]}`;
+      try {
+        if (await tauri.pathExists(target)) {
+          await tauri.removePath(e.path).catch(() => {});
+        } else {
+          await tauri.copyFile(e.path, target);
+          await tauri.removePath(e.path).catch(() => {});
+        }
+        report.migratedCg++;
+      } catch {
+        /* 迁移失败保留原文件 */
+      }
+    }
+  } catch {
+    /* 目录不存在等 */
+  }
+
+  // 孤儿文件：有管理前缀、但不被映射引用的删除
+  const referenced = new Set<string>();
+  for (const section of [map.bg, map.cg, map.figure, map.item]) {
+    for (const p of Object.values(section)) referenced.add((p.split(/[\\/]/).pop() || "").toLowerCase());
+  }
+  try {
+    const entries = await tauri.listDir(imageCacheDir);
+    for (const e of entries) {
+      if (e.isDir) continue;
+      const lower = e.name.toLowerCase();
+      if (!MANAGED_IMAGE_PREFIXES.some((pre) => lower.startsWith(pre))) continue;
+      if (!referenced.has(lower)) {
+        await tauri.removePath(e.path).catch(() => {});
+        report.purgedFiles++;
+      }
+    }
+  } catch {
+    /* 目录不存在等 */
+  }
+
+  await updateAssetMap(outputDir, (assets) => {
+    assets.bg = map.bg;
+    assets.cg = map.cg;
+    assets.figure = map.figure;
+    assets.item = map.item;
+  });
+  log({
+    step: "图像",
+    message: `无效素材清理完成：剪枝过期映射 ${report.prunedRefs} 项，迁移旧版 CG ${report.migratedCg} 项，删除孤儿文件 ${report.purgedFiles} 个，清理缺文件映射 ${report.missingDropped} 项（缺失项下次运行自动补生成）`,
+    level: "success",
+    at: Date.now(),
+  });
+  return report;
 }

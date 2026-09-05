@@ -105,6 +105,7 @@ function charParams(required: string[]): Record<string, unknown> {
       clothing: { type: "string", description: "服装描述（颜色、款式）" },
       personality: { type: "string", description: "性格特征" },
       voiceDesc: { type: "string", description: "适合的音色描述（如「清冷的女声」）" },
+      gender: { type: "string", enum: ["male", "female"], description: "角色性别：male（男）/ female（女）" },
       color: { type: "string", description: "十六进制主题色，如 #3b5bdb" },
       isNpc: { type: "boolean", description: "是否次要角色/NPC（有台词但戏份少）；主要角色填 false" },
       costumes: {
@@ -403,15 +404,17 @@ export async function runScanChunk(
 
 /* ==================== 合并去重 ==================== */
 
-function normalizeName(name: string): string {
-  return (name || "").trim().toLowerCase().replace(/\s+/g, "");
+/** 角色名归一化（增量合并与跨片段合并共用）：去空白转小写，同一人不同写法视为同一人 */
+export function normalizeName(name: string): string {  return (name || "").trim().toLowerCase().replace(/\s+/g, "");
 }
 
-function mergeCharacter(target: CharacterCard, source: CharacterCard): void {
+/** 单角色合并（增量追加共用）：缺字段补齐，动作按 id 并集 */
+export function mergeCharacter(target: CharacterCard, source: CharacterCard): void {
   for (const k of ["appearance", "clothing", "personality", "voiceDesc", "imagePrompt", "threeViewPrompt", "color"] as const) {
     if (!target[k] && source[k]) (target as unknown as Record<string, unknown>)[k] = source[k];
   }
   if (!target.voiceName && source.voiceName) target.voiceName = source.voiceName;
+  if (!target.gender && source.gender) target.gender = source.gender;
   const actionMap = new Map<string, CharacterAction>();
   for (const a of [...(target.actions ?? []), ...(source.actions ?? [])]) {
     if (a?.id) actionMap.set(a.id, a);
@@ -458,9 +461,9 @@ const ENRICH_SYSTEM = `你是视觉小说美术与制作总监。下面给出从
 - appearance（外貌描述）、clothing（服装描述）、personality（性格特征）
 - voiceDesc（适合的音色描述）
 - voiceName（必须从"可用音色列表"中选最接近的一个，不要编造列表外的值）
-- imagePrompt：用于 AI 绘画生成立绘的完整英文 prompt，只描述人物本身（全身像、服装、发型、表情、姿态），禁止写任何背景/底色/场地/环境描述（系统会自动附加纯绿幕背景），风格统一为"动漫风格，精美立绘"
+- imagePrompt：用于 AI 绘画生成立绘的完整英文 prompt，只描述人物本身（全身像、服装、发型、表情），姿态必须为自然放松站姿、双臂自然下垂，不要设计任何手势动作，禁止写任何背景/底色/场地/环境描述（系统会自动附加纯绿幕背景），风格统一为"动漫风格，精美立绘"
 - threeViewPrompt：用于生成该角色"三视图参考图"（正面/侧面/背面）的完整英文 prompt：同一角色设定、站姿自然、表情平静、全身可见，同样禁止写任何背景/底色描述（系统会自动附加纯绿幕背景），务必与人物的 imagePrompt 描述完全一致
-- actions：该角色可能做出的经典动作 [{id, name, prompt}]（prompt 为英文，保持人物外观完全一致，纯色背景，全身可见，动漫风格；数量不限，按角色特点给出）
+- actions：该角色可能做出的经典自然动作 [{id, name, prompt}]（prompt 为英文，保持人物外观完全一致，纯色背景，全身可见，动漫风格；不要设计夸张手势，表情类动作只描述面部表情、身体保持自然站姿不加手部动作；数量不限，按角色特点给出）
 - costumes：该角色的服装差分 [{id, name, prompt}]（数量按剧情决定、不设上限；剧情出现换装就要收录；prompt 为英文，人物外貌一致 + 服装款式颜色材质，全身可见，纯色背景）
 - color：十六进制主题色
 - isNpc：布尔值。次要角色/NPC（有台词但戏份少）填 true；主要角色填 false
@@ -487,7 +490,7 @@ async function enrichCards(
   };
   const fb = feedback ? `\n\n用户意见（请严格参考并落实）：${feedback}` : "";
   const user = `小说标题：${title}\n\n可用音色列表：${lib.join(", ")}${fb}\n\n当前卡片 JSON：\n${JSON.stringify(payload)}`;
-  const outputTokens = Math.min(resolveContextLength(cfg), 240_000);
+  const outputTokens = Math.min(resolveContextLength(cfg), 32_768);
   const enriched = await chatJson<{ characters?: CharacterCard[]; scenes?: SceneCard[]; items?: ItemCard[] }>(
     cfg,
     ENRICH_SYSTEM,

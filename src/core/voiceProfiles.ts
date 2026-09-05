@@ -1,6 +1,7 @@
 import type { ApiConfig, VoiceProfile } from "./types";
 import { ttsConfigById, upsertVoiceProfile } from "../stores/config";
 import { tauri } from "../utils/tauri";
+import { minimaxVoiceLabel } from "./minimaxVoices";
 
 function decodeBase64Text(encoded: string): string {
   const bytes = Uint8Array.from(atob(encoded), (character) => character.charCodeAt(0));
@@ -96,11 +97,70 @@ export async function createMiniMaxVoiceProfile(input: {
   const multipart = multipartBody(input.fileName, input.mime, input.audioB64);
   const upload = jsonResponse(await tauri.http({ method: "POST", url: apiUrl(config, "/v1/files/upload"), headers: { ...headers, "Content-Type": multipart.contentType }, bodyBase64: multipart.bodyBase64 }));
   const fileId = extractFileId(upload);
-  const clone = jsonResponse(await tauri.http({ method: "POST", url: apiUrl(config, "/v1/voice_clone"), headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify({ file_id: fileId, voice_id: `novelforge_${crypto.randomUUID().replaceAll("-", "").slice(0, 20)}` }) }));
+  const clone = jsonResponse(await tauri.http({
+    method: "POST",
+    url: apiUrl(config, "/v1/voice_clone"),
+    headers: { ...headers, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      file_id: fileId,
+      voice_id: `novelforge_${crypto.randomUUID().replaceAll("-", "").slice(0, 20)}`,
+      // 官方示例始终携带 model：指定与配置一致的合成模型，避免默认值导致复刻质量不符预期
+      ...(config.model ? { model: config.model } : {}),
+    }),
+  }));
   const profile: VoiceProfile = {
     id: crypto.randomUUID(), name: input.name.trim() || "MiniMax 克隆声音", provider: "minimax", ttsConfigId: config.id,
     voiceId: extractVoiceId(clone), status: "ready", consentConfirmedAt: new Date().toISOString(), revision: 1, createdAt: new Date().toISOString(),
   };
   upsertVoiceProfile(profile);
   return profile;
+}
+
+/** 从 MiniMax 获取可用音色（系统 + 用户克隆/设计）。voice_type: system/voice_cloning/voice_generation/all */
+export interface MiniMaxRemoteVoice {
+  voice_id: string;
+  voice_name: string;
+  kind: "system" | "clone" | "design";
+  gender?: string;
+  language?: string;
+  description?: string;
+}
+
+export async function fetchMiniMaxVoices(config: ApiConfig, voiceType: "system" | "all" = "all"): Promise<MiniMaxRemoteVoice[]> {
+  assertMiniMaxConfig(config);
+  const headers = authHeaders(config);
+  const resp = await tauri.http({
+    method: "POST",
+    url: apiUrl(config, "/v1/get_voice"),
+    headers: { ...headers, "Content-Type": "application/json" },
+    body: JSON.stringify({ voice_type: voiceType }),
+    timeoutSecs: 60,
+  });
+  const payload = jsonResponse(resp);
+  if ((payload.base_resp as Record<string, unknown> | undefined)?.status_code !== 0) {
+    throw new Error(`MiniMax 音色查询失败：${JSON.stringify(payload.base_resp ?? "")}`);
+  }
+  const out: MiniMaxRemoteVoice[] = [];
+  const sections: Array<[keyof typeof payload, "system" | "clone" | "design"]> = [
+    ["system_voice", "system"],
+    ["voice_cloning", "clone"],
+    ["voice_generation", "design"],
+  ];
+  for (const [key, kind] of sections) {
+    const list = payload[key];
+    if (!Array.isArray(list)) continue;
+    for (const v of list as Array<Record<string, unknown>>) {
+      if (typeof v.voice_id !== "string" || !v.voice_id) continue;
+      const name = typeof v.voice_name === "string" && v.voice_name ? v.voice_name : minimaxVoiceLabel(v.voice_id);
+      out.push({
+        voice_id: v.voice_id,
+        voice_name: name,
+        kind,
+        gender: typeof v.gender === "string" ? v.gender : undefined,
+        language: typeof v.language === "string" ? v.language : undefined,
+        description: Array.isArray(v.description) ? String(v.description[0] ?? "") : typeof v.description === "string" ? v.description : undefined,
+      });
+    }
+  }
+  return out;
 }

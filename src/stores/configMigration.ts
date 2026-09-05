@@ -2,12 +2,12 @@ import type { ApiConfig, ApiPreset, ChannelKey, VoiceProfile } from "../core/typ
 
 export const CONFIG_SCHEMA_VERSION = 3 as const;
 
-/** 各通道默认并发数：文本/图像/配音都是批量生成（各自独立，互不影响）；识别默认串行 */
+/** 各通道默认并发数：文本/图像批量生成（各自独立）；识别默认串行；配音受 TTS 服务 RPM 限制（尤其 MiniMax），默认 1 最稳 */
 export const DEFAULT_CONCURRENCY_BY_CHANNEL: Record<ChannelKey, number> = {
   llm: 3,
   vision: 1,
   image: 3,
-  tts: 3,
+  tts: 1,
 };
 
 /** 取某个 API 配置的并发数：配置了用配置值，否则用通道默认值 */
@@ -17,14 +17,15 @@ export function concurrencyFor(cfg: ApiConfig | undefined, kind: ChannelKey): nu
   return DEFAULT_CONCURRENCY_BY_CHANNEL[kind];
 }
 
-/** AI 抠图设置：启用开关 + 所选模型（模型列表见 core/cutout/models.ts） */
+/** AI 抠图设置：抠图方式 + 所选模型（模型列表见 core/cutout/models.ts） */
+export type CutoutMode = "ai" | "chroma" | "off";
 export interface CutoutSettings {
-  enabled: boolean;
+  mode: CutoutMode;
   modelId: string;
 }
 
 export const DEFAULT_CUTOUT_SETTINGS: CutoutSettings = {
-  enabled: true,
+  mode: "ai",
   modelId: "isnet-anime",
 };
 
@@ -197,8 +198,14 @@ function normalizeCutoutSettings(input: unknown): CutoutSettings {
   const modelId = typeof record.modelId === "string" && record.modelId.trim()
     ? record.modelId
     : DEFAULT_CUTOUT_SETTINGS.modelId;
-  const enabled = typeof record.enabled === "boolean" ? record.enabled : DEFAULT_CUTOUT_SETTINGS.enabled;
-  return { enabled, modelId };
+  // 新版三档开关；兼容老版 enabled 布尔值（true=AI 优先，false=只用色度键，保持老行为）
+  let mode: CutoutMode = DEFAULT_CUTOUT_SETTINGS.mode;
+  if (record.mode === "ai" || record.mode === "chroma" || record.mode === "off") {
+    mode = record.mode;
+  } else if (typeof record.enabled === "boolean") {
+    mode = record.enabled ? "ai" : "chroma";
+  }
+  return { mode, modelId };
 }
 
 function normalizeVoiceProfiles(input: unknown): VoiceProfile[] {

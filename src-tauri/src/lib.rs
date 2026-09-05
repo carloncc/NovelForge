@@ -76,7 +76,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .register_uri_scheme_protocol("model", |_ctx, request| {
-            // model://localhost/<模型文件名> → 应用配置目录 models/ 下的文件
+            // model://localhost/<模型文件名> → 程序目录 models/ 下的文件
             let path = request.uri().path().trim_start_matches('/');
             let filename = Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or_default();
             if filename.is_empty() {

@@ -1324,6 +1324,11 @@ code {
   align-items: start;
 }
 
+/* 网格子项允许收缩到轨道宽：卡片内部再长的内容也不得把整页撑宽 */
+.cfg-grid > * {
+  min-width: 0;
+}
+
 .cfg-channel {
   display: flex;
   flex-direction: column;
@@ -1488,7 +1493,25 @@ code {
   font-weight: 600;
 }
 
+/* 复选框行：勾选框与文字水平对齐 */
+label.check {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+  user-select: none;
+}
+
 /* AI 抠图模型设置（配置页） */
+label.field > span.cutout-desc {
+  display: block;
+  margin: 5px 0 0;
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--text-dim);
+}
 .cutout-status {
   font-size: 12.5px;
   color: var(--text-dim);
@@ -1513,6 +1536,13 @@ code {
   background: rgba(88, 101, 242, 0.07);
 }
 .cutout-dir {
+  display: block;
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: 12px;
   color: var(--text-dim);
 }
@@ -1520,7 +1550,6 @@ code {
   font-family: var(--font-mono, monospace);
   font-size: 11.5px;
   color: var(--text);
-  word-break: break-all;
 }
 .cfg-context-budget {
   color: var(--text-dim);
@@ -1578,6 +1607,40 @@ code {
   font-size: 10.5px;
   font-weight: 600;
   vertical-align: 1px;
+}
+
+/* Tab 分组小标签（运行 / 内容） */
+.tabs .tab-group {
+  align-self: center;
+  font-size: 12px;
+  color: var(--text-faint);
+  padding: 0 2px 0 12px;
+  user-select: none;
+  white-space: nowrap;
+}
+.tabs .tab-group:first-child {
+  padding-left: 0;
+}
+
+/* 可折叠卡片（复用 card 外观，summary 当卡头） */
+details.card > summary.card-head {
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+  margin-bottom: 0;
+}
+details.card > summary.card-head::-webkit-details-marker {
+  display: none;
+}
+details.card > summary.card-head h3::before {
+  content: "▸ ";
+  color: var(--text-faint);
+}
+details.card[open] > summary.card-head {
+  margin-bottom: var(--space-4);
+}
+details.card[open] > summary.card-head h3::before {
+  content: "▾ ";
 }
 
 .vb-panel .vb-sub {
@@ -2030,8 +2093,7 @@ details.adv[open] > summary::before {
 }
 
 /* 卡片内区块分隔 */
-.card-section {
-  border-top: 1px solid var(--border);
+.card-section {  border-top: 1px solid var(--border);
   margin-top: var(--space-4);
   padding-top: var(--space-4);
 }

@@ -6,10 +6,18 @@ export interface CardsSaveResult {
   imageCacheCleared: number;
 }
 
+/**
+ * 保存编辑后的卡片。
+ * 默认只清立绘/物品图缓存（外貌变化需重新出图），不清剧本缓存——
+ * 剧本引用的是角色 id/name，多数编辑（音色/服装/外貌微调）不该触发全量重跑剧本，
+ * 否则一章失败会让整个项目的剧本缓存被清空、下次全部重跑，白烧大量 token。
+ * 明确改动了台词相关的角色信息时，可传 invalidateScriptCache=true 主动清剧本缓存。
+ */
 export async function saveEditedCards(
   outputDir: string,
   cards: ExtractionResult,
   log: (msg: string, level?: "info" | "warn" | "success") => void,
+  invalidateScriptCache = false,
 ): Promise<CardsSaveResult> {
   const metaDir = `${outputDir}/.novel2vn`;
   const cacheDir = `${metaDir}/cache`;
@@ -36,17 +44,19 @@ export async function saveEditedCards(
   let scriptCleared = 0;
   let imageCleared = 0;
 
-  // 剧本缓存失效：角色/物品信息变化会影响剧本引用
-  try {
-    const entries = await tauri.listDir(cacheDir);
-    for (const e of entries) {
-      if (!e.isDir && /^script(_demo)?_ch\d+_/.test(e.name)) {
-        await tauri.removePath(e.path).catch(() => {});
-        scriptCleared++;
+  // 剧本缓存：仅显式要求时清空（默认保留，避免全量重跑白烧 token）
+  if (invalidateScriptCache) {
+    try {
+      const entries = await tauri.listDir(cacheDir);
+      for (const e of entries) {
+        if (!e.isDir && /^script(_demo)?_ch\d+_/.test(e.name)) {
+          await tauri.removePath(e.path).catch(() => {});
+          scriptCleared++;
+        }
       }
+    } catch {
+      /* cache 目录不存在 */
     }
-  } catch {
-    /* cache 目录不存在 */
   }
 
   // 立绘/物品图缓存失效：外貌描述变化需要重新生成
@@ -64,7 +74,9 @@ export async function saveEditedCards(
   }
 
   log(
-    `卡片已保存：剧本缓存清除 ${scriptCleared} 个，立绘/物品图缓存清除 ${imageCleared} 个（重新生成时将使用新卡片）`,
+    invalidateScriptCache
+      ? `卡片已保存：剧本缓存清除 ${scriptCleared} 个，立绘/物品图缓存清除 ${imageCleared} 个（重新生成时将使用新卡片）`
+      : `卡片已保存：立绘/物品图缓存清除 ${imageCleared} 个（剧本缓存保留，仅外貌/音色改动不会重跑全部剧本；如需重写剧本请用「重新生成此章」）`,
     "success",
   );
   return { scriptCacheCleared: scriptCleared, imageCacheCleared: imageCleared };

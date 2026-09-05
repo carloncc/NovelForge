@@ -12,13 +12,14 @@ import {
 } from "../stores/config";
 import { testLlm, testVision, testTts, testImage, fetchModelsForChannel } from "../api/openaiCompatible";
 import { templatesForCapability } from "../api/templates";
+import { fetchMiniMaxVoices } from "../core/voiceProfiles";
 import { errMsg } from "../utils/errors";
 import { log } from "../utils/logger";
 import { t } from "../i18n";
 import PageHead from "../components/PageHead.vue";
 import { knownImageModelCapabilities } from "../api/providers";
 import { resolveContextLength, inputCharBudget } from "../api/providers";
-import { DEFAULT_CONCURRENCY_BY_CHANNEL } from "../stores/configMigration";
+import { DEFAULT_CONCURRENCY_BY_CHANNEL, type CutoutMode } from "../stores/configMigration";
 import type { ApiConfig, ChannelKey, ImageModelCapabilities } from "../core/types";
 import type { DiscoveredModel } from "../api/providers";
 import { CUTOUT_MODELS, findCutoutModel, type CutoutModel } from "../core/cutout/models";
@@ -33,6 +34,7 @@ const cutoutModelDir = ref("");
 let cutoutPollTimer: number | undefined;
 
 const currentCutoutModel = computed<CutoutModel>(() => findCutoutModel(configState.cutout?.modelId ?? "isnet-anime"));
+const cutoutMode = computed<CutoutMode>(() => configState.cutout?.mode ?? "ai");
 
 const cutoutStatusText = computed(() => {
   const status = cutoutStatus.value;
@@ -122,13 +124,52 @@ watch(
 onMounted(async () => {
   await refreshCutoutStatus();
   if (isTauri()) {
-    cutoutModelDir.value = `${(await tauri.appConfigDir().catch(() => ""))}/models`;
+    cutoutModelDir.value = `${(await tauri.resourceDir().catch(() => ""))}/models`;
   }
 });
 onUnmounted(stopCutoutPoll);
 
 function defaultConcurrency(kind: ChannelKey): number {
   return DEFAULT_CONCURRENCY_BY_CHANNEL[kind] ?? 3;
+}
+
+/** 格式化 MiniMax 滑块参数的显示值（保留最多 1 位小数） */
+function fmtTtsParam(value: unknown, fallback: number): string {
+  const n = typeof value === "number" ? value : fallback;
+  return String(Math.round(n * 10) / 10);
+}
+
+const voiceFetching = ref<string | null>(null);
+const voiceFetchMsg = ref<Record<string, string>>({});
+
+/** 从 MiniMax 拉取系统音色 + 用户克隆/设计音色，填入该 TTS 配置的音色库 */
+async function fetchVoicesFor(cfg: ApiConfig): Promise<void> {
+  voiceFetching.value = cfg.id;
+  voiceFetchMsg.value[cfg.id] = "";
+  try {
+    const remote = await fetchMiniMaxVoices(cfg, "all");
+    if (!remote.length) throw new Error("MiniMax 未返回任何音色");
+    cfg.extra ??= {};
+    const current = Array.isArray(cfg.extra.voiceLibrary) ? (cfg.extra.voiceLibrary as string[]) : [];
+    const ids = remote.map((v) => v.voice_id);
+    cfg.extra.voiceLibrary = Array.from(new Set([...current, ...ids]));
+    const kinds: Record<string, string> = {
+      system: t("系统音色"),
+      clone: t("克隆音色"),
+      design: t("设计音色"),
+    };
+    const count = (kind: string) => remote.filter((v) => v.kind === kind).length;
+    voiceFetchMsg.value[cfg.id] = t("已获取音色：系统 {sys} 个，克隆 {clone} 个，设计 {design} 个", {
+      sys: String(count("system")),
+      clone: String(count("clone")),
+      design: String(count("design")),
+    });
+    void kinds;
+  } catch (error) {
+    voiceFetchMsg.value[cfg.id] = t("获取音色失败：{error}", { error: errMsg(error) });
+  } finally {
+    voiceFetching.value = null;
+  }
 }
 
 const channels = computed<{ key: ChannelKey; label: string; desc: string; icon: string }[]>(() => [
@@ -495,9 +536,96 @@ watch(
                     if (list.length) cfg.extra!.voiceLibrary = list;
                   }
                 "
-                placeholder="alloy&#10;echo&#10;fable&#10;onyx&#10;nova&#10;shimmer"
+                placeholder="female-tianmei&#10;male-qn-qingse&#10;female-chengshu"
               />
             </label>
+            <div v-if="cfg.adapter === 'minimax-tts' || /minimaxi?\.com/i.test(cfg.baseUrl)" class="row mt-2">
+              <button class="btn secondary small" :disabled="voiceFetching === cfg.id || !cfg.apiKey" @click="fetchVoicesFor(cfg)">
+                {{ voiceFetching === cfg.id ? t("获取中…") : t("从 MiniMax 获取音色") }}
+              </button>
+              <span v-if="voiceFetchMsg[cfg.id]" class="cfg-test-result" :class="voiceFetchMsg[cfg.id].includes('失败') ? 'err' : 'ok'">{{ voiceFetchMsg[cfg.id] }}</span>
+            </div>
+          </details>
+          <details v-if="ch.key === 'tts' && cfg.adapter === 'minimax-tts'" class="cfg-details">
+            <summary>{{ t("MiniMax 语音参数（参考官网：文本转语音）") }}</summary>
+            <div class="cfg-row mt-2">
+              <label class="field">
+                <span>{{ t("模型") }}</span>
+                <select
+                  :value="cfg.model ?? 'speech-2.6-hd'"
+                  @change="(e: any) => { cfg.model = (e.target as HTMLSelectElement).value; }"
+                >
+                  <option value="speech-2.8-hd">speech-2.8-hd（最新高质量）</option>
+                  <option value="speech-2.8-turbo">speech-2.8-turbo（低延迟）</option>
+                  <option value="speech-2.6-hd">speech-2.6-hd（默认）</option>
+                  <option value="speech-2.6-turbo">speech-2.6-turbo</option>
+                  <option value="speech-02-hd">speech-02-hd</option>
+                  <option value="speech-02-turbo">speech-02-turbo</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>{{ t("情感") }}</span>
+                <select
+                  :value="(cfg.extra!.emotion as string | undefined) ?? ''"
+                  @change="(e: any) => { cfg.extra!.emotion = (e.target as HTMLSelectElement).value || undefined; }"
+                >
+                  <option value="">{{ t("自动（默认）") }}</option>
+                  <option value="happy">{{ t("高兴") }}</option>
+                  <option value="sad">{{ t("悲伤") }}</option>
+                  <option value="angry">{{ t("愤怒") }}</option>
+                  <option value="calm">{{ t("平静") }}</option>
+                  <option value="whisper">{{ t("耳语") }}</option>
+                  <option value="surprised">{{ t("惊讶") }}</option>
+                </select>
+              </label>
+            </div>
+            <div class="cfg-row">
+              <label class="field cfg-narrow">
+                <span>{{ t("语速") }}（{{ fmtTtsParam(cfg.extra!.speed, 1.1) }}×）</span>
+                <input
+                  type="range"
+                  min="0.5"
+                  max="2"
+                  step="0.05"
+                  :value="cfg.extra!.speed ?? 1.1"
+                  @input="(e: any) => { cfg.extra!.speed = Number((e.target as HTMLInputElement).value); }"
+                />
+              </label>
+              <label class="field cfg-narrow">
+                <span>{{ t("音量") }}（{{ fmtTtsParam(cfg.extra!.vol, 1) }}）</span>
+                <input
+                  type="range"
+                  min="0.1"
+                  max="10"
+                  step="0.1"
+                  :value="cfg.extra!.vol ?? 1"
+                  @input="(e: any) => { cfg.extra!.vol = Number((e.target as HTMLInputElement).value); }"
+                />
+              </label>
+              <label class="field cfg-narrow">
+                <span>{{ t("音调") }}（{{ fmtTtsParam(cfg.extra!.pitch, 0) }}）</span>
+                <input
+                  type="range"
+                  min="-12"
+                  max="12"
+                  step="1"
+                  :value="cfg.extra!.pitch ?? 0"
+                  @input="(e: any) => { cfg.extra!.pitch = Number((e.target as HTMLInputElement).value); }"
+                />
+              </label>
+              <label class="field cfg-narrow">
+                <span>{{ t("输出格式") }}</span>
+                <select
+                  :value="(cfg.extra!.ttsFormat as string | undefined) ?? 'mp3'"
+                  @change="(e: any) => { cfg.extra!.ttsFormat = (e.target as HTMLSelectElement).value; }"
+                >
+                  <option value="mp3">mp3（推荐）</option>
+                  <option value="wav">wav</option>
+                  <option value="flac">flac</option>
+                </select>
+              </label>
+            </div>
+            <p class="hint">{{ t("这些参数会应用到所有使用该 TTS 配置生成的台词配音；模型列表与官网同步。") }}</p>
           </details>
           <details v-if="ch.key === 'image'" class="cfg-details">
             <summary>{{ t("图片模型能力") }}</summary>
@@ -578,45 +706,50 @@ watch(
           </span>
           <div>
             <div class="cfg-channel-title">{{ t("AI 抠图模型") }}</div>
-            <div class="cfg-channel-desc">{{ t("生成立绘/物品时优先用所选模型抠出透明底；未安装时降级色度键。模型在本机运行，需手动下载。") }}</div>
+            <div class="cfg-channel-desc">{{ t("按「抠图方式」把立绘/动作/物品抠出透明底；AI 模式未安装模型时降级色度键。模型在本机运行，需手动下载。") }}</div>
           </div>
         </div>
       </div>
 
       <div class="cfg-row">
         <label class="field grow-2 mb-0">
-          <span>{{ t("抠图模型") }}</span>
+          <span>{{ t("抠图方式") }}</span>
           <select
-            :value="configState.cutout?.modelId ?? 'isnet-anime'"
-            @change="(e: any) => { configState.cutout!.modelId = (e.target as HTMLSelectElement).value; }"
+            :value="cutoutMode"
+            @change="(e: any) => { configState.cutout!.mode = (e.target as HTMLSelectElement).value as CutoutMode; }"
           >
-            <option v-for="m in cutoutModels" :key="m.id" :value="m.id">{{ m.label }}（{{ m.sizeMB }} MB）— {{ m.description }}</option>
+            <option value="ai">{{ t("AI 抠图优先（失败自动降级色度键）") }}</option>
+            <option value="chroma">{{ t("只用色度键（无需下载模型）") }}</option>
+            <option value="off">{{ t("不抠图（保留原图）") }}</option>
           </select>
         </label>
       </div>
       <div class="cfg-row">
-        <label class="check">
-          <input
-            type="checkbox"
-            :checked="configState.cutout?.enabled ?? true"
-            @change="(e: any) => { configState.cutout!.enabled = (e.target as HTMLInputElement).checked; }"
-          />
-          {{ t("生成立绘/物品时使用 AI 抠图") }}
+        <label class="field grow-2 mb-0">
+          <span>{{ t("抠图模型") }}</span>
+          <select
+            :value="configState.cutout?.modelId ?? 'isnet-anime'"
+            :disabled="cutoutMode !== 'ai'"
+            @change="(e: any) => { configState.cutout!.modelId = (e.target as HTMLSelectElement).value; }"
+          >
+            <option v-for="m in cutoutModels" :key="m.id" :value="m.id">{{ m.label }}（{{ m.sizeMB }} MB）</option>
+          </select>
+          <span class="cutout-desc">{{ currentCutoutModel.description }}</span>
         </label>
       </div>
       <div class="cfg-row">
         <span class="cutout-status" :class="cutoutStatusClass">{{ cutoutStatusText }}</span>
       </div>
       <div class="cfg-row">
-        <button class="btn secondary small" :disabled="cutoutBusy || cutoutStatus?.installed" @click="downloadCurrentModel">
+        <button class="btn secondary small" :disabled="cutoutBusy || cutoutStatus?.installed || cutoutMode !== 'ai'" @click="downloadCurrentModel">
           <span v-if="cutoutBusy" class="spinner" />
           {{ cutoutStatus?.installed ? t("已安装") : t("下载模型") }}
         </button>
         <button v-if="cutoutStatus?.installed" class="btn danger small" :disabled="cutoutBusy" @click="removeCurrentModel">{{ t("删除模型") }}</button>
         <span v-if="cutoutError" class="cfg-model-error">{{ cutoutError }}</span>
       </div>
-      <div v-if="cutoutModelDir" class="cfg-row">
-        <span class="cutout-dir">{{ t("模型目录") }}：<code>{{ cutoutModelDir }}</code></span>
+      <div v-if="cutoutModelDir" class="cfg-row mb-0">
+        <span class="cutout-dir" :title="cutoutModelDir">{{ t("模型目录") }}：<code>{{ cutoutModelDir }}</code></span>
       </div>
     </div>
   </div>
