@@ -1097,15 +1097,15 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
       });
       if (!prepared) return false;
     } else if (!projectState.lastResult) {
-      error.value = t("请先运行文本阶段，生成角色卡片后再确认视觉圣经");
+      error.value = t("请先运行文本阶段，生成角色卡片后再确认视觉守门");
       tab.value = "bible";
       return false;
     }
     pendingResumeStages.value = resumeStagesAfterVisualApproval(opts.stages);
     tab.value = "bible";
     pushLog({
-      step: "视觉圣经",
-      message: t("图像生成前需要确认视觉圣经；文本阶段已准备，请选择来源并创建/重新确认草稿"),
+      step: "视觉守门",
+      message: t("图像生成前需要确认视觉守门；文本阶段已准备，请选择来源并创建/重新确认草稿"),
       level: "info",
       at: Date.now(),
     });
@@ -1374,8 +1374,8 @@ async function resumeAfterVisualApproval(): Promise<void> {
     return;
   }
   pushLog({
-    step: "视觉圣经",
-    message: `圣经已批准，续跑剩余阶段：${stages.map((s) => STAGE_LABELS[s]).join(" → ")}`,
+    step: "视觉守门",
+    message: `视觉守门已批准，续跑剩余阶段：${stages.map((s) => STAGE_LABELS[s]).join(" → ")}`,
     level: "info",
     at: Date.now(),
   });
@@ -1578,7 +1578,7 @@ async function runChapterFullRegen(novelIdx: number): Promise<boolean> {
     error.value = t("还没有角色卡片，请先运行「提取」阶段（或一次全量流程），再逐章生成内容");
     return false;
   }
-  // 视觉圣经未批准时跳过图像阶段，避免阻断剧本重生成（与原 regenChapter 同策略）
+  // 视觉守门未批准时跳过图像阶段，避免阻断剧本重生成（与原 regenChapter 同策略）
   const canFillImages = projectState.options.useImage && !visualBibleNeedsReview(projectState.visualBible);
   const fb = scriptChapterFeedback.value[novelIdx]?.trim() ?? "";
   const forceAll = !!chapterForce.value[novelIdx];
@@ -1587,7 +1587,7 @@ async function runChapterFullRegen(novelIdx: number): Promise<boolean> {
   chapterForce.value[novelIdx] = false;
   pushLog({
     step: "单章",
-    message: `第 ${novelIdx + 1} 章「${ch.title}」全链开始（${fb ? "按意见重写剧本" : forceAll ? "全量重写剧本" : "剧本只补缺失"}${canFillImages ? `＋图像${forceAll ? "（该章背景/CG 强制）" : ""}` : "（圣经待确认，跳过图像）"}，不含配音）`,
+    message: `第 ${novelIdx + 1} 章「${ch.title}」全链开始（${fb ? "按意见重写剧本" : forceAll ? "全量重写剧本" : "剧本只补缺失"}${canFillImages ? `＋图像${forceAll ? "（该章背景/CG 强制）" : ""}` : "（视觉守门待确认，跳过图像）"}，不含配音）`,
     level: "info",
     at: Date.now(),
   });
@@ -1729,7 +1729,7 @@ async function runAppend(tailRaw: string, label: string): Promise<void> {
   if (tail.length < 500 && !window.confirm(`新增内容仅 ${tail.length} 字（不足半章），仍要追加吗？`)) return;
   const fileName = label.split(/[\\/]/).pop() || label;
   if (!window.confirm(
-    `增量追加：在现有 ${novel.chapters.length} 章（约 ${novel.fullText.length} 字）后追加「${fileName}」（约 ${tail.length} 字）。\n旧章节、卡片与全部素材原样保留，只对新增部分分章→提取→生成新章；如有新角色将自动同步加入圣经（三视图走图像 API，需去圣经页确认）。继续吗？`,
+    `增量追加：在现有 ${novel.chapters.length} 章（约 ${novel.fullText.length} 字）后追加「${fileName}」（约 ${tail.length} 字）。\n旧章节、卡片与全部素材原样保留，只对新增部分分章→提取→生成新章；如有新角色将自动同步加入视觉守门（三视图走图像 API，需去视觉守门页确认）。继续吗？`,
   )) return;
   const stages: StageKey[] = ["split", "extract", "script", "image", "assemble"];
   if ((projectState.options.language ?? "").trim()) stages.splice(1, 0, "translate");
@@ -1740,10 +1740,10 @@ async function runAppend(tailRaw: string, label: string): Promise<void> {
     at: Date.now(),
   });
   if (projectState.options.useImage && visualBibleNeedsReview(projectState.visualBible)) {
-    // 圣经待确认时不进图像阶段（避免流程被 divert 到圣经页导致追加上下文丢失）：
-    // 先追加文本，图像待圣经确认后跑一次图像阶段即可自动补上新章（缓存复用旧图）
+    // 视觉守门待确认时不进图像阶段（避免流程被 divert 到视觉守门页导致追加上下文丢失）：
+    // 先追加文本，图像待视觉守门确认后跑一次图像阶段即可自动补上新章（缓存复用旧图）
     stages.splice(stages.indexOf("image"), 1);
-    pushLog({ step: "追加", message: "视觉圣经待确认，本次先追加文本（分章/提取/剧本），图像待圣经确认后跑「图像」阶段自动补新章", level: "warn", at: Date.now() });
+    pushLog({ step: "追加", message: "视觉守门待确认，本次先追加文本（分章/提取/剧本），图像待视觉守门确认后跑「图像」阶段自动补新章", level: "warn", at: Date.now() });
   }
   const ok = await execute({
     stages,
@@ -1763,14 +1763,14 @@ async function runAppend(tailRaw: string, label: string): Promise<void> {
     }
     scheduleSave();
     void chapterStatus.refresh();
-    // 追加新角色自动同步圣经：对比圣经条目，缺失的按当前卡片补建三视图（旧人走老路不受影响）；
-    // 同步后圣经待确认，去圣经页确认批准后再跑图像阶段补新章图
+    // 追加新角色自动同步视觉守门：对比视觉守门条目，缺失的按当前卡片补建三视图（旧人走老路不受影响）；
+    // 同步后视觉守门待确认，去视觉守门页确认批准后再跑图像阶段补新章图
     const bibleNote = await syncAppendedCharactersToBible();
     pushLog({ step: "追加", message: `增量追加完成：现共 ${novel.chapters.length} 章${bibleNote}；新章节配音请跑配音阶段（勾选新章节）或在素材页单句重配`, level: "success", at: Date.now() });
   }
 }
 
-/** 追加后圣经同步：新角色补建三视图条目。返回日志后缀（无新角色/无圣经则为空）。 */
+/** 追加后视觉守门同步：新角色补建三视图条目。返回日志后缀（无新角色/无视觉守门则为空）。 */
 async function syncAppendedCharactersToBible(): Promise<string> {
   const out = projectState.outputDir;
   const bible = projectState.visualBible;
@@ -1780,10 +1780,10 @@ async function syncAppendedCharactersToBible(): Promise<string> {
   if (!missing.length) return "";
   const imageCfg = activeConfig("image");
   if (!imageCfg?.apiKey) {
-    pushLog({ step: "追加", message: `新增 ${missing.length} 个角色（${missing.map((c) => c.name || c.id).join("、")}）不在圣经中，但未配置图像 API，跳过同步：请配置后去圣经页点「同步当前卡片」`, level: "warn", at: Date.now() });
+    pushLog({ step: "追加", message: `新增 ${missing.length} 个角色（${missing.map((c) => c.name || c.id).join("、")}）不在视觉守门中，但未配置图像 API，跳过同步：请配置后去视觉守门页点「同步当前卡片」`, level: "warn", at: Date.now() });
     return "";
   }
-  pushLog({ step: "追加", message: `新增 ${missing.length} 个角色（${missing.map((c) => c.name || c.id).join("、")}），正在同步加入圣经…`, level: "info", at: Date.now() });
+  pushLog({ step: "追加", message: `新增 ${missing.length} 个角色（${missing.map((c) => c.name || c.id).join("、")}），正在同步加入视觉守门…`, level: "info", at: Date.now() });
   try {
     const r = await syncBibleCharactersWithCards(out, bible, { characters: cards.characters, imageCfg });
     const novel = projectState.novel;
@@ -1794,13 +1794,13 @@ async function syncAppendedCharactersToBible(): Promise<string> {
     scheduleSave();
     pushLog({
       step: "追加",
-      message: `圣经同步完成：补建 ${r.added.length} 个新角色三视图${r.adopted.length ? `（${r.adopted.length} 个复用孤儿文件免生成）` : ""}${r.failed.length ? `，失败 ${r.failed.length} 个（${r.failed.map((f) => f.name).join("、")}）` : ""}；请去圣经页确认后批准，再跑图像阶段补新章图`,
+      message: `视觉守门同步完成：补建 ${r.added.length} 个新角色三视图${r.adopted.length ? `（${r.adopted.length} 个复用孤儿文件免生成）` : ""}${r.failed.length ? `，失败 ${r.failed.length} 个（${r.failed.map((f) => f.name).join("、")}）` : ""}；请去视觉守门页确认后批准，再跑图像阶段补新章图`,
       level: r.failed.length ? "warn" : "success",
       at: Date.now(),
     });
-    return `；新角色 ${r.added.length + r.adopted.length} 个已同步加入圣经（待确认）`;
+    return `；新角色 ${r.added.length + r.adopted.length} 个已同步加入视觉守门（待确认）`;
   } catch (e) {
-    pushLog({ step: "追加", message: `圣经同步失败（不影响已追加章节）：${errMsg(e)}；请去圣经页手动点「同步当前卡片」`, level: "error", at: Date.now() });
+    pushLog({ step: "追加", message: `视觉守门同步失败（不影响已追加章节）：${errMsg(e)}；请去视觉守门页手动点「同步当前卡片」`, level: "error", at: Date.now() });
     return "";
   }
 }
@@ -2767,7 +2767,7 @@ function fileExistsLabel(file: string | undefined): string {
 
     <div v-if="visualBibleReviewNeeded" class="vb-banner">
       <div>
-        <strong>{{ t("图像生成前需要确认视觉圣经") }}</strong>
+        <strong>{{ t("图像生成前需要确认视觉守门") }}</strong>
         <p>{{ t("统一风格与角色三视图尚未批准，图像阶段会先停在这里。") }}</p>
       </div>
       <button class="btn secondary small" @click="tab = 'bible'">{{ t("去确认") }}</button>
@@ -3064,7 +3064,7 @@ function fileExistsLabel(file: string | undefined): string {
       <button class="tab" :class="{ active: tab === 'cards' }" @click="tab = 'cards'">{{ t("卡片编辑") }}</button>
       <button class="tab" :class="{ active: tab === 'script' }" @click="tab = 'script'; loadScripts()">{{ t("剧本") }}</button>
       <button class="tab" :class="{ active: tab === 'bible' }" @click="tab = 'bible'">
-        {{ t("视觉圣经") }}
+        {{ t("视觉守门") }}
         <span v-if="visualBibleReviewNeeded" class="tab-badge">{{ t("待确认") }}</span>
       </button>
       <button class="tab" :class="{ active: tab === 'video' }" @click="tab = 'video'; checkVideos()">{{ t("视频推荐位") }}</button>

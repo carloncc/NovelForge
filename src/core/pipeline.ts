@@ -253,7 +253,7 @@ export function pruneAssetRefs(
   return stat;
 }
 
-/** 重提 id 对齐（纯函数）：新卡片按归一化姓名认领老 id，避免圣经/人物图/配音因 id  churn 全废。
+/** 重提 id 对齐（纯函数）：新卡片按归一化姓名认领老 id，避免视觉守门/人物图/配音因 id  churn 全废。
  * 同名只认领一次（多 Claim  protection：第二个同名新人保留自己的 id，不硬并）；
  * 身份类粘性字段（音色映射/参考图/已选音色）沿用老的，描述类取新的。
  * 老卡片没有时原样返回。 */
@@ -1328,11 +1328,11 @@ export class Pipeline {
         }
         const prevCards = (await this.readCachedJson<ExtractionResult>(cardsCache)) ?? undefined;
         if (!demo && prevCards) {
-          // id 对齐：同名角色沿用老 id（圣经/人物图/配音不因重提换 id 全废），粘性字段保留
+          // id 对齐：同名角色沿用老 id（视觉守门/人物图/配音不因重提换 id 全废），粘性字段保留
           const { aligned, adopted } = alignExtractedIds(prevCards, cards);
           if (adopted > 0) {
             cards = aligned;
-            log({ step: "提取", message: `角色 id 已对齐：${adopted} 个同名角色沿用原 id 与音色/参考图（圣经与人物图不受影响）`, level: "info", at: Date.now() });
+            log({ step: "提取", message: `角色 id 已对齐：${adopted} 个同名角色沿用原 id 与音色/参考图（视觉守门与人物图不受影响）`, level: "info", at: Date.now() });
           }
           // 退化熔断：新卡片不足老卡片半数视为提取失败，不覆盖（多因 Agent 早退/截断）
           if (isExtractDegraded(prevCards.characters.length, cards.characters.length)) {
@@ -1725,7 +1725,7 @@ export class Pipeline {
     // 映射自动剪枝（仅当剧本覆盖完整、且本次包含图像/配音阶段时）：
     // 删掉当前剧本不再引用的 bg/cg/vocal 旧条目，解决「重分章后映射总数只增不减」。
     // 两条高压线：
-    // ① 图像/配音阶段不在本次运行时绝不剪——否则剪完没人补（如圣经门禁分流的准备阶段只跑文本），映射被洗空；
+    // ① 图像/配音阶段不在本次运行时绝不剪——否则剪完没人补（如视觉守门分流的准备阶段只跑文本），映射被洗空；
     // ② 单章等不完整上下文（有缺缓存章节）绝不剪，由一键清理在完整上下文里收尾。
     // 剪之前先备份 assets.json（最多保留 3 份），误删可从素材页恢复。
     {

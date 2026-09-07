@@ -142,7 +142,7 @@ async function seedState(page, mode, outputDir) {
 
 async function openBibleTab(page) {
   await page.getByText("生成项目", { exact: true }).first().click();
-  await page.locator(".tabs .tab", { hasText: "视觉圣经" }).click();
+  await page.locator(".tabs .tab", { hasText: "视觉守门" }).click();
   await page.waitForSelector(".vb-panel");
 }
 
@@ -168,7 +168,7 @@ async function runMissingState(browser) {
   const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
   await seedState(page, "missing", "/app/exports/visual-bible-missing");
   const { errors, layout } = await inspectPage(page, "missing-1280");
-  const createButton = page.getByRole("button", { name: "创建视觉圣经草稿" });
+  const createButton = page.getByRole("button", { name: "创建视觉守门草稿" });
   check("missing state shows both style sources", await page.locator(".vb-source-option").count() === 2);
   check("missing state default novel-analysis allows draft creation", await createButton.isEnabled());
   await page.locator('.vb-source-option input[value="reference_image"]').check();

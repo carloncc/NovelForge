@@ -83,7 +83,7 @@ const DEFAULT_NEGATIVE =
   "lowres, bad anatomy, bad hands, extra fingers, mutated hands, deformed, disfigured, missing fingers, extra digit, watermark, signature, text, logo, jpeg artifacts, blurry, noise, low quality, worst quality, black background, dark background, white background, gray background, plain background, solid color background, gradient background, empty background, scenery, landscape";
 
 // 立绘/物品强制纯色背景：生成纯色底，色度键可稳定抠出透明底（统一使用亮绿色 chroma key green）
-// 与视觉圣经绿幕 prompt 保持一致结构：明确"背景区域每个像素都是同一种绿"，并排除黑/白/灰等
+// 与视觉守门绿幕 prompt 保持一致结构：明确"背景区域每个像素都是同一种绿"，并排除黑/白/灰等
 // 会被色度键误判的底色（此前多个项目出现 AI 画纯黑底，导致黑色前景被色度键误抠）。
 //
 // 【发丝/缝隙反阴影加固】AI 对蓬松头发的发丝间隙、衣服褶皱、手指缝隙天然会加"体积阴影/自阴影/环境光遮蔽"
@@ -626,7 +626,7 @@ export async function resolveImageTaskReferences(
       try {
         identity = await fileReference(generatedPath, "identity", `Generated identity for ${task.id}`);
       } catch (e) {
-        // 参考图文件缺失（上游任务被尺寸校验删除/上轮失败/中断）：不硬失败，降级到圣经图或纯文本生图，
+        // 参考图文件缺失（上游任务被尺寸校验删除/上轮失败/中断）：不硬失败，降级到视觉守门图或纯文本生图，
         // 避免一个依赖失败拖垮整批任务（曾出现 20+ 任务连环 REFERENCE_MISSING）。
         logger.warn("images", "生成的参考图缺失，尝试降级", {
           task: task.id,
@@ -643,7 +643,7 @@ export async function resolveImageTaskReferences(
           `Approved identity for ${task.characterId}`,
         );
       } catch (e) {
-        logger.warn("images", "圣经参考图也缺失，改用纯文本生图", {
+        logger.warn("images", "视觉守门参考图也缺失，改用纯文本生图", {
           task: task.id,
           characterId: task.characterId,
           error: e instanceof Error ? e.message : String(e),
@@ -660,8 +660,8 @@ export async function resolveImageTaskReferences(
         `Approved identity for ${task.characterId}`,
       ));
     } catch (e) {
-      // 圣经图缺失：降级纯文本生图，不阻断整批
-      logger.warn("images", "圣经参考图缺失，该任务降级为纯文本生图", {
+      // 视觉守门图缺失：降级纯文本生图，不阻断整批
+      logger.warn("images", "视觉守门参考图缺失，该任务降级为纯文本生图", {
         task: task.id,
         characterId: task.characterId,
         error: e instanceof Error ? e.message : String(e),
@@ -775,8 +775,8 @@ export async function runImageTask(
   let resolvedReferences: ImageReference[] = [];
   let materialReference: ImageReference | undefined;
 
-  // 视觉圣经三视图复用：角色三视图已在视觉圣经确认过（approved）→ 直接复用其图，不重复生成。
-  // 视觉圣经流程已生成并确认 threeview_<id>.png，此处作为最终素材直接引用，避免每轮重生成。
+  // 视觉守门三视图复用：角色三视图已在视觉守门确认过（approved）→ 直接复用其图，不重复生成。
+  // 视觉守门流程已生成并确认 threeview_<id>.png，此处作为最终素材直接引用，避免每轮重生成。
   // 仅「非强制重生成」时复用；force=true（用户主动重生成三视图）时仍走正常生成级联。
   if (task.kind === "threeview" && task.characterId && !opts.force) {
     const approvedBible = opts.visualBible?.status === "approved" ? opts.visualBible : undefined;
@@ -1127,9 +1127,9 @@ export async function generateImages(
   const globalCacheCurrent = !approvedBible
     || storedCacheBinding?.globalFingerprint === approvedCacheBinding?.globalFingerprint;
 
-  // 单章模式精简人物/物品构建：已有三视图/物品图成品、且圣经修订未变的角色/物品，
+  // 单章模式精简人物/物品构建：已有三视图/物品图成品、且视觉守门修订未变的角色/物品，
   // 根本不建任务（而非建完再跳过）——400+ 任务的 stat 开销与"顺手生成计费"一并消除。
-  // 新角色（无三视图）、新物品、圣经修订、force/意见、全量模式不受影响。
+  // 新角色（无三视图）、新物品、视觉守门修订、force/意见、全量模式不受影响。
   let taskCards = cards;
   if (chapterScope && !force && !feedback && globalCacheCurrent) {
     const keepChars: CharacterCard[] = [];
@@ -1247,7 +1247,7 @@ export async function generateImages(
 
   // 静默预分区：纯文件缓存命中的任务直接记入结果，不走执行/进度/写盘链路。
   // 解决"点一次图像重生成，全书 N 张图挨个走一遍进度"——命中只是本地文件存在性＋尺寸检查，
-  // 不产生 API 调用。force/用户素材/圣经三视图/尺寸不符等情况仍进 pending，由 runImageTask 原逻辑处理。
+  // 不产生 API 调用。force/用户素材/视觉守门三视图/尺寸不符等情况仍进 pending，由 runImageTask 原逻辑处理。
   // （imageCacheDir 见函数开头，单章精简已复用）
   const pending: ImageTask[] = [];
   let cacheReused = 0;
@@ -1271,7 +1271,7 @@ export async function generateImages(
       record(task, hit);
       cacheReused++;
     } else {
-      // 用户素材本地拷贝免费：与 runImageTask 同判定（item＋已批准圣经＋有 API 时作参考图仍计费，其余拷贝免费）
+      // 用户素材本地拷贝免费：与 runImageTask 同判定（item＋已批准视觉守门＋有 API 时作参考图仍计费，其余拷贝免费）
       const billableRef = !!cfg && task.kind === "item" && !!approvedBible;
       if (!billableRef && findMaterial(materials, task)) materialFree.add(task);
       pending.push(task);

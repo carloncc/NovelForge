@@ -78,7 +78,7 @@ function llmLimiterFor(cfg: ApiConfig): ConcurrencyLimiter {
   return limiter;
 }
 
-/** 设置某个 API 的文本/视觉请求并发上限（由文本生成/视觉圣经入口按该 API 的并发配置调用） */
+/** 设置某个 API 的文本/视觉请求并发上限（由文本生成/视觉守门入口按该 API 的并发配置调用） */
 export function setLlmConcurrency(cfg: ApiConfig, n: number): void {
   llmLimiterFor(cfg).setMaxConcurrent(n);
 }

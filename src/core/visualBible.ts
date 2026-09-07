@@ -46,7 +46,7 @@ export interface VisualBibleApprovalResult {
 export class VisualBibleApprovalRequiredError extends Error {
   readonly code = "VISUAL_BIBLE_APPROVAL_REQUIRED" as const;
 
-  constructor(message = "视觉圣经尚未确认或已经失效，请先完成风格与角色三视图确认") {
+  constructor(message = "视觉守门尚未确认或已经失效，请先完成风格与角色三视图确认") {
     super(`VISUAL_BIBLE_APPROVAL_REQUIRED: ${message}`);
     this.name = "VisualBibleApprovalRequiredError";
   }
@@ -776,13 +776,13 @@ export async function regenerateCharacterSheet(
   const dependencies = request.dependencies ?? DEFAULT_DEPENDENCIES;
   const published = await mutateAndPublishVisualBible(outputDir, async (artifactDir, artifactRevision) => {
     const storedCharacter = bible.characters[characterId];
-    // 自愈：卡片存在但圣经缺条目（多因重提换 id）→ 按当前卡片新建条目再生成，
+    // 自愈：卡片存在但视觉守门缺条目（多因重提换 id）→ 按当前卡片新建条目再生成，
     // 而不是直接抛 missing。卡片连绘画提示词都没有时才报错指引先修描述。
     let promptForGen = storedCharacter?.prompt;
     if (!storedCharacter) {
       const cardPrompt = normalizeStyleDescription(characterCard.threeViewPrompt || characterCard.imagePrompt);
       if (!cardPrompt) {
-        throw new Error(`Character ${characterId} 在圣经中缺失，且卡片缺少绘画提示词：请先点「重新生成描述」或去卡片编辑补写 imagePrompt`);
+        throw new Error(`Character ${characterId} 在视觉守门中缺失，且卡片缺少绘画提示词：请先点「重新生成描述」或去卡片编辑补写 imagePrompt`);
       }
       promptForGen = cardPrompt;
     }
@@ -915,13 +915,13 @@ export async function regenerateAllCharacterSheets(
         threeViewPrompt = rewritten.threeViewPrompt;
         rewrote = true;
       }
-      // ② 三视图重画（与 regenerateCharacterSheet 同语义：圣经缺条目按卡片自愈）
+      // ② 三视图重画（与 regenerateCharacterSheet 同语义：视觉守门缺条目按卡片自愈）
       const storedCharacter = bible.characters[characterCard.id];
       let promptForGen = rewrote ? threeViewPrompt : storedCharacter?.prompt;
       if (!promptForGen) {
         const cardPrompt = normalizeStyleDescription(threeViewPrompt || imagePrompt || "");
         if (!cardPrompt) {
-          throw new Error(`Character ${characterCard.id} 在圣经中缺失，且卡片缺少绘画提示词：请先点「重新生成描述」或去卡片编辑补写 imagePrompt`);
+          throw new Error(`Character ${characterCard.id} 在视觉守门中缺失，且卡片缺少绘画提示词：请先点「重新生成描述」或去卡片编辑补写 imagePrompt`);
         }
         promptForGen = cardPrompt;
       }
@@ -975,7 +975,7 @@ export async function regenerateAllCharacterSheets(
             sheetSourceRevision: 0,
           };
         } else if (s.rewrote && s.imagePrompt) {
-          // persist 同语义：描述重写后 prompt 取新 imagePrompt；没重写保持圣经原值
+          // persist 同语义：描述重写后 prompt 取新 imagePrompt；没重写保持视觉守门原值
           nextCharacter.prompt = s.imagePrompt;
         }
         // 打回待确认＋修订号＋1（mark 内处理）
@@ -1040,8 +1040,8 @@ async function findOrphanThreeViewSheet(artifactDir: string, characterId: string
 }
 
 /**
- * 圣经×卡片同步：按当前卡片补建缺失的三视图条目，移除卡片里已没有的多余条目。
- * 根因：重跑提取后角色 id 变化（AI 现场给 id），旧圣经条目按老 id 存，全员 missing、
+ * 视觉守门×卡片同步：按当前卡片补建缺失的三视图条目，移除卡片里已没有的多余条目。
+ * 根因：重跑提取后角色 id 变化（AI 现场给 id），旧视觉守门条目按老 id 存，全员 missing、
  * 三视图未生成、提示词暂无。同步只增删条目，不动风格与已确认项；
  * 被移除 id 的旧人物图孤儿请用素材页「清理无效素材」收尾。
  */
@@ -1143,7 +1143,7 @@ export async function syncBibleCharactersWithCards(
 }
 
 /**
- * 确保圣经有该角色条目（无图建条目）：全局重建等流程需要先有条目才能 persist 描述。
+ * 确保视觉守门有该角色条目（无图建条目）：全局重建等流程需要先有条目才能 persist 描述。
  * 已有条目直接返回，不覆盖；新建条目 prompt 取给定值或卡片当前值（卡片也没有则抛错指引先修描述），
  * approved=false，修订号 1；只对齐缓存绑定 key 集，不发图像请求。
  */
@@ -1950,7 +1950,7 @@ export async function assertVisualBibleReadyForImages(
   }
   if (currentFingerprint === bible.inputFingerprint) return;
   await refreshVisualBibleFingerprint(outputDir, bible, currentFingerprint, characters);
-  throw new VisualBibleApprovalRequiredError("小说、角色或风格输入已经变化，视觉圣经已标记为失效");
+  throw new VisualBibleApprovalRequiredError("小说、角色或风格输入已经变化，视觉守门已标记为失效");
 }
 
 export async function validateVisualBibleForApproval(

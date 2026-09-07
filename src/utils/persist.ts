@@ -109,7 +109,7 @@ export async function saveProjectState(state: {
       chapters: state.novel.chapters.map((c) => ({ index: c.index, title: c.title, enabled: c.enabled })),
     };
     // AI 分章快照：当分章结果无法用正则从源文件重建时保存（如 AI 分章丢弃了杂项、边界与正则不同）。
-    // 附带源文件全文指纹，恢复时指纹匹配才使用，保证源文件改动后视觉圣经仍能正确降级。
+    // 附带源文件全文指纹，恢复时指纹匹配才使用，保证源文件改动后视觉守门仍能正确降级。
     if (shouldPersistSplitChapters(state.novel)) {
       persistedState.novel.splitChapters = {
         fp: splitSnapshotFingerprint(state.novel),

@@ -246,7 +246,7 @@ async function createDraft(): Promise<void> {
   }
   const imageCfg = activeConfig("image");
   if (!imageCfg?.apiKey) {
-    createError.value = t("尚未配置图像生成 API，无法生成视觉圣经参考图");
+    createError.value = t("尚未配置图像生成 API，无法生成视觉守门参考图");
     return;
   }
   if (styleSource.value === "reference_image" && !pendingStyleImage.value) {
@@ -280,7 +280,7 @@ async function createDraft(): Promise<void> {
   creating.value = true;
   createProgress.value = null;
   pushLog({
-    step: "视觉圣经",
+    step: "视觉守门",
     message: `创建草稿开始（风格来源：${styleSource.value === "reference_image" ? "参考图" : "小说分析"}；${cards.characters.length} 个角色${Object.keys(pendingCharImages.value).length ? `，其中 ${Object.keys(pendingCharImages.value).length} 个带上传参考图` : ""}）`,
     level: "info",
     at: Date.now(),
@@ -303,7 +303,7 @@ async function createDraft(): Promise<void> {
     pendingCharImages.value = {};
     await refreshApprovalValidation();
     await afterMutation();
-    pushLog({ step: "视觉圣经", message: `视觉圣经草稿已生成（风格分析覆盖全书 ${novel.chapters.length} 章，${cards.characters.length} 个角色全部建档），请逐项确认后批准`, level: "success", at: Date.now() });
+    pushLog({ step: "视觉守门", message: `视觉守门草稿已生成（风格分析覆盖全书 ${novel.chapters.length} 章，${cards.characters.length} 个角色全部建档），请逐项确认后批准`, level: "success", at: Date.now() });
   } catch (e) {
     createError.value = visualBibleErrorMessage(e, {
       imageModel: activeConfig("image")?.model,
@@ -330,7 +330,7 @@ async function saveStyleDescription(): Promise<void> {
     await refreshFingerprint();
     await refreshApprovalValidation();
     await afterMutation();
-    pushLog({ step: "视觉圣经", message: t("风格描述已更新，角色需重新确认"), level: "info", at: Date.now() });
+    pushLog({ step: "视觉守门", message: t("风格描述已更新，角色需重新确认"), level: "info", at: Date.now() });
   } catch (e) {
     styleError.value = visualBibleErrorMessage(e, {
       imageModel: activeConfig("image")?.model,
@@ -364,7 +364,7 @@ async function rewriteStyle(): Promise<void> {
     await refreshFingerprint();
     await refreshApprovalValidation();
     await afterMutation();
-    pushLog({ step: "视觉圣经", message: t("风格描述已由 AI 重写"), level: "success", at: Date.now() });
+    pushLog({ step: "视觉守门", message: t("风格描述已由 AI 重写"), level: "success", at: Date.now() });
   } catch (e) {
     styleError.value = visualBibleErrorMessage(e, {
       imageModel: activeConfig("image")?.model,
@@ -397,7 +397,7 @@ async function regenerateSample(): Promise<void> {
     await regenerateStyleSample(outputDir.value, current, imageCfg);
     await refreshApprovalValidation();
     await afterMutation();
-    pushLog({ step: "视觉圣经", message: t("风格示例图已重新生成，需重新确认角色"), level: "success", at: Date.now() });
+    pushLog({ step: "视觉守门", message: t("风格示例图已重新生成，需重新确认角色"), level: "success", at: Date.now() });
   } catch (e) {
     styleError.value = visualBibleErrorMessage(e, {
       imageModel: imageCfg.model,
@@ -428,7 +428,7 @@ async function replaceStyleFromUpload(): Promise<void> {
     await refreshFingerprint();
     await refreshApprovalValidation();
     await afterMutation();
-    pushLog({ step: "视觉圣经", message: t("全局风格参考图已替换，需重新确认"), level: "success", at: Date.now() });
+    pushLog({ step: "视觉守门", message: t("全局风格参考图已替换，需重新确认"), level: "success", at: Date.now() });
   } catch (e) {
     styleError.value = visualBibleErrorMessage(e, {
       imageModel: activeConfig("image")?.model,
@@ -457,7 +457,7 @@ async function replaceCharacterFromUpload(characterId: string): Promise<void> {
     await refreshFingerprint();
     await refreshApprovalValidation();
     await afterMutation();
-    pushLog({ step: "视觉圣经", message: `角色「${character.name}」参考图已替换，需重新生成三视图`, level: "info", at: Date.now() });
+    pushLog({ step: "视觉守门", message: `角色「${character.name}」参考图已替换，需重新生成三视图`, level: "info", at: Date.now() });
   } catch (e) {
     charErrors.value[characterId] = visualBibleErrorMessage(e, {
       imageModel: activeConfig("image")?.model,
@@ -483,12 +483,12 @@ async function regenerateCharacter(characterId: string): Promise<void> {
     busyKey.value = "";
     return;
   }
-  pushLog({ step: "视觉圣经", message: `角色「${character.name}」三视图重生成开始…`, level: "info", at: Date.now() });
+  pushLog({ step: "视觉守门", message: `角色「${character.name}」三视图重生成开始…`, level: "info", at: Date.now() });
   try {
     await regenerateCharacterSheet(outputDir.value, current, { character, imageCfg });
     await refreshApprovalValidation();
     await afterMutation();
-    pushLog({ step: "视觉圣经", message: `角色「${character.name}」三视图已重新生成`, level: "success", at: Date.now() });
+    pushLog({ step: "视觉守门", message: `角色「${character.name}」三视图已重新生成`, level: "success", at: Date.now() });
   } catch (e) {
     charErrors.value[characterId] = visualBibleErrorMessage(e, {
       imageModel: imageCfg.model,
@@ -516,7 +516,7 @@ async function regenerateCharacterDesc(characterId: string): Promise<void> {
   }
   busyKey.value = `char-desc:${characterId}`;
   charErrors.value[characterId] = "";
-  pushLog({ step: "视觉圣经", message: `角色「${character.name}」描述重生成开始…`, level: "info", at: Date.now() });
+  pushLog({ step: "视觉守门", message: `角色「${character.name}」描述重生成开始…`, level: "info", at: Date.now() });
   try {
     const { imagePrompt, threeViewPrompt } = await regenerateCharacterDescription(visionCfg, character);
     const { card: updatedCard } = await persistRegeneratedCharacterDescription(
@@ -538,7 +538,7 @@ async function regenerateCharacterDesc(characterId: string): Promise<void> {
     await refreshApprovalValidation();
     await afterMutation();
     pushLog({
-      step: "视觉圣经",
+      step: "视觉守门",
       message: `角色「${character.name}」描述已重新生成（强制绿幕），需重新生成三视图`,
       level: "success",
       at: Date.now(),
@@ -552,7 +552,7 @@ async function regenerateCharacterDesc(characterId: string): Promise<void> {
   }
 }
 
-/** 同步当前卡片：圣经条目按老 id 存、重提换 id 后全员 missing 时，一键按当前卡片补建＋移除多余条目 */
+/** 同步当前卡片：视觉守门条目按老 id 存、重提换 id 后全员 missing 时，一键按当前卡片补建＋移除多余条目 */
 async function syncCharactersWithCards(): Promise<void> {
   const current = bible.value;
   const cards = projectState.lastResult?.cards;
@@ -562,7 +562,7 @@ async function syncCharactersWithCards(): Promise<void> {
   const cardIds = new Set(cards.characters.map((c) => c.id));
   const extra = Object.keys(current.characters).filter((id) => !cardIds.has(id));
   if (!missing.length && !extra.length) {
-    pushLog({ step: "视觉圣经", message: "圣经条目与当前卡片已同步，无需操作", level: "success", at: Date.now() });
+    pushLog({ step: "视觉守门", message: "视觉守门条目与当前卡片已同步，无需操作", level: "success", at: Date.now() });
     return;
   }
   // 只有需要补建三视图（调图像 API）时才要求图像配置；仅移除多余条目时不需要
@@ -571,14 +571,14 @@ async function syncCharactersWithCards(): Promise<void> {
     return;
   }
   if (!window.confirm(
-    `圣经与当前卡片不同步：缺失 ${missing.length} 个角色条目（${missing.slice(0, 5).map((c) => c.name || c.id).join("、")}${missing.length > 5 ? "…" : ""}）`
+    `视觉守门与当前卡片不同步：缺失 ${missing.length} 个角色条目（${missing.slice(0, 5).map((c) => c.name || c.id).join("、")}${missing.length > 5 ? "…" : ""}）`
     + `${extra.length ? `，多余 ${extra.length} 个旧条目（${extra.slice(0, 5).join("、")}${extra.length > 5 ? "…" : ""}）` : ""}。`
     + "将按当前卡片补建三视图（调用图像 API）、移除多余条目，已确认项不受影响。继续吗？",
   )) return;
   busyKey.value = "sync-cards";
   approvalError.value = "";
   pushLog({
-    step: "视觉圣经",
+    step: "视觉守门",
     message: `同步开始：缺失 ${missing.length} 个条目待补建${extra.length ? `，多余 ${extra.length} 个待移除` : ""}…`,
     level: "info",
     at: Date.now(),
@@ -600,7 +600,7 @@ async function syncCharactersWithCards(): Promise<void> {
     await refreshApprovalValidation();
     await afterMutation();
     pushLog({
-      step: "视觉圣经",
+      step: "视觉守门",
       message: `同步完成：补建 ${r.added.length} 个三视图条目${r.adopted.length ? `（其中 ${r.adopted.length} 个复用孤儿文件免生成：${r.adopted.join("、")}）` : ""}，移除多余 ${r.removed.length} 个`
         + `${r.failed.length ? `，失败 ${r.failed.length} 个（${r.failed.map((f) => `${f.name}：${f.reason.slice(0, 60)}`).join("；")}）` : ""}`
         + "；被移除 id 的旧人物图孤儿请用素材页「清理无效素材」收尾",
@@ -643,7 +643,7 @@ async function regenerateAllCharacters(): Promise<void> {
     return;
   }
   pushLog({
-    step: "视觉圣经",
+    step: "视觉守门",
     message: `全局重新生成开始：${n} 个角色重写描述＋重画三视图（${limit} 并发）…`,
     level: "info",
     at: Date.now(),
@@ -672,7 +672,7 @@ async function regenerateAllCharacters(): Promise<void> {
     await refreshApprovalValidation();
     await afterMutation();
     pushLog({
-      step: "视觉圣经",
+      step: "视觉守门",
       message: `全局重新生成完成：成功 ${r.ok.length} 个${r.failed.length ? `，失败 ${r.failed.length} 个（${r.failed.map((f) => `${f.name}：${f.reason.slice(0, 60)}`).join("；")}）` : ""}（描述＋三视图已全量重做，均待确认）`,
       level: r.failed.length ? "warn" : "success",
       at: Date.now(),
@@ -691,12 +691,12 @@ async function acceptCharacter(characterId: string): Promise<void> {
   if (!current || !outputDir.value) return;
   busyKey.value = `char-accept:${characterId}`;
   charErrors.value[characterId] = "";
-  pushLog({ step: "视觉圣经", message: `角色「${characters.value.find((c) => c.id === characterId)?.name ?? characterId}」确认开始…`, level: "info", at: Date.now() });
+  pushLog({ step: "视觉守门", message: `角色「${characters.value.find((c) => c.id === characterId)?.name ?? characterId}」确认开始…`, level: "info", at: Date.now() });
   try {
     await acceptCharacterSheet(outputDir.value, current, characterId);
     await refreshApprovalValidation();
     await afterMutation();
-    pushLog({ step: "视觉圣经", message: `角色「${characters.value.find((c) => c.id === characterId)?.name ?? characterId}」三视图已确认`, level: "success", at: Date.now() });
+    pushLog({ step: "视觉守门", message: `角色「${characters.value.find((c) => c.id === characterId)?.name ?? characterId}」三视图已确认`, level: "success", at: Date.now() });
   } catch (e) {
     charErrors.value[characterId] = visualBibleErrorMessage(e, {
       imageModel: activeConfig("image")?.model,
@@ -720,7 +720,7 @@ async function approve(): Promise<void> {
     });
     await refreshApprovalValidation();
     await afterMutation();
-    pushLog({ step: "视觉圣经", message: t("视觉圣经已批准，开始续跑剩余阶段"), level: "success", at: Date.now() });
+    pushLog({ step: "视觉守门", message: t("视觉守门已批准，开始续跑剩余阶段"), level: "success", at: Date.now() });
     emit("approve");
   } catch (e) {
     approvalError.value = visualBibleErrorMessage(e, {
@@ -754,7 +754,7 @@ function characterNeedsRegeneration(characterId: string): boolean {
     <div class="card">
       <div class="card-head">
         <div>
-          <h3>{{ t("视觉圣经确认") }}</h3>
+          <h3>{{ t("视觉守门确认") }}</h3>
           <p class="vb-sub">{{ t("图像生成前的统一风格与角色三视图门禁。") }}</p>
         </div>
         <div class="row" style="justify-content: flex-end">
@@ -800,7 +800,7 @@ function characterNeedsRegeneration(characterId: string): boolean {
           <div class="vb-actions">
             <button class="btn" :disabled="!canCreateDraft" @click="createDraft">
               <span v-if="creating" class="spinner" />
-              {{ creating ? t("生成草稿中…") : t("创建视觉圣经草稿") }}
+              {{ creating ? t("生成草稿中…") : t("创建视觉守门草稿") }}
             </button>
           </div>
         </div>
