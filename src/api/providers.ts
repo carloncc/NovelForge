@@ -238,9 +238,34 @@ export function resolveContextLength(cfg: { model?: string; extra?: Record<strin
 }
 
 /**
+ * 按实际文本语种估算字符/token 比率（采样前 2 万字）。
+ * 英文约 4 字符/token，中文约 0.6 字符/token（1 个汉字 ≈ 1.5~2 token），线性混合。
+ * 注意以前这里写反了（按 1.5 字符/token 给中文小说算预算），导致中文长文分段超大。
+ */
+export function estimateCharsPerToken(text: string): number {
+  const sample = text.slice(0, 20_000);
+  if (!sample.length) return 0.7;
+  const cjk = (sample.match(/[぀-ヿ㐀-䶿一-鿿豈-﫿＀-￯]/g) || []).length;
+  const cjkRatio = cjk / [...sample].length;
+  return 4 * (1 - cjkRatio) + 0.6 * cjkRatio;
+}
+
+/** 单次请求字符硬上限：上下文再长也别一次塞太多——
+ * 巨型负载易触发网关 500/超时，且超长输入提取质量明显下降（lost in the middle） */
+export const MAX_INPUT_CHUNK_CHARS = 150_000;
+
+/** 按实际文本语种估算的安全输入字符预算（中文小说约按 0.6 字符/token） */
+export function inputCharBudgetForText(cfg: { model?: string; extra?: Record<string, unknown> } | undefined, text: string): number {
+  const context = resolveContextLength(cfg);
+  const reservedOutput = 36_000;
+  const safeTokens = Math.max(2_000, context - reservedOutput);
+  return Math.min(MAX_INPUT_CHUNK_CHARS, Math.floor(safeTokens * estimateCharsPerToken(text)));
+}
+
+/**
  * 根据模型上下文算"安全输入字符预算"。
- * - 中英文保守估算：1 token ≈ 1.5 字符（中文 1.5~2 字符/token；英文 4 字符/token）
- *   取下限确保不超限，但会保守（英文文本利用率约 37%）
+ * - 无原文时的粗估：1 token ≈ 1.5 字符（偏英文）；有原文请用 inputCharBudgetForText
+ *   （中文小说实际约 0.6 字符/token，用 1.5 会超预算触发网关 500）
  * - 扣掉输出预留（默认 32K 输出 + 4K reasoning 余量 = 36K token）
  * - 绝对上限 1_000_000 字符防荒谬值
  */

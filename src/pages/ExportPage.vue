@@ -45,13 +45,25 @@ function setMsg(m: string, ok = true): void {
 
 async function openFolder(): Promise<void> {
   if (!outputDir.value) return;
-  await tauri.openInExplorer(outputDir.value);
+  if (!isTauri()) {
+    setMsg(t("网页版无法打开本地文件夹：请用上方「复制路径」手动打开"), false);
+    return;
+  }
+  try {
+    await tauri.openInExplorer(outputDir.value);
+  } catch (e) {
+    setMsg(`打开文件夹失败：${errMsg(e)}`, false);
+  }
 }
 
 async function copyPath(): Promise<void> {
   if (!outputDir.value) return;
-  await navigator.clipboard.writeText(outputDir.value);
-  setMsg(t("路径已复制到剪贴板"));
+  try {
+    await navigator.clipboard.writeText(outputDir.value);
+    setMsg(t("路径已复制到剪贴板"));
+  } catch {
+    setMsg(t("复制失败（浏览器可能限制了剪贴板权限）：请手动复制上方路径"), false);
+  }
 }
 
 async function runLint(): Promise<void> {
@@ -118,6 +130,9 @@ async function packZip(): Promise<void> {
     setMsg(t("尚未生成项目"), false);
     return;
   }
+  // 打包前必做一次新鲜检查：用旧报告会误拦（修完没重跑）或漏拦（新改坏了没检查）
+  setMsg(t("正在重新检查项目…"));
+  await runLint();
   if (lintReport.value?.errors.length) {
     setMsg(t("存在导出检查错误，请先修复（见上方检查结果）"), false);
     return;

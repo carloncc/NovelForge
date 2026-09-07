@@ -9,6 +9,7 @@ const props = defineProps<{
   statuses: Record<StageKey, StageState>;
   failedCounts: Record<StageKey, number>;
   feedback: Partial<Record<StageKey, string>>;
+  force: Partial<Record<StageKey, boolean>>;
   busy: boolean;
 }>();
 
@@ -28,7 +29,10 @@ function stateText(s: StageState, key: StageKey): string {
 }
 
 const showFeedback = (s: StageKey): boolean =>
-  s === "split" || s === "translate" || s === "extract" || s === "script" || s === "image";
+  s === "split" || s === "translate" || s === "extract" || s === "script" || s === "image" || s === "voice";
+
+// 全量开关：assemble 是本地免费操作，无需强制；其余阶段勾选后无视缓存全量重跑（计费，执行前二次确认）
+const showForce = (s: StageKey): boolean => s !== "assemble";
 
 const stageOrder = computed(() => STAGE_ORDER);
 </script>
@@ -50,9 +54,12 @@ const stageOrder = computed(() => STAGE_ORDER);
         <b>{{ t(STAGE_LABELS[s]) }}</b>
         <span class="stage-state-text" :class="statuses[s]">{{ stateText(statuses[s], s) }}</span>
       </div>
-      <input v-if="showFeedback(s)" type="text" v-model="feedback[s]" :placeholder="t('意见（可选）')" />
-      <span v-else-if="s === 'voice'" style="color: var(--text-faint); font-size: 12px">{{ t("TTS 不接收意见") }}</span>
-      <button class="btn small" :disabled="busy" @click="emit('regen', s)">
+      <input v-if="showFeedback(s)" type="text" v-model="feedback[s]" :placeholder="s === 'voice' ? t('意见（填了=全书重配，计费）') : t('意见（填了=全量重生成，计费）')" />
+      <label v-if="showForce(s)" class="opt-item mb-0" :title="t('勾选后无视缓存全量重跑该阶段（计费），不需要填意见；执行前会二次确认')">
+        <input type="checkbox" v-model="force[s]" :disabled="busy" />
+        {{ t("全量") }}
+      </label>
+      <button class="btn small" :disabled="busy" :title="t('无意见且未勾全量=只补缺失/失败项，不计费')" @click="emit('regen', s)">
         {{ t("重新生成") }}
       </button>
     </div>

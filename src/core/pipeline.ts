@@ -1,6 +1,7 @@
 import type {
   ApiConfig,
   AssetMap,
+  CharacterCard,
   ChapterInfo,
   ChapterScript,
   CostStats,
@@ -19,12 +20,13 @@ import type {
 import { STAGE_ORDER, languageName } from "./types";
 import type { RenderAssets, WebgalLanguage } from "./render";
 import { sanitizeId } from "./render";
-import { extractFromNovel, demoExtract } from "./extract";
-import { extractFromNovelAgent, mergeCharacter, normalizeName } from "./extractAgent";
-import { scriptChapter, demoScriptAll, verifyScriptAgainstSource } from "./script";
+import { demoExtract } from "./extract";
+import { extractFromNovelAgent, extractFromNovelChunked, mergeCharacter, normalizeName } from "./extractAgent";
+import { scriptChapter, demoScriptAll, verifyScriptAgainstSource, scriptVerifyFileName, readScriptVerify, writeScriptVerify, SCRIPT_MIN_KEPT_RATIO } from "./script";
+import type { ScriptVerifyResult } from "./script";
 import { translateChapter } from "./translate";
 import { aiSplitChapters, splitChaptersForFallback } from "./split";
-import type { SplitStats } from "./split";
+import type { AiSplitOptions, SplitStats } from "./split";
 import { generateImages } from "./images";
 import { generateVoice, vocalKeysForChapters } from "./voice";
 import { assembleProject, gameKeyFor } from "./project";
@@ -38,7 +40,7 @@ import { configIsUsable } from "../api/providers";
 import { concurrencyFor } from "../stores/configMigration";
 import { setLlmConcurrency } from "../api/openaiCompatible";
 import { assertVisualBibleApprovalStatus, assertVisualBibleReadyForImages } from "./visualBible";
-import { readAssetMap, updateAssetMap } from "./assetMap";
+import { readAssetMap, updateAssetMap, backupAssetMap } from "./assetMap";
 import { parseChapterScript } from "./dataValidation";
 
 export interface PipelineInput {
@@ -147,6 +149,7 @@ async function splitNovelForPipeline(
   feedback?: string,
   concurrency = 3,
   out?: { method?: SplitMethod; stats?: SplitStats },
+  splitOpts?: AiSplitOptions,
 ): Promise<ChapterInfo[]> {
   if (!cfg?.apiKey) {
     if (out) out.method = "fallback";
@@ -154,7 +157,7 @@ async function splitNovelForPipeline(
   }
   if (out) out.method = "ai";
   const stats: SplitStats = {};
-  const chapters = await aiSplitChapters(cfg, fullText, onUsage, 40000, feedback, concurrency, stats);
+  const chapters = await aiSplitChapters(cfg, fullText, onUsage, 40000, feedback, concurrency, stats, splitOpts);
   if (out) out.stats = stats;
   return chapters;
 }
@@ -225,6 +228,8 @@ export function pruneAssetRefs(
     if (!bgKeep.has(k)) { delete assets.bg[k]; stat.bg++; }
   }
   for (const [k, v] of Object.entries(assets.cg)) {
+    // 新键本身就在保留集里：先认，避免数字开头的 scene.id（如 1_a）被当成旧版 cg_1_a 误伤
+    if (cgKeep.has(k)) continue;
     const legacy = /^(\d+)_(.+)$/.exec(k);
     if (legacy) {
       const sceneId = legacy[2];
@@ -246,6 +251,44 @@ export function pruneAssetRefs(
     if (!vocalKeep.has(k)) { delete assets.vocal[k]; stat.vocal++; }
   }
   return stat;
+}
+
+/** 重提 id 对齐（纯函数）：新卡片按归一化姓名认领老 id，避免圣经/人物图/配音因 id  churn 全废。
+ * 同名只认领一次（多 Claim  protection：第二个同名新人保留自己的 id，不硬并）；
+ * 身份类粘性字段（音色映射/参考图/已选音色）沿用老的，描述类取新的。
+ * 老卡片没有时原样返回。 */
+export function alignExtractedIds(
+  oldCards: ExtractionResult | undefined,
+  fresh: ExtractionResult,
+): { aligned: ExtractionResult; adopted: number } {
+  if (!oldCards?.characters.length) return { aligned: fresh, adopted: 0 };
+  const oldByName = new Map<string, CharacterCard>();
+  for (const c of oldCards.characters) {
+    const k = normalizeName(c.name);
+    if (k && !oldByName.has(k)) oldByName.set(k, c);
+  }
+  const claimedOldIds = new Set<string>();
+  let adopted = 0;
+  const characters = fresh.characters.map((fc) => {
+    const hit = normalizeName(fc.name) ? oldByName.get(normalizeName(fc.name)) : undefined;
+    if (!hit || hit.id === fc.id || claimedOldIds.has(hit.id)) return fc;
+    claimedOldIds.add(hit.id);
+    adopted++;
+    return {
+      ...fc,
+      id: hit.id,
+      voiceProfileId: fc.voiceProfileId ?? hit.voiceProfileId,
+      voiceName: fc.voiceName || hit.voiceName,
+      referenceImage: fc.referenceImage ?? hit.referenceImage,
+      referenceImagePath: fc.referenceImagePath ?? hit.referenceImagePath,
+    };
+  });
+  return { aligned: { ...fresh, characters }, adopted };
+}
+
+/** 提取退化熔断：老卡片 ≥3 人且新卡片不足半数 → 视为提取失败，不覆盖（纯函数供单测） */
+export function isExtractDegraded(oldCount: number, newCount: number): boolean {
+  return oldCount >= 3 && newCount * 2 < oldCount;
 }
 
 /** 增量卡片合并（纯追加）：老卡片为底，新增部分提取结果按归一化姓名并入。
@@ -418,12 +461,19 @@ export class Pipeline {
   private classifyScriptCache(
     name: string,
     expectedByIndex: Map<number, string>,
+    demo?: boolean,
   ): { kind: "valid" | "legacy" | "stale" | "ignore"; chapterPos: number } {
     const m = name.match(/^script(_demo)?_ch(\d+)_(.+)\.json$/);
     if (!m) return { kind: "ignore", chapterPos: -1 };
     const n = parseInt(m[2], 10) - 1;
     const rest = m[3];
     const expected = expectedByIndex.get(n);
+    // demo/正式隔离：同文同风时两套缓存指纹体相同，不隔离会被对方覆盖命中
+    if (demo !== undefined && !!m[1] !== demo) {
+      // 非本模式的有效键按过期处理（不清，load 时忽略；prune 只清 stale——此处归 stale 会被删！
+      // 为保险起见归 ignore，让 prune 放过它）
+      return { kind: "ignore", chapterPos: n };
+    }
     if (expected !== undefined && rest === expected) return { kind: "valid", chapterPos: n };
     if (rest.includes("_t")) return { kind: "stale", chapterPos: n };
     return { kind: "legacy", chapterPos: n };
@@ -432,6 +482,7 @@ export class Pipeline {
   private async loadChaptersFiltered(
     working: { index: number; title: string; text: string }[],
     styleFrag: string,
+    demo?: boolean,
   ): Promise<{ chapters: ChapterScript[]; rawCount: number; staleCount: number; legacyCount: number }> {
     const expectedByIndex = new Map(working.map((c) => [c.index, this.expectedScriptRest(c, styleFrag)] as [number, string]));
     const chapters: ChapterScript[] = [];
@@ -447,7 +498,7 @@ export class Pipeline {
       const picked = new Map<number, { path: string; legacy: boolean }>();
       for (const f of files) {
         rawCount++;
-        const { kind, chapterPos } = this.classifyScriptCache(f.name, expectedByIndex);
+        const { kind, chapterPos } = this.classifyScriptCache(f.name, expectedByIndex, demo);
         if (kind === "ignore" || kind === "stale") {
           if (kind === "stale") staleCount++;
           continue;
@@ -487,6 +538,7 @@ export class Pipeline {
   private async pruneStaleScriptCache(
     working: { index: number; title: string; text: string }[],
     styleFrag: string,
+    demo?: boolean,
   ): Promise<number> {
     const expectedByIndex = new Map(working.map((c) => [c.index, this.expectedScriptRest(c, styleFrag)] as [number, string]));
     let deleted = 0;
@@ -494,7 +546,7 @@ export class Pipeline {
       const entries = await tauri.listDir(this.cacheRoot);
       for (const e of entries) {
         if (e.isDir || !/^script(_demo)?_ch\d+_/.test(e.name)) continue;
-        if (this.classifyScriptCache(e.name, expectedByIndex).kind === "stale") {
+        if (this.classifyScriptCache(e.name, expectedByIndex, demo).kind === "stale") {
           await tauri.removePath(e.path).catch(() => {});
           deleted++;
         }
@@ -524,10 +576,44 @@ export class Pipeline {
     });
   }
 
-    /** 卡片变化后使依赖卡片的缓存失效（分级）：
-   * 有新旧卡片时只清「被删除/外貌变化」的角色与物品对应图片文件，剧本缓存保留
+    /** 删除改移入回收站：.novel2vn/trash/<时间>/ 下只保留最近 2 轮，误删可找回。
+   * （曾经直接删除：一次退化重提就丢了全书人物图文件，只能花钱重画。） */
+  private async trashPaths(paths: string[]): Promise<number> {
+    if (!paths.length) return 0;
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const trashRound = `${this.input.outputDir}/.novel2vn/trash/${stamp}`;
+    let moved = 0;
+    try {
+      await tauri.mkdirAll(trashRound);
+      for (const p of paths) {
+        const name = p.split(/[\\/]/).pop() || "";
+        if (!name) continue;
+        try {
+          await tauri.copyFile(p, `${trashRound}/${name}`);
+          await tauri.removePath(p).catch(() => {});
+          moved++;
+        } catch {
+          /* 单个失败跳过 */
+        }
+      }
+      const parent = `${this.input.outputDir}/.novel2vn/trash`;
+      const entries = await tauri.listDir(parent).catch(() => []);
+      const rounds = entries.filter((e) => e.isDir).map((e) => e.name).sort();
+      while (rounds.length > 2) {
+        const old = rounds.shift()!;
+        await tauri.removePath(`${parent}/${old}`).catch(() => {});
+      }
+    } catch {
+      /* 回收站不可用：已移动的计数保留 */
+    }
+    return moved;
+  }
+
+  /** 卡片变化后使依赖卡片的缓存失效（分级）：
+   * 有新旧卡片时只处理「被删除/外貌变化」的角色与物品对应图片文件，剧本缓存保留
    * （与卡片编辑页 saveEditedCards 同策略，避免改一句小传就全书重跑）；
-   * 无旧卡片（首跑/缓存丢失）时沿用旧的全量清理。返回清理数。 */
+   * 无旧卡片（首跑/缓存丢失）时沿用旧的全量清理。失效文件移入回收站而非删除。
+   * 返回清理数。 */
   private async invalidateAfterCardsChange(oldCards?: ExtractionResult, newCards?: ExtractionResult): Promise<{ script: number; images: number }> {
     if (oldCards && newCards) {
       const oldChars = new Map(oldCards.characters.map((c) => [c.id, c]));
@@ -567,6 +653,7 @@ export class Pipeline {
         const deadThreeview = new Set([...deadCharIds].map((id) => `threeview_${sanitizeId(id).toLowerCase()}`));
         const deadItem = new Set([...deadItemIds].map((id) => `item_${sanitizeId(id).toLowerCase()}`));
         const baseNoExt = (name: string): string => name.replace(/\.(png|jpg|jpeg|webp)$/i, "");
+        const victims: string[] = [];
         try {
           const imgDir = `${this.cacheRoot}/images`;
           const entries = await tauri.listDir(imgDir);
@@ -584,25 +671,27 @@ export class Pipeline {
             } else if (lower.startsWith("item_")) {
               dead = deadItem.has(base) && !liveItem.has(base);
             }
-            if (dead) {
-              await tauri.removePath(e.path).catch(() => {});
-              images++;
-            }
+            if (dead) victims.push(e.path);
           }
         } catch {
           /* images 目录不存在 */
         }
+        images = await this.trashPaths(victims);
+      }
+      if (images > 0) {
+        this.log(`卡片变化：${images} 个人物/物品图文件已移入回收站（.novel2vn/trash，保留最近 2 轮），对应图将在图像阶段重生成`, "warn", "提取");
       }
       return { script: 0, images };
     }
     let script = 0;
     let images = 0;
+    const scriptVictims: string[] = [];
+    const imageVictims: string[] = [];
     try {
       const entries = await tauri.listDir(this.cacheRoot);
       for (const e of entries) {
         if (!e.isDir && /^script(_demo)?_ch\d+_/.test(e.name)) {
-          await tauri.removePath(e.path).catch(() => {});
-          script++;
+          scriptVictims.push(e.path);
         }
       }
     } catch {
@@ -613,12 +702,16 @@ export class Pipeline {
       const entries = await tauri.listDir(imgDir);
       for (const e of entries) {
         if (!e.isDir && /^(figure_|item_|threeview_)/.test(e.name)) {
-          await tauri.removePath(e.path).catch(() => {});
-          images++;
+          imageVictims.push(e.path);
         }
       }
     } catch {
       /* images 目录不存在 */
+    }
+    script = await this.trashPaths(scriptVictims);
+    images = await this.trashPaths(imageVictims);
+    if (script + images > 0) {
+      this.log(`提取后失效清理：${script} 个剧本缓存 / ${images} 个人物物品图已移入回收站（.novel2vn/trash，保留最近 2 轮），对应内容将在下游阶段重生成`, "warn", "提取");
     }
     return { script, images };
   }
@@ -644,7 +737,38 @@ export class Pipeline {
     return `${this.input.outputDir}/.novel2vn/split.json`;
   }
 
-    private async loadSplitChapters(): Promise<{ chapters: ChapterInfo[]; method: SplitMethod | "legacy"; discarded: number } | null> {    const parsed = await this.readCachedJson<{ fp: string; chapters: ChapterInfo[]; method?: SplitMethod; discarded?: number }>(this.splitCacheFile());
+    /** 剧本保真核对并落盘（供剧本页逐条处理）：
+   * 核对报告与剧本缓存同指纹（原文/标题/文风）；剧本重写覆盖同名文件，指纹不变，
+   * 故重写后必须 force 重算，否则复用的是上一版剧本的旧报告。报告已存在且指纹一致、
+   * 且剧本未重写时直接复用（含忽略表）。 */
+  private async verifyAndPersistScript(
+    chapter: { index: number; title: string; text?: string },
+    script: ChapterScript,
+    characters: { id: string; name: string }[],
+    demo: boolean,
+    styleFrag: string,
+    // 刚写入新剧本后必须 force：核对报告只按原文/标题/文风寻址，
+    // 不 force 会复用上一版剧本的旧核对结果（行号与结论全错版）
+    force = false,
+  ) {
+    const verifyFile = scriptVerifyFileName(cacheDirFor(this.cacheRoot, ""), demo, chapter.index, chapter.title, chapter.text || "", styleFrag);
+    const expectedFp = scriptCacheRest(chapter.title, chapter.text || "", styleFrag);
+    const prev = await readScriptVerify(verifyFile);
+    if (!force && prev && prev.textFp === expectedFp) return prev.result;
+    const vr = verifyScriptAgainstSource(chapter.text || "", script.scenes, characters);
+    await writeScriptVerify(verifyFile, {
+      version: 1,
+      chapterIndex: chapter.index,
+      title: chapter.title,
+      textFp: expectedFp,
+      at: new Date().toISOString(),
+      result: vr,
+      ignored: prev?.ignored ?? [],
+    }).catch(() => {});
+    return vr;
+  }
+
+  private async loadSplitChapters(): Promise<{ chapters: ChapterInfo[]; method: SplitMethod | "legacy"; discarded: number } | null> {    const parsed = await this.readCachedJson<{ fp: string; chapters: ChapterInfo[]; method?: SplitMethod; discarded?: number }>(this.splitCacheFile());
     if (!parsed || !Array.isArray(parsed.chapters) || !parsed.chapters.length) return null;
     const currentFp = novelFingerprint(this.input.novel.fullText);
     if (parsed.fp !== currentFp) {
@@ -716,8 +840,13 @@ export class Pipeline {
     }
     const feedback = this.feedback.split;
     const out: { method?: SplitMethod; stats?: SplitStats } = {};
+    // 分章选项（用户可配）：碎章合并阈值（0=不合并）＋保留后记/番外/特典/插图等特殊章
+    const splitOpts: AiSplitOptions = {
+      minChapterChars: this.options.splitMinChapterChars,
+      keepSpecials: this.options.splitKeepSpecials,
+    };
     const chapters = await withTextRetry(
-      () => splitNovelForPipeline(this.input.llm!, fullText, this.onUsageCb, feedback, concurrencyFor(this.input.llm, "llm"), out),
+      () => splitNovelForPipeline(this.input.llm!, fullText, this.onUsageCb, feedback, concurrencyFor(this.input.llm, "llm"), out, splitOpts),
       {
         isAborted: () => this.aborted,
         onRetry: (attempt, delay, e) =>
@@ -738,7 +867,7 @@ export class Pipeline {
     this.input.log({
       step: "分章",
       message: method === "ai"
-        ? `AI 分章完成：共 ${chapters.length} 章${discarded > 0 ? `（已丢弃 ${discarded} 个杂项块）` : ""}${(out.stats?.mergedTiny ?? 0) > 0 ? `（碎章合并 ${out.stats!.mergedTiny} 个）` : ""}`
+        ? `AI 分章完成：共 ${chapters.length} 章${discarded > 0 ? `（已丢弃 ${discarded} 个杂项块：${(out.stats?.discardedSamples ?? []).slice(0, 3).join("、")}${discarded > 3 ? "…" : ""}；后记/番外/特典/插图被丢了就在这里，如需保留请开「保留特殊章节」重切）` : ""}${(out.stats?.mergedTiny ?? 0) > 0 ? `（碎章合并 ${out.stats!.mergedTiny} 个；阈值 ${this.options.splitMinChapterChars ?? 3000} 字，设 0 可关闭合并）` : ""}${(out.stats?.keptSpecials ?? 0) > 0 ? `（保留特殊章 ${out.stats!.keptSpecials} 个）` : ""}`
         : `规则回退分章完成：共 ${chapters.length} 章（机械切分，未做杂项丢弃/超长拆分/碎章合并）`,
       level: "success",
       at: Date.now(),
@@ -761,6 +890,13 @@ export class Pipeline {
       throw new Error("原文与分章缓存对不上（可能更换过小说或重分过章），追加已中止：请走全量流程，或确认原文无误后重试");
     }
     const oldChapters = parsed.chapters.map((c, i) => ({ ...c, index: i }));
+    // 停用标记保留：split.json 不存 enabled，按当前小说同序号章节的标记恢复，避免追加复活已停用章
+    {
+      const enabledByIndex = new Map((this.input.novel.chapters || []).map((c) => [c.index, c.enabled]));
+      for (const c of oldChapters) {
+        if (enabledByIndex.get(c.index) === false) c.enabled = false;
+      }
+    }
     const newFull = joinAppendText(baseFullText, tail);
     const newFp = novelFingerprint(newFull);
     // 只对新增部分分章（与 runSplit 同重试/并发模型；无 LLM 时规则回退）
@@ -775,7 +911,10 @@ export class Pipeline {
       });
     }
     const tailChapters = await withTextRetry(
-      () => splitNovelForPipeline(this.input.llm!, tail, this.onUsageCb, this.feedback.split, concurrencyFor(this.input.llm, "llm"), out),
+      () => splitNovelForPipeline(this.input.llm!, tail, this.onUsageCb, this.feedback.split, concurrencyFor(this.input.llm, "llm"), out, {
+        minChapterChars: this.options.splitMinChapterChars,
+        keepSpecials: this.options.splitKeepSpecials,
+      }),
       {
         isAborted: () => this.aborted,
         onRetry: (attempt, delay, e) =>
@@ -1094,8 +1233,14 @@ export class Pipeline {
                   onUsage,
                   isAborted: () => this.aborted,
                   log: (message, level = "info") => log({ step: "提取", message, level, at: Date.now() }),
+                  chunkChars: this.options.extractChunkChars,
                 })
-              : extractFromNovel(input.llm!, tailText, title, onUsage);
+              : extractFromNovelChunked(input.llm!, tailText, title, {
+                  onUsage,
+                  isAborted: () => this.aborted,
+                  log: (message, level = "info") => log({ step: "提取", message, level, at: Date.now() }),
+                  chunkChars: this.options.extractChunkChars,
+                });
           const fresh = demo
             ? demoExtract(tailText, title)
             : await withTextRetry(runTailExtract, {
@@ -1140,15 +1285,25 @@ export class Pipeline {
       if (!cards) {
         try {
           const useAgent = !!this.options.extractAgent;
+          const extractLog = (message: string, level: "info" | "warn" | "success" | "error" = "info") =>
+            log({ step: "提取", message, level, at: Date.now() });
           const runExtract = (): Promise<ExtractionResult> =>
             useAgent
               ? extractFromNovelAgent(input.llm!, workingNovel.fullText, workingNovel.fileName.replace(/\.txt$/i, ""), {
                   onUsage,
                   isAborted: () => this.aborted,
                   feedback: extractFeedback,
-                  log: (message, level = "info") => log({ step: "提取", message, level, at: Date.now() }),
+                  log: extractLog,
+                  chunkChars: this.options.extractChunkChars,
                 })
-              : extractFromNovel(input.llm!, workingNovel.fullText, workingNovel.fileName.replace(/\.txt$/i, ""), onUsage, extractFeedback);
+              // 经典模式也分段全书扫描：旧单次截断只看前文，长篇后半人物永远提不出来
+              : extractFromNovelChunked(input.llm!, workingNovel.fullText, workingNovel.fileName.replace(/\.txt$/i, ""), {
+                  onUsage,
+                  feedback: extractFeedback,
+                  isAborted: () => this.aborted,
+                  log: extractLog,
+                  chunkChars: this.options.extractChunkChars,
+                });
           cards = demo
             ? demoExtract(workingNovel.fullText, workingNovel.fileName.replace(/\.txt$/i, ""))
             : await withTextRetry(runExtract, {
@@ -1172,6 +1327,20 @@ export class Pipeline {
           throw e;
         }
         const prevCards = (await this.readCachedJson<ExtractionResult>(cardsCache)) ?? undefined;
+        if (!demo && prevCards) {
+          // id 对齐：同名角色沿用老 id（圣经/人物图/配音不因重提换 id 全废），粘性字段保留
+          const { aligned, adopted } = alignExtractedIds(prevCards, cards);
+          if (adopted > 0) {
+            cards = aligned;
+            log({ step: "提取", message: `角色 id 已对齐：${adopted} 个同名角色沿用原 id 与音色/参考图（圣经与人物图不受影响）`, level: "info", at: Date.now() });
+          }
+          // 退化熔断：新卡片不足老卡片半数视为提取失败，不覆盖（多因 Agent 早退/截断）
+          if (isExtractDegraded(prevCards.characters.length, cards.characters.length)) {
+            const msg = `本次提取仅得到 ${cards.characters.length} 个角色（原有 ${prevCards.characters.length} 个，不足半数），已中止并保留旧卡片：请检查原文后重试提取。如确认原文已删减，请删除 .novel2vn/cards.json 后重提`;
+            this.recordFailure({ id: "extract", kind: "llm", step: "提取", message: msg, at: Date.now() });
+            throw new Error(msg);
+          }
+        }
         await tauri.writeTextFile(cardsCache, JSON.stringify({ ...cards, _novelFp: novelFp }, null, 2));
         // 新提取（指纹失配/意见/强制/首跑）后分级失效下游：有新旧卡片时只清被删/外貌变化者的图，
         // 剧本缓存保留（与卡片编辑页同策略）；无旧卡片时沿用全量清理。首跑时目录为空，调用无害。
@@ -1223,11 +1392,25 @@ export class Pipeline {
         log({ step: "剧本", message: `增量追加：只生成新增的 ${this.appendedIndexes.length} 章剧本，其余 ${activeChapters.length - this.appendedIndexes.length} 章复用缓存`, level: "info", at: Date.now() });
       }
       const feedbackSet = new Set(Object.keys(this.feedback.script ?? {}).map(Number));
+      {
+        // 越界保护：勾选的章节不在当前分章中（多因分章变化后按旧编号勾选）→ 忽略并明示，
+        // 否则静默跑错章节（表现即"分章节没有效果"）
+        const workingIdx = new Set(activeChapters.map((c) => c.index));
+        const oor = [...rerunSet].filter((i) => !workingIdx.has(i));
+        if (oor.length) {
+          log({
+            step: "剧本",
+            message: `勾选的第 ${oor.map((i) => i + 1).join("、")} 章不在当前分章（共 ${activeChapters.length} 章）中，已忽略；分章变化后请按当前章节重新勾选`,
+            level: "warn",
+            at: Date.now(),
+          });
+        }
+      }
       const style = (this.options.scriptStyle ?? "").trim();
       const styleFrag = style ? `_st${titleHash(style)}` : "";
       // 先清理与当前章节失配的过期剧本缓存（重分章/重翻译/改标题正文/换文风后残留），
       // 避免旧剧本混入本次结果；旧版无指纹文件保留（加载时兼容并提示重跑）
-      const prunedScripts = await this.pruneStaleScriptCache(workingChapters, styleFrag);
+      const prunedScripts = await this.pruneStaleScriptCache(workingChapters, styleFrag, demo);
       if (prunedScripts > 0) {
         log({
           step: "剧本",
@@ -1296,11 +1479,15 @@ export class Pipeline {
           const cacheFile = scriptCacheFileName(cacheDir, demo, chapter.index, chapter.title, chapter.text || "", styleFrag);
           const hasFeedback = feedbackSet.has(chapter.index);
           const selected = rerunSet.has(chapter.index);
+          // 单章强制（章节盘/剧本页「全量」开关）：跳过缓存直接重写，不需要填意见
+          const chapterForce = (this.options.rerunChaptersForce ?? []).includes(chapter.index);
           let script: ChapterScript | null = null;
           if (!selected && !hasFeedback) {
             script = await this.readCachedJson<ChapterScript>(cacheFile);
             if (script) {
               log({ step: "剧本", message: `[缓存] 第 ${chapter.index + 1} 章（未勾选重跑，复用）：${chapter.title}`, level: "info", at: Date.now() });
+              // 复用也保证核对报告存在（旧版本跑出的剧本可能没有）：有则复用，无则补算落盘
+              await this.verifyAndPersistScript(chapter, script, cards!.characters, demo, styleFrag).catch(() => {});
             } else {
               log({
                 step: "剧本",
@@ -1312,13 +1499,13 @@ export class Pipeline {
               continue;
             }
           } else {
-            if (!this.options.skipCache && !hasFeedback && !scriptForce) {
+            if (!this.options.skipCache && !hasFeedback && !chapterForce && !scriptForce) {
               script = await this.readCachedJson<ChapterScript>(cacheFile);
             }
             if (!script) {
               log({
                 step: "剧本",
-                message: `生成第 ${chapter.index + 1} 章剧本：${chapter.title}${hasFeedback ? "（按你的意见重写）" : ""}`,
+                message: `生成第 ${chapter.index + 1} 章剧本：${chapter.title}${hasFeedback ? "（按你的意见重写）" : chapterForce ? "（全量重写）" : ""}`,
                 level: "info",
                 at: Date.now(),
               });
@@ -1370,15 +1557,15 @@ export class Pipeline {
                 continue;
               }
               await tauri.writeTextFile(cacheFile, JSON.stringify(script, null, 2));
-              // 保真自检：拿原文逐句核对刚生成的剧本（覆盖率＋说话人归属），只告警不阻断
-              try {
-                const vr = verifyScriptAgainstSource(chapter.text || "", script.scenes, cards!.characters);
+              // 保真自检：核对刚生成的剧本并落盘核对报告（剧本页「保真核对」可逐条接受/删除/忽略）；
+              // 覆盖率过低（<85%）且无用户意见时自动重写一次补足遗漏（最多 1 次）
+              const reportVerify = (vr: ScriptVerifyResult): void => {
                 const pct = Math.round(vr.keptRatio * 100);
                 const suspectSpeakers = vr.speakerIssues.filter((i) => i.reason !== "not-in-source").length;
                 if (vr.originalQuoteCount >= 5 && (vr.keptRatio < 0.9 || vr.notFoundCount > 0 || suspectSpeakers > 0)) {
                   log({
                     step: "剧本",
-                    message: `第 ${chapter.index + 1} 章保真告警：原文 ${vr.originalQuoteCount} 处引语→剧本 ${vr.dialogueCount} 句对话（${pct}%），${vr.notFoundCount} 句原文无出处，${suspectSpeakers} 处说话人存疑（短回合可能被合并/删除，详见后续 warn）`,
+                    message: `第 ${chapter.index + 1} 章保真告警：原文 ${vr.originalQuoteCount} 处引语→剧本 ${vr.dialogueCount} 句对话（${pct}%），${vr.notFoundCount} 句原文无出处，${suspectSpeakers} 处说话人存疑（可在剧本页「保真核对」逐条接受/删除/忽略）`,
                     level: "warn",
                     at: Date.now(),
                   });
@@ -1396,6 +1583,40 @@ export class Pipeline {
                     at: Date.now(),
                   });
                 }
+              };
+              try {
+                let vr = await this.verifyAndPersistScript(chapter, script, cards!.characters, demo, styleFrag, true);
+                if (!demo && !hasFeedback && !chapterForce && vr.originalQuoteCount >= 5 && vr.keptRatio < SCRIPT_MIN_KEPT_RATIO) {
+                  log({
+                    step: "剧本",
+                    message: `第 ${chapter.index + 1} 章覆盖率仅 ${Math.round(vr.keptRatio * 100)}%（低于 ${Math.round(SCRIPT_MIN_KEPT_RATIO * 100)}%），自动重写一次补足遗漏台词…`,
+                    level: "warn",
+                    at: Date.now(),
+                  });
+                  try {
+                    script = await withTextRetry(
+                      () => scriptChapter(input.llm!, chapter, cards!, onUsage, {
+                        style: style || undefined,
+                        feedback: `保真复核未通过：上一版只覆盖原文 ${Math.round(vr.keptRatio * 100)}% 引语，请逐段核对原文把遗漏的对话与关键旁白补全，不要新增原文没有的台词，不要张冠李戴说话人。`,
+                      }),
+                      {
+                        isAborted: () => this.aborted,
+                        onRetry: (attempt, delay, e) =>
+                          log({
+                            step: "剧本",
+                            message: `第 ${chapter.index + 1} 章自动重写失败，${delay / 1000}s 后重试（第 ${attempt} 次）：${errMsg(e).slice(0, 100)}`,
+                            level: "warn",
+                            at: Date.now(),
+                          }),
+                      },
+                    );
+                    await tauri.writeTextFile(cacheFile, JSON.stringify(script, null, 2));
+                    vr = await this.verifyAndPersistScript(chapter, script, cards!.characters, demo, styleFrag, true);
+                  } catch (e) {
+                    log({ step: "剧本", message: `第 ${chapter.index + 1} 章自动重写失败，保留上一版（可在剧本页手动处理）：${errMsg(e).slice(0, 100)}`, level: "warn", at: Date.now() });
+                  }
+                }
+                reportVerify(vr);
               } catch {
                 /* 自检失败不阻断生成 */
               }
@@ -1406,6 +1627,7 @@ export class Pipeline {
                 level: "info",
                 at: Date.now(),
               });
+              await this.verifyAndPersistScript(chapter, script!, cards!.characters, demo, styleFrag).catch(() => {});
             }
           }
           this.applyVideoOptions(script);
@@ -1428,7 +1650,8 @@ export class Pipeline {
       // 指纹过滤：只接受与当前章节（标题＋正文＋文风）匹配的剧本缓存，
       // 重分章/重导小说/改标题正文后的残留文件会被忽略（不再按字典序误用旧剧本）
       const styleFragElse = this.scriptStyleFrag();
-      const loaded = await this.loadChaptersFiltered(workingChapters, styleFragElse);
+      const demoElse = !input.llm?.apiKey;
+      const loaded = await this.loadChaptersFiltered(workingChapters, styleFragElse, demoElse);
       const cachedChapters = loaded.chapters;
       if (cachedChapters.length) {
         for (const c of cachedChapters) {
@@ -1499,15 +1722,22 @@ export class Pipeline {
       assets.vocal = existingAssets.vocal ?? {};
     }
 
-    // 映射自动剪枝（仅当剧本覆盖完整时）：删掉当前剧本不再引用的 bg/cg/vocal 旧条目，
-    // 解决「重分章后映射总数只增不减」。单章等不完整上下文（有缺缓存章节）绝不剪，
-    // 由一键清理（repairImageAssets）在完整上下文里收尾。
+    // 映射自动剪枝（仅当剧本覆盖完整、且本次包含图像/配音阶段时）：
+    // 删掉当前剧本不再引用的 bg/cg/vocal 旧条目，解决「重分章后映射总数只增不减」。
+    // 两条高压线：
+    // ① 图像/配音阶段不在本次运行时绝不剪——否则剪完没人补（如圣经门禁分流的准备阶段只跑文本），映射被洗空；
+    // ② 单章等不完整上下文（有缺缓存章节）绝不剪，由一键清理在完整上下文里收尾。
+    // 剪之前先备份 assets.json（最多保留 3 份），误删可从素材页恢复。
     {
       const activeCount = workingChapters.filter((c) => c.enabled !== false).length;
-      if (existingAssets && chapters.length > 0 && chapters.length >= activeCount && this.skippedScriptChapters.length === 0) {
+      const repopulates = stages.has("image") || stages.has("voice");
+      if (!repopulates) {
+        logger.debug("pipeline", "跳过映射剪枝：本次不含图像/配音阶段（剪完无人补回）", {});
+      } else if (existingAssets && chapters.length > 0 && chapters.length >= activeCount && this.skippedScriptChapters.length === 0) {
         const stat = pruneAssetRefs(assets, chapters);
         const total = stat.bg + stat.cg + stat.vocal;
         if (total > 0 || stat.cgMigrated > 0) {
+          const backupName = await backupAssetMap(input.outputDir);
           await updateAssetMap(input.outputDir, (m) => {
             m.bg = assets.bg;
             m.cg = assets.cg;
@@ -1515,7 +1745,7 @@ export class Pipeline {
           });
           log({
             step: "组装",
-            message: `素材映射已剪枝：清理过期引用 ${total} 项（背景 ${stat.bg}、CG ${stat.cg}、配音 ${stat.vocal}）${stat.cgMigrated > 0 ? `，迁移旧版 CG 键 ${stat.cgMigrated} 项` : ""}；孤儿文件可用素材页「清理无效素材」删除`,
+            message: `素材映射已剪枝：清理过期引用 ${total} 项（背景 ${stat.bg}、CG ${stat.cg}、配音 ${stat.vocal}）${stat.cgMigrated > 0 ? `，迁移旧版 CG 键 ${stat.cgMigrated} 项` : ""}${backupName ? `（已备份 ${backupName}，误删可从素材页恢复）` : ""}；孤儿文件可用素材页「清理无效素材」删除`,
             level: "info",
             at: Date.now(),
           });
@@ -1585,6 +1815,7 @@ export class Pipeline {
           this.options.imageBudgetPerChapter ?? 0,
           imageChapterScope,
           this.options.figureDetail ?? "full",
+          (this.options.rerunChaptersForce?.length ?? 0) > 0,
         );
         this.failedTasks.push(...failed);
         this.imageHadFailures = this.imageHadFailures || failed.length > 0;

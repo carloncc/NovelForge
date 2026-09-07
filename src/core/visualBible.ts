@@ -1,4 +1,4 @@
-import { chatCompletion, chatVision, generateImage, ReferenceImageError } from "../api/openaiCompatible";
+import { chatCompletion, chatVision, extractJson, generateImage, ReferenceImageError } from "../api/openaiCompatible";
 import { setLlmConcurrency } from "../api/openaiCompatible";
 import { tauri } from "../utils/tauri";
 import { errMsg } from "../utils/errors";
@@ -72,7 +72,7 @@ export interface VisualBibleServiceDependencies {
     cfg: ApiConfig,
     system: string,
     user: string,
-    options?: { maxTokens?: number; temperature?: number },
+    options?: { maxTokens?: number; temperature?: number; json?: boolean },
   ) => Promise<string>;
   chatVision: (
     cfg: ApiConfig,
@@ -466,7 +466,10 @@ async function resolveCharacterReference(
 
 function characterThreeViewPrompt(identityPrompt: string, styleDescription: string): string {
   const identity = stripBackground(normalizeStyleDescription(identityPrompt));
-  return `${identity}. ${styleDescription}. Character turnaround sheet showing exactly the same person in front, side, and back orthographic full-body views, neutral pose, consistent proportions and clothing, solid chroma key green background (pure #00FF00 green filling the entire background, no gradient, no pattern, no text), no extra figures, no text.`;
+  // 风格描述同样剥背景词：LLM 综合的风格里可能带 "soft gradient background" 之类，
+  // 不剥会与后面的纯绿幕后缀冲突（环境采样图那边要完整风格，不动它，只在这里剥）
+  const style = stripBackground(normalizeStyleDescription(styleDescription));
+  return `${identity}. ${style}. Character turnaround sheet showing exactly the same person in front, side, and back orthographic full-body views, neutral pose, consistent proportions and clothing, solid chroma key green background (pure #00FF00 green filling the entire background, no gradient, no pattern, no text), no extra figures, no text.`;
 }
 
 function characterImageTasks(character: CharacterCard) {
@@ -773,9 +776,18 @@ export async function regenerateCharacterSheet(
   const dependencies = request.dependencies ?? DEFAULT_DEPENDENCIES;
   const published = await mutateAndPublishVisualBible(outputDir, async (artifactDir, artifactRevision) => {
     const storedCharacter = bible.characters[characterId];
-    if (!storedCharacter) throw new Error(`Character is missing from visual bible: ${characterId}`);
+    // 自愈：卡片存在但圣经缺条目（多因重提换 id）→ 按当前卡片新建条目再生成，
+    // 而不是直接抛 missing。卡片连绘画提示词都没有时才报错指引先修描述。
+    let promptForGen = storedCharacter?.prompt;
+    if (!storedCharacter) {
+      const cardPrompt = normalizeStyleDescription(characterCard.threeViewPrompt || characterCard.imagePrompt);
+      if (!cardPrompt) {
+        throw new Error(`Character ${characterId} 在圣经中缺失，且卡片缺少绘画提示词：请先点「重新生成描述」或去卡片编辑补写 imagePrompt`);
+      }
+      promptForGen = cardPrompt;
+    }
     let identityReference: ImageReference | undefined;
-    if (storedCharacter.sourceReferencePath) {
+    if (storedCharacter?.sourceReferencePath) {
       const referencePath = visualBiblePath(outputDir, storedCharacter.sourceReferencePath);
       const sourceReference = await readReferenceFile(referencePath, `Character reference for ${characterId}`);
       identityReference = {
@@ -788,7 +800,7 @@ export async function regenerateCharacterSheet(
     const styleReference = await readReferenceFile(styleReferencePath, "Global style reference");
     const generated = await dependencies.generateImage(
       imageCfg,
-      characterThreeViewPrompt(storedCharacter.prompt, bible.styleDescription),
+      characterThreeViewPrompt(promptForGen!, bible.styleDescription),
       {
         references: [
           ...(identityReference ? [{ ...identityReference, required: true }] : []),
@@ -803,14 +815,366 @@ export async function regenerateCharacterSheet(
       },
     );
     const next = cloneVisualBible(bible);
-    const nextCharacter = next.characters[characterId];
+    let nextCharacter = next.characters[characterId];
+    if (!nextCharacter) {
+      const actionIds = productionActionIds(characterCard);
+      nextCharacter = next.characters[characterId] = {
+        threeViewPath: "",
+        prompt: promptForGen!,
+        ...(actionIds.length ? { actionIds } : {}),
+        approved: false,
+        revision: 1,
+        sourceRevision: 0,
+        sheetSourceRevision: 0,
+      };
+    }
     markCharacterBibleChanged(next, characterId);
     nextCharacter.threeViewPath = revisionedArtifactPath(canonicalThreeViewPath(characterId), artifactRevision);
     nextCharacter.sheetSourceRevision = characterSourceRevision(nextCharacter);
+    reconcileCacheBindingKeys(next);
     await writeGeneratedImage(visualBibleArtifactPath(artifactDir, nextCharacter.threeViewPath), generated);
     return { bible: next, cards: [characterCard], afterPublish: () => invalidateCharacterCaches(outputDir, invalidationCharacter) };
   }, bible);
   return visualBiblePath(outputDir, published.characters[characterId].threeViewPath);
+}
+
+export interface RegenerateAllSheetsRequest {
+  characters: CharacterCard[];
+  imageCfg: ApiConfig;
+  /** 描述重写用的文本/视觉配置；不传则只重画三视图、不重写描述 */
+  visionCfg?: ApiConfig;
+  /** 并发数（默认取图像通道配置，通道默认 3） */
+  concurrency?: number;
+  onProgress?: (done: number, total: number, label: string) => void;
+  dependencies?: VisualBibleServiceDependencies;
+}
+
+export interface RegenerateAllSheetsResult {
+  /** 成功的角色 id */
+  ok: string[];
+  /** 失败的角色（单字符失败只记不抛，不中断其余） */
+  failed: { id: string; name: string; reason: string }[];
+  /** 描述重写后的卡片（含未重写的原卡），调用方同步内存卡片 */
+  updatedCards: CharacterCard[];
+}
+
+/** 小规模 worker 池 */
+async function runWithLimit<T>(items: T[], limit: number, worker: (item: T, index: number) => Promise<void>): Promise<void> {
+  const queue = items.map((item, index) => ({ item, index }));
+  const runners = Array.from({ length: Math.max(1, Math.min(limit, queue.length)) }, async () => {
+    for (;;) {
+      const next = queue.shift();
+      if (!next) return;
+      await worker(next.item, next.index);
+    }
+  });
+  await Promise.all(runners);
+}
+
+/**
+ * 全局重新生成（批量）：LLM 描述重写＋三视图重画。
+ * 慢的 API 调用按并发并行，清单变更一次组装提交——mutate 整单覆盖写，
+ * 逐个调 regenerateCharacterSheet 并行会互相覆盖丢更新，所以不能那样并行。
+ * 与单字符语义一致：覆盖版本、打回待确认、下游人物图作废。
+ */
+export async function regenerateAllCharacterSheets(
+  outputDir: string,
+  bible: ProjectVisualBible,
+  request: RegenerateAllSheetsRequest,
+): Promise<RegenerateAllSheetsResult> {
+  const dependencies = request.dependencies ?? DEFAULT_DEPENDENCIES;
+  const limit = Math.max(1, request.concurrency ?? concurrencyFor(request.imageCfg, "image"));
+  // 先全量校验再花钱：与单字符一致，冲突直接抛
+  for (const character of request.characters) {
+    validateCharacterAssetKeys(characterCardsFromVisualBible(bible, character));
+  }
+  const styleReferencePath = visualBiblePath(outputDir, bible.styleReferencePath);
+  const styleReference = await readReferenceFile(styleReferencePath, "Global style reference");
+
+  interface SheetJob {
+    character: CharacterCard;
+    rewrote: boolean;
+    imagePrompt: string;
+    threeViewPrompt: string;
+    promptForGen: string;
+    generated: { dataB64: string; mime: string };
+  }
+  const succeeded: SheetJob[] = [];
+  const failed: RegenerateAllSheetsResult["failed"] = [];
+  let done = 0;
+  await runWithLimit(request.characters, limit, async (characterCard) => {
+    const label = characterCard.name || characterCard.id;
+    try {
+      // ① 描述重写（可选，与 regenerateCharacterDescription 同口径）
+      let imagePrompt = characterCard.imagePrompt;
+      let threeViewPrompt = characterCard.threeViewPrompt;
+      let rewrote = false;
+      if (request.visionCfg?.apiKey) {
+        const rewritten = await regenerateCharacterDescription(request.visionCfg, characterCard, dependencies);
+        imagePrompt = rewritten.imagePrompt;
+        threeViewPrompt = rewritten.threeViewPrompt;
+        rewrote = true;
+      }
+      // ② 三视图重画（与 regenerateCharacterSheet 同语义：圣经缺条目按卡片自愈）
+      const storedCharacter = bible.characters[characterCard.id];
+      let promptForGen = rewrote ? threeViewPrompt : storedCharacter?.prompt;
+      if (!promptForGen) {
+        const cardPrompt = normalizeStyleDescription(threeViewPrompt || imagePrompt || "");
+        if (!cardPrompt) {
+          throw new Error(`Character ${characterCard.id} 在圣经中缺失，且卡片缺少绘画提示词：请先点「重新生成描述」或去卡片编辑补写 imagePrompt`);
+        }
+        promptForGen = cardPrompt;
+      }
+      let identityReference: ImageReference | undefined;
+      if (storedCharacter?.sourceReferencePath) {
+        const referencePath = visualBiblePath(outputDir, storedCharacter.sourceReferencePath);
+        const sourceReference = await readReferenceFile(referencePath, `Character reference for ${characterCard.id}`);
+        identityReference = { role: "identity", ...sourceReference, sourcePath: referencePath };
+      }
+      const generated = await dependencies.generateImage(
+        request.imageCfg,
+        characterThreeViewPrompt(promptForGen, bible.styleDescription),
+        {
+          references: [
+            ...(identityReference ? [{ ...identityReference, required: true }] : []),
+            { role: "style", ...styleReference, sourcePath: styleReferencePath, required: !identityReference },
+          ],
+          size: "1024x1024",
+        },
+      );
+      succeeded.push({ character: characterCard, rewrote, imagePrompt: imagePrompt ?? "", threeViewPrompt: threeViewPrompt ?? "", promptForGen, generated });
+    } catch (e) {
+      failed.push({ id: characterCard.id, name: label, reason: errMsg(e).slice(0, 160) });
+    } finally {
+      done++;
+      request.onProgress?.(done, request.characters.length, label);
+    }
+  });
+
+  const byId = new Map(succeeded.map((s) => [s.character.id, s]));
+  const updatedCards = request.characters.map((c) => {
+    const s = byId.get(c.id);
+    return s ? { ...c, imagePrompt: s.imagePrompt, threeViewPrompt: s.threeViewPrompt } : c;
+  });
+  const invalidationCharacters = succeeded.map((s) => characterWithHistoricalActions(bible, s.character));
+  if (succeeded.length) {
+    await mutateAndPublishVisualBible(outputDir, async (artifactDir, artifactRevision) => {
+      const next = cloneVisualBible(bible);
+      for (const s of succeeded) {
+        const characterId = s.character.id;
+        let nextCharacter = next.characters[characterId];
+        if (!nextCharacter) {
+          const actionIds = productionActionIds(s.character);
+          nextCharacter = next.characters[characterId] = {
+            threeViewPath: "",
+            prompt: s.promptForGen,
+            ...(actionIds.length ? { actionIds } : {}),
+            approved: false,
+            revision: 1,
+            sourceRevision: 0,
+            sheetSourceRevision: 0,
+          };
+        } else if (s.rewrote && s.imagePrompt) {
+          // persist 同语义：描述重写后 prompt 取新 imagePrompt；没重写保持圣经原值
+          nextCharacter.prompt = s.imagePrompt;
+        }
+        // 打回待确认＋修订号＋1（mark 内处理）
+        markCharacterBibleChanged(next, characterId);
+        nextCharacter.threeViewPath = revisionedArtifactPath(canonicalThreeViewPath(characterId), artifactRevision);
+        nextCharacter.sheetSourceRevision = characterSourceRevision(nextCharacter);
+        await writeGeneratedImage(visualBibleArtifactPath(artifactDir, nextCharacter.threeViewPath), s.generated);
+      }
+      reconcileCacheBindingKeys(next);
+      return {
+        bible: next,
+        cards: updatedCards,
+        afterPublish: async () => {
+          for (const c of invalidationCharacters) await invalidateCharacterCaches(outputDir, c);
+        },
+      };
+    }, bible);
+  }
+  return { ok: succeeded.map((s) => s.character.id), failed, updatedCards };
+}
+
+export interface BibleCharacterSyncRequest {
+  characters: CharacterCard[];
+  /** 缺失条目补建三视图时需要（调图像 API）；仅移除多余条目时可不传 */
+  imageCfg?: ApiConfig;
+  characterReferences?: Record<string, VisualBibleImageInput>;
+  onProgress?: (done: number, total: number, label: string) => void;
+  dependencies?: VisualBibleServiceDependencies;
+}
+
+export interface BibleCharacterSyncResult {
+  /** 新建条目的角色 id */
+  added: string[];
+  /** 复用孤儿三视图文件建条目的角色 id（免一次图像生成，需人工确认） */
+  adopted: string[];
+  /** 移除的多余条目 id（卡片里已没有，多因重提换 id） */
+  removed: string[];
+  /** 未能补建的角色（卡片缺绘画提示词等，不调用图像 API，直接给修复指引） */
+  failed: { id: string; name: string; reason: string }[];
+}
+
+/** 找同 id 的孤儿三视图文件（条目丢了但图还在，如北川丽音）：取最新 rev 版。
+ * 复用前需人工确认（accept 流程），故只认领文件、不认领 approved 状态。 */
+async function findOrphanThreeViewSheet(artifactDir: string, characterId: string): Promise<string | null> {
+  const canonical = canonicalThreeViewPath(characterId);
+  const dot = canonical.lastIndexOf(".");
+  const stem = dot >= 0 ? canonical.slice(0, dot) : canonical;
+  const ext = dot >= 0 ? canonical.slice(dot) : ".png";
+  const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`^${escapeRe(stem)}\\.rev-([A-Za-z0-9-]+)${escapeRe(ext)}$`);
+  try {
+    const entries = await tauri.listDir(artifactDir);
+    const hits = entries
+      .filter((e) => !e.isDir && re.test(e.name))
+      .map((e) => e.name)
+      .sort();
+    if (!hits.length) return null;
+    return hits[hits.length - 1];
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 圣经×卡片同步：按当前卡片补建缺失的三视图条目，移除卡片里已没有的多余条目。
+ * 根因：重跑提取后角色 id 变化（AI 现场给 id），旧圣经条目按老 id 存，全员 missing、
+ * 三视图未生成、提示词暂无。同步只增删条目，不动风格与已确认项；
+ * 被移除 id 的旧人物图孤儿请用素材页「清理无效素材」收尾。
+ */
+export async function syncBibleCharactersWithCards(
+  outputDir: string,
+  bible: ProjectVisualBible,
+  request: BibleCharacterSyncRequest,
+): Promise<BibleCharacterSyncResult> {
+  const dependencies = request.dependencies ?? DEFAULT_DEPENDENCIES;
+  const cardIds = new Set(request.characters.map((c) => c.id));
+  const missing = request.characters.filter((c) => !bible.characters[c.id]);
+  const removed = Object.keys(bible.characters).filter((id) => !cardIds.has(id));
+  const failed: BibleCharacterSyncResult["failed"] = [];
+  const added: string[] = [];
+  const adopted: string[] = [];
+  if (missing.length === 0 && removed.length === 0) return { added, adopted, removed, failed };
+  if (missing.length > 0 && !request.imageCfg?.apiKey) {
+    throw new Error("同步需要配置图像生成 API（为缺失角色生成三视图）");
+  }
+  validateCharacterAssetKeys(request.characters);
+  const styleReferencePath = visualBiblePath(outputDir, bible.styleReferencePath);
+  const styleReference = await readReferenceFile(styleReferencePath, "Global style reference");
+  await mutateAndPublishVisualBible(outputDir, async (artifactDir, artifactRevision) => {
+    const next = cloneVisualBible(bible);
+    for (const id of removed) delete next.characters[id];
+    let done = 0;
+    for (const card of missing) {
+      const label = `${card.name || card.id}`;
+      try {
+        const prompt = normalizeStyleDescription(card.threeViewPrompt || card.imagePrompt);
+        if (!prompt) {
+          failed.push({
+            id: card.id,
+            name: label,
+            reason: "卡片缺少绘画提示词（imagePrompt/threeViewPrompt 均为空），请先点该角色「重新生成描述」或去卡片编辑补写",
+          });
+          continue;
+        }
+        // 孤儿认领：同 id 三视图文件还在（条目丢了），直接建条目指过去，免一次生成；照样待确认
+        const orphan = await findOrphanThreeViewSheet(artifactDir, card.id);
+        const actionIds = productionActionIds(card);
+        if (orphan) {
+          next.characters[card.id] = {
+            threeViewPath: orphan,
+            prompt,
+            ...(actionIds.length ? { actionIds } : {}),
+            approved: false,
+            revision: 1,
+            sourceRevision: 0,
+            sheetSourceRevision: 0,
+          };
+          markCharacterBibleChanged(next, card.id);
+          adopted.push(card.id);
+          continue;
+        }
+        const refInput = { outputDir, characterReferences: request.characterReferences } as CreateVisualBibleDraftInput;
+        const reference = await resolveCharacterReference(refInput, card, artifactDir, artifactRevision);
+        const generated = await dependencies.generateImage(
+          // 缺失循环只在 missing 非空时执行，前置守卫已保证此时 imageCfg 存在
+          request.imageCfg!,
+          characterThreeViewPrompt(prompt, bible.styleDescription),
+          {
+            references: [
+              ...(reference.dataB64
+                ? [{ role: "identity" as const, dataB64: reference.dataB64, mime: reference.mime ?? "image/png", sourcePath: reference.relativePath!, required: true }]
+                : []),
+              { role: "style", ...styleReference, sourcePath: styleReferencePath, required: !reference.dataB64 },
+            ],
+            size: "1024x1024",
+          },
+        );
+        const threeViewPath = revisionedArtifactPath(canonicalThreeViewPath(card.id), artifactRevision);
+        await writeGeneratedImage(visualBibleArtifactPath(artifactDir, threeViewPath), generated);
+        const sourceRevision = reference.relativePath ? 1 : 0;
+        next.characters[card.id] = {
+          ...(reference.relativePath ? { sourceReferencePath: reference.relativePath } : {}),
+          threeViewPath,
+          prompt,
+          ...(actionIds.length ? { actionIds } : {}),
+          approved: false,
+          revision: 1,
+          sourceRevision,
+          sheetSourceRevision: sourceRevision,
+        };
+        markCharacterBibleChanged(next, card.id);
+        added.push(card.id);
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        failed.push({ id: card.id, name: label, reason: `三视图生成失败：${message.slice(0, 160)}` });
+      } finally {
+        done++;
+        request.onProgress?.(done, missing.length, label);
+      }
+    }
+    reconcileCacheBindingKeys(next);
+    return { bible: next, cards: request.characters };
+  }, bible);
+  return { added, adopted, removed, failed };
+}
+
+/**
+ * 确保圣经有该角色条目（无图建条目）：全局重建等流程需要先有条目才能 persist 描述。
+ * 已有条目直接返回，不覆盖；新建条目 prompt 取给定值或卡片当前值（卡片也没有则抛错指引先修描述），
+ * approved=false，修订号 1；只对齐缓存绑定 key 集，不发图像请求。
+ */
+export async function ensureBibleCharacterEntry(
+  outputDir: string,
+  bible: ProjectVisualBible,
+  characterCard: CharacterCard,
+  prompt?: string,
+): Promise<void> {
+  if (bible.characters[characterCard.id]) return;
+  const finalPrompt = normalizeStyleDescription(prompt ?? characterCard.threeViewPrompt ?? characterCard.imagePrompt ?? "");
+  if (!finalPrompt) {
+    throw new Error(`Character ${characterCard.id} 缺少绘画提示词：请先点「重新生成描述」或去卡片编辑补写 imagePrompt`);
+  }
+  const actionIds = productionActionIds(characterCard);
+  await mutateAndPublishVisualBible(outputDir, async () => {
+    const next = cloneVisualBible(bible);
+    // threeViewPath 先占 canonical 位（格式校验通过、文件尚不存在；批准/确认时有文件存在性校验拦着，
+    // 全局重建紧接着就会生成真正的 rev 文件并替换它）
+    next.characters[characterCard.id] = {
+      threeViewPath: canonicalThreeViewPath(characterCard.id),
+      prompt: finalPrompt,
+      ...(actionIds.length ? { actionIds } : {}),
+      approved: false,
+      revision: 1,
+      sourceRevision: 0,
+      sheetSourceRevision: 0,
+    };
+    if (next.cacheBinding) next.cacheBinding.characterRevisions[characterCard.id] = 1;
+    return { bible: next, cards: [characterCard] };
+  }, bible);
 }
 
 export async function acceptCharacterSheet(
@@ -932,16 +1296,13 @@ ${character.imagePrompt || "(none)"}
     cfg,
     systemPrompt,
     userPrompt,
-    { maxTokens: 1400, temperature: 0.2 },
+    // json 模式让模型直接返回纯 JSON（中转不一定遵守，解析侧另有括号平衡兜底）
+    { maxTokens: 1400, temperature: 0.2, json: true },
   );
 
-  const cleaned = reply.replace(/```json|```/g, "").trim();
   let data: { imagePrompt?: string; threeViewPrompt?: string };
   try {
-    const jsonStart = cleaned.indexOf("{");
-    const jsonEnd = cleaned.lastIndexOf("}");
-    if (jsonStart < 0 || jsonEnd < 0) throw new Error("no JSON object");
-    data = JSON.parse(cleaned.slice(jsonStart, jsonEnd + 1));
+    data = extractJson(reply) as { imagePrompt?: string; threeViewPrompt?: string };
   } catch (e) {
     throw new Error(`角色描述重新生成失败：返回内容不是合法 JSON（${errMsg(e)}）`);
   }
@@ -971,7 +1332,7 @@ export async function persistRegeneratedCharacterDescription(
   if (!storedCharacter) throw new Error(`Character is missing from visual bible: ${characterId}`);
   const invalidationCharacter = characterWithHistoricalActions(bible, characterCard);
   const updatedCard: CharacterCard = { ...characterCard, imagePrompt, threeViewPrompt };
-  await mutateAndPublishVisualBible(outputDir, async () => {
+  const published = await mutateAndPublishVisualBible(outputDir, async () => {
     const next = cloneVisualBible(bible);
     const nextCharacter = next.characters[characterId];
     markCharacterBibleChanged(next, characterId);
@@ -983,7 +1344,7 @@ export async function persistRegeneratedCharacterDescription(
       afterPublish: () => invalidateCharacterCaches(outputDir, invalidationCharacter),
     };
   }, bible);
-  return { bible, card: updatedCard };
+  return { bible: published, card: updatedCard };
 }
 
 function normalizeImageExtension(imageTypeOrPath: string): string {
@@ -1758,6 +2119,18 @@ function cacheBindingFromBible(bible: ProjectVisualBible, globalFingerprint: str
       Object.entries(bible.characters).map(([characterId, character]) => [characterId, character.revision]),
     ),
   };
+}
+
+/** 增删角色条目后对齐缓存绑定的 key 集合（只增删 key，不动已有修订值与全局指纹）：
+ * isCacheBinding 要求 key 与角色完全一致，否则整个 manifest 发布失败。 */
+function reconcileCacheBindingKeys(bible: ProjectVisualBible): void {
+  if (!bible.cacheBinding) return;
+  for (const [id, ch] of Object.entries(bible.characters)) {
+    if (!(id in bible.cacheBinding.characterRevisions)) bible.cacheBinding.characterRevisions[id] = ch.revision;
+  }
+  for (const id of Object.keys(bible.cacheBinding.characterRevisions)) {
+    if (!bible.characters[id]) delete bible.cacheBinding.characterRevisions[id];
+  }
 }
 
 function cacheBindingAfterApproval(

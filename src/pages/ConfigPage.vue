@@ -209,6 +209,13 @@ function showTemplateError(): void {
 }
 
 async function runTest(kind: ChannelKey, cfg: ApiConfig): Promise<void> {
+  // 测试是真实调用（扣费）：图像通道含文生图＋图生图探测共 2 张，先确认
+  const costHint = kind === "image"
+    ? "将真实调用图像 API（含文生图 1 张＋图生图探测 1 张，共约 2 张额度）"
+    : kind === "tts"
+      ? "将真实合成一句测试语音（扣少量字符额度）"
+      : "将真实调用一次（扣少量 token 额度）";
+  if (!window.confirm(`测试连接将${costHint}。继续吗？`)) return;
   testing.value = { key: kind, id: cfg.id };
   testResult.value = null;
   log.info("page", `测试连接 ${kind}`, { model: cfg.model, baseUrl: cfg.baseUrl });
@@ -225,8 +232,8 @@ async function runTest(kind: ChannelKey, cfg: ApiConfig): Promise<void> {
     } else {
       const result = await testImage(cfg);
       const editMsg = result.editOk
-        ? t("正常（已消耗 1 张额度）；已自动探测：支持参考图/图生图")
-        : `正常（已消耗 1 张额度）；已自动探测：不支持参考图${result.detail ? `（${result.detail.slice(0, 80)}）` : ""}`;
+        ? t("正常（已消耗约 2 张额度：文生图＋图生图探测）；已自动探测：支持参考图/图生图")
+        : `正常（已消耗约 2 张额度：文生图＋图生图探测）；已自动探测：不支持参考图${result.detail ? `（${result.detail.slice(0, 80)}）` : ""}`;
       testResult.value = { key: kind, id: cfg.id, ok: true, msg: editMsg };
     }
     log.info("page", `测试连接 ${kind} 成功`);
@@ -240,6 +247,21 @@ async function runTest(kind: ChannelKey, cfg: ApiConfig): Promise<void> {
 
 function cfgActive(kind: ChannelKey, id: string): boolean {
   return activePreset().active[kind] === id;
+}
+
+/** 删除整组配置：不可恢复，二次确认 */
+function confirmRemovePreset(id: string): void {
+  const preset = configState.presets.find((p) => p.id === id);
+  const n = preset ? Object.values(preset.channels).flat().length : 0;
+  if (!window.confirm(`删除配置组「${preset?.name ?? id}」（含 ${n} 个 API 配置，不可恢复）？`)) return;
+  removePreset(id);
+}
+
+/** 删除单个 API 配置：切走正在用的通道，二次确认 */
+function confirmRemoveConfig(kind: ChannelKey, id: string, label: string): void {
+  const inUse = activePreset().active[kind] === id;
+  if (!window.confirm(`删除${inUse ? "（正在使用，将自动切换到同通道第一个）" : ""}「${label}」？不可恢复。`)) return;
+  removeConfig(kind, id);
 }
 
 function setActive(kind: ChannelKey, id: string): void {
@@ -390,7 +412,7 @@ watch(
           {{ p.name }}
         </button>
       </div>
-      <button v-if="configState.presets.length > 1" class="btn danger small ml-auto" @click="removePreset(configState.activePresetId)">{{ t("删除该组") }}</button>
+      <button v-if="configState.presets.length > 1" class="btn danger small ml-auto" @click="confirmRemovePreset(configState.activePresetId)">{{ t("删除该组") }}</button>
     </div>
 
     <div class="cfg-grid">
@@ -415,7 +437,7 @@ watch(
               <svg v-if="cfgActive(ch.key, cfg.id)" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12" /></svg>
               {{ cfgActive(ch.key, cfg.id) ? t("使用中") : t("设为当前") }}
             </button>
-            <button class="btn ghost small cfg-del" @click="removeConfig(ch.key, cfg.id)">{{ t("删除") }}</button>
+            <button class="btn ghost small cfg-del" @click="confirmRemoveConfig(ch.key, cfg.id, cfg.name || cfg.model)">{{ t("删除") }}</button>
           </div>
 
           <div v-if="ch.key === 'image' || ch.key === 'tts'" class="cfg-row">

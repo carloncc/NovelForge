@@ -7,6 +7,8 @@ import {
   computeVisualBibleFingerprint,
   createVisualBibleDraft,
   acceptCharacterSheet,
+  regenerateAllCharacterSheets,
+  regenerateCharacterDescription,
   regenerateCharacterSheet,
   regenerateStyleSample,
   rewriteStyleDescription,
@@ -975,6 +977,73 @@ async function testMissingStyleReferenceRejectsSheetRegeneration(): Promise<void
   assert(!generationCalled, "sheet regeneration must stop before the image API when global style is missing");
 }
 
+async function testRegenerateDescriptionToleratesTrailingChatter(): Promise<void> {
+  // 真实故障：模型在 JSON 后跟一段闲聊，以前报 Unexpected non-whitespace character after JSON
+  const chatter = `{"imagePrompt": "alice silver hair, black coat, full body", "threeViewPrompt": "alice turnaround sheet"}\n希望这个描述对你有帮助！如需调整请告诉我。`;
+  const dependencies: VisualBibleServiceDependencies = {
+    chatText: async () => chatter,
+    chatVision: async () => "unused",
+    generateImage: async () => ({ dataB64: PNG_B64, mime: "image/png" }),
+  };
+  const result = await regenerateCharacterDescription(apiConfig("text"), character("alice"), dependencies);
+  assert(result.imagePrompt.includes("silver hair"), "带尾巴闲聊也应解析出 imagePrompt");
+  assert(result.threeViewPrompt.includes("turnaround"), "带尾巴闲聊也应解析出 threeViewPrompt");
+}
+
+async function testBatchRegenerationParallelizesAndIsolatesFailures(): Promise<void> {
+  await reset();
+  const value = bible();
+  await writeRequiredArtifacts(value);
+  await saveVisualBible(ROOT, value);
+
+  let inFlight = 0;
+  let maxInFlight = 0;
+  let progressCalls = 0;
+  const dependencies: VisualBibleServiceDependencies = {
+    chatText: async (_cfg, _system, user) => {
+      const name = /ROLE NAME\n(\S+)/.exec(user)?.[1] ?? "unknown";
+      return JSON.stringify({ imagePrompt: `${name} regen figure`, threeViewPrompt: `${name} regen turnaround` });
+    },
+    chatVision: async () => "unused",
+    generateImage: async (_cfg, prompt) => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        if (prompt.includes("bob regen")) throw new Error("boom-bob");
+        return { dataB64: PNG_B64, mime: "image/png" };
+      } finally {
+        inFlight -= 1;
+      }
+    },
+  };
+  const result = await regenerateAllCharacterSheets(ROOT, value, {
+    characters: [character("alice"), character("bob"), character("alice_alt")],
+    imageCfg: apiConfig("image"),
+    visionCfg: apiConfig("text"),
+    concurrency: 2,
+    onProgress: () => {
+      progressCalls += 1;
+    },
+    dependencies,
+  });
+  assert(maxInFlight === 2, `批量重建应 2 并发，实际峰值 ${maxInFlight}`);
+  assert(progressCalls === 3, `进度应回调 3 次，实际 ${progressCalls}`);
+  assert(result.ok.length === 2 && result.failed.length === 1, "2 成功 1 失败");
+  assert(result.failed[0].id === "bob" && result.failed[0].reason.includes("boom-bob"), "bob 的失败应被记录");
+  const aliceCard = result.updatedCards.find((c) => c.id === "alice")!;
+  assert(aliceCard.imagePrompt === "alice regen figure", "成功角色的卡片描述应同步新提示词");
+
+  // 清单一次提交：成功者更新＋打回待确认，失败者原样保留（无丢更新）
+  const loaded = await loadVisualBible(ROOT);
+  const manifest = loaded.visualBible!;
+  assert(/\.rev-[A-Za-z0-9-]+\.png$/.test(manifest.characters.alice.threeViewPath), "alice 应指向新 rev 三视图");
+  assert(manifest.characters.alice.approved === false, "alice 应打回待确认");
+  assert(manifest.characters.alice_alt.approved === false, "alice_alt 应打回待确认");
+  assert(manifest.characters.bob.threeViewPath === "threeview_bob.png", "失败的 bob 条目不应被碰");
+  assert(manifest.characters.bob.approved === true, "失败的 bob 应保持已确认");
+}
+
 async function testLifecycleOperationsRequireFreshReview(): Promise<void> {
   await reset();
   const value = { ...bible(), status: "approved" as const, approvedAt: "2026-08-07T00:00:00.000Z" };
@@ -1055,6 +1124,8 @@ async function main(): Promise<void> {
   await testAnalysisUsesBoundedInputs();
   await testBothDraftSourcesCreateCanonicalArtifacts();
   await testMissingStyleReferenceRejectsSheetRegeneration();
+  await testRegenerateDescriptionToleratesTrailingChatter();
+  await testBatchRegenerationParallelizesAndIsolatesFailures();
   await testLifecycleOperationsRequireFreshReview();
   await tauri.removePath(ROOT).catch(() => {});
   console.log("=== visual bible unit tests passed ===");

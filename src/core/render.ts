@@ -142,6 +142,8 @@ export function renderChapter(
   const stageSlot = new Map<string, "left" | "right">();
   const stageOrder: string[] = [];
   const lastFigureFile = new Map<string, string>();
+  // 换装状态：角色标注 costume 后沿用该服装，直到再次标注（跨场景保留，章节结束重置）
+  const costumeState = new Map<string, string>();
   let entranceIdx = 0;
   // BGM 状态：WebGAL 的 changeScene 不自动清舞台，跨场景/跨章节残留的音乐需显式停止
   let lastBgm: string | null = null;
@@ -157,13 +159,24 @@ export function renderChapter(
     if (!line || !line.text || !String(line.text).trim()) return;
     if (line.type === "dialogue") {
       const char = charById.get(line.characterId) ?? opts.characters.find((c) => c.id === line.characterId);
-      const figureFile = opts.assets.figure[line.characterId];
-      // 立绘优先级：台词指定动作 → 对应动作立绘；否则表情差分立绘；否则默认立绘
+      // 换装：本句标注 costume 即切换并记住；服装图只有 normal 姿态，换装期间表情差分暂停。
+      // 服装图缺失时（如核心档不生成服装差分、服装图生成失败）回退默认立绘，且不抑制表情差分
+      if (line.costume) costumeState.set(line.characterId, line.costume);
+      const wornId = costumeState.get(line.characterId);
+      const costumeFile = wornId
+        ? (opts.assets.figure[`${line.characterId}_ct_${wornId}`] ?? opts.assets.figure[`${line.characterId}_ct_${sanitizeId(wornId)}`])
+        : undefined;
+      const worn = costumeFile ? wornId : undefined;
+      const figureFile = costumeFile ?? opts.assets.figure[line.characterId];
+      // 立绘优先级：台词指定动作 → 对应动作立绘；否则（无换装时）表情差分立绘；否则默认/服装立绘
       let displayFile = figureFile;
       if (line.action) {
-        const actionFile = opts.assets.figure[`${line.characterId}_act_${sanitizeId(line.action)}`];
+        // 动作 id 含中文/空格等特殊字符时，生产用裸 id、此处消毒，两边对不上；
+        // 先裸查再消毒查，兜住历史存量
+        const actionFile = opts.assets.figure[`${line.characterId}_act_${line.action}`]
+          ?? opts.assets.figure[`${line.characterId}_act_${sanitizeId(line.action)}`];
         if (actionFile) displayFile = actionFile;
-      } else if (opts.figureEmotions !== false && line.emotion && line.emotion !== "normal") {
+      } else if (!worn && opts.figureEmotions !== false && line.emotion && line.emotion !== "normal") {
         displayFile = opts.assets.figure[`${line.characterId}_${line.emotion}`] ?? figureFile;
       }
       // 舞台管理 + 人物动作：最多 2 个角色同台（左/右），新角色入场 / 表情切换 / 情绪动作

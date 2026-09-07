@@ -79,7 +79,7 @@ async function handleModelRequest(req: Connect.IncomingMessage, res: Connect.Ser
   const modelId = u.searchParams.get("model") ?? "";
   const model = findCutoutModel(modelId);
 
-  if (pathname === "/status") {
+  if (pathname === "/status") { if (!authorizeGet(req, res)) return;
     sendJson(res, 200, modelStatusFor(model.id));
     return;
   }
@@ -118,7 +118,7 @@ async function handleModelRequest(req: Connect.IncomingMessage, res: Connect.Ser
     sendJson(res, 200, { ok: true });
     return;
   }
-  if (pathname === "/file") {
+  if (pathname === "/file") { if (!isSameOriginRequest(req)) { sendJson(res, 403, { error: "forbidden" }); return; }
     const file = modelPath(model.filename);
     try {
       await stat(file);
@@ -210,8 +210,8 @@ export function validateProxyUrl(raw: string): URL {
   return url;
 }
 
-function authorize(req: Connect.IncomingMessage, res: Connect.ServerResponse): boolean {
-  if (req.headers["x-novelforge-token"] !== SESSION_TOKEN) {
+function isLocalHost(host: unknown): boolean { let h = String(host || "").toLowerCase(); if (h.startsWith("[")) { const end = h.indexOf("]"); h = end >= 0 ? h.slice(0, end + 1) : h.split(":")[0]; } else { h = h.split(":")[0]; } const name = h.replace(/^\[|\]$/g, ""); return name === "localhost" || name === "127.0.0.1" || name === "::1"; } function isSameOriginRequest(req: Connect.IncomingMessage): boolean { const host = req.headers.host; if (!host || !isLocalHost(host)) return false; const origin = req.headers.origin as string | undefined; const referer = req.headers.referer as string | undefined; const expectHttp = "http://" + host; const expectHttps = "https://" + host; if (origin && origin !== expectHttp && origin !== expectHttps) return false; if (!origin && referer) { try { const r = new URL(referer); if (r.host !== String(host)) return false; } catch { return false; } } return true; } function authorizeGet(req: Connect.IncomingMessage, res: Connect.ServerResponse): boolean { if (!isLocalHost(req.headers.host)) { sendJson(res, 403, { error: "forbidden" }); return false; } if (req.headers["x-novelforge-token"] !== SESSION_TOKEN) { sendJson(res, 403, { error: "forbidden" }); return false; } if (!isSameOriginRequest(req)) { sendJson(res, 403, { error: "invalid origin" }); return false; } return true; } function authorize(req: Connect.IncomingMessage, res: Connect.ServerResponse): boolean {
+  if (!isLocalHost(req.headers.host)) { sendJson(res, 403, { error: "forbidden" }); return false; } if (req.headers["x-novelforge-token"] !== SESSION_TOKEN) {
     sendJson(res, 403, { error: "forbidden" });
     return false;
   }
@@ -489,9 +489,9 @@ function webPlugin(): Plugin {
         res.end();
         return;
       }
-      sendJson(res, 200, { token: SESSION_TOKEN });
+      if (!isSameOriginRequest(req)) { sendJson(res, 403, { error: "forbidden" }); return; } res.setHeader("Cache-Control", "no-store"); sendJson(res, 200, { token: SESSION_TOKEN });
     });
-    server.middlewares.use("/__novelforge/template", (req, res) => {
+    server.middlewares.use("/__novelforge/template", (req, res) => { if (!authorizeGet(req, res)) return;
       void handleTemplate(req, res);
     });
     server.middlewares.use("/__novelforge/preview", (req, res) => {

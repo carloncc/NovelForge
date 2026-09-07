@@ -48,6 +48,9 @@ const DEFAULT_OPTIONS: GenerationOptions = {
   styleAnchor: true,
   scriptStyle: "",
   language: "",
+  splitMinChapterChars: 3000,
+  splitKeepSpecials: false,
+  extractChunkChars: 0,
 };
 
 export const projectState = reactive<ProjectState>({

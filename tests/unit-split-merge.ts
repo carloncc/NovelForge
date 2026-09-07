@@ -1,4 +1,4 @@
-import { mergeTinyChapters, MIN_CHAPTER_CHARS } from "../src/core/split";
+import { mergeTinyChapters, protectSpecialBlocks, MIN_CHAPTER_CHARS } from "../src/core/split";
 import type { ChapterInfo } from "../src/core/types";
 
 function assert(cond: boolean, msg: string): void {
@@ -52,6 +52,34 @@ function main(): void {
   {
     const r = mergeTinyChapters([ch(0, "第一章", 20000), ch(1, "短章", 4000)], 5000);
     assert(r.merged === 1 && r.chapters.length === 1, "自定义阈值应生效");
+  }
+
+  // 阈值 0 = 关闭合并（特殊小章独立成章，配合 keepSpecials 找回 26 章）
+  {
+    const r = mergeTinyChapters([ch(0, "第一章", 20000), ch(1, "后记", 1185), ch(2, "插图", 300)], 0);
+    assert(r.merged === 0 && r.chapters.length === 3, "阈值 0 不应合并");
+  }
+
+  // 特殊章节保护：被标丢弃的后记/插图/特典移出丢弃集并立章；普通杂项不动；已立章不重复
+  {
+    const blocks = ["第一章正文很长很长", "后记\n感谢看到这里的读者", "广告关注公众号", "特典 小剧场\n正文", "第一章 第二节\n正文继续"];
+    const discard = new Set([2, 3, 4]);
+    const marks: { blockIndex: number; raw: string }[] = [{ blockIndex: 1, raw: "第一章" }, { blockIndex: 5, raw: "第一节" }];
+    const kept = protectSpecialBlocks(blocks, discard, marks);
+    assert(kept === 2, `应救回 2 个特殊章，实际 ${kept}`);
+    assert(!discard.has(2) && !discard.has(4) && discard.has(3), "普通杂项应保留在丢弃集");
+    assert(marks.some((m) => m.blockIndex === 2 && m.raw === "后记"), "后记应就地立章");
+    assert(marks.some((m) => m.blockIndex === 4), "特典应就地立章");
+    assert(marks.filter((m) => m.blockIndex === 5).length === 1, "已立章不应重复");
+    for (let i = 1; i < marks.length; i++) assert(marks[i].blockIndex > marks[i - 1].blockIndex, "marks 应保持有序");
+  }
+
+  // 非特殊首行不救
+  {
+    const discard = new Set([1]);
+    const marks: { blockIndex: number; raw: string }[] = [];
+    assert(protectSpecialBlocks(["第一章正文"], discard, marks) === 0, "普通块不应被救");
+    assert(discard.has(1), "普通块应留在丢弃集");
   }
 
   console.log("=== split merge tests passed ===");

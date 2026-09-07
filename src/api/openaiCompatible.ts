@@ -383,6 +383,9 @@ export async function chatCompletion(
       if (/model.{0,20}(?:unavailable|not found|does not exist)|模型.{0,12}(?:不可用|不存在)/i.test(message)) {
         message += "（该模型当前可能不可用，请在 LLM 模型下拉框换一个，如 deepseek-v4-pro / minimax-m3）";
       }
+      if (/requires explicit opt.?in|opt.?in.{0,30}(data|quality)|collects data/i.test(message)) {
+        message += "（该模型要求先在服务商页面点同意「数据用于改进质量」才能调用：用浏览器打开报错里的链接完成 opt-in 后重试；或换一个不需要 opt-in 的模型/通道）";
+      }
       throw new Error(`LLM 返回错误 ${res.status}: ${message}`);
     }
 
@@ -501,6 +504,35 @@ export async function chatCompletion(
   }));
 }
 
+/**
+ * 括号平衡扫描（含字符串/转义感知）：从首个 `{` 起返回首个完整 JSON 对象子串。
+ * 找不到（无花括号，或对象被截断没闭合）返回 null。
+ */
+export function sliceFirstJsonObject(text: string): string | null {
+  const cleaned = text.replace(/```json|```/g, "");
+  const start = cleaned.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < cleaned.length; i++) {
+    const ch = cleaned[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) return cleaned.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+
 export function extractJson(text: string): unknown {
   const cleaned = text.replace(/```json|```/g, "").trim();
 
@@ -511,18 +543,18 @@ export function extractJson(text: string): unknown {
     /* fallthrough */
   }
 
-  // 截取首个 { 到最后一个 } 再解析（容忍前后多余文字）
-  const start = cleaned.indexOf("{");
-  const end = cleaned.lastIndexOf("}");
-  if (start >= 0 && end > start) {
+  // 首个完整对象提取（括号平衡，容忍前后闲聊/第二个对象/尾巴文字；
+  // 以前的 indexOf("{")+lastIndexOf("}") 切片会把尾巴吞进来，
+  // 报 "Unexpected non-whitespace character after JSON"）
+  const first = sliceFirstJsonObject(cleaned);
+  if (first) {
     try {
-      return JSON.parse(cleaned.slice(start, end + 1));
+      return JSON.parse(first);
     } catch {
       /* fallthrough */
     }
     // 常见损坏修复：去掉对象/数组末尾的尾随逗号后重试（截断时很常见）
-    const repaired = cleaned
-      .slice(start, end + 1)
+    const repaired = first
       .replace(/,\s*([\]}])/g, "$1")
       .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, "");
     try {
@@ -544,17 +576,14 @@ function canParseJson(text: string): boolean {
   } catch {
     /* fallthrough */
   }
-  const start = cleaned.indexOf("{");
-  const end = cleaned.lastIndexOf("}");
-  if (start >= 0 && end > start) {
-    try {
-      JSON.parse(cleaned.slice(start, end + 1));
-      return true;
-    } catch {
-      return false;
-    }
+  const first = sliceFirstJsonObject(cleaned);
+  if (!first) return false;
+  try {
+    JSON.parse(first);
+    return true;
+  } catch {
+    return false;
   }
-  return false;
 }
 
 /**

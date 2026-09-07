@@ -73,7 +73,8 @@ export function useChapterStatus(input: ChapterStatusInput) {
   ): Promise<{ title: string; text: string }> {
     if (!lang) return { title: ch.title, text: ch.text };
     try {
-      const file = `${dir}/.novel2vn/translate/translate_${lang}_ch${ch.index + 1}_${titleHash(ch.title)}_${titleHash(ch.text)}.json`;
+      // 与管线 translateCacheFile 同格式（去序号，只认标题＋正文哈希）
+      const file = `${dir}/.novel2vn/translate/translate_${lang}_${titleHash(ch.title)}_${titleHash(ch.text)}.json`;
       if (await pathExists(file)) {
         const { text } = await tauri.readTextFile(file);
         const parsed = JSON.parse(text) as { title?: string; text?: string };
@@ -133,6 +134,8 @@ export function useChapterStatus(input: ChapterStatusInput) {
       .sort((a, b) => a.name.localeCompare(b.name))) {
       const m = e.name.match(/^script(_demo)?_ch(\d+)_(.+)\.json$/);
       if (!m) continue;
+      // demo/正式隔离：同文同风时两套指纹体相同，不隔离会被对方覆盖
+      if (!!m[1] !== demo) continue;
       const n = parseInt(m[2], 10) - 1;
       const rest = m[3];
       const expected = expectedByIndex.get(n);

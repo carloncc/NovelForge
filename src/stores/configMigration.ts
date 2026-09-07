@@ -35,8 +35,21 @@ export interface ConfigFile {
   activePresetId: string;
   outputDir?: string;
   recentOutputDirs?: string[];
+  /** 项目注册表：每个项目绑定小说＋输出目录，切换项目即切换目录和整套状态 */
+  projects?: ProjectEntry[];
   voiceProfiles: VoiceProfile[];
   cutout?: CutoutSettings;
+}
+
+/** 已知项目（输出目录即项目键，快照里存着小说/素材/选项全套状态） */
+export interface ProjectEntry {
+  id: string;
+  /** 显示名（默认取小说文件名去后缀） */
+  name: string;
+  outputDir: string;
+  novelFileName: string;
+  novelTitle: string;
+  updatedAt: string;
 }
 
 export interface ConfigMigrationResult {
@@ -187,10 +200,31 @@ export function migrateConfigFile(
       recentOutputDirs: Array.isArray(root.recentOutputDirs)
         ? root.recentOutputDirs.filter((dir): dir is string => typeof dir === "string")
         : [],
+      projects: normalizeProjects(root.projects, createId),
       voiceProfiles: normalizeVoiceProfiles(root.voiceProfiles),
       cutout: normalizeCutoutSettings(root.cutout),
     },
   };
+}
+
+function normalizeProjects(input: unknown, createId: () => string): ProjectEntry[] {
+  if (!Array.isArray(input)) return [];
+  const seen = new Set<string>();
+  return input.flatMap((candidate) => {
+    const record = recordOrEmpty(candidate);
+    const outputDir = typeof record.outputDir === "string" ? record.outputDir : "";
+    if (!outputDir || seen.has(outputDir)) return [];
+    seen.add(outputDir);
+    const novelFileName = typeof record.novelFileName === "string" ? record.novelFileName : "";
+    return [{
+      id: typeof record.id === "string" && record.id ? record.id : createId(),
+      name: typeof record.name === "string" && record.name.trim() ? record.name : novelFileName.replace(/\.[^.]+$/, "") || outputDir,
+      outputDir,
+      novelFileName,
+      novelTitle: typeof record.novelTitle === "string" ? record.novelTitle : "",
+      updatedAt: typeof record.updatedAt === "string" ? record.updatedAt : new Date(0).toISOString(),
+    } satisfies ProjectEntry];
+  });
 }
 
 function normalizeCutoutSettings(input: unknown): CutoutSettings {

@@ -1,9 +1,10 @@
-import type { ApiConfig, CharacterAction, CharacterCard, ExtractionResult, ItemCard, SceneCard } from "./types";
+import type { ApiConfig, CharacterAction, CharacterCard, CharacterCostume, ExtractionResult, ItemCard, SceneCard } from "./types";
 import { chatCompletion, chatJson } from "../api/openaiCompatible";
 import type { ChatMessage, ChatTool, ToolCall } from "../api/openaiCompatible";
-import { inputCharBudget, resolveContextLength } from "../api/providers";
+import { inputCharBudgetForText, resolveContextLength } from "../api/providers";
 import { voiceLibraryFor } from "../stores/config";
 import { normalizeExtractionResult } from "./extract";
+import { extractFromNovel } from "./extract";
 import { log as logger } from "../utils/logger";
 
 /**
@@ -26,6 +27,8 @@ export interface ExtractAgentOptions {
   log?: AgentLog;
   /** 用户对上一版提取结果的修改意见（注入扫描与补全步骤） */
   feedback?: string;
+  /** 分段字数上限（0/缺省 = 自动；手动值只会调小自动预算，不会放大） */
+  chunkChars?: number;
 }
 
 /** 单次工具调用的结构化参数（供状态机执行） */
@@ -408,7 +411,8 @@ export async function runScanChunk(
 export function normalizeName(name: string): string {  return (name || "").trim().toLowerCase().replace(/\s+/g, "");
 }
 
-/** 单角色合并（增量追加共用）：缺字段补齐，动作按 id 并集 */
+/** 单角色合并（增量追加共用）：缺字段补齐，动作/服装按 id 并集，表情按字符串并集。
+ * 旧人物在新章节换装/新增表情（新形态）时，老卡片自动收录，不丢。 */
 export function mergeCharacter(target: CharacterCard, source: CharacterCard): void {
   for (const k of ["appearance", "clothing", "personality", "voiceDesc", "imagePrompt", "threeViewPrompt", "color"] as const) {
     if (!target[k] && source[k]) (target as unknown as Record<string, unknown>)[k] = source[k];
@@ -420,6 +424,22 @@ export function mergeCharacter(target: CharacterCard, source: CharacterCard): vo
     if (a?.id) actionMap.set(a.id, a);
   }
   target.actions = [...actionMap.values()];
+  // 服装差分（旧人物新形态：换装）按 id 并集
+  const costumeMap = new Map<string, CharacterCostume>();
+  for (const c of [...(target.costumes ?? []), ...(source.costumes ?? [])]) {
+    if (c?.id) costumeMap.set(c.id, c);
+  }
+  const mergedCostumes = [...costumeMap.values()];
+  if (mergedCostumes.length || target.costumes || source.costumes) target.costumes = mergedCostumes;
+  // 表情集按字符串并集（去重保序）
+  if (Array.isArray(source.emotions) || Array.isArray(target.emotions)) {
+    const seen = new Set<string>();
+    target.emotions = [...(target.emotions ?? []), ...(source.emotions ?? [])].filter((e) => {
+      if (typeof e !== "string" || !e || seen.has(e)) return false;
+      seen.add(e);
+      return true;
+    });
+  }
 }
 
 /** 跨片段合并：同名（归一化后一致）角色视为同一人，保留先收录的更完整字段 */
@@ -595,8 +615,9 @@ export async function extractFromNovelAgent(
     return { content: res.content, toolCalls: res.toolCalls };
   };
 
-  // 每段文本预算打八折，给系统提示 + 已收录卡片摘要 + 工具往返留出上下文余量
-  const chunks = splitNovelForAgent(novelText, Math.max(100, Math.floor(inputCharBudget(cfg) * 0.8)));
+  // 每段文本预算打八折，给系统提示 + 已收录卡片摘要 + 工具往返留出上下文余量；
+  // 预算按实际语种估算（中文约 0.6 字符/token），否则中文长文单段超大触发网关 500
+  const chunks = splitNovelForAgent(novelText, extractChunkBudget(cfg, novelText, opts.chunkChars));
   const system = scanSystemPrompt(opts.feedback);
   const state: ExtractAgentState = { characters: new Map(), scenes: new Map(), items: new Map() };
 
@@ -628,5 +649,88 @@ export async function extractFromNovelAgent(
   await enrichCards(cfg, state, title, lib, onUsage, opts.feedback);
   const result = finalizeState(state, lib, title);
   logFn?.(`Agent 提取完成：${result.characters.length} 角色 / ${result.scenes.length} 场景 / ${result.items.length} 物品`, "success");
+  return result;
+}
+
+/* ==================== 分段经典提取（非 Agent 模式的全书覆盖） ==================== */
+
+export interface ChunkedExtractOptions {
+  onUsage?: (pt: number, ct: number) => void;
+  /** 用户对上一版提取结果的修改意见（逐段注入） */
+  feedback?: string;
+  log?: AgentLog;
+  isAborted?: () => boolean;
+  /** 分段字数上限（0/缺省 = 自动；手动值只会调小自动预算，不会放大） */
+  chunkChars?: number;
+}
+
+/** 提取分段预算（纯函数）：自动预算按语种估算，手动值只收紧不放大 */
+export function extractChunkBudget(
+  cfg: ApiConfig,
+  text: string,
+  chunkChars?: number,
+): number {
+  const auto = Math.max(100, Math.floor(inputCharBudgetForText(cfg, text) * 0.8));
+  if (typeof chunkChars === "number" && chunkChars > 0) return Math.min(auto, Math.floor(chunkChars));
+  return auto;
+}
+
+/**
+ * 经典单次提取的分段版：超长小说按模型上下文预算切段，逐段提取后合并。
+ * 根因修复：旧实现只取全文前 inputCharBudget 字（"剩余部分将不被 LLM 看到"），
+ * 长篇小说后半登场的人物/场景/物品永远提不出来（提回 1～3 个人就"完成"了）。
+ * 单段能装下时与旧行为完全一致（直接调 extractFromNovel）。
+ */
+export async function extractFromNovelChunked(
+  cfg: ApiConfig,
+  fullText: string,
+  title: string,
+  opts: ChunkedExtractOptions = {},
+): Promise<ExtractionResult> {
+  const lib = voiceLibraryFor(cfg);
+  const isAborted = opts.isAborted ?? (() => false);
+  // 单段预算打八折：给系统提示词留余量（与 Agent 扫描同口径）；
+  // 预算按实际语种估算（中文约 0.6 字符/token），否则中文长文单段超大触发网关 500
+  const chunks = splitNovelForAgent(fullText, extractChunkBudget(cfg, fullText, opts.chunkChars));
+  if (chunks.length <= 1) {
+    return extractFromNovel(cfg, fullText, title, opts.onUsage, opts.feedback);
+  }
+  opts.log?.(`小说全文 ${fullText.length} 字超出单次上下文，分 ${chunks.length} 段扫描提取（覆盖全书）…`);
+  const state: ExtractAgentState = { characters: new Map(), scenes: new Map(), items: new Map() };
+  for (let i = 0; i < chunks.length; i++) {
+    if (isAborted()) throw new Error("已中止");
+    opts.log?.(`提取第 ${i + 1}/${chunks.length} 段（约${chunks[i].length}字）…`);
+    const part = await extractFromNovel(cfg, chunks[i], title, opts.onUsage, opts.feedback);
+    for (const c of part.characters) {
+      const prev = state.characters.get(c.id);
+      if (prev) mergeCharacter(prev, c);
+      else state.characters.set(c.id, c);
+    }
+    for (const s of part.scenes) {
+      const prev = state.scenes.get(s.id);
+      if (!prev) {
+        state.scenes.set(s.id, s);
+      } else {
+        // 同 id 场景：缺字段补齐（首段优先，后段只填空）
+        for (const k of ["location", "atmosphere", "time", "imagePrompt"] as const) {
+          if (!prev[k] && s[k]) (prev as unknown as Record<string, unknown>)[k] = s[k];
+        }
+      }
+    }
+    for (const it of part.items) {
+      const prev = state.items.get(it.id);
+      if (!prev) {
+        state.items.set(it.id, it);
+      } else {
+        for (const k of ["name", "appearance", "note", "imagePrompt"] as const) {
+          if (!prev[k] && it[k]) (prev as unknown as Record<string, unknown>)[k] = it[k];
+        }
+      }
+    }
+  }
+  opts.log?.(`分段扫描完成：${state.characters.size} 角色 / ${state.scenes.size} 场景 / ${state.items.size} 物品，正在合并去重…`);
+  mergeCandidates(state);
+  const result = finalizeState(state, lib, title);
+  opts.log?.(`分段提取完成（覆盖全书）：${result.characters.length} 角色 / ${result.scenes.length} 场景 / ${result.items.length} 物品`, "success");
   return result;
 }

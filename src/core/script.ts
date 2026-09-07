@@ -14,6 +14,8 @@ import type {
 import { chatJson } from "../api/openaiCompatible";
 import { resolveContextLength } from "../api/providers";
 import { log as logger } from "../utils/logger";
+import { tauri } from "../utils/tauri";
+import { scriptCacheRest } from "./cache";
 import type { ApiConfig } from "./types";
 
 interface ScriptModel {
@@ -39,6 +41,7 @@ interface ScriptModel {
       characterId?: string;
       emotion?: string;
       action?: string;
+      costume?: string;
       monologue?: boolean;
       text: string;
     }[];
@@ -50,6 +53,7 @@ interface ScriptModel {
         characterId?: string;
         emotion?: string;
         action?: string;
+        costume?: string;
         monologue?: boolean;
         text: string;
       }[];
@@ -71,7 +75,8 @@ const SYSTEM_PROMPT = `你是视觉小说编剧。根据小说章节文本与角
    - dialogue: {type:"dialogue", characterId: 角色卡id, emotion:"normal|happy|sad|angry|surprised", text}
    - 可选 ttsEmotion: 该句配音情绪（传给 TTS 合成，让声音更有表现力），按说话语气选：happy/sad/angry/calm/whisper/surprised；没有明显情绪就省略
    - 可选 speed: 该句配音语速（0.5-2，默认 1.1 更像人；激动/紧张略快如 1.2-1.3，悲伤/低沉略慢如 0.9-1.0），没有明显语气差异就省略
-   - 可选 action: 当该句台词有明显动作姿态（抬手指、拔剑、挥手、抱臂、蹲下等）时，从该角色的"动作列表"(见角色卡)中选最贴切的一个填 action: "动作id"；没有合适的动作就省略该字段
+    - 可选 action: 当该句台词有明显动作姿态（抬手指、拔剑、挥手、抱臂、蹲下等）时，从该角色的"动作列表"(见角色卡)中选最贴切的一个填 action: "动作id"；没有合适的动作就省略该字段
+    - 可选 costume: 仅当剧情明确写了换装（换上礼服/战斗服/睡衣等）时，从该角色的"服装列表"(见角色卡)中选填 costume: "服装id"；换装后该角色后续台词自动沿用该服装直到再次标注，没有换装情节就省略该字段
    - narration: {type:"narration", text}
    - 内心独白: {type:"narration", monologue:true, text}（数量要少，每章最多 2 条）
 5. CG 事件：挑本章 1-3 个最具画面感的"名场面"（战斗高潮、重要相遇、宏大场景），
@@ -105,7 +110,10 @@ function buildCharacterContext(chars: CharacterCard[]): string {
       const acts = Array.isArray(c.actions) && c.actions.length
         ? `；动作列表：${c.actions.map((a) => `${a.id}(${a.name})`).join("、")}`
         : "";
-      return `${c.id}（${c.name}）：外貌${c.appearance}；服装${c.clothing}；性格${c.personality}${acts}`;
+      const cts = Array.isArray(c.costumes) && c.costumes.length
+        ? `；服装列表：${c.costumes.map((t) => `${t.id}(${t.name})`).join("、")}`
+        : "";
+      return `${c.id}（${c.name}）：外貌${c.appearance}；服装${c.clothing}；性格${c.personality}${acts}${cts}`;
     })
     .join("\n");
 }
@@ -165,6 +173,7 @@ export async function scriptChapter(
               characterId: l.characterId || cards.characters[0]?.id || "narrator",
               emotion: l.emotion || "normal",
               action: l.action || undefined,
+              costume: l.costume || undefined,
               text: l.text,
             }
           : {
@@ -198,6 +207,7 @@ export async function scriptChapter(
             characterId: l.characterId || cards.characters[0]?.id || "narrator",
             emotion: l.emotion || "normal",
             action: l.action || undefined,
+            costume: l.costume || undefined,
             text: l.text,
           }
         : {
@@ -692,4 +702,70 @@ export function verifyScriptAgainstSource(
     orderSuspectCount,
     speakerIssues,
   };
+}
+
+/** 覆盖率低于此值且原文引语足够多时，管线自动重写该章一次（最多 1 次） */
+export const SCRIPT_MIN_KEPT_RATIO = 0.85;
+
+/** 存疑项稳定 key（忽略表用）：场景序号:行序号:原因 */
+export function verifyIssueKey(sceneIndex: number, lineIndex: number, reason: SpeakerIssue["reason"]): string {
+  return `${sceneIndex}:${lineIndex}:${reason}`;
+}
+
+/** 接受建议说话人（纯函数）：把指定对话行的 characterId 改为新说话人，不碰其它内容 */
+export function applySpeakerFix(script: ChapterScript, sceneIndex: number, lineIndex: number, newCharacterId: string): ChapterScript {
+  const next: ChapterScript = JSON.parse(JSON.stringify(script));
+  const line = next.scenes[sceneIndex]?.lines[lineIndex];
+  if (!line) throw new Error(`剧本中找不到场景${sceneIndex + 1}#${lineIndex + 1}`);
+  if (line.type !== "dialogue") throw new Error(`场景${sceneIndex + 1}#${lineIndex + 1}不是对话，无法改说话人`);
+  line.characterId = newCharacterId;
+  return next;
+}
+
+/** 删除疑似新增/错位台词（纯函数）：删除指定行；场景保留（背景仍需它），行号整体前移 */
+export function deleteScriptLine(script: ChapterScript, sceneIndex: number, lineIndex: number): ChapterScript {
+  const next: ChapterScript = JSON.parse(JSON.stringify(script));
+  const scene = next.scenes[sceneIndex];
+  if (!scene || !scene.lines[lineIndex]) throw new Error(`剧本中找不到场景${sceneIndex + 1}#${lineIndex + 1}`);
+  scene.lines.splice(lineIndex, 1);
+  return next;
+}
+
+export interface ScriptVerifyFile {
+  version: 1;
+  chapterIndex: number;
+  title: string;
+  /** 与剧本缓存同一指纹公式：原文/标题/文风任一变化即换文件，旧核对自动失效 */
+  textFp: string;
+  at: string;
+  result: ScriptVerifyResult;
+  /** 已忽略的存疑 key（verifyIssueKey），重验时保留 */
+  ignored: string[];
+}
+
+/** 核对报告文件名：与剧本缓存同键（script_verify_chN_<rest>.json），剧本重写即换文件 */
+export function scriptVerifyFileName(
+  cacheDir: string,
+  demo: boolean,
+  chapterIndex: number,
+  title: string,
+  text: string,
+  styleFrag: string,
+): string {
+  return `${cacheDir}/${demo ? "script_verify_demo" : "script_verify"}_ch${chapterIndex + 1}_${scriptCacheRest(title, text, styleFrag)}.json`;
+}
+
+export async function readScriptVerify(path: string): Promise<ScriptVerifyFile | null> {
+  try {
+    const { text } = await tauri.readTextFile(path);
+    const parsed = JSON.parse(text) as Partial<ScriptVerifyFile>;
+    if (!parsed || !parsed.result || !Array.isArray(parsed.result.speakerIssues) || !Array.isArray(parsed.ignored)) return null;
+    return parsed as ScriptVerifyFile;
+  } catch {
+    return null;
+  }
+}
+
+export async function writeScriptVerify(path: string, payload: ScriptVerifyFile): Promise<void> {
+  await tauri.writeTextFile(path, JSON.stringify(payload, null, 2));
 }

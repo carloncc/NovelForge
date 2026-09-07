@@ -129,7 +129,7 @@ fn installed(dir: &Path, filename: &str) -> bool {
 }
 
 fn set_install_state(model_id: &str, filename: &str, state: &str, error: Option<String>) {
-    let mut guard = INSTALL.lock().unwrap();
+    let mut guard = INSTALL.lock().unwrap_or_else(|e| e.into_inner());
     guard.model_id = Some(model_id.to_string());
     guard.filename = Some(filename.to_string());
     guard.state = state.to_string();
@@ -138,7 +138,7 @@ fn set_install_state(model_id: &str, filename: &str, state: &str, error: Option<
 
 fn status_for(model_id: &str, filename: &str) -> ModelStatus {
     let dir = models_dir().cloned().unwrap_or_default();
-    let guard = INSTALL.lock().unwrap();
+    let guard = INSTALL.lock().unwrap_or_else(|e| e.into_inner());
     let active = guard.model_id.as_deref() == Some(model_id);
     ModelStatus {
         model_id: model_id.to_string(),
@@ -220,7 +220,7 @@ async fn download_to_part(dir: &Path, filename: &str, url: &str) -> Result<(), S
                 Ok(bytes) => {
                     file.write_all(&bytes).map_err(|e| format!("写入下载文件失败: {e}"))?;
                     downloaded += bytes.len() as u64;
-                    let mut guard = INSTALL.lock().unwrap();
+                    let mut guard = INSTALL.lock().unwrap_or_else(|e| e.into_inner());
                     guard.bytes = downloaded;
                     guard.total = total;
                 }
@@ -352,7 +352,7 @@ pub async fn model_download_start(
         return Ok(status_for(&model_id, &safe));
     }
     {
-        let guard = INSTALL.lock().unwrap();
+        let guard = INSTALL.lock().unwrap_or_else(|e| e.into_inner());
         if guard.state == "downloading" && guard.model_id.as_deref() == Some(model_id.as_str()) {
             return Ok(status_for(&model_id, &safe));
         }
@@ -365,7 +365,7 @@ pub async fn model_download_start(
     let spawn_model_id = model_id.clone();
     tauri::async_runtime::spawn(async move {
         let result = download_model(&spawn_dir, &spawn_safe, &spawn_url, &spawn_md5).await;
-        let mut guard = INSTALL.lock().unwrap();
+        let mut guard = INSTALL.lock().unwrap_or_else(|e| e.into_inner());
         match result {
             Ok(()) => {
                 guard.state = "done".to_string();
@@ -395,7 +395,7 @@ pub async fn model_remove(model_id: String, filename: String) -> Result<(), Stri
         let _ = fs::remove_file(model_file(dir, &safe));
         let _ = fs::remove_file(model_part_file(dir, &safe));
     }
-    let mut guard = INSTALL.lock().unwrap();
+    let mut guard = INSTALL.lock().unwrap_or_else(|e| e.into_inner());
     if guard.model_id.as_deref() == Some(model_id.as_str()) {
         guard.model_id = None;
         guard.filename = None;

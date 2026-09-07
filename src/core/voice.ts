@@ -2,7 +2,7 @@
 import { ttsSpeech } from "../api/openaiCompatible";
 import { tauri } from "../utils/tauri";
 import { errMsg } from "../utils/errors";
-import { cacheDirFor, cacheHit } from "./cache";
+import { cacheDirFor } from "./cache";
 import { sceneVocalKey } from "./render";
 import { ttsConfigById, voiceLibraryFor, voiceProfileById } from "../stores/config";
 import { log as logger } from "../utils/logger";
@@ -68,6 +68,58 @@ function fnv1a(parts: (string | number | undefined)[]): string {
 
 function voiceFingerprint(voice: string, configId?: string): string {
   return fnv1a([`${configId ?? "default"}:${voice}`]);
+}
+
+/** 配音文件名解析：v_<key>_<voiceFp>_<textHash>.<ext>。
+ * key 可含下划线，但 fp/hash 为 base36（无下划线），故从右切最后两段即得；
+ * 扩展名不限 mp3（部分 TTS 落 ogg/opus/wav）。 */
+export function splitVocalFileName(fileName: string): { key: string; fp: string; hash: string } | null {
+  const base = (fileName.split(/[\\/]/).pop() || "").replace(/\.(mp3|ogg|opus|wav|flac|m4a)$/i, "");
+  const m = /^v_(.+)_([0-9a-z]+)_([0-9a-z]+)$/.exec(base);
+  if (!m) return null;
+  return { key: m[1], fp: m[2].toLowerCase(), hash: m[3].toLowerCase() };
+}
+
+const VOCAL_EXTS = ["mp3", "ogg", "opus", "wav", "flac", "m4a"];
+
+/** 配音缓存命中：精确文件名优先，否则按 stem 匹配音频扩展名。
+ * runVoiceJob 会按 mime 落 ogg 等扩展名，只查 .mp3 会导致每次都 miss 重合成。 */
+export async function vocalHit(dir: string, fileName: string): Promise<string | null> {
+  const path = `${dir}/${fileName}`;
+  try {
+    if (await tauri.pathExists(path)) return path;
+  } catch {
+    /* ignore */
+  }
+  const base = fileName.replace(/\.(mp3|ogg|opus|wav|flac|m4a)$/i, "");
+  for (const ext of VOCAL_EXTS) {
+    const candidate = `${dir}/${base}.${ext}`;
+    if (candidate === path) continue;
+    try {
+      if (await tauri.pathExists(candidate)) return candidate;
+    } catch {
+      /* ignore */
+    }
+  }
+  return null;
+}
+
+/** 孤儿语音内容索引：`${voiceFp}_${textHash}` → 文件路径。
+ * 同一音色＋同一文本（含语速/情绪参数）即同一句话，key（章节/场景/行号）变化不影响内容，
+ * 重分章/重提后可用它把旧文件认领回来，0 计费。 */
+export async function buildVocalContentIndex(vocalCacheDir: string): Promise<Map<string, string>> {
+  const index = new Map<string, string>();
+  try {
+    const entries = await tauri.listDir(vocalCacheDir);
+    for (const e of entries) {
+      if (e.isDir) continue;
+      const parts = splitVocalFileName(e.name);
+      if (parts) index.set(`${parts.fp}_${parts.hash}`, e.path);
+    }
+  } catch {
+    /* 目录不存在 */
+  }
+  return index;
 }
 
 /** 配音文件名按「位置 key + 音色 + 文本 + 语速 + 情绪」内容寻址。
@@ -212,7 +264,7 @@ export async function runVoiceJob(
   const library = voiceLibraryFor(jobConfig);
   const fallbackVoice = library[0] || "default";
   if (!force) {
-    const cached = await cacheHit(cacheDir, job.file);
+    const cached = await vocalHit(cacheDir, job.file);
     if (cached) return cached;
   }
   log({ step: "配音", message: `配音中：${job.voice} 「${job.text.slice(0, 20)}…」`, level: "info", at: Date.now() });
@@ -294,20 +346,33 @@ export async function generateVoice(
   // 静默预分区：缓存命中的句子直接记入结果，不走合成/进度链路。
   // 解决"点一次配音重配，全书 N 句挨个走一遍进度"——命中只是本地文件存在性检查，不产生 TTS 调用。
   // force（整批重配）时跳过检查，全部合成。
+  // 孤儿认领：exact 文件名对不上时，按音色＋文本哈希找内容相同的文件（重分章/重提换 key 后免费找回）。
   const pending: VoiceJob[] = [];
+  let relinked = 0;
   if (!force) {
     const vocalCacheDir = cacheDirFor(cacheRoot, "vocal");
+    let contentIndex: Map<string, string> | null = null;
     for (const job of jobs) {
       let hit: string | null = null;
       try {
-        hit = await cacheHit(vocalCacheDir, job.file);
+        hit = await vocalHit(vocalCacheDir, job.file);
       } catch {
         hit = null;
       }
       if (hit) {
         vocal[job.key] = hit;
       } else {
-        pending.push(job);
+        if (!contentIndex) {
+          contentIndex = await buildVocalContentIndex(vocalCacheDir).catch(() => new Map<string, string>());
+        }
+        const parts = splitVocalFileName(job.file);
+        const found = parts ? contentIndex.get(`${parts.fp}_${parts.hash}`) : undefined;
+        if (found) {
+          vocal[job.key] = found;
+          relinked++;
+        } else {
+          pending.push(job);
+        }
       }
     }
   } else {
@@ -317,7 +382,12 @@ export async function generateVoice(
   if (jobs.length > 0 && pending.length === 0) {
     log({ step: "配音", message: `配音阶段完成：${jobs.length} 句全部命中缓存，无需合成（0 计费）`, level: "success", at: Date.now() });
   } else if (cachedCount > 0) {
-    log({ step: "配音", message: `缓存复用 ${cachedCount} 句，实际合成 ${pending.length} 句…`, level: "info", at: Date.now() });
+    log({
+      step: "配音",
+      message: `缓存复用 ${cachedCount} 句${relinked > 0 ? `（其中 ${relinked} 句为孤儿语音认领：key 变化但内容一致，0 计费）` : ""}，实际合成 ${pending.length} 句…`,
+      level: "info",
+      at: Date.now(),
+    });
   }
   const total = pending.length;
   let done = 0;
@@ -375,7 +445,7 @@ export async function repairVoiceAssets(
   log: (ev: PipelineEvent) => void,
   concurrency = 3,
   isAborted?: () => boolean,
-): Promise<{ total: number; fixed: number; failed: number; purged: number; kept: number }> {
+): Promise<{ total: number; fixed: number; failed: number; purged: number; kept: number; relinked: number }> {
   const cacheRoot = `${outputDir.replace(/[\\/]+$/, "")}/.novel2vn/cache`;
   const cacheDir = cacheDirFor(cacheRoot, "vocal");
   await tauri.mkdirAll(cacheDir);
@@ -383,17 +453,39 @@ export async function repairVoiceAssets(
   const assets = await readAssetMap(outputDir);
   const baseNameNoExt = (p: string): string => (p.split(/[\\/]/).pop() || "").replace(/\.[^.]+$/, "").toLowerCase();
   // 预判需要重配的句子：无映射 / 映射文件名 ≠ 期望内容寻址文件名（内容哈希或命名规则不符）/ 映射指向的文件已不存在
+  // 孤儿认领优先：内容一致（同音色同文本）的旧文件直接改映射指过去，不花钱重配
   const need: VoiceJob[] = [];
+  let relinked = 0;
+  let contentIndex: Map<string, string> | null = null;
+  const relinkedPairs: Array<{ key: string; path: string }> = [];
   for (const job of jobs) {
     const entry = assets.vocal[job.key];
     const entryOk = !!entry
       && baseNameNoExt(entry) === baseNameNoExt(job.file)
       && (await tauri.pathExists(entry).catch(() => false));
-    if (!entryOk) need.push(job);
+    if (entryOk) continue;
+    if (!contentIndex) {
+      contentIndex = await buildVocalContentIndex(cacheDir).catch(() => new Map<string, string>());
+    }
+    const parts = splitVocalFileName(job.file);
+    const found = parts ? contentIndex.get(`${parts.fp}_${parts.hash}`) : undefined;
+    if (found && (await tauri.pathExists(found).catch(() => false))) {
+      // 先收集、循环后一次写映射：逐句 updateAssetMap 是整文件读改写，N 句认领即 N 次全量写
+      relinkedPairs.push({ key: job.key, path: found });
+      relinked++;
+      continue;
+    }
+    need.push(job);
+  }
+  // 预检循环是串行的，批量写一次即可（worker 里的并发合并链在此之后，照样可见）
+  if (relinkedPairs.length) {
+    await updateAssetMap(outputDir, (map) => {
+      for (const r of relinkedPairs) map.vocal[r.key] = r.path;
+    }).catch(() => {});
   }
   log({
     step: "配音",
-    message: `配音结构检查：共 ${jobs.length} 句，${jobs.length - need.length} 句健康，${need.length} 句缺失/错配需重配`,
+    message: `配音结构检查：共 ${jobs.length} 句，${jobs.length - need.length - relinked} 句健康，${relinked} 句孤儿认领（0 计费），${need.length} 句缺失/错配需重配`,
     level: "info",
     at: Date.now(),
   });
@@ -444,10 +536,10 @@ export async function repairVoiceAssets(
   log({
     step: "配音",
     message: purged
-      ? `配音结构修复完成：重配 ${fixed} 句，失败 ${failed}，清理孤儿文件 ${purged} 个`
-      : `配音结构修复完成：重配 ${fixed} 句，失败 ${failed}（无需清理孤儿文件）`,
+      ? `配音结构修复完成：孤儿认领 ${relinked} 句，重配 ${fixed} 句，失败 ${failed}，清理孤儿文件 ${purged} 个`
+      : `配音结构修复完成：孤儿认领 ${relinked} 句，重配 ${fixed} 句，失败 ${failed}（无需清理孤儿文件）`,
     level: fixed ? "success" : "info",
     at: Date.now(),
   });
-  return { total, fixed, failed, purged, kept: total - need.length };
+  return { total, fixed, failed, purged, kept: total - need.length - relinked, relinked };
 }

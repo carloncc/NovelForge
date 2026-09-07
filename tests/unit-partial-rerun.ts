@@ -148,6 +148,56 @@ async function main(): Promise<void> {
     const ch0After = await readFile(ch0File, "utf8");
     assert(ch0After === ch0Before, "第 1 章缓存文件内容不应被改动");
     assert(res2.chapters.length === 2, `单章重跑不应丢章，实际 ${res2.chapters.length}`);
+
+    // 单章全量（无意见，经 rerunChaptersForce）：第 2 章跳过缓存直接重写，第 1 章不动
+    const logs3: PipelineEvent[] = [];
+    const res3 = await new Pipeline({
+      novel, materials: [], outputDir: out, templateDir,
+      options: { useImage: false, useTts: false, skipCache: false, maxConcurrent: 2, rerunChapters: [1], rerunChaptersForce: [1] },
+      stages: ["script"],
+      log: (e) => logs3.push(e),
+    }).run();
+    assert(logs3.some((l) => l.message.includes("生成第 2 章剧本") && l.message.includes("全量重写")), "无意见全量应重写第 2 章并注明");
+    assert(!logs3.some((l) => /生成第 1 章剧本/.test(l.message)), "全量单章不应动第 1 章");
+    const ch0AfterForce = await readFile(ch0File, "utf8");
+    assert(ch0AfterForce === ch0Before, "全量单章不应改动第 1 章缓存");
+    assert(res3.chapters.length === 2, `全量单章不应丢章，实际 ${res3.chapters.length}`);
+  }
+
+  /* ---------- 图像单章强制：范围内背景进执行，人物/物品保持静默复用 ---------- */
+  {
+    const cacheRoot = `${root}/imgforce/.novel2vn/cache`;
+    await mkdir(`${cacheRoot}/images`, { recursive: true });
+    const scope = new Set([demoScripts[0].chapter]);
+    const tasks = buildImageTasks(demoScripts, demoCards, {
+      figurePerCharacter: 1, cgPerChapter: 0, maxPerChapter: 0,
+      figureEmotions: false, threeView: false, actions: false, styleAnchor: false,
+      chapterIndexes: scope,
+    });
+    const bgInScope = tasks.filter((t) => t.kind === "background");
+    // cgPerChapter: 0 = 不限制（全要），目标章有 cgEvent 的场景同样会建 CG 任务
+    const bgCgInScope = tasks.filter((t) => t.kind === "background" || t.kind === "cg");
+    assert(bgInScope.length > 0, "目标章应有背景任务");
+    for (const t of tasks) {
+      await writeFile(`${cacheRoot}/images/${t.fileName}`, pngBuffer(t.width, t.height));
+    }
+    const logs: PipelineEvent[] = [];
+    const r = await generateImages(
+      undefined, demoScripts, demoCards, [], cacheRoot, (e) => logs.push(e),
+      3, false, undefined, undefined, false, false, false,
+      undefined, undefined, false, undefined, undefined, undefined, undefined, 0, 0,
+      scope, "full", true,
+    );
+    const progress = logs.filter((l) => (l as { progress?: unknown }).progress);
+    // 无 API 时强制的背景/CG 进执行后跳过（无映射），人物/物品静默复用（有映射、无进度）
+    assert(progress.length === bgCgInScope.length, `单章强制应只执行范围内背景/CG：${progress.length}/${bgCgInScope.length}`);
+    for (const t of bgCgInScope) {
+      const section = t.kind === "cg" ? r.images.cg : r.images.bg;
+      assert(section[t.id] === undefined, "强制背景/CG 无 API 时不应有映射");
+    }
+    const figMapped = Object.keys(r.images.figure).length;
+    assert(figMapped > 0, "人物图应静默复用不断映射");
+    assert(logs.some((l) => l.message.includes("缓存复用")), "应有复用总结");
   }
 
   console.log("=== partial rerun tests passed ===");

@@ -4,6 +4,7 @@ import { t } from "../i18n";
 import { open } from "@tauri-apps/plugin-dialog";
 import { projectState, pushLog, clearLogs, scheduleSave, restoreProject, flushPendingProjectSave, getStageLastLevels, getLastActiveStage } from "../stores/project";
 import { activeConfig, configState, addRecentOutputDir } from "../stores/config";
+import { upsertProject } from "../stores/projects";
 import { Pipeline, novelFingerprint, joinAppendText } from "../core/pipeline";
 import type { SplitMethod } from "../core/pipeline";
 import { resolveTemplateDir } from "../utils/template";
@@ -50,8 +51,26 @@ import {
   resumeStagesAfterVisualApproval,
   visualBibleNeedsReview,
 } from "../core/visualBibleWorkflow";
-import { parseAssetMap } from "../core/assetMap";
+import {
+  computeProjectVisualBibleFingerprint,
+  refreshVisualBibleFingerprint,
+  syncBibleCharactersWithCards,
+} from "../core/visualBible";
+import { parseAssetMap, updateAssetMap, listAssetBackups, restoreAssetBackup } from "../core/assetMap";
 import { parseChapterScript } from "../core/dataValidation";
+import { scriptCacheFileName, scriptCacheRest, titleHash } from "../core/cache";
+import {
+  applySpeakerFix,
+  deleteScriptLine,
+  readScriptVerify,
+  SCRIPT_MIN_KEPT_RATIO,
+  scriptVerifyFileName,
+  verifyIssueKey,
+  verifyScriptAgainstSource,
+  writeScriptVerify,
+} from "../core/script";
+import type { SpeakerIssue } from "../core/script";
+import type { ChapterScript } from "../core/types";
 
 const tab = ref<"run" | "cards" | "video" | "script" | "log" | "failed" | "asset" | "bible">("run");
 
@@ -201,6 +220,8 @@ const videoPoints = computed<(VideoSuggestion & { chapter: number; location: str
 
 const selectedStages = ref<Record<StageKey, boolean>>({ split: true, translate: true, extract: true, script: true, image: true, voice: true, assemble: true });
 const stageFeedback = ref<Partial<Record<StageKey, string>>>({});
+/** 分阶段全量开关：勾选后该阶段无视缓存全量重跑（不需要填意见，执行前二次确认，一次有效） */
+const stageForce = ref<Partial<Record<StageKey, boolean>>>({});
 const outputDirDraft = ref("");
 
 watch(
@@ -351,6 +372,12 @@ async function previewSplit(): Promise<void> {
     if (!window.confirm("当前是旧规则回退分章（机械切分），是否升级为 AI 分章？升级后下游剧本/图像/配音缓存将作废重跑。")) return;
   }
   const upgrade = !fb && splitMeta.value?.method === "fallback" && !!activeConfig("llm")?.apiKey;
+  pushLog({
+    step: "分章",
+    message: `AI 分章预览开始（${fb ? "带意见：强制重切" : upgrade ? "规则回退升级：强制 AI 重切（下游缓存作废）" : "无意见：复用缓存"}）`,
+    level: "info",
+    at: Date.now(),
+  });
   const ok = await execute({
     stages: ["split", "extract"],
     feedback: fb ? { split: fb } : undefined,
@@ -417,6 +444,12 @@ async function runChapterQueue(): Promise<void> {
   queueRunning.value = true;
   let done = 0;
   let stoppedAt = "";
+  pushLog({
+    step: "单章",
+    message: `队列开始：${targets.length} 章待生成（${targets.map((c) => `第${c.index + 1}章「${c.title}」`).join("、")}），逐章跑剧本＋图像＋组装（不含配音）`,
+    level: "info",
+    at: Date.now(),
+  });
   try {
     for (const ch of targets) {
       if (!queueRunning.value) {
@@ -450,6 +483,7 @@ async function runChapterQueue(): Promise<void> {
 function stopChapterQueue(): void {
   queueRunning.value = false;
   pipelineRef.value?.abort();
+  pushLog({ step: "单章", message: "用户停止队列：当前章节完成后即停，已完成的章节下次自动跳过", level: "warn", at: Date.now() });
 }
 
 /** 日志中「最后一条」为 error 的阶段（用于中断/未落盘运行的失败识别，成功后会更新为成功状态） */
@@ -545,6 +579,8 @@ const visualBibleReviewNeeded = computed(() => projectState.options.useImage && 
 /* ==================== 剧本 Tab 单章重生成 ==================== */
 
 const scriptChapterFeedback = ref<Record<number, string>>({});
+/** 单章全量开关：勾选后该章跳过剧本缓存直接重写（同范围图像同步强制），一次有效 */
+const chapterForce = ref<Record<number, boolean>>({});
 
 /* ==================== 素材 Tab ==================== */
 
@@ -637,6 +673,12 @@ function selectAllInTab(): void {
 async function regenSelected(): Promise<void> {
   const keys = Array.from(selected.value);
   if (!keys.length) return;
+  pushLog({
+    step: "素材",
+    message: `批量重生成开始：${keys.length} 项（${keys.slice(0, 5).join("、")}${keys.length > 5 ? "…" : ""}）`,
+    level: "info",
+    at: Date.now(),
+  });
   const ctx = await regenCtx();
   if (!ctx) return;
   assetBusy.value = `batch:${keys.length} 项`;
@@ -677,18 +719,38 @@ async function regenMissingImages(): Promise<void> {
     baseSeed: ctx.imageSeed,
     styleAnchor: approvedBible ? false : ctx.styleAnchor !== false,
   });
-  // 预检缺失：任务文件在 cache/images 下不存在（含 .png/.jpg/.webp 变体）
+  // 预检缺失：任务文件在 cache/images 下不存在（含 .png/.jpg/.webp 变体）或尺寸不符（与管线分区同口径）
   const missingTaskKeys = new Set<string>();
+  pushLog({
+    step: "素材",
+    message: `补全缺失图片：共 ${allTasks.length} 个图像任务，正在逐个检查文件是否存在…`,
+    level: "info",
+    at: Date.now(),
+  });
   for (const t of allTasks) {
     if (t.kind === "anchor") continue; // 锚点不在素材映射里，跳过
     const base = `${cacheRoot}/images/${t.fileName.replace(/\.png$/i, "")}`;
-    const variants = await Promise.all([
-      tauri.pathExists(`${base}.png`).catch(() => false),
-      tauri.pathExists(`${base}.jpg`).catch(() => false),
-      tauri.pathExists(`${base}.jpeg`).catch(() => false),
-      tauri.pathExists(`${base}.webp`).catch(() => false),
-    ]);
-    if (!variants.some(Boolean)) missingTaskKeys.add(imageTaskIdentity(t));
+    // 与管线分区同口径：变体命中＋尺寸相符才算存在，否则进缺失补生成
+    let found: string | null = null;
+    for (const ext of ["png", "jpg", "jpeg", "webp"]) {
+      const candidate = `${base}.${ext}`;
+      try {
+        if (await tauri.pathExists(candidate)) {
+          found = candidate;
+          break;
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+    if (found && t.width > 0 && t.height > 0) {
+      try {
+        if (!(await tauri.imageSizeMatches(found, t.width, t.height).catch(() => true))) found = null;
+      } catch {
+        /* 查询失败视为命中 */
+      }
+    }
+    if (!found) missingTaskKeys.add(imageTaskIdentity(t));
   }
   if (!missingTaskKeys.size) {
     pushLog({ step: "素材", message: "没有缺失的图片，无需补全", level: "info", at: Date.now() });
@@ -834,14 +896,22 @@ function stopAssetLiveRefresh(): void {
 const figureRows = computed(() => {
   const r = projectState.lastResult;
   if (!r || !assetMap.value) return [];
-  return r.cards.characters.map((c) => ({
-    id: c.id,
-    name: c.name,
-    hasRef: !!c.referenceImage,
-    threeView: assetMap.value!.figure[`${c.id}_threeview`],
-    emotions: FIGURE_EMOTIONS.map((emo) => ({ emo, file: assetMap.value!.figure[emo === "normal" ? c.id : `${c.id}_${emo}`] })),
-    actions: (c.actions || []).map((a) => ({ id: a.id, name: a.name, file: assetMap.value!.figure[`${c.id}_act_${a.id}`] })),
-  }));
+  // 表情/服装行与管线 buildImageTasks 同口径：关闭表情差分→仅默认；核心档→标准5；
+  // 完整档→AI 自定义表情集（缺省标准5）；服装差分仅完整档有任务
+  const useEmotions = projectState.options.figureEmotions !== false;
+  const core = projectState.options.figureDetail === "core";
+  return r.cards.characters.map((c) => {
+    const emos = !useEmotions ? ["normal"] : core ? FIGURE_EMOTIONS : (c.emotions?.length ? c.emotions : FIGURE_EMOTIONS);
+    return {
+      id: c.id,
+      name: c.name,
+      hasRef: !!c.referenceImage,
+      threeView: assetMap.value!.figure[`${c.id}_threeview`],
+      emotions: emos.map((emo) => ({ emo, file: assetMap.value!.figure[emo === "normal" ? c.id : `${c.id}_${emo}`] })),
+      actions: (c.actions || []).map((a) => ({ id: a.id, name: a.name, file: assetMap.value!.figure[`${c.id}_act_${a.id}`] })),
+      costumes: core ? [] : (c.costumes || []).map((ct) => ({ id: ct.id, name: ct.name, file: assetMap.value!.figure[`${c.id}_ct_${ct.id}`] })),
+    };
+  });
 });
 
 const itemRows = computed(() => {
@@ -878,19 +948,34 @@ const voiceRows = computed(() => {
   const r = projectState.lastResult;
   if (!r || !assetMap.value) return [];
   const rows = r.chapters.flatMap((ch) =>
-    ch.scenes.flatMap((s) =>
-      s.lines.map((line, i) => {
+    ch.scenes.flatMap((s) => {
+      const main = s.lines.map((line, i) => {
         const key = `ch${ch.chapter}_${sanitizeId(s.id)}_${i}`;
         const file = assetMap.value!.vocal[key];
         const failed = !file && failedVocalKeys.value.has(key);
         if (line.type === "dialogue") {
-          return { key, chapter: ch.chapter + 1, scene: s.location, charId: line.characterId, displayName: charNameOf.value(line.characterId), text: line.text, file, failed };
+          return { key, chapter: ch.chapter + 1, scene: s.location, charId: line.characterId, displayName: charNameOf.value(line.characterId), text: line.text, file, failed, branch: "" };
         }
         // 旁白/独白默认隐藏（避免配音表看起来断裂）；打开开关后显示，key 与配音任务一致
         if (!showNarrationVoice.value) return null;
-        return { key, chapter: ch.chapter + 1, scene: s.location, charId: "narrator", displayName: line.monologue ? t("内心独白") : t("旁白"), text: line.text, file, failed };
-      }),
-    ),
+        return { key, chapter: ch.chapter + 1, scene: s.location, charId: "narrator", displayName: line.monologue ? t("内心独白") : t("旁白"), text: line.text, file, failed, branch: "" };
+      });
+      // 分支选项台词：key 公式与 buildVoiceJobs 完全一致（lines.length + 1000*(b+1) + j），否则分支配音隐形
+      const branches = (s.choices || []).flatMap((choice, b) =>
+        choice.lines.map((line, j) => {
+          const key = `ch${ch.chapter}_${sanitizeId(s.id)}_${s.lines.length + 1000 * (b + 1) + j}`;
+          const file = assetMap.value!.vocal[key];
+          const failed = !file && failedVocalKeys.value.has(key);
+          const branch = `分支「${choice.prompt}」`;
+          if (line.type === "dialogue") {
+            return { key, chapter: ch.chapter + 1, scene: s.location, charId: line.characterId, displayName: charNameOf.value(line.characterId), text: line.text, file, failed, branch };
+          }
+          if (!showNarrationVoice.value) return null;
+          return { key, chapter: ch.chapter + 1, scene: s.location, charId: "narrator", displayName: line.monologue ? t("内心独白") : t("旁白"), text: line.text, file, failed, branch };
+        }),
+      );
+      return [...main, ...branches];
+    }),
   ).filter((x): x is NonNullable<typeof x> => !!x);
   return rows.filter(
     (r) => (!voiceChapterFilter.value || r.chapter === voiceChapterFilter.value) && (!voiceCharFilter.value || r.charId === voiceCharFilter.value),
@@ -955,6 +1040,8 @@ interface ExecuteOptions {
   forceStages?: StageKey[];
   clearLogsFirst?: boolean;
   rerunChapters?: number[] | null;
+  /** 单章强制重跑的 novel index（跳过剧本缓存直接重写；同范围图像背景/CG 同步强制） */
+  rerunChaptersForce?: number[];
   /** 单章节模式保护：缺剧本缓存时在组装前中止，避免游戏缩水 */
   requireFullScriptCoverage?: boolean;
   /** 纯追加式增量加更：旧全文 + 新增文本（要求 stages 含 split+extract+script） */
@@ -1096,6 +1183,7 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
       options: {
         ...projectState.options,
         rerunChapters: opts.rerunChapters !== undefined ? opts.rerunChapters ?? undefined : rerunChapters.value ?? undefined,
+        rerunChaptersForce: opts.rerunChaptersForce,
       },
       stages: opts.stages,
       feedback: opts.feedback,
@@ -1108,7 +1196,13 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
 
     log({
       step: "开始",
-      message: `管线启动（阶段：${opts.stages.map((s) => STAGE_LABELS[s]).join(" → ")}）`,
+      message: `管线启动（阶段：${opts.stages.map((s) => STAGE_LABELS[s]).join(" → ")}`
+        + `；章节：${opts.rerunChapters === undefined || opts.rerunChapters === null ? "全部" : opts.rerunChapters.length ? `仅第 ${opts.rerunChapters.map((n) => n + 1).join("、")} 章` : "未选任何章节"}`
+        + `${opts.forceStages?.length ? `；强制：${opts.forceStages.map((s) => STAGE_LABELS[s]).join("、")}` : ""}`
+        + `${opts.feedback && Object.keys(opts.feedback).length ? `；意见：${Object.keys(opts.feedback).join("、")}（该阶段全量重生成）` : "；意见：无（复用缓存、只补缺失）"}`
+        + `${opts.append ? `；增量追加：新增约 ${opts.append.tailText.length} 字` : ""}`
+        + `${projectState.options.skipCache ? "；跳过缓存：开（全量重跑）" : ""}`
+        + `；人物图：${projectState.options.figureDetail === "core" ? "核心档" : "完整档"}）`,
       level: "info",
       at: Date.now(),
     });
@@ -1134,6 +1228,7 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
     }
     projectState.lastResult = result;
     addRecentOutputDir(result.meta.outputDir);
+    upsertProject(result.meta.outputDir, projectState.novel ? { fileName: projectState.novel.fileName, title: projectState.novel.chapters[0]?.title ?? "" } : undefined);
     // 分章来源徽标：本次跑了分章（或透出来源）就直接更新，免一次读盘
     if (result.splitMethod !== undefined) {
       splitMeta.value = {
@@ -1147,9 +1242,22 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
       const split = result.splitChapters;
       const wasMerged = projectState.novel.chapters.length <= 1 && projectState.novel.chapters[0]?.title === "全文";
       if (wasMerged || split.length > 1) {
+        const beforeSig = projectState.novel.chapters.map((c) => c.title).join("|");
         // 新分章默认全部启用（不继承旧章节的 enabled，避免旧第 0 章被停用时所有新章全被停用）
         projectState.novel.chapters = split.map((c) => ({ ...c, enabled: c.enabled !== false }));
         logger.info("page", "分章结果已写入项目", { chapterCount: split.length, titles: split.map((c) => c.title).slice(0, 8) });
+        // 分章变化后旧勾选会打错章（合法编号指向不同原文）：直接重置为全选并明示
+        const afterSig = projectState.novel.chapters.map((c) => c.title).join("|");
+        if (beforeSig !== afterSig) {
+          rerunChapters.value = null;
+          splitConfirmed.value = false;
+          try {
+            localStorage.removeItem(splitConfirmKey());
+          } catch {
+            /* 忽略 */
+          }
+          log({ step: "分章", message: `分章已变化（${split.length} 章），重跑勾选已重置为全选、分章确认已失效：请核对章节后重新勾选并确认分章`, level: "warn", at: Date.now() });
+        }
       }
     }
     if (opts.stages.includes("assemble")) {
@@ -1183,6 +1291,38 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
     activeRunLabels.value = [];
     void stageStatus.refresh();
     void chapterStatus.refresh();
+    // 运行日志自动落盘（含失败/中止）：下次出事先看 .novel2vn/logs/run-*.log
+    void persistRunLog();
+  }
+}
+
+/** 每次管线运行结束自动落盘一份运行日志（成功失败都存，最多保留 10 份）：
+ * 事故复盘不再依赖"我贴日志"——.novel2vn/logs/run-<时间>.log 直接可查。 */
+async function persistRunLog(): Promise<void> {
+  const out = projectState.outputDir;
+  if (!out) return;
+  try {
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const lines = [
+      `NovelForge 运行日志 ${stamp}`,
+      `项目：${out}`,
+      `失败项：${failedTasks.value.length} 个`,
+      "",
+      ...projectState.logs.map((l) => `[${new Date(l.at).toLocaleTimeString()}] [${l.step}] ${l.message}`),
+    ];
+    await tauri.mkdirAll(`${out}/.novel2vn/logs`).catch(() => {});
+    await tauri.writeTextFile(`${out}/.novel2vn/logs/run-${stamp}.log`, lines.join("\n"));
+    const entries = await tauri.listDir(`${out}/.novel2vn/logs`).catch(() => []);
+    const runs = entries
+      .filter((e) => !e.isDir && /^run-.*\.log$/.test(e.name))
+      .map((e) => e.name)
+      .sort();
+    while (runs.length > 10) {
+      const old = runs.shift()!;
+      await tauri.removePath(`${out}/.novel2vn/logs/${old}`).catch(() => {});
+    }
+  } catch {
+    /* 落盘失败不打扰 */
   }
 }
 
@@ -1233,6 +1373,12 @@ async function resumeAfterVisualApproval(): Promise<void> {
     tab.value = "run";
     return;
   }
+  pushLog({
+    step: "视觉圣经",
+    message: `圣经已批准，续跑剩余阶段：${stages.map((s) => STAGE_LABELS[s]).join(" → ")}`,
+    level: "info",
+    at: Date.now(),
+  });
   await execute({ stages, clearLogsFirst: false });
   if (stages.includes("assemble")) {
     await checkVideos();
@@ -1254,10 +1400,21 @@ function onVisualBibleChanged(): void {
  */
 function runStageRegen(stage: StageKey): void {
   const fb = stageFeedback.value[stage]?.trim() || "";
-  // 带意见即全量强制：执行前二次确认并明示影响（防"填一句意见烧掉全书"）
-  if (!confirmStageOpinion(stage, fb)) return;
+  const forceAll = !!stageForce.value[stage];
+  // 全量路径（填意见或勾全量）执行前二次确认并明示影响（防"填一句意见烧掉全书"）；
+  // 两者都无 = 安全的只补缺失
+  if (!confirmStageOpinion(stage, fb, forceAll)) return;
+  stageForce.value[stage] = false;
   const failedFor = failedTasks.value.filter((f) => stageStatus.STEP_TO_STAGE[f.step] === stage);
+  pushLog({
+    step: "单阶段",
+    message: `重跑「${STAGE_LABELS[stage]}」（${fb ? "带意见" : forceAll ? "勾全量" : "无意见"}：${fb || forceAll ? "全量强制重生成" : "复用缓存、只补缺失"}${failedFor.length ? `；该阶段失败项 ${failedFor.length} 个` : ""}）`,
+    level: "info",
+    at: Date.now(),
+  });
   const feedback = fb ? ({ [stage]: fb } as Partial<StageFeedback>) : undefined;
+  // 全量 = 填意见或勾全量开关（后者不需要写意见）
+  const full = fb !== "" || forceAll;
   const thenRefresh = (): void => {
     void stageStatus.refresh();
     void loadAssetMapNow(true);
@@ -1290,9 +1447,9 @@ function runStageRegen(stage: StageKey): void {
       });
       break;
     case "translate": {
-      // 填了意见 → 全量重翻；否则「继续」：只补未缓存/失败的章节，已翻译的复用缓存
+      // 全量（意见/开关）→ 全量重翻；否则「继续」：只补未缓存/失败的章节，已翻译的复用缓存
       // 严格单阶段：不联动提取/剧本/图像，下游过期需手动重跑
-      const force = fb ? (["translate"] as StageKey[]) : undefined;
+      const force = full ? (["translate"] as StageKey[]) : undefined;
       void execute({
         stages: ["translate"],
         feedback: feedback as StageFeedback | undefined,
@@ -1301,22 +1458,22 @@ function runStageRegen(stage: StageKey): void {
       }).then((ok) => {
         clearFb();
         thenRefresh();
-        if (ok && fb) hintDownstreamStale("翻译", "提取 / 剧本 / 图像 / 配音");
+        if (ok && full) hintDownstreamStale("翻译", "提取 / 剧本 / 图像 / 配音");
       });
       break;
     }
     case "extract":
-      // 填了意见 → 强制重提取（并作废下游剧本/立绘缓存）；否则复用缓存/补缺。
+      // 全量 → 强制重提取（并作废下游剧本/立绘缓存）；否则复用缓存/补缺。
       // 严格单阶段：不自动重跑剧本/图像，下游过期需手动重跑，避免一次点击烧掉整套下游费用
       void execute({
         stages: ["extract"],
         feedback: feedback as StageFeedback | undefined,
-        forceStages: fb ? (["extract"] as StageKey[]) : undefined,
+        forceStages: full ? (["extract"] as StageKey[]) : undefined,
         rerunChapters: null,
       }).then((ok) => {
         clearFb();
         thenRefresh();
-        if (ok && fb) hintDownstreamStale("提取", "剧本 / 图像 / 配音");
+        if (ok && full) hintDownstreamStale("提取", "剧本 / 图像 / 配音");
       });
       break;
     case "script": {
@@ -1326,10 +1483,10 @@ function runStageRegen(stage: StageKey): void {
       // 严格单阶段：只跑剧本，不自动补图/组装。新场景缺图时去「图像」点重新生成补齐，
       // 预览更新点「组装」（免费）。避免改一章剧本就把全书图片重跑一遍。
       const stages: StageKey[] = ["script"];
-      if (fb) {
+      if (full) {
         const fbMap: Record<number, string> = {};
-        for (const c of projectState.novel?.chapters ?? []) fbMap[c.index] = fb;
-        void execute({ stages, feedback: { script: fbMap }, forceStages: ["script"], rerunChapters: null }).then((ok) => {
+        if (fb) for (const c of projectState.novel?.chapters ?? []) fbMap[c.index] = fb;
+        void execute({ stages, feedback: fb ? { script: fbMap } : undefined, forceStages: ["script"], rerunChapters: null }).then((ok) => {
           void loadScripts();
           thenRefresh();
           if (ok) hintDownstreamStale("剧本", "图像 / 配音");
@@ -1352,9 +1509,9 @@ function runStageRegen(stage: StageKey): void {
       break;
     }
     case "image": {
-      // 填了意见 → 全量重生成；否则「继续」：缓存命中复用、只补缺失/失败的图
+      // 全量 → 全量重生成；否则「继续」：缓存命中复用、只补缺失/失败的图
       // 严格单阶段：不自动组装，预览更新手动点「组装」（免费）
-      const force = fb ? (["image"] as StageKey[]) : undefined;
+      const force = full ? (["image"] as StageKey[]) : undefined;
       void execute({
         stages: ["image"],
         feedback: feedback as StageFeedback | undefined,
@@ -1374,9 +1531,9 @@ function runStageRegen(stage: StageKey): void {
       break;
     }
     case "voice": {
-      // 填了意见 → 按意见全书重配（此前意见会被静默忽略）；否则「继续」只补缺失配音。
+      // 全量 → 全书重配；否则「继续」只补缺失配音。
       // 严格单阶段，不自动组装
-      const force = fb ? (["voice"] as StageKey[]) : undefined;
+      const force = full ? (["voice"] as StageKey[]) : undefined;
       void execute({ stages: ["voice"], feedback: feedback as StageFeedback | undefined, forceStages: force }).then((ok) => {
         thenRefresh();
         if (ok) {
@@ -1400,8 +1557,9 @@ function runStageRegen(stage: StageKey): void {
 
 /**
  * 单章节全链重跑（不含配音，为省 TTS 费用）：只动指定章节——
- * 剧本（默认只补缺失：有缓存直接复用；仅当填写了该章意见才按意见重写）、
- * 图像（仅该章背景/CG，其余复用映射；人物基础图已有成品的不重建任务）、组装（本地免费刷新预览）。
+ * 剧本（默认只补缺失：有缓存直接复用；填意见按意见重写；勾全量直接重写）、
+ * 图像（仅该章背景/CG，其余复用映射；全量时该章背景/CG 同步强制；人物基础图已有成品的不重建任务）、
+ * 组装（本地免费刷新预览）。
  * 带 requireFullScriptCoverage：其他章节缺缓存时在组装前中止，保护已有游戏不缩水。
  * 返回管线是否成功，供队列顺序调用。
  */
@@ -1423,13 +1581,24 @@ async function runChapterFullRegen(novelIdx: number): Promise<boolean> {
   // 视觉圣经未批准时跳过图像阶段，避免阻断剧本重生成（与原 regenChapter 同策略）
   const canFillImages = projectState.options.useImage && !visualBibleNeedsReview(projectState.visualBible);
   const fb = scriptChapterFeedback.value[novelIdx]?.trim() ?? "";
-  // 只补缺失（默认）：无意见时不带 feedback key，管线优先复用该章剧本缓存、只生成缺失部分；
-  // 只有填写了意见才强制按意见重写该章（scene.id 会变，该章图片随之重画）。
+  const forceAll = !!chapterForce.value[novelIdx];
+  // 全量单章先确认（影响：整章剧本重写＋该章背景/CG 重画）
+  if (forceAll && !window.confirm(`第 ${novelIdx + 1} 章「${ch.title}」将全量重跑（剧本重写${canFillImages ? "＋该章背景/CG 重画" : ""}，scene 变化后该章配音需重配）。继续吗？`)) return false;
+  chapterForce.value[novelIdx] = false;
+  pushLog({
+    step: "单章",
+    message: `第 ${novelIdx + 1} 章「${ch.title}」全链开始（${fb ? "按意见重写剧本" : forceAll ? "全量重写剧本" : "剧本只补缺失"}${canFillImages ? `＋图像${forceAll ? "（该章背景/CG 强制）" : ""}` : "（圣经待确认，跳过图像）"}，不含配音）`,
+    level: "info",
+    at: Date.now(),
+  });
+  // 只补缺失（默认）：无意见无全量时不带 feedback key，管线优先复用该章剧本缓存、只生成缺失部分；
+  // 填意见按意见重写；勾全量经 rerunChaptersForce 直接重写（scene.id 会变，该章图片随之重画）。
   // rerunChapters 限定单章，图像 scope 同口径过滤。
   const ok = await execute({
     stages: canFillImages ? (["script", "image", "assemble"] as StageKey[]) : (["script", "assemble"] as StageKey[]),
     feedback: fb ? { script: { [novelIdx]: fb } } : undefined,
     rerunChapters: [novelIdx],
+    rerunChaptersForce: forceAll ? [novelIdx] : undefined,
     requireFullScriptCoverage: true,
   });
   scriptChapterFeedback.value[novelIdx] = "";
@@ -1439,7 +1608,7 @@ async function runChapterFullRegen(novelIdx: number): Promise<boolean> {
   if (ok) {
     pushLog({
       step: "单章",
-      message: `第 ${novelIdx + 1} 章「${ch.title}」已重新生成（${fb ? "按意见重写剧本，" : ""}剧本${canFillImages ? "＋图像" : ""}只补缺失、不含配音；预览已组装）。配音请跑配音阶段或在素材页单句重配`,
+      message: `第 ${novelIdx + 1} 章「${ch.title}」已重新生成（${fb ? "按意见重写剧本，" : forceAll ? "全量重写剧本，" : ""}剧本${canFillImages ? "＋图像" : ""}${fb || forceAll ? "" : "只补缺失"}、不含配音；预览已组装）。配音请跑配音阶段或在素材页单句重配`,
       level: "success",
       at: Date.now(),
     });
@@ -1447,10 +1616,11 @@ async function runChapterFullRegen(novelIdx: number): Promise<boolean> {
   return ok;
 }
 
-/** 带意见的阶段重跑二次确认：明示全量影响（张数/句数/章数），防"填一句意见烧掉全书"。
- * 无意见返回 true（直接执行"继续/补缺"语义）。 */
-function confirmStageOpinion(stage: StageKey, fb: string): boolean {
-  if (!fb) return true;
+/** 全量重跑二次确认：明示全量影响（张数/句数/章数），防"填一句意见烧掉全书"。
+ * 无意见且未勾全量返回 true（直接执行"继续/补缺"语义）。 */
+function confirmStageOpinion(stage: StageKey, fb: string, forceAll = false): boolean {
+  if (!fb && !forceAll) return true;
+  const how = fb ? "意见" : "全量开关";
   const r = projectState.lastResult;
   const chapters = r?.chapters ?? [];
   const cards = r?.cards;
@@ -1472,23 +1642,23 @@ function confirmStageOpinion(stage: StageKey, fb: string): boolean {
         figs = tasks.filter((t) => t.kind === "figure" || t.kind === "threeview" || t.kind === "action").length;
       }
       return window.confirm(
-        `「图像」意见将强制重画全书图片${total ? `约 ${total} 张（含人物基础图约 ${figs} 张）` : ""}，会产生图片费用。继续吗？\n（只想改单张图：去素材页点那张图的"重新生成"，意见填在那一区的意见框）`,
+        `「图像」${how}将强制重画全书图片${total ? `约 ${total} 张（含人物基础图约 ${figs} 张）` : ""}，会产生图片费用。继续吗？\n（只想改单张图：去素材页点那张图的"重新生成"，意见填在那一区的意见框）`,
       );
     }
     case "script": {
       const n = enabledNovelCount || chapters.length;
       return window.confirm(
-        `「剧本」意见将重写全书 ${n} 章剧本（旧场景图/配音随之过期需重跑）。继续吗？\n（只改一章：去章节盘点那一章的重新生成，意见填在该章意见框）`,
+        `「剧本」${how}将重写全书 ${n} 章剧本（旧场景图/配音随之过期需重跑）。继续吗？\n（只改一章：去章节盘点那一章的重新生成，意见填在该章意见框）`,
       );
     }
     case "extract":
-      return window.confirm("「提取」意见将重新提取全部卡片，并作废下游剧本缓存与人物/物品图（背景/CG/配音文件保留）。继续吗？");
+      return window.confirm(`「提取」${how}将重新提取全部卡片，并作废下游剧本缓存与人物/物品图（背景/CG/配音文件保留）。继续吗？`);
     case "translate": {
       const n = enabledNovelCount || chapters.length;
-      return window.confirm(`「翻译」意见将重翻全书 ${n} 章。继续吗？`);
+      return window.confirm(`「翻译」${how}将重翻全书 ${n} 章。继续吗？`);
     }
     case "split":
-      return window.confirm("将按意见重新分章：分章变化会导致下游剧本/图像/配音缓存过期需重跑。继续吗？");
+      return window.confirm(`将按${how}重新分章：分章变化会导致下游剧本/图像/配音缓存过期需重跑。继续吗？`);
     case "voice": {
       let n = 0;
       for (const ch of chapters) {
@@ -1498,7 +1668,7 @@ function confirmStageOpinion(stage: StageKey, fb: string): boolean {
         }
       }
       return window.confirm(
-        `「配音」意见将全书重配${n ? `约 ${n} 句` : ""}，会产生配音费用。继续吗？\n（只重配一句/一人：去素材页配音区点单句重配或整人重配）`,
+        `「配音」${how}将全书重配${n ? `约 ${n} 句` : ""}，会产生配音费用。继续吗？\n（只重配一句/一人：去素材页配音区点单句重配或整人重配）`,
       );
     }
     default:
@@ -1559,10 +1729,16 @@ async function runAppend(tailRaw: string, label: string): Promise<void> {
   if (tail.length < 500 && !window.confirm(`新增内容仅 ${tail.length} 字（不足半章），仍要追加吗？`)) return;
   const fileName = label.split(/[\\/]/).pop() || label;
   if (!window.confirm(
-    `增量追加：在现有 ${novel.chapters.length} 章（约 ${novel.fullText.length} 字）后追加「${fileName}」（约 ${tail.length} 字）。\n旧章节、卡片与全部素材原样保留，只对新增部分分章→提取→生成新章。继续吗？`,
+    `增量追加：在现有 ${novel.chapters.length} 章（约 ${novel.fullText.length} 字）后追加「${fileName}」（约 ${tail.length} 字）。\n旧章节、卡片与全部素材原样保留，只对新增部分分章→提取→生成新章；如有新角色将自动同步加入圣经（三视图走图像 API，需去圣经页确认）。继续吗？`,
   )) return;
   const stages: StageKey[] = ["split", "extract", "script", "image", "assemble"];
   if ((projectState.options.language ?? "").trim()) stages.splice(1, 0, "translate");
+  pushLog({
+    step: "追加",
+    message: `增量追加开始：「${fileName}」约 ${tail.length} 字接在现有 ${novel.chapters.length} 章之后（阶段：${stages.map((s) => STAGE_LABELS[s]).join(" → ")}；旧章节/卡片/素材全部保留）`,
+    level: "info",
+    at: Date.now(),
+  });
   if (projectState.options.useImage && visualBibleNeedsReview(projectState.visualBible)) {
     // 圣经待确认时不进图像阶段（避免流程被 divert 到圣经页导致追加上下文丢失）：
     // 先追加文本，图像待圣经确认后跑一次图像阶段即可自动补上新章（缓存复用旧图）
@@ -1587,7 +1763,45 @@ async function runAppend(tailRaw: string, label: string): Promise<void> {
     }
     scheduleSave();
     void chapterStatus.refresh();
-    pushLog({ step: "追加", message: `增量追加完成：现共 ${novel.chapters.length} 章；新章节配音请跑配音阶段（勾选新章节）或在素材页单句重配`, level: "success", at: Date.now() });
+    // 追加新角色自动同步圣经：对比圣经条目，缺失的按当前卡片补建三视图（旧人走老路不受影响）；
+    // 同步后圣经待确认，去圣经页确认批准后再跑图像阶段补新章图
+    const bibleNote = await syncAppendedCharactersToBible();
+    pushLog({ step: "追加", message: `增量追加完成：现共 ${novel.chapters.length} 章${bibleNote}；新章节配音请跑配音阶段（勾选新章节）或在素材页单句重配`, level: "success", at: Date.now() });
+  }
+}
+
+/** 追加后圣经同步：新角色补建三视图条目。返回日志后缀（无新角色/无圣经则为空）。 */
+async function syncAppendedCharactersToBible(): Promise<string> {
+  const out = projectState.outputDir;
+  const bible = projectState.visualBible;
+  const cards = projectState.lastResult?.cards;
+  if (!out || !bible || !cards?.characters.length) return "";
+  const missing = cards.characters.filter((c) => !bible.characters[c.id]);
+  if (!missing.length) return "";
+  const imageCfg = activeConfig("image");
+  if (!imageCfg?.apiKey) {
+    pushLog({ step: "追加", message: `新增 ${missing.length} 个角色（${missing.map((c) => c.name || c.id).join("、")}）不在圣经中，但未配置图像 API，跳过同步：请配置后去圣经页点「同步当前卡片」`, level: "warn", at: Date.now() });
+    return "";
+  }
+  pushLog({ step: "追加", message: `新增 ${missing.length} 个角色（${missing.map((c) => c.name || c.id).join("、")}），正在同步加入圣经…`, level: "info", at: Date.now() });
+  try {
+    const r = await syncBibleCharactersWithCards(out, bible, { characters: cards.characters, imageCfg });
+    const novel = projectState.novel;
+    if (novel) {
+      const fp = await computeProjectVisualBibleFingerprint(out, bible, novel, cards.characters);
+      await refreshVisualBibleFingerprint(out, bible, fp, cards.characters, true);
+    }
+    scheduleSave();
+    pushLog({
+      step: "追加",
+      message: `圣经同步完成：补建 ${r.added.length} 个新角色三视图${r.adopted.length ? `（${r.adopted.length} 个复用孤儿文件免生成）` : ""}${r.failed.length ? `，失败 ${r.failed.length} 个（${r.failed.map((f) => f.name).join("、")}）` : ""}；请去圣经页确认后批准，再跑图像阶段补新章图`,
+      level: r.failed.length ? "warn" : "success",
+      at: Date.now(),
+    });
+    return `；新角色 ${r.added.length + r.adopted.length} 个已同步加入圣经（待确认）`;
+  } catch (e) {
+    pushLog({ step: "追加", message: `圣经同步失败（不影响已追加章节）：${errMsg(e)}；请去圣经页手动点「同步当前卡片」`, level: "error", at: Date.now() });
+    return "";
   }
 }
 
@@ -1645,12 +1859,20 @@ async function afterAssetRegen(label: string, resultsLength: number): Promise<vo
   await loadAssetMapNow(true);
 }
 
+/* ==================== 素材 Tab 单项重生成 ==================== */
+
+/** 单项重生成入口日志：哪一项、带不带意见（结果由 afterAssetRegen 记录张数） */
+function logAssetStart(label: string, fb?: string): void {
+  pushLog({ step: "素材", message: `开始${label}${fb ? "（带意见）" : ""}…`, level: "info", at: Date.now() });
+}
+
 async function regenFigureEmotion(charId: string, emo: string): Promise<void> {
   const ctx = await regenCtx();
   if (!ctx) return;
   const fb = assetFeedback.value.figure?.trim() || undefined;
   assetBusy.value = `figure:${charId}:${emo}`;
   resetRegenState();
+  logAssetStart(`重生成立绘「${charId}」${EMOTION_LABELS[emo] ?? emo}`, fb);
   try {
     const { signal, onProgress } = regenCtl();
     const results = await regenerateImages(
@@ -1676,6 +1898,7 @@ async function regenAllFigure(charId: string): Promise<void> {
   const fb = assetFeedback.value.figure?.trim() || undefined;
   assetBusy.value = `figure:${charId}`;
   resetRegenState();
+  logAssetStart(`重生成立绘「${charId}」（全部表情）`, fb);
   try {
     const { signal, onProgress } = regenCtl();
     const results = await regenerateCharacterFigures(ctx, charId, fb, signal, onProgress);
@@ -1695,6 +1918,7 @@ async function regenThreeView(charId: string): Promise<void> {
   const fb = assetFeedback.value.figure?.trim() || undefined;
   assetBusy.value = `threeview:${charId}`;
   resetRegenState();
+  logAssetStart(`重生成三视图「${charId}」（联动默认/表情/动作）`, fb);
   try {
     const { signal, onProgress } = regenCtl();
     const results = await regenerateCharacterThreeView(ctx, charId, fb, signal, onProgress);
@@ -1714,6 +1938,7 @@ async function regenAction(charId: string, actionId: string, actionName: string)
   const fb = assetFeedback.value.figure?.trim() || undefined;
   assetBusy.value = `action:${charId}:${actionId}`;
   resetRegenState();
+  logAssetStart(`重生成动作「${actionName}」（${charId}）`, fb);
   try {
     const { signal, onProgress } = regenCtl();
     const results = await regenerateCharacterAction(ctx, charId, actionId, fb, signal, onProgress);
@@ -1727,12 +1952,38 @@ async function regenAction(charId: string, actionId: string, actionName: string)
   }
 }
 
-async function regenItem(id: string): Promise<void> {
+async function regenCostume(charId: string, costumeId: string, costumeName: string): Promise<void> {
   const ctx = await regenCtx();
+  if (!ctx) return;
+  const fb = assetFeedback.value.figure?.trim() || undefined;
+  assetBusy.value = `costume:${charId}:${costumeId}`;
+  resetRegenState();
+  logAssetStart(`重生成服装「${costumeName}」（${charId}）`, fb);
+  try {
+    const { signal, onProgress } = regenCtl();
+    const results = await regenerateImages(
+      ctx,
+      (t) => t.kind === "figure" && t.id === `${charId}_ct_${costumeId}`,
+      fb,
+      signal,
+      onProgress,
+    );
+    await afterAssetRegen(`服装「${costumeName}」（${charId}）`, results.length);
+  } catch (e) {
+    pushLog({ step: "素材", message: `重新生成服装失败：${errMsg(e)}`, level: "error", at: Date.now() });
+  } finally {
+    assetBusy.value = "";
+    assetFeedback.value.figure = "";
+    resetRegenState();
+  }
+}
+
+async function regenItem(id: string): Promise<void> {  const ctx = await regenCtx();
   if (!ctx) return;
   const fb = assetFeedback.value.item?.trim() || undefined;
   assetBusy.value = `item:${id}`;
   resetRegenState();
+  logAssetStart(`重生成物品图「${id}」`, fb);
   try {
     const { signal, onProgress } = regenCtl();
     const results = await regenerateItemImage(ctx, id, fb, signal, onProgress);
@@ -1752,6 +2003,7 @@ async function regenBg(sceneId: string): Promise<void> {
   const fb = assetFeedback.value.bg?.trim() || undefined;
   assetBusy.value = `bg:${sceneId}`;
   resetRegenState();
+  logAssetStart(`重生成背景「${sceneId}」`, fb);
   try {
     const { signal, onProgress } = regenCtl();
     const results = await regenerateBackground(ctx, sceneId, fb, signal, onProgress);
@@ -1771,6 +2023,7 @@ async function regenCgRow(chapter: number, sceneId: string): Promise<void> {
   const fb = assetFeedback.value.cg?.trim() || undefined;
   assetBusy.value = `cg:${chapter}:${sceneId}`;
   resetRegenState();
+  logAssetStart(`重生成 CG「${sceneId}」（第 ${chapter} 章）`, fb);
   try {
     const { signal, onProgress } = regenCtl();
     const results = await regenerateCg(ctx, chapter - 1, sceneId, fb, signal, onProgress);
@@ -1822,6 +2075,7 @@ async function regenVoice(key: string): Promise<void> {
   }
   assetBusy.value = `voice:${key}`;
   resetRegenState();
+  logAssetStart(`重配单句 ${key}`);
   try {
     const p = await regenerateVoiceLine(ctx, key);
     pushLog(
@@ -1857,6 +2111,7 @@ async function regenCharVoice(charId: string): Promise<void> {
   }
   assetBusy.value = `voice-all:${charId}`;
   resetRegenState();
+  logAssetStart(`重配「${charId}」全部配音`);
   try {
     const { signal, onProgress } = regenCtl();
     const n = await regenerateCharacterVoice(ctx, charId, signal, onProgress);
@@ -1888,6 +2143,7 @@ async function regenMissingVoices(): Promise<void> {
   }
   assetBusy.value = "repair-voice";
   resetRegenState();
+  logAssetStart("补全缺失/错配语音：逐句核对剧本→映射→文件");
   try {
     const r = await repairVoiceAssets(ctx.ttsCfg, ctx.chapters, ctx.cards.characters, ctx.outputDir, ctx.log);
     if (r.fixed > 0) {
@@ -1929,6 +2185,12 @@ async function cleanupInvalidAssets(): Promise<void> {
     : "当前剧本上下文不完整（素材页章节少于原文），本次只做文件级清理（删孤儿文件、迁移旧版 CG），不剪映射。继续吗？")) return;
   assetBusy.value = "cleanup-images";
   resetRegenState();
+  pushLog({
+    step: "素材",
+    message: `清理无效素材开始（${chaptersComplete ? "剧本上下文完整：剪过期映射＋迁旧 CG＋删孤儿文件＋去缺文件条目" : "剧本上下文不完整：只做文件级清理，不剪映射"}）…`,
+    level: "info",
+    at: Date.now(),
+  });
   try {
     const r = await repairImageAssets(ctx.outputDir, {
       chapters: chaptersComplete ? ctx.chapters : undefined,
@@ -1957,6 +2219,27 @@ async function cleanupInvalidAssets(): Promise<void> {
   }
 }
 
+/** 从自动备份恢复 assets.json 映射（剪枝误删/映射被洗空时救命用；恢复后缺文件项用补全补回） */
+async function restoreAssetBackupNow(): Promise<void> {
+  const out = projectState.outputDir;
+  if (!out || assetBusy.value) return;
+  const backups = await listAssetBackups(out);
+  if (!backups.length) {
+    pushLog({ step: "素材", message: "暂无映射备份（剪枝时会自动备份，最多保留 3 份）", level: "info", at: Date.now() });
+    return;
+  }
+  const latest = backups[0];
+  if (!window.confirm(`将素材映射恢复到备份 ${latest}？\n共 ${backups.length} 份备份：${backups.join("、")}\n当前映射将被覆盖。继续吗？`)) return;
+  pushLog({ step: "素材", message: `从备份恢复映射开始：${latest}`, level: "info", at: Date.now() });
+  try {
+    await restoreAssetBackup(out, latest);
+    await loadAssetMapNow(true);
+    pushLog({ step: "素材", message: `映射已从 ${latest} 恢复；文件缺失项可用「补全缺失图片/补全缺失语音」补回`, level: "success", at: Date.now() });
+  } catch (e) {
+    pushLog({ step: "素材", message: `恢复失败：${errMsg(e)}`, level: "error", at: Date.now() });
+  }
+}
+
 /* ==================== 原有功能 ==================== */
 
 async function browseOutputDir(): Promise<void> {
@@ -1977,6 +2260,7 @@ async function loadProjectState(): Promise<void> {
   await restoreProject(dir);
   configState.outputDir = dir;
   addRecentOutputDir(dir);
+  upsertProject(dir);
   pushLog({ step: "项目", message: `已加载项目状态：${dir}`, level: "success", at: Date.now() });
   await stageStatus.refresh();
 }
@@ -2126,6 +2410,234 @@ async function loadScripts(): Promise<void> {
   } catch {
     scriptFiles.value = [];
   }
+  await loadVerifyReports();
+}
+
+/* ==================== 保真核对（剧本 vs 原文，逐条可操作） ==================== */
+
+interface VerifyReportRow {
+  chapterIndex: number;
+  title: string;
+  keptRatio: number;
+  originalQuoteCount: number;
+  dialogueCount: number;
+  notFoundCount: number;
+  ignored: string[];
+  issues: SpeakerIssue[];
+}
+
+const verifyReports = ref<VerifyReportRow[]>([]);
+const showTrivialVerify = ref(false);
+const verifyBusy = ref("");
+
+function verifyReasonLabel(reason: SpeakerIssue["reason"]): string {
+  switch (reason) {
+    case "not-in-source": return "原文无出处（疑似新增/改写）";
+    case "order-suspect": return "疑似乱序/并句";
+    case "context-mismatch": return "说话人存疑";
+    case "third-person-self": return "张冠李戴";
+    default: return reason;
+  }
+}
+
+function isTrivialVerifyIssue(issue: SpeakerIssue): boolean {
+  return issue.reason === "order-suspect" && (issue.text || "").length < 6;
+}
+
+async function loadVerifyReports(): Promise<void> {
+  verifyReports.value = [];
+  const out = projectState.outputDir;
+  if (!out) return;
+  try {
+    const entries = await tauri.listDir(`${out}/.novel2vn/cache`);
+    const rows: VerifyReportRow[] = [];
+    for (const e of entries) {
+      if (e.isDir || !/^script_verify(_demo)?_ch\d+_/.test(e.name)) continue;
+      const rep = await readScriptVerify(e.path);
+      if (!rep) continue;
+      // demo/正式隔离 + 过期残留过滤（与剧本缓存同口径）
+      const demoNow = !activeConfig("llm")?.apiKey;
+      if (e.name.includes("script_verify_demo_") !== demoNow) continue;
+      const ch0 = projectState.novel?.chapters.find((c) => c.index === rep.chapterIndex);
+      if (ch0) {
+        const style0 = (projectState.options.scriptStyle ?? "").trim();
+        const rest0 = scriptCacheRest(ch0.title, ch0.text || "", style0 ? `_st${titleHash(style0)}` : "");
+        if (rep.textFp !== rest0) continue;
+      }
+      const ch = projectState.novel?.chapters.find((c) => c.index === rep.chapterIndex);
+      rows.push({
+        chapterIndex: rep.chapterIndex,
+        title: ch?.title ?? rep.title,
+        keptRatio: rep.result.keptRatio,
+        originalQuoteCount: rep.result.originalQuoteCount,
+        dialogueCount: rep.result.dialogueCount,
+        notFoundCount: rep.result.notFoundCount,
+        ignored: rep.ignored,
+        issues: rep.result.speakerIssues,
+      });
+    }
+    rows.sort((a, b) => a.chapterIndex - b.chapterIndex);
+    verifyReports.value = rows;
+  } catch {
+    verifyReports.value = [];
+  }
+}
+
+function visibleVerifyIssues(rep: VerifyReportRow): (SpeakerIssue & { key: string; trivial: boolean })[] {
+  return rep.issues
+    .map((i) => ({ ...i, key: verifyIssueKey(i.sceneIndex, i.lineIndex, i.reason), trivial: isTrivialVerifyIssue(i) }))
+    .filter((i) => !rep.ignored.includes(i.key) && (showTrivialVerify.value || !i.trivial));
+}
+
+function trivialVerifyCount(rep: VerifyReportRow): number {
+  return rep.issues.filter((i) => isTrivialVerifyIssue(i) && !rep.ignored.includes(verifyIssueKey(i.sceneIndex, i.lineIndex, i.reason))).length;
+}
+
+function charNameOfId(id: string): string {
+  const c = projectState.lastResult?.cards.characters.find((x) => x.id === id);
+  return c?.name ?? id;
+}
+
+async function verifyScriptCacheTarget(chapterIndex: number): Promise<{ path: string; script: ChapterScript; chapter: { index: number; title: string; text: string } } | null> {
+  const out = projectState.outputDir;
+  const ch = projectState.novel?.chapters.find((c) => c.index === chapterIndex);
+  if (!out || !ch) return null;
+  const demo = !activeConfig("llm")?.apiKey;
+  const style = (projectState.options.scriptStyle ?? "").trim();
+  const styleFrag = style ? `_st${titleHash(style)}` : "";
+  const path = scriptCacheFileName(`${out}/.novel2vn/cache`, demo, ch.index, ch.title, ch.text || "", styleFrag);
+  try {
+    const { text } = await tauri.readTextFile(path);
+    return { path, script: JSON.parse(text) as ChapterScript, chapter: ch };
+  } catch {
+    return null;
+  }
+}
+
+/** 该场景配音整体作废（行号/音色变化后旧 key 全错）：删掉该场景全部配音映射，下次补配自动重配 */
+async function invalidateSceneVocal(out: string, sceneId: string): Promise<number> {
+  const sid = sanitizeId(sceneId);
+  let dropped = 0;
+  await updateAssetMap(out, (m) => {
+    for (const k of Object.keys(m.vocal)) {
+      const mm = /^ch\d+_(.+)_\d+$/.exec(k);
+      if (mm && mm[1] === sid) {
+        delete m.vocal[k];
+        dropped++;
+      }
+    }
+  });
+  return dropped;
+}
+
+async function reverifyChapter(chapter: { index: number; title: string; text: string }, script: ChapterScript): Promise<void> {
+  const out = projectState.outputDir;
+  const chars = projectState.lastResult?.cards.characters;
+  if (!out || !chars) return;
+  const demo = !activeConfig("llm")?.apiKey;
+  const style = (projectState.options.scriptStyle ?? "").trim();
+  const styleFrag = style ? `_st${titleHash(style)}` : "";
+  const cacheDir = `${out}/.novel2vn/cache`;
+  const path = scriptVerifyFileName(cacheDir, demo, chapter.index, chapter.title, chapter.text || "", styleFrag);
+  const prev = await readScriptVerify(path);
+  const vr = verifyScriptAgainstSource(chapter.text || "", script.scenes, chars);
+  await writeScriptVerify(path, {
+    version: 1,
+    chapterIndex: chapter.index,
+    title: chapter.title,
+    textFp: scriptCacheRest(chapter.title, chapter.text || "", styleFrag),
+    at: new Date().toISOString(),
+    result: vr,
+    ignored: prev?.ignored ?? [],
+  });
+}
+
+/** 接受建议说话人：免费改剧本缓存（不调 LLM），该场景配音作废待补配 */
+async function acceptVerifySpeaker(rep: VerifyReportRow, issue: SpeakerIssue & { key: string }): Promise<void> {
+  if (!issue.suggestedSpeakerId || verifyBusy.value) return;
+  const out = projectState.outputDir;
+  if (!out) return;
+  verifyBusy.value = issue.key;
+  try {
+    const hit = await verifyScriptCacheTarget(rep.chapterIndex);
+    if (!hit) {
+      pushLog({ step: "剧本", message: `第 ${rep.chapterIndex + 1} 章剧本缓存不在了（可能刚重写过），请重进剧本页重试`, level: "warn", at: Date.now() });
+      return;
+    }
+    const sceneId = hit.script.scenes[issue.sceneIndex]?.id ?? "";
+    const next = applySpeakerFix(hit.script, issue.sceneIndex, issue.lineIndex, issue.suggestedSpeakerId);
+    await tauri.writeTextFile(hit.path, JSON.stringify(next, null, 2));
+    const dropped = sceneId ? await invalidateSceneVocal(out, sceneId) : 0;
+    await reverifyChapter(hit.chapter, next);
+    await loadVerifyReports();
+    await loadAssetMapNow(true);
+    pushLog({
+      step: "剧本",
+      message: `第 ${rep.chapterIndex + 1} 章场景${issue.sceneIndex + 1}#${issue.lineIndex + 1}说话人已改为「${charNameOfId(issue.suggestedSpeakerId)}」（免费改缓存）${dropped ? `，该场景 ${dropped} 条配音已作废（素材页补配）` : ""}；预览需重跑「组装」`,
+      level: "success",
+      at: Date.now(),
+    });
+  } catch (e) {
+    pushLog({ step: "剧本", message: `接受建议失败：${errMsg(e)}`, level: "error", at: Date.now() });
+  } finally {
+    verifyBusy.value = "";
+  }
+}
+
+/** 删除该句：删剧本缓存对应行（需二次确认），该场景配音作废待补配 */
+async function deleteVerifyLine(rep: VerifyReportRow, issue: SpeakerIssue & { key: string }): Promise<void> {
+  if (verifyBusy.value) return;
+  const out = projectState.outputDir;
+  if (!out) return;
+  if (!window.confirm(`删除第 ${rep.chapterIndex + 1} 章场景${issue.sceneIndex + 1}#${issue.lineIndex + 1}「${issue.text}」？剧本缓存立即修改（重跑剧本会还原），该场景配音作废。`)) return;
+  verifyBusy.value = issue.key;
+  try {
+    const hit = await verifyScriptCacheTarget(rep.chapterIndex);
+    if (!hit) {
+      pushLog({ step: "剧本", message: `第 ${rep.chapterIndex + 1} 章剧本缓存不在了，请重进剧本页重试`, level: "warn", at: Date.now() });
+      return;
+    }
+    const sceneId = hit.script.scenes[issue.sceneIndex]?.id ?? "";
+    const next = deleteScriptLine(hit.script, issue.sceneIndex, issue.lineIndex);
+    await tauri.writeTextFile(hit.path, JSON.stringify(next, null, 2));
+    const dropped = sceneId ? await invalidateSceneVocal(out, sceneId) : 0;
+    await reverifyChapter(hit.chapter, next);
+    await loadVerifyReports();
+    await loadAssetMapNow(true);
+    pushLog({
+      step: "剧本",
+      message: `已删除该句${dropped ? `，该场景 ${dropped} 条配音已作废（素材页补配）` : ""}；预览需重跑「组装」刷新`,
+      level: "success",
+      at: Date.now(),
+    });
+  } catch (e) {
+    pushLog({ step: "剧本", message: `删除失败：${errMsg(e)}`, level: "error", at: Date.now() });
+  } finally {
+    verifyBusy.value = "";
+  }
+}
+
+/** 忽略：记入忽略表（误报一批忽略），重验/重跑不丢失 */
+async function ignoreVerifyIssue(rep: VerifyReportRow, issue: SpeakerIssue & { key: string }): Promise<void> {
+  const out = projectState.outputDir;
+  const ch = projectState.novel?.chapters.find((c) => c.index === rep.chapterIndex);
+  if (!out || !ch || verifyBusy.value) return;
+  verifyBusy.value = issue.key;
+  try {
+    const demo = !activeConfig("llm")?.apiKey;
+    const style = (projectState.options.scriptStyle ?? "").trim();
+    const styleFrag = style ? `_st${titleHash(style)}` : "";
+    const cacheDir = `${out}/.novel2vn/cache`;
+    const path = scriptVerifyFileName(cacheDir, demo, ch.index, ch.title, ch.text || "", styleFrag);
+    const prev = await readScriptVerify(path);
+    if (!prev) return;
+    if (!prev.ignored.includes(issue.key)) prev.ignored.push(issue.key);
+    await writeScriptVerify(path, prev);
+    await loadVerifyReports();
+    pushLog({ step: "剧本", message: `第 ${rep.chapterIndex + 1} 章场景${issue.sceneIndex + 1}#${issue.lineIndex + 1}存疑已忽略（${verifyReasonLabel(issue.reason)}）`, level: "info", at: Date.now() });
+  } finally {
+    verifyBusy.value = "";
+  }
 }
 
 async function copyText(text: string, label: string): Promise<void> {
@@ -2180,9 +2692,13 @@ async function retryFailed(): Promise<void> {
   }
   if (chapterIds.size) {
     rerunChapters.value = Array.from(chapterIds);
-    copiedMsg.value = t("已定位失败章节，请点右侧「去整书生成」再点开始，将只重试失败项（其余自动复用缓存）");
+    const msg = t("已定位失败章节，请点右侧「去整书生成」再点开始，将只重试失败项（其余自动复用缓存）");
+    copiedMsg.value = msg;
+    pushLog({ step: "失败项", message: `定位重试：失败剧本章节→第 ${Array.from(chapterIds).map((n) => n + 1).join("、")} 章已勾选（其余复用缓存）`, level: "info", at: Date.now() });
   } else {
-    copiedMsg.value = t("失败项为图片/翻译类：请点右侧「去整书生成」再点开始重跑对应阶段，已完成的自动复用缓存、只补失败项");
+    const msg = t("失败项为图片/翻译类：请点右侧「去整书生成」再点开始重跑对应阶段，已完成的自动复用缓存、只补失败项");
+    copiedMsg.value = msg;
+    pushLog({ step: "失败项", message: "定位重试：失败为图片/翻译类，请去整书生成重跑对应阶段（已完成自动复用、只补失败项）", level: "info", at: Date.now() });
   }
   setTimeout(() => (copiedMsg.value = ""), 4000);
 }
@@ -2192,6 +2708,12 @@ const rerunChapters = ref<number[] | null>(null);
 function toggleAllRerun(on: boolean): void {
   if (!projectState.novel) return;
   rerunChapters.value = on ? null : [];
+  pushLog({
+    step: "整书",
+    message: on ? "分章节选择：已全选（全部章节参与）" : "分章节选择：已全不选（未勾选章节复用缓存/跳过）",
+    level: "info",
+    at: Date.now(),
+  });
 }
 
 function toggleChapterRerun(index: number, checked: boolean): void {
@@ -2205,6 +2727,14 @@ function toggleChapterRerun(index: number, checked: boolean): void {
       rerunChapters.value = projectState.novel?.chapters.map((c) => c.index).filter((n) => n !== index) ?? [];
     }
   }
+  const ch = projectState.novel?.chapters.find((c) => c.index === index);
+  const count = rerunChapters.value?.length ?? projectState.novel?.chapters.length ?? 0;
+  pushLog({
+    step: "整书",
+    message: `分章节选择：第 ${index + 1} 章「${ch?.title ?? ""}」${checked ? "已勾选" : "已取消"}（当前共选 ${count} 章；未勾选章节复用缓存/跳过）`,
+    level: "info",
+    at: Date.now(),
+  });
 }
 
 function stop(): void {
@@ -2407,6 +2937,11 @@ function fileExistsLabel(file: string | undefined): string {
         <input type="checkbox" v-model="projectState.options.extractAgent" />
         {{ t("Agent 模式（多步自主扫描 + 工具调用，超长小说更稳）") }}
       </label>
+      <label class="opt-item mt-2" :title="t('单次请求塞太多字容易撞网关超时/500；0=自动（按语种估算，上限15万字）。已出现 500 时调小，如 40000')">
+        <span>{{ t("提取分段") }}</span>
+        <input type="number" v-model.number="projectState.options.extractChunkChars" min="0" step="5000" style="width: 90px" />
+        <span class="hint">{{ t("字（0=自动）") }}</span>
+      </label>
       <p class="hint mt-3">
         {{ t("未勾选的阶段会复用已有结果（卡片/剧本/素材），不会重新计费；若某阶段从未运行过则会提示需先运行。") }}
       </p>
@@ -2442,7 +2977,7 @@ function fileExistsLabel(file: string | undefined): string {
 
     <div class="card" v-if="projectState.lastResult && runMode === 'stage'">
       <div class="card-head">
-        <h3>{{ t("分阶段状态（点击「重新生成」单独重跑；已完成阶段复用缓存不计费）") }}</h3>
+        <h3>{{ t("分阶段状态（无意见且未勾全量=只补缺失/失败项，不计费；填意见或勾全量=全量重跑，计费）") }}</h3>
         <div class="card-actions">
           <span v-if="!busy" class="hint">{{ t("失败阶段重试将只补失败项") }}</span>
         </div>
@@ -2451,6 +2986,7 @@ function fileExistsLabel(file: string | undefined): string {
         :statuses="stageStatus.stageStatus.value"
         :failed-counts="failedCounts"
         :feedback="stageFeedback"
+        :force="stageForce"
         :busy="busy"
         @regen="runStageRegen"
       />
@@ -2477,18 +3013,30 @@ function fileExistsLabel(file: string | undefined): string {
         <button class="btn secondary small" :disabled="busy || queueRunning || !!assetBusy" @click="previewSplit">{{ t("AI 分章预览") }}</button>
         <button class="btn small" :disabled="busy || queueRunning || splitConfirmed" @click="confirmSplit">{{ splitConfirmed ? t("已确认") : t("确认分章") }}</button>
       </div>
+      <div class="row mb-3" style="gap: 16px">
+        <label class="opt-item mb-0" :title="t('小于该字数的章节会被并入相邻章节；设 0 则关闭合并，特殊小章独立成章')">
+          <span>{{ t("碎章合并阈值") }}</span>
+          <input type="number" v-model.number="projectState.options.splitMinChapterChars" min="0" step="500" style="width: 90px" />
+          <span class="hint">{{ t("字") }}</span>
+        </label>
+        <label class="opt-item mb-0" :title="t('后记/番外/特典/插图等不再被 AI 当杂项丢弃，独立成章')">
+          <input type="checkbox" v-model="projectState.options.splitKeepSpecials" />
+          {{ t("保留特殊章节") }}
+        </label>
+      </div>
       <ChapterStatusBoard
         :chapters="enabledNovelChapters"
         :disabled-chapters="disabledNovelChapters"
         :lights="chapterStatus.lights"
         :feedback="scriptChapterFeedback"
+        :force="chapterForce"
         :disabled="busy || queueRunning || !!assetBusy"
         @regen="runChapterFullRegen"
         @toggle="toggleNovelChapter"
       />
       <p class="hint mt-3">
         {{ t("流程：点「AI 分章预览」核对每章边界/标题/字数 → 点「确认分章」→ 点「生成本章」逐章出内容，或点「顺序生成未完成」自动逐章跑完。") }}<br />
-        {{ t("单章链＝剧本＋图像＋组装，不含配音（省 TTS 费用）；其他章节自动复用缓存。配音请跑配音阶段或在素材页单句重配。") }}
+        {{ t("单章链＝剧本＋图像＋组装，不含配音（省 TTS 费用）；无意见且未勾全量=只补缺失。配音请跑配音阶段或在素材页单句重配。") }}
       </p>
     </div>
 
@@ -2555,7 +3103,7 @@ function fileExistsLabel(file: string | undefined): string {
         </p>
       </div>
       <div class="card mt-4 mb-0" v-if="costText">
-        <div class="card-head"><h3>{{ t("用量统计") }}</h3></div>
+        <div class="card-head"><h3>{{ t("用量统计（本次运行）") }}</h3></div>
         <div class="stat-grid">
           <div class="stat"><span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9" /><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z" /></svg></span><div class="stat-body"><div class="label">LLM</div><div class="value" style="font-size: 15px">{{ costText.llm }}</div></div></div>
           <div class="stat"><span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" /><circle cx="9" cy="9" r="2" /><path d="M21 15l-5-5L5 21" /></svg></span><div class="stat-body"><div class="label">{{ t("图像") }}</div><div class="value" style="font-size: 15px">{{ costText.image }}</div></div></div>
@@ -2607,6 +3155,7 @@ function fileExistsLabel(file: string | undefined): string {
             <button class="btn ghost small" :disabled="!selectedCount" @click="clearSelected">{{ t("清空") }}</button>
             <button class="btn small" :disabled="!selectedCount || !!assetBusy" @click="regenSelected">{{ t("重新生成已选（") }}{{ selectedCount }}{{ t("）") }}</button>
             <button class="btn primary small" :disabled="!!assetBusy" @click="regenMissingImages">{{ t("补全缺失图片") }}</button>
+            <button class="btn ghost small" :disabled="!!assetBusy" :title="t('剪枝误删映射时从自动备份恢复（剪枝前自动备份，最多保留 3 份）')" @click="restoreAssetBackupNow">{{ t("恢复映射") }}</button>
             <button class="btn ghost small" :disabled="!!assetBusy" :title="t('剪掉过期映射、迁移旧版CG、删除孤儿文件；缺失项下次运行自动补生成')" @click="cleanupInvalidAssets">{{ t("清理无效素材") }}</button>
           </div>
         </div>
@@ -2636,12 +3185,23 @@ function fileExistsLabel(file: string | undefined): string {
                   <span class="thumb-label">{{ t("三视图") }}</span>
                   <button class="btn ghost small" :disabled="!!assetBusy" @click.stop="reCutout('figure', `${row.id}_threeview`, row.threeView)">{{ t("抠图") }}</button>
                 </div>
-                <div v-for="e in row.emotions" :key="e.emo" class="asset-thumb" :class="{ missing: !e.file }" :title="`${EMOTION_LABELS[e.emo]}（点击放大）`" @click="e.file && openPreview(e.file, `${row.name} · ${EMOTION_LABELS[e.emo]}`)">
+                <div v-for="e in row.emotions" :key="e.emo" class="asset-thumb" :class="{ missing: !e.file }" :title="`${EMOTION_LABELS[e.emo] ?? e.emo}（点击放大）`" @click="e.file && openPreview(e.file, `${row.name} · ${EMOTION_LABELS[e.emo] ?? e.emo}`)">
                   <label class="asset-sel" @click.stop><input type="checkbox" :checked="selected.has(`figure:${row.id}:${e.emo}`)" @change="toggleSelect(`figure:${row.id}:${e.emo}`)" /></label>
-                  <LazyThumb v-if="e.file" :path="e.file" :alt="EMOTION_LABELS[e.emo]" />
-                  <span class="thumb-label">{{ EMOTION_LABELS[e.emo] }}</span>
+                  <LazyThumb v-if="e.file" :path="e.file" :alt="EMOTION_LABELS[e.emo] ?? e.emo" />
+                  <span class="thumb-label">{{ EMOTION_LABELS[e.emo] ?? e.emo }}</span>
                   <button class="btn ghost small" :disabled="!!assetBusy" @click.stop="regenFigureEmotion(row.id, e.emo)">{{ t("重生成") }}</button>
                   <button v-if="e.file" class="btn ghost small" :disabled="!!assetBusy" @click.stop="reCutout('figure', e.emo === 'normal' ? row.id : `${row.id}_${e.emo}`, e.file)">{{ t("抠图") }}</button>
+                </div>
+              </div>
+              <div v-if="row.costumes.length" style="border-top: 1px dashed var(--border); margin-top: 8px; padding-top: 8px">
+                <div class="asset-thumb-row">
+                  <div v-for="ct in row.costumes" :key="ct.id" class="asset-thumb" :class="{ missing: !ct.file }" :title="`${ct.name}（点击放大）`" @click="ct.file && openPreview(ct.file, `${row.name} · ${ct.name}`)">
+                    <label class="asset-sel" @click.stop><input type="checkbox" :checked="selected.has(`figure:${row.id}:ct_${ct.id}`)" @change="toggleSelect(`figure:${row.id}:ct_${ct.id}`)" /></label>
+                    <LazyThumb v-if="ct.file" :path="ct.file" :alt="ct.name" />
+                    <span class="thumb-label">{{ ct.name }}</span>
+                    <button class="btn ghost small" :disabled="!!assetBusy" @click.stop="regenCostume(row.id, ct.id, ct.name)">{{ t("重生成") }}</button>
+                    <button v-if="ct.file" class="btn ghost small" :disabled="!!assetBusy" @click.stop="reCutout('figure', `${row.id}_ct_${ct.id}`, ct.file)">{{ t("抠图") }}</button>
+                  </div>
                 </div>
               </div>
               <div v-if="row.actions.length" style="border-top: 1px dashed var(--border); margin-top: 8px; padding-top: 8px">
@@ -2769,6 +3329,7 @@ function fileExistsLabel(file: string | undefined): string {
                   <span class="tag">{{ row.chapter }}</span>
                   <span style="font-weight: 600; font-size: 13px">{{ row.displayName }}</span>
                   <span class="faint small">{{ row.scene }}</span>
+                  <span v-if="row.branch" class="faint small">{{ row.branch }}</span>
                   <span class="tag" :class="row.file ? 'ok' : (row.failed ? 'err' : '')">{{ row.file ? t("已生成") : (row.failed ? t("配音失败") : t("未生成")) }}</span>
                 </div>
                 <div class="hint" style="word-break: break-all">{{ row.text }}</div>
@@ -2826,11 +3387,59 @@ function fileExistsLabel(file: string | undefined): string {
             <button class="btn ghost small" @click="scriptChapterFeedback = {}">{{ t("清空意见") }}</button>
           </div>
         </div>
-          <p class="hint mb-3">{{ t("选择章节 → 填写意见（可留空 = 直接重新生成）→ 点击「重新生成此章」。其余章节自动复用缓存。") }}</p>
+          <p class="hint mb-3">{{ t("选择章节 → 填写意见（填了才按意见重写）或勾全量（直接重写）→ 点击「重新生成此章」。都不选=只补缺失。其余章节自动复用缓存。") }}</p>
         <div v-for="ch in projectState.novel?.chapters ?? []" :key="ch.index" class="stage-row mb-2">
           <div class="stage-row-label"><b>{{ ch.title }}</b></div>
           <input type="text" v-model="scriptChapterFeedback[ch.index]" :placeholder="t('意见（可选）：这一章节奏太慢，希望更快推进…')" />
-          <button class="btn small" :disabled="busy || !!assetBusy" @click="regenChapter(ch.index)">{{ t("重新生成此章") }}</button>
+          <label class="opt-item mb-0" :title="t('勾选后该章跳过缓存直接重写，不需要填意见')">
+            <input type="checkbox" v-model="chapterForce[ch.index]" :disabled="busy || !!assetBusy" />
+            {{ t("全量") }}
+          </label>
+          <button class="btn small" :disabled="busy || !!assetBusy" :title="t('无意见且未勾全量=只补缺失')" @click="regenChapter(ch.index)">{{ t("重新生成此章") }}</button>
+        </div>
+      </div>
+      <div class="card" v-if="verifyReports.length">
+        <div class="card-head">
+          <h3>{{ t("保真核对（剧本 vs 原文）") }}</h3>
+          <div class="card-actions">
+            <label class="opt-item mb-0" :title="t('短句乱序多为误报，默认折叠')">
+              <input type="checkbox" v-model="showTrivialVerify" />
+              {{ t("显示短句乱序") }}
+            </label>
+          </div>
+        </div>
+        <p class="hint mb-3">{{ t("只改你确认的问题：说话人错→接受建议（免费改缓存）；多余的句→删除；误报→忽略。改完重跑「组装」刷新预览，配音在素材页补配。覆盖率低于 {pct}% 的章节管线已自动重写过一次。", { pct: Math.round(SCRIPT_MIN_KEPT_RATIO * 100) }) }}</p>
+        <div v-for="rep in verifyReports" :key="rep.chapterIndex" class="mb-3">
+          <div class="stage-row-label" style="margin-bottom: 6px">
+            <b>{{ t("第") }}{{ rep.chapterIndex + 1 }}{{ t("章") }} {{ rep.title }}</b>
+            <span class="tag" :class="rep.keptRatio >= SCRIPT_MIN_KEPT_RATIO ? 'ok' : 'warn'">{{ t("覆盖率") }}{{ Math.round(rep.keptRatio * 100) }}%（{{ rep.dialogueCount }}/{{ rep.originalQuoteCount }}）</span>
+            <span v-if="visibleVerifyIssues(rep).length" class="tag err">{{ t("存疑") }}{{ visibleVerifyIssues(rep).length }}</span>
+            <span v-else class="tag ok">{{ t("无存疑") }}</span>
+            <span v-if="trivialVerifyCount(rep) && !showTrivialVerify" class="hint">{{ t("另有") }}{{ trivialVerifyCount(rep) }}{{ t("条短句乱序已折叠") }}</span>
+          </div>
+          <div v-for="iss in visibleVerifyIssues(rep)" :key="iss.key" class="asset-row">
+            <div class="asset-row-head">
+              <span class="tag" :class="iss.reason === 'context-mismatch' || iss.reason === 'third-person-self' ? 'err' : ''">{{ verifyReasonLabel(iss.reason) }}</span>
+              <span style="color: var(--text-faint); font-size: 11px">{{ t("场景") }}{{ iss.sceneIndex + 1 }}#{{ iss.lineIndex + 1 }}</span>
+              <span class="asset-name">「{{ iss.text }}」</span>
+            </div>
+            <p style="font-size: 12px; color: var(--text-dim); margin: 2px 0 6px">{{ iss.detail }}<template v-if="iss.suggestedSpeakerName"> → {{ t("建议") }}「{{ iss.suggestedSpeakerName }}」</template></p>
+            <div class="row" style="gap: 6px">
+              <button
+                v-if="iss.reason === 'context-mismatch' && iss.suggestedSpeakerId"
+                class="btn primary small"
+                :disabled="!!verifyBusy || busy || !!assetBusy"
+                @click="acceptVerifySpeaker(rep, iss)"
+              >{{ verifyBusy === iss.key ? t("处理中…") : `${t("接受：改成")}「${charNameOfId(iss.suggestedSpeakerId)}」` }}</button>
+              <button
+                v-if="iss.reason === 'not-in-source' || iss.reason === 'order-suspect'"
+                class="btn small"
+                :disabled="!!verifyBusy || busy || !!assetBusy"
+                @click="deleteVerifyLine(rep, iss)"
+              >{{ t("删除该句") }}</button>
+              <button class="btn ghost small" :disabled="!!verifyBusy || busy || !!assetBusy" @click="ignoreVerifyIssue(rep, iss)">{{ t("忽略") }}</button>
+            </div>
+          </div>
         </div>
       </div>
       <div class="card" v-if="scriptFiles.length">

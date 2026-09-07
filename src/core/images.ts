@@ -248,6 +248,10 @@ export function buildImageTasks(
   const maxActionsPerCharacter = opts.maxActionsPerCharacter ?? 2;
   const baseStyle = styleSuffix(opts.style);
   const style = opts.feedback ? `${baseStyle}, ${opts.feedback.trim().replace(/[。.]$/, "")}` : baseStyle;
+  // 绿幕类提示词专用风格：人物/三视图/动作/服装/物品一律纯绿幕，风格文本里若带背景词
+  // （风格综合/用户手写都可能带，如 "soft gradient background"）会与绿幕后缀冲突，先剥掉；
+  // 背景/CG/锚点继续用完整风格（那里的背景描述是合法的）。
+  const figureStyle = stripBackground(style);
   const useAnchor = opts.styleAnchor !== false;
 
   // ① 全项目画风锚点：一张无人物场景基准图，作为所有背景/CG 的画风参考
@@ -273,7 +277,7 @@ export function buildImageTasks(
         characterId: char.id,
         prompt:
           stripBackground(char.threeViewPrompt || threeViewFallback(char.imagePrompt)) +
-          style +
+          figureStyle +
           (char.referenceImage ? THREEVIEW_REF_HINT : "") +
           THREEVIEW_GREEN_SUFFIX,
         ...(char.referenceImage ? { references: [inlineIdentityReference(char.referenceImage)] } : {}),
@@ -294,7 +298,7 @@ export function buildImageTasks(
         id: isNormal ? char.id : `${char.id}_${emo}`,
         characterId: char.id,
         emotion: emo,
-        prompt: emotionPrompt(char.imagePrompt, emo) + REF_HINT + style + FIGURE_BG_SUFFIX,
+        prompt: emotionPrompt(char.imagePrompt, emo) + REF_HINT + figureStyle + FIGURE_BG_SUFFIX,
         refFromTask: isNormal ? (threeView ? `${char.id}_threeview` : undefined) : char.id,
         fileName: `figure_${sanitizeId(char.id)}_${emo}.png`,
         width: 1024,
@@ -312,7 +316,7 @@ export function buildImageTasks(
           characterId: char.id,
           emotion: "normal",
           costume: ct.id,
-          prompt: stripBackground(ct.prompt) + REF_HINT + style + FIGURE_BG_SUFFIX,
+          prompt: stripBackground(ct.prompt) + REF_HINT + figureStyle + FIGURE_BG_SUFFIX,
           refFromTask: `${char.id}_threeview`,
           fileName: `figure_${sanitizeId(char.id)}_ct_${sanitizeId(ct.id)}_normal.png`,
           width: 1024,
@@ -330,7 +334,7 @@ export function buildImageTasks(
           id: `${char.id}_act_${a.id}`,
           characterId: char.id,
           actionId: a.id,
-          prompt: stripBackground(a.prompt) + ACTION_CLARITY_HINT + REF_HINT + style + FIGURE_BG_SUFFIX,
+          prompt: stripBackground(a.prompt) + ACTION_CLARITY_HINT + REF_HINT + figureStyle + FIGURE_BG_SUFFIX,
           refFromTask: `${char.id}_threeview`,
           fileName: `figure_${sanitizeId(char.id)}_act_${sanitizeId(a.id)}.png`,
           width: 1024,
@@ -345,7 +349,7 @@ export function buildImageTasks(
     tasks.push({
       kind: "item",
       id: item.id,
-      prompt: stripBackground(item.imagePrompt) + style + ITEM_BG_SUFFIX,
+      prompt: stripBackground(item.imagePrompt) + figureStyle + ITEM_BG_SUFFIX,
       fileName: `item_${sanitizeId(item.id)}.png`,
       width: 1024,
       height: 1024,
@@ -1101,6 +1105,8 @@ export async function generateImages(
   maxPerChapter = 0,
   chapterScope?: Set<number>,
   figureDetail: FigureDetail = "full",
+  /** 单章强制：仅当 chapterScope 限定单章模式时生效，范围内背景/CG 跳过缓存直接重画（人物/物品不受影响） */
+  chapterForce = false,
 ): Promise<{ images: ImageResultMap; failed: FailedTask[]; generated: number }> {
   const result: ImageResultMap = { bg: {}, cg: {}, figure: {}, item: {} };
   const failed: FailedTask[] = [];
@@ -1181,6 +1187,8 @@ export async function generateImages(
   await tauri.mkdirAll(cacheDirFor(cacheRoot, "images"));
   const imageForceFor = (task: ImageTask): boolean => {
     if (force || !globalCacheCurrent) return true;
+    // 单章强制：scope 内的背景/CG 直接重画（人物/物品是项目级的，不动）
+    if (chapterForce && chapterScope && (task.kind === "background" || task.kind === "cg")) return true;
     if (!task.characterId || !approvedCacheBinding) return false;
     return storedCacheBinding?.characterRevisions[task.characterId]
       !== approvedCacheBinding.characterRevisions[task.characterId];
@@ -1649,25 +1657,49 @@ export async function repairImageAssets(
       detail: opts.figureDetail ?? "full",
       threeView: opts.threeView,
       actions: opts.withActions,
+      // 必须覆盖全部动作：缺了会把第 3 个起的动作当过期剪映射、再当孤儿删文件
+      maxActionsPerCharacter: 0,
     });
     figureKeep = new Set(tasks.filter((t) => t.kind === "figure" || t.kind === "threeview" || t.kind === "action").map((t) => t.id));
     itemKeep = new Set(tasks.filter((t) => t.kind === "item").map((t) => t.id));
   }
 
   const dropMissing = async (section: Record<string, string>): Promise<void> => {
+    // 跨扩展名兼容：映射存 .png 而盘存 .jpg（API 常回 jpeg）不算缺失；
+    // 找到变体时把映射修正到实际文件，避免误删映射。
     for (const [k, p] of Object.entries(section)) {
       try {
         if (await tauri.pathExists(p)) continue;
       } catch {
-        /* 查询失败视为缺失 */
+        /* 查询失败继续走变体检查 */
+      }
+      const base = p.replace(/\.(png|jpg|jpeg|webp)$/i, "");
+      let fixed: string | null = null;
+      for (const ext of ["png", "jpg", "jpeg", "webp"]) {
+        const candidate = `${base}.${ext}`;
+        if (candidate === p) continue;
+        try {
+          if (await tauri.pathExists(candidate)) {
+            fixed = candidate;
+            break;
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+      if (fixed) {
+        section[k] = fixed;
+        continue;
       }
       delete section[k];
       report.missingDropped++;
     }
   };
 
-  // 旧版 CG 映射键迁移：cg_<章>_<scene> → <scene>（场景仍存在才迁，否则按过期剪掉）
+  // 旧版 CG 映射键迁移：cg_<章>_<scene> → <scene>（场景仍存在才迁，否则按过期剪掉）。
+  // 新键本身在保留集里时先认，避免数字开头的 scene.id（如 1_a）被当旧版误伤。
   for (const [k, p] of Object.entries(map.cg)) {
+    if (cgKeep?.has(k)) continue;
     const m = /^(\d+)_(.+)$/.exec(k);
     if (!m) continue;
     const sceneId = m[2];
@@ -1717,7 +1749,8 @@ export async function repairImageAssets(
     /* 目录不存在等 */
   }
 
-  // 孤儿文件：有管理前缀、但不被映射引用的删除
+  // 孤儿文件：有管理前缀、但不被映射引用的删除。
+  // 注意锚点 anchor_style.png 不在映射里（设计如此），必须排除，否则每次清理必误删画风基准。
   const referenced = new Set<string>();
   for (const section of [map.bg, map.cg, map.figure, map.item]) {
     for (const p of Object.values(section)) referenced.add((p.split(/[\\/]/).pop() || "").toLowerCase());
@@ -1727,6 +1760,7 @@ export async function repairImageAssets(
     for (const e of entries) {
       if (e.isDir) continue;
       const lower = e.name.toLowerCase();
+      if (lower.startsWith("anchor_")) continue;
       if (!MANAGED_IMAGE_PREFIXES.some((pre) => lower.startsWith(pre))) continue;
       if (!referenced.has(lower)) {
         await tauri.removePath(e.path).catch(() => {});

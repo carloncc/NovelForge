@@ -42,18 +42,30 @@ async function startPreview(): Promise<void> {
 async function stopPreview(): Promise<void> {
   await tauri.stopPreviewServer();
   url.value = "";
+  log.info("page", "预览服务器已停止");
 }
 
 async function openInBrowser(): Promise<void> {
   if (!url.value) return;
-  await tauri.openUrl(url.value);
+  try {
+    await tauri.openUrl(url.value);
+  } catch (e) {
+    error.value = `打开失败：${errMsg(e)}`;
+  }
 }
 
 /** 鉴赏室：立绘换装/表情/缩放、CG 画廊、角色图鉴、BGM 试听 */
 async function openAppreciation(): Promise<void> {
   if (!url.value) return;
-  const ap = url.value.replace(/index\.html$/, "appreciation.html");
-  await tauri.openUrl(ap);
+  // 服务 URL 不一定以 index.html 结尾：有则替换，无则直接拼 appreciation.html
+  const ap = /index\.html$/.test(url.value)
+    ? url.value.replace(/index\.html$/, "appreciation.html")
+    : `${url.value.replace(/\/$/, "")}/appreciation.html`;
+  try {
+    await tauri.openUrl(ap);
+  } catch (e) {
+    error.value = `打开鉴赏室失败：${errMsg(e)}`;
+  }
 }
 
 onMounted(() => {

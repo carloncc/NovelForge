@@ -123,6 +123,7 @@ export const configState = reactive<ConfigFile>({
   activePresetId: initialPreset.id,
   outputDir: "",
   recentOutputDirs: [],
+  projects: [],
   voiceProfiles: [],
   cutout: { ...DEFAULT_CUTOUT_SETTINGS },
 });
@@ -168,6 +169,7 @@ async function loadPersisted() {
     configState.configSchemaVersion = CONFIG_SCHEMA_VERSION;
     configState.outputDir = parsed.outputDir || "";
     configState.recentOutputDirs = parsed.recentOutputDirs ?? [];
+    configState.projects = parsed.projects ?? [];
     configState.voiceProfiles = parsed.voiceProfiles ?? [];
     configState.cutout = parsed.cutout ?? { ...DEFAULT_CUTOUT_SETTINGS };
   } catch (error) {
@@ -192,6 +194,7 @@ function persistedConfigContent(): string {
     activePresetId: configState.activePresetId,
     outputDir: configState.outputDir,
     recentOutputDirs: configState.recentOutputDirs,
+    projects: configState.projects,
     voiceProfiles: configState.voiceProfiles,
     cutout: configState.cutout,
   });
@@ -240,6 +243,7 @@ watch(
       activePresetId: configState.activePresetId,
       outputDir: configState.outputDir,
       recentOutputDirs: configState.recentOutputDirs,
+      projects: configState.projects,
       voiceProfiles: configState.voiceProfiles,
       cutout: configState.cutout,
     }),

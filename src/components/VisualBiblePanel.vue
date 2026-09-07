@@ -4,6 +4,7 @@ import { t } from "../i18n";
 import { open } from "@tauri-apps/plugin-dialog";
 import { projectState, pushLog, scheduleSave } from "../stores/project";
 import { activeConfig, configState } from "../stores/config";
+import { concurrencyFor } from "../stores/configMigration";
 import { tauri, isTauri } from "../utils/tauri";
 import { errMsg } from "../utils/errors";
 import { configIsUsable } from "../api/providers";
@@ -19,12 +20,14 @@ import {
   createVisualBibleDraft,
   persistRegeneratedCharacterDescription,
   refreshVisualBibleFingerprint,
+  regenerateAllCharacterSheets,
   regenerateCharacterDescription,
   regenerateCharacterSheet,
   regenerateStyleSample,
   replaceCharacterReference,
   replaceStyleReference,
   rewriteStyleDescription,
+  syncBibleCharactersWithCards,
   updateStyleDescription,
   validateVisualBibleForApproval,
   visualBiblePath,
@@ -276,6 +279,12 @@ async function createDraft(): Promise<void> {
 
   creating.value = true;
   createProgress.value = null;
+  pushLog({
+    step: "视觉圣经",
+    message: `创建草稿开始（风格来源：${styleSource.value === "reference_image" ? "参考图" : "小说分析"}；${cards.characters.length} 个角色${Object.keys(pendingCharImages.value).length ? `，其中 ${Object.keys(pendingCharImages.value).length} 个带上传参考图` : ""}）`,
+    level: "info",
+    at: Date.now(),
+  });
   try {
     const created = styleSource.value === "reference_image"
       ? await createVisualBibleDraft({
@@ -294,7 +303,7 @@ async function createDraft(): Promise<void> {
     pendingCharImages.value = {};
     await refreshApprovalValidation();
     await afterMutation();
-    pushLog({ step: "视觉圣经", message: t("视觉圣经草稿已生成，请逐项确认后批准"), level: "success", at: Date.now() });
+    pushLog({ step: "视觉圣经", message: `视觉圣经草稿已生成（风格分析覆盖全书 ${novel.chapters.length} 章，${cards.characters.length} 个角色全部建档），请逐项确认后批准`, level: "success", at: Date.now() });
   } catch (e) {
     createError.value = visualBibleErrorMessage(e, {
       imageModel: activeConfig("image")?.model,
@@ -342,6 +351,10 @@ async function rewriteStyle(): Promise<void> {
   }
   busyKey.value = "style-rewrite";
   styleError.value = "";
+  if (!window.confirm("AI 重写将覆盖当前风格描述（含你的手改）。继续吗？")) {
+    busyKey.value = "";
+    return;
+  }
   try {
     await rewriteStyleDescription(outputDir.value, current, {
       llmCfg,
@@ -376,6 +389,10 @@ async function regenerateSample(): Promise<void> {
   }
   busyKey.value = "style-sample";
   styleError.value = "";
+  if (!window.confirm("重新生成风格示例图将覆盖旧图（角色需重新确认），并产生 1 张图片费用。继续吗？")) {
+    busyKey.value = "";
+    return;
+  }
   try {
     await regenerateStyleSample(outputDir.value, current, imageCfg);
     await refreshApprovalValidation();
@@ -462,6 +479,11 @@ async function regenerateCharacter(characterId: string): Promise<void> {
   }
   busyKey.value = `char-sheet:${characterId}`;
   charErrors.value[characterId] = "";
+  if (!window.confirm(`重新生成「${character.name}」的三视图？将覆盖当前版本（已确认的打回待确认），并产生 1 张图片费用。`)) {
+    busyKey.value = "";
+    return;
+  }
+  pushLog({ step: "视觉圣经", message: `角色「${character.name}」三视图重生成开始…`, level: "info", at: Date.now() });
   try {
     await regenerateCharacterSheet(outputDir.value, current, { character, imageCfg });
     await refreshApprovalValidation();
@@ -494,6 +516,7 @@ async function regenerateCharacterDesc(characterId: string): Promise<void> {
   }
   busyKey.value = `char-desc:${characterId}`;
   charErrors.value[characterId] = "";
+  pushLog({ step: "视觉圣经", message: `角色「${character.name}」描述重生成开始…`, level: "info", at: Date.now() });
   try {
     const { imagePrompt, threeViewPrompt } = await regenerateCharacterDescription(visionCfg, character);
     const { card: updatedCard } = await persistRegeneratedCharacterDescription(
@@ -529,35 +552,138 @@ async function regenerateCharacterDesc(characterId: string): Promise<void> {
   }
 }
 
-/** 全局重新生成：按顺序逐个重新生成所有角色三视图 */
+/** 同步当前卡片：圣经条目按老 id 存、重提换 id 后全员 missing 时，一键按当前卡片补建＋移除多余条目 */
+async function syncCharactersWithCards(): Promise<void> {
+  const current = bible.value;
+  const cards = projectState.lastResult?.cards;
+  if (!current || !outputDir.value || !cards?.characters.length) return;
+  const imageCfg = activeConfig("image");
+  const missing = cards.characters.filter((c) => !current.characters[c.id]);
+  const cardIds = new Set(cards.characters.map((c) => c.id));
+  const extra = Object.keys(current.characters).filter((id) => !cardIds.has(id));
+  if (!missing.length && !extra.length) {
+    pushLog({ step: "视觉圣经", message: "圣经条目与当前卡片已同步，无需操作", level: "success", at: Date.now() });
+    return;
+  }
+  // 只有需要补建三视图（调图像 API）时才要求图像配置；仅移除多余条目时不需要
+  if (missing.length && !imageCfg?.apiKey) {
+    approvalError.value = t("同步需要配置图像生成 API（为缺失角色生成三视图）");
+    return;
+  }
+  if (!window.confirm(
+    `圣经与当前卡片不同步：缺失 ${missing.length} 个角色条目（${missing.slice(0, 5).map((c) => c.name || c.id).join("、")}${missing.length > 5 ? "…" : ""}）`
+    + `${extra.length ? `，多余 ${extra.length} 个旧条目（${extra.slice(0, 5).join("、")}${extra.length > 5 ? "…" : ""}）` : ""}。`
+    + "将按当前卡片补建三视图（调用图像 API）、移除多余条目，已确认项不受影响。继续吗？",
+  )) return;
+  busyKey.value = "sync-cards";
+  approvalError.value = "";
+  pushLog({
+    step: "视觉圣经",
+    message: `同步开始：缺失 ${missing.length} 个条目待补建${extra.length ? `，多余 ${extra.length} 个待移除` : ""}…`,
+    level: "info",
+    at: Date.now(),
+  });
+  try {
+    const refs: Record<string, VisualBibleImageInput> = {};
+    for (const [id, pending] of Object.entries(pendingCharImages.value)) {
+      refs[id] = imageInput(pending.dataB64, pending.mime);
+    }
+    const r = await syncBibleCharactersWithCards(outputDir.value, current, {
+      characters: cards.characters,
+      imageCfg,
+      characterReferences: refs,
+      onProgress: (done, total) => {
+        createProgress.value = { phase: "threeview", done, total };
+      },
+    });
+    await refreshFingerprint();
+    await refreshApprovalValidation();
+    await afterMutation();
+    pushLog({
+      step: "视觉圣经",
+      message: `同步完成：补建 ${r.added.length} 个三视图条目${r.adopted.length ? `（其中 ${r.adopted.length} 个复用孤儿文件免生成：${r.adopted.join("、")}）` : ""}，移除多余 ${r.removed.length} 个`
+        + `${r.failed.length ? `，失败 ${r.failed.length} 个（${r.failed.map((f) => `${f.name}：${f.reason.slice(0, 60)}`).join("；")}）` : ""}`
+        + "；被移除 id 的旧人物图孤儿请用素材页「清理无效素材」收尾",
+      level: r.failed.length ? "warn" : "success",
+      at: Date.now(),
+    });
+    if (r.failed.length) {
+      approvalError.value = r.failed.map((f) => `${f.name}：${f.reason}`).join("；");
+    }
+  } catch (e) {
+    approvalError.value = visualBibleErrorMessage(e, {
+      imageModel: activeConfig("image")?.model,
+      visionModel: activeConfig("vision")?.model,
+    });
+  } finally {
+    busyKey.value = "";
+    createProgress.value = null;
+  }
+}
+
+/** 全局重新生成＝全量重建：逐个角色「LLM 重写描述 ＋ 重画三视图」，覆盖现有版本并打回待确认，
+ * 下游人物图同步作废。_prompt 与图片一起重做_，这正是这个按钮的语义。 */
 async function regenerateAllCharacters(): Promise<void> {
   const imageCfg = activeConfig("image");
   if (!imageCfg?.apiKey) {
     approvalError.value = t("全局重新生成需要配置图像生成 API");
     return;
   }
+  const visionCfg = activeConfig("vision") ?? activeConfig("llm");
+  if (!visionCfg?.apiKey) {
+    approvalError.value = t("全局重新生成需要配置视觉或文本 API（重写角色描述用）");
+    return;
+  }
   busyKey.value = "regenerate-all";
   approvalError.value = "";
-  let ok = 0;
-  const failures: string[] = [];
-  for (const character of characters.value) {
-    try {
-      await regenerateCharacterSheet(outputDir.value!, bible.value!, { character, imageCfg });
-      ok++;
-    } catch (e) {
-      failures.push(`${character.name}：${visualBibleErrorMessage(e, { imageModel: imageCfg.model, visionModel: activeConfig("vision")?.model })}`);
-    }
+  const n = characters.value.length;
+  const limit = Math.max(1, concurrencyFor(imageCfg, "image"));
+  if (!window.confirm(`全局重新生成将为 ${n} 个角色重写描述（LLM）＋重画三视图（图像），${limit} 个一组并行，覆盖现有版本并打回待确认，下游人物图同步作废。约 ${n} 次文本调用＋${n} 张图片费用。继续吗？`)) {
+    busyKey.value = "";
+    return;
   }
-  await refreshApprovalValidation();
-  await afterMutation();
   pushLog({
     step: "视觉圣经",
-    message: `全局重新生成完成：成功 ${ok} 个${failures.length ? `，失败 ${failures.length} 个` : ""}`,
-    level: failures.length ? "warn" : "success",
+    message: `全局重新生成开始：${n} 个角色重写描述＋重画三视图（${limit} 并发）…`,
+    level: "info",
     at: Date.now(),
   });
-  if (failures.length) approvalError.value = failures.join("；");
-  busyKey.value = "";
+  createProgress.value = { phase: "threeview", done: 0, total: n };
+  try {
+    // 批量：API 调用并行、清单一次提交（逐个调单字符接口再并行会互相覆盖丢更新）
+    const r = await regenerateAllCharacterSheets(outputDir.value!, bible.value!, {
+      characters: characters.value,
+      imageCfg,
+      visionCfg,
+      concurrency: limit,
+      onProgress: (done) => {
+        createProgress.value = { phase: "threeview", done, total: n };
+      },
+    });
+    // 同步内存卡片（后续管线用新描述）
+    const lastResult = projectState.lastResult;
+    if (lastResult?.cards?.characters) {
+      const updatedById = new Map(r.updatedCards.map((c) => [c.id, c]));
+      for (let i = 0; i < lastResult.cards.characters.length; i++) {
+        const u = updatedById.get(lastResult.cards.characters[i].id);
+        if (u) lastResult.cards.characters.splice(i, 1, u);
+      }
+    }
+    await refreshApprovalValidation();
+    await afterMutation();
+    pushLog({
+      step: "视觉圣经",
+      message: `全局重新生成完成：成功 ${r.ok.length} 个${r.failed.length ? `，失败 ${r.failed.length} 个（${r.failed.map((f) => `${f.name}：${f.reason.slice(0, 60)}`).join("；")}）` : ""}（描述＋三视图已全量重做，均待确认）`,
+      level: r.failed.length ? "warn" : "success",
+      at: Date.now(),
+    });
+    if (r.failed.length) approvalError.value = r.failed.map((f) => `${f.name}：${f.reason}`).join("；");
+  } catch (e) {
+    approvalError.value = visualBibleErrorMessage(e, { imageModel: imageCfg.model, visionModel: visionCfg.model });
+  } finally {
+    busyKey.value = "";
+    createProgress.value = null;
+  }
 }
 
 async function acceptCharacter(characterId: string): Promise<void> {
@@ -565,6 +691,7 @@ async function acceptCharacter(characterId: string): Promise<void> {
   if (!current || !outputDir.value) return;
   busyKey.value = `char-accept:${characterId}`;
   charErrors.value[characterId] = "";
+  pushLog({ step: "视觉圣经", message: `角色「${characters.value.find((c) => c.id === characterId)?.name ?? characterId}」确认开始…`, level: "info", at: Date.now() });
   try {
     await acceptCharacterSheet(outputDir.value, current, characterId);
     await refreshApprovalValidation();
@@ -735,7 +862,16 @@ function characterNeedsRegeneration(characterId: string): boolean {
             {{ t("角色三视图") }}
             <span class="vb-section-hint">{{ characters.length }} {{ t("个主角色") }}</span>
             <span class="vb-section-actions">
-              <button class="btn small" :disabled="!!busyKey" @click="regenerateAllCharacters">
+              <button
+                class="btn secondary small"
+                :disabled="!!busyKey"
+                :title="t('重跑提取后角色 id 变化导致条目对不上时用：按当前卡片补建缺失条目、移除多余条目')"
+                @click="syncCharactersWithCards"
+              >
+                <span v-if="busyKey === 'sync-cards'" class="spinner" />
+                {{ t("同步当前卡片") }}
+              </button>
+              <button class="btn small" :disabled="!!busyKey" :title="t('全部角色：LLM 重写描述＋重画三视图，覆盖现有版本并打回待确认，下游人物图同步作废')" @click="regenerateAllCharacters">
                 <span v-if="busyKey === 'regenerate-all'" class="spinner" />
                 {{ t("全局重新生成") }}
               </button>

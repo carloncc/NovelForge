@@ -10,6 +10,7 @@ const props = defineProps<{
   disabledChapters: ChapterInfo[];
   lights: Record<number, ChapterLight>;
   feedback: Record<number, string>;
+  force: Record<number, boolean>;
   disabled: boolean;
 }>();
 
@@ -71,7 +72,11 @@ defineExpose({ incompleteCount });
         :placeholder="t('意见（可选）：本章节奏太慢…')"
         style="min-width: 140px; flex: 1"
       />
-      <button class="btn small" :disabled="disabled" @click="emit('regen', c.index)">
+      <label class="opt-item mb-0" :title="t('勾选后该章跳过缓存直接重写（同范围图像同步强制），不需要填意见')">
+        <input type="checkbox" :checked="!!force[c.index]" :disabled="disabled" @change="(e) => (force[c.index] = (e.target as HTMLInputElement).checked)" />
+        {{ t("全量") }}
+      </label>
+      <button class="btn small" :disabled="disabled" :title="t('无意见且未勾全量=只补缺失')" @click="emit('regen', c.index)">
         {{ t("生成本章") }}
       </button>
       <button class="btn ghost small" :disabled="disabled" :title="t('停用后不再参与生成')" @click="emit('toggle', c.index)">

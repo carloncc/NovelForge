@@ -1,12 +1,15 @@
 import { buildImageTasks, taskSeedForId } from "../src/core/images";
-import { vocalKeysForChapters } from "../src/core/voice";
+import { vocalKeysForChapters, splitVocalFileName, buildVocalContentIndex } from "../src/core/voice";
 import { scriptCacheRest } from "../src/core/cache";
 import {
   novelBodyFingerprint,
   joinAppendText,
   pruneAssetRefs,
   mergeAppendedCards,
+  alignExtractedIds,
+  isExtractDegraded,
 } from "../src/core/pipeline";
+import { tauri } from "../src/utils/tauri";
 import type { ChapterScript, ExtractionResult } from "../src/core/types";
 
 function assert(cond: boolean, msg: string): void {
@@ -161,6 +164,178 @@ const line = (text: string, characterId = "c1") => ({ type: "dialogue" as const,
   assert(coreFig === 5, `core 档应只有标准 5 表情，实际 ${coreFig}`);
   assert(full.some((t) => t.kind === "threeview"), "两档都应有三视图");
   assert(core.some((t) => t.kind === "threeview"), "两档都应有三视图");
+}
+
+// ---------- 9. 重提 id 对齐：同名沿用老 id，粘性字段保留 ----------
+{
+  const oldCards: ExtractionResult = {
+    title: "t",
+    characters: [
+      { id: "iriyasatoshi", name: "入谷聪", appearance: "旧", imagePrompt: "old", voiceName: "lin", voiceProfileId: "vp1", referenceImagePath: "ref/old.png" } as never,
+    ],
+    scenes: [],
+    items: [],
+  };
+  const fresh: ExtractionResult = {
+    title: "t",
+    characters: [
+      { id: "routanakisaki", name: "入谷 聪", appearance: "新", imagePrompt: "new" } as never,
+      { id: "brandnew", name: "新人", appearance: "新", imagePrompt: "new2" } as never,
+      // 第二个同名新人：老 id 已被认领，保留自己的 id（不硬并）
+      { id: "routanakisaki2", name: "入谷聪", appearance: "新", imagePrompt: "new3" } as never,
+    ],
+    scenes: [],
+    items: [],
+  };
+  const { aligned, adopted } = alignExtractedIds(oldCards, fresh);
+  assert(adopted === 1, `应认领 1 个，实际 ${adopted}`);
+  const kept = aligned.characters.find((c) => c.name === "入谷 聪")!;
+  assert(kept.id === "iriyasatoshi", "同名应沿用老 id");
+  assert(kept.imagePrompt === "new", "描述取新的");
+  assert((kept as { voiceProfileId?: string }).voiceProfileId === "vp1", "音色映射应沿用老的");
+  assert(kept.voiceName === "lin", "已选音色应沿用老的");
+  assert((kept as { referenceImagePath?: string }).referenceImagePath === "ref/old.png", "参考图应沿用老的");
+  assert(aligned.characters.find((c) => c.name === "入谷聪")!.id === "routanakisaki2", "重复认领应保留新 id");
+  // 无老卡片：原样返回
+  const passthrough = alignExtractedIds(undefined, fresh);
+  assert(passthrough.aligned === fresh && passthrough.adopted === 0, "无老卡片应原样返回");
+}
+
+// ---------- 10. 提取退化熔断 ----------
+{
+  assert(isExtractDegraded(9, 3) === true, "9→3 应熔断");
+  assert(isExtractDegraded(9, 4) === true, "9→4（不足半数）应熔断");
+  assert(isExtractDegraded(9, 5) === false, "9→5（过半）不应熔断");
+  assert(isExtractDegraded(9, 9) === false, "持平不应熔断");
+  assert(isExtractDegraded(2, 0) === false, "老卡片不足 3 人不熔断（小项目/首提）");
+  assert(isExtractDegraded(0, 0) === false, "无老卡片不熔断");
+}
+
+// ---------- 11. 配音文件名解析＋孤儿认领 ----------
+{
+  const p1 = splitVocalFileName("v_ch0_school_gate_2_abc123_def456.mp3");
+  assert(p1?.key === "ch0_school_gate_2" && p1.fp === "abc123" && p1.hash === "def456", `key 含下划线应从右切：${JSON.stringify(p1)}`);
+  assert(splitVocalFileName("bg_s1.png") === null, "非配音文件应返回 null");
+  assert(splitVocalFileName("v_nofp.mp3") === null, "格式不全应返回 null");
+
+  const dir = `${process.cwd().replace(/\\/g, "/")}/tests/.tmp-vocal-relink`;
+  await tauri.removePath(dir).catch(() => {});
+  await tauri.mkdirAll(dir);
+  await tauri.writeTextFile(`${dir}/v_ch0_olds_5_fp9x_hash7q.mp3`, "fake-audio");
+  await tauri.writeTextFile(`${dir}/bg_s1.png`, "img");
+  const index = await buildVocalContentIndex(dir);
+  assert(index.get("fp9x_hash7q")?.endsWith("v_ch0_olds_5_fp9x_hash7q.mp3") === true, "应按音色＋文本哈希建索引");
+  assert(!index.has("fp9x_other"), "不同文本哈希不应命中");
+  assert(index.size === 1, "非配音文件不应进索引");
+  await tauri.removePath(dir).catch(() => {});
+}
+
+// ---------- 12. 旧人物新形态：追加合并收录新服装/新表情 ----------
+{
+  const oldCards: ExtractionResult = {
+    title: "t",
+    characters: [{
+      id: "hero", name: "主角", appearance: "旧", imagePrompt: "old",
+      costumes: [{ id: "daily", name: "日常服", prompt: "daily" }],
+      emotions: ["normal", "happy"],
+      actions: [],
+    } as never],
+    scenes: [],
+    items: [],
+  };
+  const fresh: ExtractionResult = {
+    title: "t",
+    characters: [{
+      id: "hero_new", name: "主角", appearance: "", imagePrompt: "new",
+      costumes: [{ id: "daily", name: "日常服", prompt: "daily新版" }, { id: "battle", name: "战斗服", prompt: "battle" }],
+      emotions: ["happy", "angry"],
+      actions: [{ id: "wave", name: "挥手", prompt: "wave" }],
+    } as never],
+    scenes: [],
+    items: [],
+  };
+  const { merged } = mergeAppendedCards(oldCards, fresh);
+  const hero = merged.characters.find((c) => c.name === "主角")!;
+  assert(hero.id === "hero", "同名应沿用老 id");
+  const costumeIds = (hero.costumes ?? []).map((c) => c.id);
+  assert(costumeIds.includes("daily") && costumeIds.includes("battle"), `新服装应并入：${costumeIds}`);
+  assert((hero.emotions ?? []).includes("angry"), "新表情应并入");
+  assert(new Set(hero.emotions ?? []).size === (hero.emotions ?? []).length, "表情不应重复");
+  assert((hero.actions ?? []).some((a) => a.id === "wave"), "新动作应并入");
+}
+
+// ---------- 13. 批量 CG 选择键（新纯 scene.id 语义） ----------
+{
+  const { imageTaskMatchesSelectionKey } = await import("../src/core/regenerate");
+  const cgTask = { kind: "cg", id: "s9", fileName: "cg_s9.png", prompt: "", width: 0, height: 0 } as never;
+  assert(imageTaskMatchesSelectionKey(cgTask, "cg:3:s9") === true, "批量 CG 应按 scene 命中（忽略显示章号）");
+  assert(imageTaskMatchesSelectionKey(cgTask, "cg:3:s8") === false, "不同场景不应命中");
+}
+
+// ---------- 14. 剪枝数字开头 scene.id 保护 ----------
+{
+  const chapters: ChapterScript[] = [{
+    chapter: 0, title: "t",
+    scenes: [{ id: "1_a", location: "x", atmosphere: "", time: "", bgPrompt: "", itemEvents: [], lines: [], figures: [], cgEvent: { title: "c", imagePrompt: "p" } as never }],
+  }];
+  const assets = { bg: {}, cg: { "1_a": "/p/cg_1_a.png" }, vocal: {} };
+  const stat = pruneAssetRefs(assets, chapters);
+  assert(assets.cg["1_a"] === "/p/cg_1_a.png", "新键本身在保留集时不得当旧版迁移/删除");
+  assert(stat.cg === 0 && stat.cgMigrated === 0, "不应计数");
+}
+
+// ---------- 15. 配音文件名多扩展名解析 ----------
+{
+  const ogg = splitVocalFileName("v_ch2_s1_10_fpab_hashcd.ogg");
+  assert(ogg?.key === "ch2_s1_10" && ogg.fp === "fpab" && ogg.hash === "hashcd", `ogg 应正常解析：${JSON.stringify(ogg)}`);
+}
+
+// ---------- 16. 卡片保存差分失效：只改音色不碰图，改提示词只清该角色 ----------
+{
+  const { saveEditedCards } = await import("../src/core/cards");
+  const dir = `${process.cwd().replace(/\\/g, "/")}/tests/.tmp-cards-save`;
+  await tauri.removePath(dir).catch(() => {});
+  await tauri.mkdirAll(`${dir}/.novel2vn/cache/images`);
+  const mkCards = (voice: string, prompt: string) => ({
+    title: "t",
+    characters: [
+      { id: "hero", name: "主角", appearance: "", clothing: "", personality: "", voiceDesc: "", voiceName: voice, imagePrompt: prompt, color: "" },
+      { id: "side", name: "配角", appearance: "", clothing: "", personality: "", voiceDesc: "", voiceName: "v2", imagePrompt: "sideprompt", color: "" },
+    ],
+    scenes: [],
+    items: [],
+  });
+  await tauri.writeTextFile(`${dir}/.novel2vn/cards.json`, JSON.stringify(mkCards("v1", "p1")));
+  for (const f of ["figure_hero_normal.png", "figure_side_normal.png", "threeview_hero.png", "item_sword.png"]) {
+    await tauri.writeTextFile(`${dir}/.novel2vn/cache/images/${f}`, "x");
+  }
+  const noop: (msg: string) => void = () => {};
+  // 只改音色：一张图都不该动
+  const r1 = await saveEditedCards(dir, mkCards("v9", "p1") as never, noop);
+  assert(r1.imageCacheCleared === 0, `纯音色改动不应清图，实际清了 ${r1.imageCacheCleared}`);
+  for (const f of ["figure_hero_normal.png", "figure_side_normal.png", "threeview_hero.png"]) {
+    assert(await tauri.pathExists(`${dir}/.novel2vn/cache/images/${f}`).catch(() => false), `音色改动不应删 ${f}`);
+  }
+  // 改 hero 提示词：只清 hero 的图，side 的保留
+  const r2 = await saveEditedCards(dir, mkCards("v9", "p2") as never, noop);
+  assert(r2.imageCacheCleared === 2, `应只清 hero 的 2 张图，实际 ${r2.imageCacheCleared}`);
+  assert(!(await tauri.pathExists(`${dir}/.novel2vn/cache/images/figure_hero_normal.png`).catch(() => false)), "hero 图应被清");
+  assert(await tauri.pathExists(`${dir}/.novel2vn/cache/images/figure_side_normal.png`).catch(() => false), "side 图应保留");
+  await tauri.removePath(dir).catch(() => {});
+}
+
+// ---------- 17. 配音命中跨扩展名 ----------
+{
+  const { vocalHit } = await import("../src/core/voice");
+  const dir = `${process.cwd().replace(/\\/g, "/")}/tests/.tmp-vocal-hit`;
+  await tauri.removePath(dir).catch(() => {});
+  await tauri.mkdirAll(dir);
+  await tauri.writeTextFile(`${dir}/v_ch0_s1_0_fp_hash.ogg`, "fake");
+  const hit = await vocalHit(dir, "v_ch0_s1_0_fp_hash.mp3");
+  assert(hit?.endsWith(".ogg") === true, `ogg 文件应被命中：${hit}`);
+  const miss = await vocalHit(dir, "v_ch0_s9_9_fp_hash.mp3");
+  assert(miss === null, "不存在的应返回 null");
+  await tauri.removePath(dir).catch(() => {});
 }
 
 console.log("=== regen safety tests passed ===");

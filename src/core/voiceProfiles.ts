@@ -76,10 +76,22 @@ export async function importVoiceProfile(input: { name: string; configId: string
   const config = ttsConfigById(input.configId);
   if (!config) throw new Error("找不到所选 TTS 配置");
   assertMiniMaxConfig(config);
-  if (!input.voiceId.trim()) throw new Error("voice_id 不能为空");
+  const vid = input.voiceId.trim();
+  if (!vid) throw new Error("voice_id 不能为空");
+  // 导入即校验：乱填以前显示"已绑定"，到配音阶段才爆错难查。现在拉取可用音色当场核对。
+  let remote: MiniMaxRemoteVoice[];
+  try {
+    remote = await fetchMiniMaxVoices(config, "all");
+  } catch (e) {
+    throw new Error(`音色列表查询失败，无法校验 voice_id（网络或 Key 问题）：${e instanceof Error ? e.message : String(e)}`);
+  }
+  const hit = remote.find((v) => v.voice_id === vid);
+  if (!hit) {
+    throw new Error(`voice_id「${vid}」不存在（已核对 ${remote.length} 个可用音色）：请检查是否填错，或该音色不在当前 Key 下`);
+  }
   const profile: VoiceProfile = {
-    id: crypto.randomUUID(), name: input.name.trim() || input.voiceId.trim(), provider: "minimax",
-    ttsConfigId: config.id, voiceId: input.voiceId.trim(), status: "ready", revision: 1, createdAt: new Date().toISOString(),
+    id: crypto.randomUUID(), name: input.name.trim() || hit.voice_name || vid, provider: "minimax",
+    ttsConfigId: config.id, voiceId: vid, status: "ready", revision: 1, createdAt: new Date().toISOString(),
   };
   upsertVoiceProfile(profile);
   return profile;

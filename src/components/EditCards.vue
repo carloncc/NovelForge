@@ -252,7 +252,7 @@ async function pickReferenceImage(card: CharacterCard): Promise<void> {
   try {
     const b64 = await tauri.readFileBase64(picked);
     card.referenceImage = b64;
-    savedMsg.value = `已为「${card.name}」设置参考图：${picked.split(/[\\/]/).pop()}`;
+    savedMsg.value = `已为「${card.name}」设置参考图：${picked.split(/[\\/]/).pop()}（记得点「保存卡片」）`;
   } catch (e) {
     savedMsg.value = `读取参考图失败：${errMsg(e)}`;
   }
@@ -269,7 +269,7 @@ async function onRefImgFile(e: Event): Promise<void> {
     const vPath = `/app/materials/ref_${Date.now()}_${file.name}`;
     await vfsWriteFileBase64(vPath, b64);
     card.referenceImage = b64;
-    savedMsg.value = `已为「${card.name}」设置参考图`;
+    savedMsg.value = `已为「${card.name}」设置参考图（记得点「保存卡片」）`;
   } catch (err) {
     savedMsg.value = `读取参考图失败：${(err as Error).message}`;
   } finally {
@@ -296,7 +296,7 @@ async function save(): Promise<void> {
     await saveEditedCards(projectState.outputDir, local.value, (m, level = "info") => {
       savedMsg.value = m;
       void level;
-    }, invalidateScript.value);
+    }, invalidateScript.value, !activeConfig("llm")?.apiKey);
     emit("saved", local.value);
   } catch (e) {
     savedMsg.value = `保存失败：${errMsg(e)}`;
@@ -306,13 +306,18 @@ async function save(): Promise<void> {
 }
 
 function reset(): void {
+  if (!window.confirm("放弃所有未保存的修改，恢复为上次生成时的卡片？")) return;
   local.value = JSON.parse(JSON.stringify(props.cards));
   savedMsg.value = t("已恢复为上次生成时的卡片");
 }
 
 function addCostume(c: CharacterCard): void {
   if (!c.costumes) c.costumes = [];
-  const base = `costume_${c.costumes.length + 1}`;
+  // id 去重：删后重加不再撞号（撞号会导致两套服装生成同一张图互相覆盖）
+  const used = new Set(c.costumes.map((x) => x.id));
+  let n = c.costumes.length + 1;
+  while (used.has(`costume_${n}`)) n++;
+  const base = `costume_${n}`;
   c.costumes.push({
     id: base,
     name: t("新服装"),
@@ -320,7 +325,14 @@ function addCostume(c: CharacterCard): void {
   });
 }
 
+function confirmClearRefImage(card: CharacterCard): void {
+  if (!window.confirm(`清除「${card.name}」的参考图？（保存后生效）`)) return;
+  card.referenceImage = undefined;
+}
+
 function removeCostume(c: CharacterCard, idx: number): void {
+  const target = c.costumes?.[idx];
+  if (!window.confirm(`删除服装「${target?.name ?? target?.id ?? ""}」？未保存前可点「放弃修改」找回。`)) return;
   c.costumes?.splice(idx, 1);
   if (!c.costumes?.length) c.costumes = undefined;
 }
@@ -345,9 +357,9 @@ onBeforeUnmount(() => {
       </div>
     </div>
     <p v-if="savedMsg" class="small mb-2" style="color: var(--ok)">{{ savedMsg }}</p>
-    <p class="hint mb-2">
-      {{ t("修改外貌/服装/音色后保存：立绘会在下次生成时重新生成；剧本缓存默认保留（仅外貌/音色改动不会重跑全部剧本）。背景/CG 保留。") }}
-    </p>
+      <p class="hint mb-2">
+        {{ t("保存后：只有绘画相关改动（立绘/三视图/动作/服装/表情提示词）会作废对应图片缓存；改音色/文字不重画图。剧本缓存默认保留。背景/CG 保留。") }}
+      </p>
 
     <Disclosure
       v-for="c in local.characters"
@@ -439,8 +451,8 @@ onBeforeUnmount(() => {
         <span class="hint">{{ t("参考图（图生图保持一致）：") }}</span>
         <span v-if="c.referenceImage" class="tag ok">{{ t("已设置") }}</span>
         <span v-else class="tag">{{ t("未设置") }}</span>
-        <button class="btn secondary small" @click="pickReferenceImage(c)">{{ t("从素材库选择…") }}</button>
-        <button v-if="c.referenceImage" class="btn danger small" @click="c.referenceImage = undefined">{{ t("清除") }}</button>
+        <button class="btn secondary small" @click="pickReferenceImage(c)" :title="t('选择后仅暂存，记得点右上「保存卡片」才落盘')">{{ t("上传参考图…") }}</button>
+        <button v-if="c.referenceImage" class="btn danger small" @click="confirmClearRefImage(c)">{{ t("清除") }}</button>
         <input v-if="!isTauri()" ref="refImgInput" type="file" accept="image/*" style="display: none" @change="onRefImgFile" />
       </div>
       <div class="row mt-2">

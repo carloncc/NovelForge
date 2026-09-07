@@ -5,7 +5,7 @@ src-tauri/gen/
 resources/
 *.log
 output/
-.novel2n/
+.novel2vn/
 .DS_Store
 Thumbs.db
 src-tauri/templates/webgal/

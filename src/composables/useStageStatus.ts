@@ -71,8 +71,8 @@ export function useStageStatus(input: StageStatusInput) {
   function allExpectedImagesExist(map: AssetMap, result: PipelineResult, options: GenerationOptions): boolean {
     const tasks = buildImageTasks(result.chapters, result.cards, {
       figurePerCharacter: 1,
-      cgPerChapter: 0,
-      maxPerChapter: 0,
+      cgPerChapter: options.cgPerChapter ?? 0,
+      maxPerChapter: options.imageBudgetPerChapter ?? 0,
       figureEmotions: options.figureEmotions,
       detail: options.figureDetail ?? "full",
       style: options.imageStyle,
@@ -116,13 +116,15 @@ export function useStageStatus(input: StageStatusInput) {
     const activeCount = novel?.chapters.filter((c) => c.enabled !== false).length ?? 0;
 
     // 翻译：语言为空 = 无需执行；否则按当前语言统计译文缓存 ≥ 启用章节数
+    // 键格式与管线 translateCacheFile 同源（去序号，只认标题＋正文哈希）
     const lang = input.getLanguage();
     if (!lang) {
       base.translate = true;
     } else {
       const translated = await listUniqueChapters(`${metaDir}/translate`, (name) => {
-        if (!name.startsWith(`translate_${lang}_ch`)) return null;
-        return name.match(/_ch(\d+)_/)?.[1] ?? null;
+        if (!name.startsWith(`translate_${lang}_`)) return null;
+        if (/^translate_.+_ch\d+_/.test(name)) return null; // 旧序号键已废除，不计
+        return name;
       });
       base.translate = activeCount > 0 && translated >= activeCount;
     }

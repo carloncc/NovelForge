@@ -145,6 +145,27 @@ function main(): void {
   const out7 = renderChapter(s7, { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets, introCard: false }, 1);
   assert(out7.includes("changeBg:cg_scene_shortcut.png"), "scene.cgFile 捷径未生效");
 
+  // 8) 换装：标注 costume 即切换服装立绘并记住，后续句沿用；未知服装 id 回退默认
+  const assetsCt: RenderAssets = {
+    bg: { s1: "/x/bg_s1.png" },
+    cg: {},
+    figure: { linche: "/x/f_linche.png", linche_ct_battle: "/x/f_linche_battle.png", linche_happy: "/x/f_linche_happy.png" },
+    item: {},
+    vocal: {},
+  };
+  const s8 = makeScript();
+  s8.scenes[0].lines = [
+    { type: "dialogue", characterId: "linche", text: "换上战斗服！", emotion: "normal", costume: "battle" },
+    { type: "dialogue", characterId: "linche", text: "再来一句。", emotion: "happy" },
+    { type: "dialogue", characterId: "linche", text: "幻之服装？", emotion: "normal", costume: "ghost" },
+  ];
+  const out8 = renderChapter(s8, { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets: assetsCt, introCard: false }, 1);
+  assert(out8.includes("changeFigure:f_linche_battle.png"), "换装句应切服装立绘");
+  // 第二句 emotion=happy 但已换装：服装图无表情差分，应沿用服装而非 happy 图
+  assert(!out8.includes("f_linche_happy.png"), "换装期间不应切表情差分");
+  // 第三句未知服装 id：回退默认立绘不断线
+  assert(out8.includes("changeFigure:f_linche.png"), "未知服装应回退默认立绘");
+
   console.log("=== 渲染注入边界测试通过 ===");
 }
 main();

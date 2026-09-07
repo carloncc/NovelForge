@@ -1,4 +1,10 @@
-import { countSourceQuotes, verifyScriptAgainstSource } from "../src/core/script";
+import {
+  applySpeakerFix,
+  countSourceQuotes,
+  deleteScriptLine,
+  verifyIssueKey,
+  verifyScriptAgainstSource,
+} from "../src/core/script";
 
 function assert(cond: boolean, msg: string): void {
   if (!cond) throw new Error(msg);
@@ -67,6 +73,74 @@ function main(): void {
   ], characters);
   assert(fabricated.notFoundCount === 1, "捏造台词应计入 notFound");
   assert(fabricated.speakerIssues.some((i) => i.reason === "not-in-source"), "捏造台词应有 not-in-source 记录");
+
+  // 存疑 key 稳定（忽略表用）
+  assert(verifyIssueKey(1, 10, "context-mismatch") === "1:10:context-mismatch", "存疑 key 格式异常");
+
+  // 接受建议说话人：只改 characterId，不碰其它内容
+  const scriptForFix = {
+    chapter: 0,
+    title: "第一章",
+    scenes: [
+      {
+        id: "s1", location: "教室", atmosphere: "", time: "", bgPrompt: "", itemEvents: [], figures: [],
+        lines: [
+          { type: "dialogue", characterId: "sakura", text: "你好。" },
+          { type: "narration", text: "旁白。" },
+        ],
+      },
+    ],
+  } as never;
+  const fixed = applySpeakerFix(scriptForFix, 0, 0, "yuto");
+  assert((fixed.scenes[0].lines[0] as { characterId: string }).characterId === "yuto", "说话人应被改掉");
+  assert((fixed.scenes[0].lines[1] as { text: string }).text === "旁白。", "其它行不应被动");
+  assert((scriptForFix.scenes[0].lines[0] as { characterId: string }).characterId === "sakura", "原对象不应被改动");
+  let threw = false;
+  try {
+    applySpeakerFix(scriptForFix, 0, 1, "yuto");
+  } catch {
+    threw = true;
+  }
+  assert(threw, "旁白行改说话人应抛错");
+  threw = false;
+  try {
+    applySpeakerFix(scriptForFix, 9, 0, "yuto");
+  } catch {
+    threw = true;
+  }
+  assert(threw, "不存在的场景应抛错");
+
+  // 删除该句：删行不删场景，行号前移
+  const scriptForDel = {
+    chapter: 0,
+    title: "第一章",
+    scenes: [
+      {
+        id: "s1", location: "教室", atmosphere: "", time: "", bgPrompt: "", itemEvents: [], figures: [],
+        lines: [
+          { type: "dialogue", characterId: "sakura", text: "第一句。" },
+          { type: "dialogue", characterId: "yuto", text: "第二句。" },
+        ],
+      },
+    ],
+  } as never;
+  const deleted = deleteScriptLine(scriptForDel, 0, 0);
+  assert(deleted.scenes.length === 1, "场景应保留（背景仍需它）");
+  assert(deleted.scenes[0].lines.length === 1, "应只剩一行");
+  assert((deleted.scenes[0].lines[0] as { text: string }).text === "第二句。", "后行应前移");
+
+  // 修正后重验：说话人存疑消失
+  const srcFixed = "樱月说「你好。」";
+  const before = verifyScriptAgainstSource(srcFixed, [
+    { lines: [{ type: "dialogue", characterId: "yuto", text: "你好。" }] },
+  ], characters);
+  assert(before.speakerIssues.some((i) => i.reason === "context-mismatch"), "错说话人应先被检出");
+  const repairedScript = applySpeakerFix(
+    { chapter: 0, title: "t", scenes: [{ id: "s", location: "", atmosphere: "", time: "", bgPrompt: "", itemEvents: [], figures: [], lines: [{ type: "dialogue", characterId: "yuto", text: "你好。" }] }] } as never,
+    0, 0, "sakura",
+  );
+  const afterRe = verifyScriptAgainstSource(srcFixed, repairedScript.scenes, characters);
+  assert(!afterRe.speakerIssues.some((i) => i.reason === "context-mismatch"), "修正后说话人存疑应消失");
 
   console.log("=== script verify tests passed ===");
 }

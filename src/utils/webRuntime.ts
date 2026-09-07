@@ -124,7 +124,7 @@ async function directFetch(args: {
 /* ============ 模板资源同步（dev server → IndexedDB 缓存） ============ */
 
 async function fetchTemplateNode(rel: string): Promise<{ kind: "file"; base64: string } | { kind: "dir"; entries: FsEntry[] } | undefined> {
-  const resp = await fetch(`${TEMPLATE_URL}?path=${encodeURIComponent(rel)}`, { method: "GET" });
+  let token = ""; try { token = await webSessionToken(); } catch { return undefined; } const resp = await fetch(`${TEMPLATE_URL}?path=${encodeURIComponent(rel)}`, { method: "GET", headers: { "X-NovelForge-Token": token } });
   if (!resp.ok) return undefined;
   return (await resp.json()) as { kind: "file"; base64: string } | { kind: "dir"; entries: FsEntry[] };
 }
@@ -336,7 +336,7 @@ export async function webBuildZip(
 export async function webCutoutModelStatus(modelId: string, filename: string): Promise<CutoutModelStatus> {
   const fallback: CutoutModelStatus = { modelId, state: "idle", bytes: 0, total: 0, error: null, installed: false };
   try {
-    const resp = await fetch(`${MODEL_URL}/status?model=${encodeURIComponent(modelId)}`, { method: "GET" });
+    const stoken = await webSessionToken(); const resp = await fetch(`${MODEL_URL}/status?model=${encodeURIComponent(modelId)}`, { method: "GET", headers: { "X-NovelForge-Token": stoken } });
     if (!resp.ok) return fallback;
     return (await resp.json()) as CutoutModelStatus;
   } catch {

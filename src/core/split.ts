@@ -175,6 +175,46 @@ export interface SplitStats {
   blocks?: number;
   /** 碎章合并数 */
   mergedTiny?: number;
+  /** keepSpecials 救回的特殊章节数（后记/番外/特典/插图等） */
+  keptSpecials?: number;
+  /** 被丢弃块的首行样本（最多 8 条，供日志留痕） */
+  discardedSamples?: string[];
+}
+
+export interface AiSplitOptions {
+  /** 碎章合并阈值（默认 3000；0 = 不合并，特殊小章独立成章） */
+  minChapterChars?: number;
+  /** 保留特殊章节：后记/番外/特典/插图等不被当杂项丢弃，独立成章 */
+  keepSpecials?: boolean;
+}
+
+/** 特殊章节首行特征：这类块即使被 AI 标成杂项也要留（用户要的 26 章里就有它们）。
+ * 注意不用 \b：中文两侧都是非 \w 字符，\b 永远匹配不上，改用显式分隔断言。 */
+const SPECIAL_CHAPTER_RE = /^(第?\s*[零〇一二三四五六七八九十百千万两\d]+\s*[章节回]?\s*[:：·\s-]?)?\s*(后记|前言|序章|序言|楔子|引子|尾声|终章|番外|特典|插图|设定|登场人物|人物介绍)(?=$|[\s：:·—\-卷章节回篇话集部幕\d])/;
+
+/**
+ * 特殊章节保护（纯函数）：被标丢弃的块若首行是特殊章节标题，则移出丢弃集；
+ * 若它还不是章节起点，则就地立为章节（标题取首行）。返回救回数。
+ */
+export function protectSpecialBlocks(
+  blocks: string[],
+  discardSet: Set<number>,
+  marks: { blockIndex: number; raw: string }[],
+): number {
+  let kept = 0;
+  const marked = new Set(marks.map((m) => m.blockIndex));
+  for (const idx of [...discardSet].sort((a, b) => a - b)) {
+    const firstLine = (blocks[idx - 1] || "").split("\n")[0].trim().slice(0, 20);
+    if (firstLine.length < 2 || !SPECIAL_CHAPTER_RE.test(firstLine)) continue;
+    discardSet.delete(idx);
+    if (!marked.has(idx)) {
+      marks.push({ blockIndex: idx, raw: firstLine });
+      marked.add(idx);
+    }
+    kept++;
+  }
+  marks.sort((a, b) => a.blockIndex - b.blockIndex);
+  return kept;
 }
 
 /**
@@ -291,6 +331,7 @@ export async function aiSplitChapters(
   feedback?: string,
   concurrency = 3,
   stats?: SplitStats,
+  opts?: AiSplitOptions,
 ): Promise<ChapterInfo[]> {
   const blocks = splitBlocks(fullText);
   if (blocks.length <= 1) {
@@ -342,6 +383,10 @@ export async function aiSplitChapters(
 
   // 章节标题块不应被当作杂项丢弃
   for (const m of uniqueMarks) discardSet.delete(m.blockIndex);
+  // 特殊章节保护（keepSpecials）：后记/番外/特典/插图等不许当杂项丢
+  let keptSpecials = 0;
+  if (opts?.keepSpecials) keptSpecials = protectSpecialBlocks(blocks, discardSet, uniqueMarks);
+  if (stats) stats.keptSpecials = (stats.keptSpecials ?? 0) + keptSpecials;
 
   // 若 LLM 一个章节标题都没识别到 → 回退：按块数均匀切成若干章
   if (!uniqueMarks.length) {
@@ -355,6 +400,13 @@ export async function aiSplitChapters(
   if (stats) {
     stats.discarded = (stats.discarded ?? 0) + discardSet.size;
     stats.blocks = (stats.blocks ?? 0) + blocks.length;
+    // 丢弃留痕：被丢的块首行样本记下来，用户能在日志里看到底丢了什么
+    const samples: string[] = [];
+    for (const idx of [...discardSet].sort((a, b) => a - b).slice(0, 8)) {
+      const head = (blocks[idx - 1] || "").split("\n")[0].trim().slice(0, 30);
+      if (head) samples.push(`块${idx}「${head}」`);
+    }
+    stats.discardedSamples = [...(stats.discardedSamples ?? []), ...samples].slice(0, 8);
   }
 
   // 用标题块作为边界切分正文；跳过被标记丢弃的杂项块
@@ -390,7 +442,7 @@ export async function aiSplitChapters(
   const result: ChapterInfo[] = [];
   for (const ch of chapters) {
     if (ch.text.length > maxChapterChars) {
-      const sub = await aiSplitChapters(cfg, ch.text, onUsage, maxChapterChars, feedback, concurrency, stats);
+      const sub = await aiSplitChapters(cfg, ch.text, onUsage, maxChapterChars, feedback, concurrency, stats, opts);
       const mechanical = sub.length > 1 && sub.every((s) => /^第\d+部分$/.test(s.title));
       if (mechanical) {
         log.info("split", `超长章无内层标题，改用剧情断点切分：${ch.title}`, { chars: ch.text.length });
@@ -411,8 +463,10 @@ export async function aiSplitChapters(
     }
   }
   result.forEach((c, i) => (c.index = i));
-  // 碎章合并：插图/后记/特典等不足 MIN_CHAPTER_CHARS 的章节并入相邻章节，不再独占一章
-  const merged = mergeTinyChapters(result, MIN_CHAPTER_CHARS);
+  // 碎章合并：插图/后记/特典等不足阈值的章节并入相邻章节，不再独占一章；
+  // 阈值设 0 即关闭合并（特殊小章独立成章，配合 keepSpecials 找回 26 章）
+  const minChars = opts?.minChapterChars ?? MIN_CHAPTER_CHARS;
+  const merged = mergeTinyChapters(result, minChars);
   if (merged.merged > 0) {
     log.info("split", `碎章合并：${merged.merged} 个过小章节已并入相邻章节`, {});
     if (stats) stats.mergedTiny = (stats.mergedTiny ?? 0) + merged.merged;

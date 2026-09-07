@@ -244,8 +244,8 @@ export function imageTaskMatchesSelectionKey(task: ImageTask, key: string): bool
     case "bg":
       return task.kind === "background" && task.id === parts[1];
     case "cg":
-      // 选择键为 1-based 显示章号（cg:1:s1），任务 id 为 0-based（0_s1），此处 -1 对齐
-      return task.kind === "cg" && task.id === `${Number(parts[1]) - 1}_${parts[2]}`;
+      // 选择键为 1-based 显示章号（cg:1:s1），任务 id 已是纯 scene.id（去章节号后不再含章节信息）
+      return task.kind === "cg" && task.id === parts[2];
     default:
       return false;
   }

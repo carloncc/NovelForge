@@ -202,6 +202,8 @@ export interface DialogueLine {
   emotion?: string;
   /** 台词对应的角色动作（引用角色卡的 actions 列表，如 "point"/"wave"）；渲染时切换对应动作立绘 */
   action?: string;
+  /** 台词时角色所穿服装（引用角色卡的 costumes 列表 id）；换装后持续有效直到再次标注，渲染时切换对应服装立绘 */
+  costume?: string;
   /** 配音语速（0.5-2，MiniMax 取值；缺省用全局 TTS 配置默认值）。AI 生成剧本时按语气自动标注 */
   speed?: number;
   /** 配音情绪（如 happy/sad/angry/calm/whisper/surprised），传给 TTS 合成；缺省用全局配置默认值 */
@@ -431,7 +433,17 @@ export interface GenerationOptions {
   extractAgent?: boolean;
   /** 目标语言（如 en/ja），把小说翻译成该语言后再生成；空 = 使用原文 */
   language?: string;
+  /** AI 分章碎章合并阈值（默认 3000 字；0 = 不合并，特殊小章独立成章） */
+  splitMinChapterChars?: number;
+  /** AI 分章保留特殊章节（后记/番外/特典/插图等不被当杂项丢弃） */
+  splitKeepSpecials?: boolean;
+  /** 提取分段字数上限（0/缺省 = 自动：按语种估算，上限 15 万字）。
+   * 中转网关常有单请求 ~70 秒超时墙：大段必 500 时手动调小（如 40000），段小单次必能跑完。 */
+  extractChunkChars?: number;
   rerunChapters?: number[];
+  /** 单章强制重跑（与 rerunChapters 同口径的 novel index）：这些章节跳过剧本缓存直接重写，
+   * 不需要填意见；图像阶段同范围背景/CG 同步强制。由章节盘/剧本页「全量」开关传入。 */
+  rerunChaptersForce?: number[];
 }
 
 export interface PipelineEvent {

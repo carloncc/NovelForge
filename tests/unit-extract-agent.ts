@@ -1,6 +1,7 @@
 import type { ToolCall } from "../src/api/openaiCompatible";
 import {
   applyTool,
+  extractChunkBudget,
   finalizeState,
   isToolUnsupportedError,
   mergeCandidates,
@@ -177,6 +178,35 @@ async function main(): Promise<void> {
     s.characters.set("a", { id: "a", name: "林骁", appearance: "黑发", clothing: "", personality: "", voiceDesc: "", color: "#3b5bdb", imagePrompt: "" });
     const summary = stateSummary(s);
     assert(typeof summary === "string" && summary.includes("林骁"), "stateSummary 应序列化角色");
+  }
+
+  /* ---------- 11) splitNovelForAgent：分段无损覆盖（分段提取的基础） ---------- */
+  {
+    // 短文本不分段
+    const one = splitNovelForAgent("短文本", 100000);
+    assert(one.length === 1 && one[0] === "短文本", "短文本应单段");
+    // 长文本分段：拼接还原必须等于原文（不少字）
+    const para = "第一段正文内容专门凑字数用。\n\n第二段正文内容专门凑字数用。\n\n";
+    const long = para.repeat(200);
+    const chunks = splitNovelForAgent(long, 2000);
+    assert(chunks.length > 3, `长文本应切多段，实际 ${chunks.length}`);
+    // 切片连续分区：直接拼接必须逐字还原原文
+    assert(chunks.join("") === long, "分段拼接必须无损还原原文");
+    for (const c of chunks) assert(c.length <= 2000, "每段不应超预算");
+    // 空文本兜底
+    assert(splitNovelForAgent("", 1000).length === 1, "空文本应返回单段");
+  }
+
+  /* ---------- 12) extractChunkBudget：手动值只收紧不放大 ---------- */
+  {
+    const cfg = { model: "m", extra: { contextLength: 700000 } } as never;
+    const zh = "林澈拔剑。".repeat(5000);
+    const auto = extractChunkBudget(cfg, zh);
+    assert(auto > 10000 && auto <= 120000, `自动预算应在合理区间，实际 ${auto}`);
+    assert(extractChunkBudget(cfg, zh, 0) === auto, "0 应等同自动");
+    assert(extractChunkBudget(cfg, zh, -5) === auto, "负数应等同自动");
+    assert(extractChunkBudget(cfg, zh, 40000) === 40000, "手动 40000 应生效");
+    assert(extractChunkBudget(cfg, zh, 99999999) === auto, "手动超大值不应放大自动预算");
   }
 
   console.log("unit-extract-agent: 全部通过 ✅");
