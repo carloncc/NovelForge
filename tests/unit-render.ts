@@ -166,6 +166,54 @@ function main(): void {
   // 第三句未知服装 id：回退默认立绘不断线
   assert(out8.includes("changeFigure:f_linche.png"), "未知服装应回退默认立绘");
 
+  // 9) 长旁白（无配音）按句读拆成多条消息：一屏一句，接近 galgame 节奏
+  const s9 = makeScript();
+  s9.scenes[0].lines = [
+    { type: "narration", text: "城门前，守夜人林澈握着佩剑，目光如鹰隼般扫视着官道上渐行渐远的人流。他已经在城门口站了整整六个时辰。" },
+  ];
+  const out9 = renderChapter(s9, { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets, introCard: false }, 1);
+  const nar9 = nonCommentLines(out9).filter((l) => l.startsWith(":"));
+  assert(nar9.length === 2, `长旁白应拆成 2 条，实际 ${nar9.length}: ${nar9.join(" | ")}`);
+  assert(nar9[0].includes("渐行渐远的人流。") && nar9[1].includes("站了整整六个时辰。"), "长旁白拆分点错误");
+
+  // 10) 动作标签旁白吸收：形如「X叹了口气：」不独立成行，下句对话保留
+  const s10 = makeScript();
+  s10.scenes[0].lines = [
+    { type: "narration", text: "林澈叹了口气：" },
+    { type: "dialogue", characterId: "linche", text: "你和你爹一样，认死理。", emotion: "normal" },
+  ];
+  const out10 = renderChapter(s10, { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets, introCard: false }, 1);
+  assert(!out10.includes("林澈叹了口气"), "动作标签旁白不应独立成行");
+  assert(out10.includes("林澈:你和你爹一样"), "动作标签后的对话应保留");
+
+  // 11) 动作标签推断说话人/情绪：对话缺说话人（narrator）且情绪默认时用标签
+  const s11 = makeScript();
+  s11.scenes[0].lines = [
+    { type: "narration", text: "林澈冷冷道：" },
+    { type: "dialogue", characterId: "narrator", text: "苏小姐消息灵通。", emotion: "normal" },
+  ];
+  const out11 = renderChapter(s11, { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets, introCard: false }, 1);
+  assert(out11.includes("林澈:苏小姐消息灵通。"), "动作标签应推断说话人（冷冷道→angry 情绪）");
+
+  // 12) 内心独白用「」包裹区分
+  const s12 = makeScript();
+  s12.scenes[0].lines = [
+    { type: "narration", text: "我该不该相信她呢……", monologue: true },
+  ];
+  const out12 = renderChapter(s12, { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets, introCard: false }, 1);
+  assert(out12.includes(":「我该不该相信她呢……」;"), "独白应用「」包裹");
+
+  // 13) 有配音的台词不拆分：保持单条，避免换页掐断语音
+  const s13 = makeScript();
+  s13.scenes[0].lines = [
+    { type: "dialogue", characterId: "linche", text: "城门前，守夜人林澈握着佩剑，目光如鹰隼般扫视着官道上渐行渐远的人流。他已经在城门口站了整整六个时辰。", emotion: "normal" },
+  ];
+  const vocalAssets: RenderAssets = { ...assets, vocal: { ch0_s1_0: "/x/v_ch0_s1_0.mp3" } };
+  const out13 = renderChapter(s13, { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets: vocalAssets, introCard: false }, 1);
+  const dia13 = nonCommentLines(out13).filter((l) => l.startsWith("林澈:"));
+  assert(dia13.length === 1, `有配音的长台词应保持单条，实际 ${dia13.length}`);
+  assert(dia13[0].includes("v_ch0_s1_0.mp3"), "配音应挂在唯一一条消息上");
+
   console.log("=== 渲染注入边界测试通过 ===");
 }
 main();
