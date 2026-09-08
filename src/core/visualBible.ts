@@ -15,6 +15,7 @@ import type {
   StyleSource,
   VisualBibleCacheBinding,
   VisualBibleCharacter,
+  VisualBibleCostumeSheet,
   VisualBiblePendingInvalidation,
 } from "./types";
 import { updateAssetMap } from "./assetMap";
@@ -200,6 +201,11 @@ export function sanitizeVisualBibleId(id: string): string {
 
 export function canonicalThreeViewPath(characterId: string): string {
   return `threeview_${sanitizeVisualBibleId(characterId)}.png`;
+}
+
+/** 单套服装三视图锚点的规范存储路径（与默认装三视图 / 换装立绘均不冲突） */
+export function canonicalCostumeSheetPath(characterId: string, costumeId: string): string {
+  return `threeview_${sanitizeVisualBibleId(characterId)}_ct_${sanitizeVisualBibleId(costumeId)}.png`;
 }
 
 export function canonicalCharacterReferencePath(characterId: string, extension: string): string {
@@ -464,6 +470,48 @@ async function resolveCharacterReference(
   return {};
 }
 
+/** 为角色每套服装生成独立三视图锚点：以默认装三视图为身份参考，保证换装后脸/体/装一致。
+ * 单套失败不阻断草稿（该服装换装立绘回退用默认装三视图）。 */
+async function generateCostumeSheets(
+  imageCfg: ApiConfig,
+  card: CharacterCard,
+  baseSheetPath: string,
+  styleDescription: string,
+  styleReference: ImageReference,
+  artifactDir: string,
+  artifactRevision: string,
+  dependencies: VisualBibleServiceDependencies,
+): Promise<Record<string, VisualBibleCostumeSheet>> {
+  const sheets: Record<string, VisualBibleCostumeSheet> = {};
+  for (const ct of card.costumes ?? []) {
+    const ctPrompt = normalizeStyleDescription(ct.prompt || "");
+    if (!ctPrompt) continue;
+    try {
+      const baseSheet = await readReferenceFile(
+        visualBibleArtifactPath(artifactDir, baseSheetPath),
+        `Base three-view for ${card.id}`,
+      );
+      const generated = await dependencies.generateImage(
+        imageCfg,
+        characterThreeViewPrompt(ctPrompt, styleDescription),
+        {
+          references: [
+            { role: "identity", ...baseSheet, sourcePath: visualBibleArtifactPath(artifactDir, baseSheetPath), required: true },
+            styleReference,
+          ],
+          size: "1024x1024",
+        },
+      );
+      const ctPath = revisionedArtifactPath(canonicalCostumeSheetPath(card.id, ct.id), artifactRevision);
+      await writeGeneratedImage(visualBibleArtifactPath(artifactDir, ctPath), generated);
+      sheets[ct.id] = { threeViewPath: ctPath, prompt: ctPrompt, revision: 1, approved: false };
+    } catch {
+      // 服装三视图失败不阻断：该服装换装立绘回退用默认装三视图
+    }
+  }
+  return sheets;
+}
+
 function characterThreeViewPrompt(identityPrompt: string, styleDescription: string): string {
   const identity = stripBackground(normalizeStyleDescription(identityPrompt));
   // 风格描述同样剥背景词：LLM 综合的风格里可能带 "soft gradient background" 之类，
@@ -635,12 +683,17 @@ async function createDraftCharacters(
       });
       const threeViewPath = revisionedArtifactPath(canonicalThreeViewPath(card.id), artifactRevision);
       await writeGeneratedImage(visualBibleArtifactPath(artifactDir, threeViewPath), generated);
+      // 每套服装独立三视图锚点（以默认装三视图为身份参考，换装立绘可引用）
+      const costumeSheets = await generateCostumeSheets(
+        input.imageCfg, card, threeViewPath, styleDescription, styleReference, artifactDir, artifactRevision, dependencies,
+      );
       const sourceRevision = reference.relativePath ? 1 : 0;
       const actionIds = productionActionIds(card);
       characters[card.id] = {
         ...(reference.relativePath ? { sourceReferencePath: reference.relativePath } : {}),
         threeViewPath,
         prompt,
+        ...(Object.keys(costumeSheets).length ? { costumeSheets } : {}),
         ...(actionIds.length ? { actionIds } : {}),
         approved: false,
         revision: 1,
@@ -764,6 +817,54 @@ export async function regenerateStyleSample(
   return visualBiblePath(outputDir, published.styleReferencePath);
 }
 
+/** 单独重生成某一套服装的三视图锚点：以默认装三视图为身份参考，覆盖现有版本并打回待确认 */
+export async function regenerateCostumeSheet(
+  outputDir: string,
+  bible: ProjectVisualBible,
+  request: CharacterSheetRegenerationRequest & { costumeId: string },
+): Promise<string> {
+  const { character: characterCard, imageCfg, costumeId } = request;
+  const characterId = characterCard.id;
+  const costume = characterCard.costumes?.find((ct) => ct.id === costumeId);
+  if (!costume) throw new Error(`Character ${characterId} has no costume "${costumeId}"`);
+  const dependencies = request.dependencies ?? DEFAULT_DEPENDENCIES;
+  const invalidationCharacter = characterWithHistoricalActions(bible, characterCard);
+  const published = await mutateAndPublishVisualBible(outputDir, async (artifactDir, artifactRevision) => {
+    const storedCharacter = bible.characters[characterId];
+    if (!storedCharacter) throw new Error(`Character ${characterId} is missing from visual bible`);
+    const baseSheetPath = storedCharacter.threeViewPath;
+    const baseSheet = await readReferenceFile(visualBibleArtifactPath(artifactDir, baseSheetPath), `Base three-view for ${characterId}`);
+    const styleReferencePath = visualBiblePath(outputDir, bible.styleReferencePath);
+    const styleReference = await readReferenceFile(styleReferencePath, "Global style reference");
+    const generated = await dependencies.generateImage(
+      imageCfg,
+      characterThreeViewPrompt(normalizeStyleDescription(costume.prompt), bible.styleDescription),
+      {
+        references: [
+          { role: "identity", ...baseSheet, sourcePath: visualBibleArtifactPath(artifactDir, baseSheetPath), required: true },
+          { role: "style", ...styleReference, sourcePath: styleReferencePath, required: false },
+        ],
+        size: "1024x1024",
+      },
+    );
+    const next = cloneVisualBible(bible);
+    const nextCharacter = next.characters[characterId];
+    const sheets = { ...(nextCharacter.costumeSheets ?? {}) };
+    const nextSheet = {
+      threeViewPath: revisionedArtifactPath(canonicalCostumeSheetPath(characterId, costumeId), artifactRevision),
+      prompt: normalizeStyleDescription(costume.prompt),
+      revision: (sheets[costumeId]?.revision ?? 0) + 1,
+      approved: false,
+    };
+    sheets[costumeId] = nextSheet;
+    nextCharacter.costumeSheets = sheets;
+    markCharacterBibleChanged(next, characterId);
+    await writeGeneratedImage(visualBibleArtifactPath(artifactDir, nextSheet.threeViewPath), generated);
+    return { bible: next, cards: [characterCard], afterPublish: () => invalidateCharacterCaches(outputDir, invalidationCharacter) };
+  }, bible);
+  return visualBiblePath(outputDir, published.characters[characterId].costumeSheets?.[costumeId]?.threeViewPath ?? "");
+}
+
 export async function regenerateCharacterSheet(
   outputDir: string,
   bible: ProjectVisualBible,
@@ -833,6 +934,19 @@ export async function regenerateCharacterSheet(
     nextCharacter.sheetSourceRevision = characterSourceRevision(nextCharacter);
     reconcileCacheBindingKeys(next);
     await writeGeneratedImage(visualBibleArtifactPath(artifactDir, nextCharacter.threeViewPath), generated);
+    // 同步重生成每套服装的三视图锚点（以新默认装三视图为身份参考）
+    const costumeSheets = await generateCostumeSheets(
+      imageCfg,
+      characterCard,
+      nextCharacter.threeViewPath,
+      bible.styleDescription,
+      { role: "style", ...styleReference, sourcePath: styleReferencePath },
+      artifactDir,
+      artifactRevision,
+      dependencies,
+    );
+    if (Object.keys(costumeSheets).length) nextCharacter.costumeSheets = costumeSheets;
+    else delete nextCharacter.costumeSheets;
     return { bible: next, cards: [characterCard], afterPublish: () => invalidateCharacterCaches(outputDir, invalidationCharacter) };
   }, bible);
   return visualBiblePath(outputDir, published.characters[characterId].threeViewPath);
@@ -1381,7 +1495,20 @@ function isVisualBibleCharacter(rawCharacter: unknown): rawCharacter is VisualBi
     ))
     && (candidate.sourceRevision === undefined || (Number.isInteger(candidate.sourceRevision) && candidate.sourceRevision >= 0))
     && (candidate.sheetSourceRevision === undefined || (Number.isInteger(candidate.sheetSourceRevision) && candidate.sheetSourceRevision >= 0))
-    && (candidate.sourceReferencePath === undefined || isProjectLocalPath(candidate.sourceReferencePath));
+    && (candidate.sourceReferencePath === undefined || isProjectLocalPath(candidate.sourceReferencePath))
+    && (candidate.costumeSheets === undefined || (
+      typeof candidate.costumeSheets === "object"
+      && !Array.isArray(candidate.costumeSheets)
+      && Object.values(candidate.costumeSheets).every((sheetRaw) => {
+        const sheet = sheetRaw as Partial<VisualBibleCostumeSheet> | undefined;
+        return !!sheet
+          && typeof sheet === "object"
+          && isProjectLocalPath(sheet.threeViewPath ?? "")
+          && typeof sheet.prompt === "string"
+          && typeof sheet.approved === "boolean"
+          && Number.isInteger(sheet.revision) && (sheet.revision ?? 0) >= 0;
+      })
+    ));
 }
 
 function characterSourceRevision(character: VisualBibleCharacter): number {
@@ -1435,6 +1562,11 @@ function parseManifest(rawManifest: unknown): ProjectVisualBible {
     )) {
       throw new Error(`non-canonical character reference path: ${id}`);
     }
+    for (const [costumeId, sheet] of Object.entries(character.costumeSheets ?? {})) {
+      if (!isCanonicalOrRevisionedPath(sheet.threeViewPath, canonicalCostumeSheetPath(id, costumeId))) {
+        throw new Error(`non-canonical costume sheet path: ${id}/${costumeId}`);
+      }
+    }
   }
   if (!isPendingInvalidation(candidate.pendingInvalidation, candidate.characters)) {
     throw new Error("invalid pending invalidation scope");
@@ -1457,6 +1589,14 @@ function manifestForSave(bible: ProjectVisualBible): ProjectVisualBible {
       threeViewPath: character.threeViewPath,
       prompt: character.prompt,
       ...(character.actionIds?.length ? { actionIds: [...character.actionIds] } : {}),
+      ...(character.costumeSheets && Object.keys(character.costumeSheets).length
+        ? { costumeSheets: Object.fromEntries(Object.entries(character.costumeSheets).map(([ctId, sheet]) => [ctId, {
+            threeViewPath: sheet.threeViewPath,
+            prompt: sheet.prompt,
+            revision: sheet.revision,
+            approved: sheet.approved,
+          }])) }
+        : {}),
       approved: character.approved,
       revision: character.revision,
       sourceRevision: characterSourceRevision(character),
@@ -1738,8 +1878,13 @@ function cloneVisualBible(bible: ProjectVisualBible): ProjectVisualBible {
     characters: Object.fromEntries(Object.entries(bible.characters).map(([id, character]) => [id, {
       ...character,
       ...(character.actionIds ? { actionIds: [...character.actionIds] } : {}),
+      ...(character.costumeSheets ? { costumeSheets: cloneCostumeSheets(character.costumeSheets) } : {}),
     }])),
   };
+}
+
+function cloneCostumeSheets(sheets: Record<string, VisualBibleCostumeSheet>): Record<string, VisualBibleCostumeSheet> {
+  return Object.fromEntries(Object.entries(sheets).map(([costumeId, sheet]) => [costumeId, { ...sheet }]));
 }
 
 function syncVisualBible(target: ProjectVisualBible, source: ProjectVisualBible): void {
@@ -1751,6 +1896,7 @@ function syncVisualBible(target: ProjectVisualBible, source: ProjectVisualBible)
   target.characters = Object.fromEntries(Object.entries(source.characters).map(([id, character]) => [id, {
     ...character,
     ...(character.actionIds ? { actionIds: [...character.actionIds] } : {}),
+    ...(character.costumeSheets ? { costumeSheets: cloneCostumeSheets(character.costumeSheets) } : {}),
   }]));
   target.inputFingerprint = source.inputFingerprint;
   if (source.pendingInvalidation) target.pendingInvalidation = clonePendingInvalidation(source.pendingInvalidation);
@@ -1915,7 +2061,13 @@ export async function computeProjectVisualBibleFingerprint(
       characterReferenceB64[card.id] = parseLegacyImage(card.referenceImage).dataB64;
     }
   }
-  return computeVisualBibleFingerprint({
+  // 服装三视图纳入指纹：增删服装 / 重生成服装锚点都会使视觉守门过期待确认；
+  // 无服装时保持原指纹，避免升级后误判全部项目过期
+  const costumeEntries = Object.entries(bible.characters)
+    .flatMap(([characterId, character]) => Object.entries(character.costumeSheets ?? {})
+      .map(([costumeId, sheet]) => `${characterId}:${costumeId}:${sheet.revision}:${normalizeStyleDescription(sheet.prompt)}`))
+    .sort();
+  const baseFingerprint = await computeVisualBibleFingerprint({
     novel,
     characters,
     styleSource: bible.styleSource,
@@ -1923,6 +2075,7 @@ export async function computeProjectVisualBibleFingerprint(
     sourceReferenceB64,
     characterReferenceB64,
   });
+  return costumeEntries.length ? `${baseFingerprint}-ct${stableHash(JSON.stringify(costumeEntries))}` : baseFingerprint;
 }
 
 export function assertVisualBibleApprovalStatus(

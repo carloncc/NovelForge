@@ -128,10 +128,22 @@ export interface ImageModelCapabilities {
   referenceEncoding: "raw-base64" | "data-url";
 }
 
+/** 单套服装的独立三视图锚点：以默认装三视图为身份参考生成，换装立绘以此为图生图参考 */
+export interface VisualBibleCostumeSheet {
+  /** 该服装三视图的存储路径（相对 .novel2vn/visual-bible/） */
+  threeViewPath: string;
+  /** 生成该服装三视图用的英文 prompt（= 该服装的 prompt） */
+  prompt: string;
+  revision: number;
+  approved: boolean;
+}
+
 export interface VisualBibleCharacter {
   sourceReferencePath?: string;
   threeViewPath: string;
   prompt: string;
+  /** 每套服装的独立三视图锚点（换装立绘以此为图生图参考，保证换装后身份/服装一致） */
+  costumeSheets?: Record<string, VisualBibleCostumeSheet>;
   /** Action IDs used by production image-task naming. Stored so reload can revalidate collisions. */
   actionIds?: string[];
   approved: boolean;

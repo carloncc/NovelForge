@@ -1853,6 +1853,27 @@ details.card[open] > summary.card-head h3::before {
   border-radius: var(--radius-sm);
 }
 
+.vb-costume-sheets {
+  grid-column: 1 / -1;
+  border-top: 1px dashed var(--border);
+  padding-top: var(--space-3);
+  margin-top: var(--space-3);
+}
+
+.vb-costume-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: 6px 0;
+}
+
+.vb-costume-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
 .vb-approval-bar {
   display: flex;
   align-items: center;

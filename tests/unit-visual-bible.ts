@@ -24,6 +24,7 @@ import {
   visualBibleDir,
   visualBibleManifestPath,
   visualBiblePath,
+  canonicalCostumeSheetPath,
   type VisualBibleServiceDependencies,
 } from "../src/core/visualBible";
 import { ReferenceImageError } from "../src/api/openaiCompatible";
@@ -1100,6 +1101,72 @@ async function testLifecycleOperationsRequireFreshReview(): Promise<void> {
   await acceptCharacterSheet(ROOT, value, "alice");
 }
 
+async function testCostumeSheetsGeneratedAndFingerprinted(): Promise<void> {
+  await reset();
+  const generations: { prompt: string; references: ImageReference[] }[] = [];
+  const dependencies: VisualBibleServiceDependencies = {
+    chatText: async (_cfg, _system, user) => user.includes("STYLE SUMMARIES")
+      ? "graphic novel, restrained red and teal palette, crisp inks"
+      : "era: contemporary; genre: thriller; mood: tense",
+    chatVision: async () => "unused",
+    generateImage: async (_cfg, prompt, options) => {
+      generations.push({ prompt, references: options.references ?? [] });
+      return { dataB64: PNG_B64, mime: "image/png" };
+    },
+  };
+  const aliceWithCostume = character("alice");
+  aliceWithCostume.costumes = [
+    { id: "battle", name: "战斗服", prompt: "alice wearing battle armor, full body, anime style" },
+    { id: "formal", name: "礼服", prompt: "alice wearing a formal dress, full body, anime style" },
+  ];
+
+  const draft = await createVisualBibleDraft({
+    outputDir: ROOT,
+    novel: novel(),
+    cards: { title: "Book", characters: [aliceWithCostume], scenes: [], items: [] },
+    imageCfg: apiConfig("image"),
+    styleSource: "novel_analysis",
+    llmCfg: apiConfig("text"),
+  }, dependencies);
+
+  const battleSheet = draft.characters.alice.costumeSheets?.["battle"];
+  assert(battleSheet !== undefined, "costume sheet should be generated for each costume");
+  assert(
+    /^threeview_alice_ct_battle\.rev-[A-Za-z0-9-]+\.png$/.test(battleSheet.threeViewPath),
+    `costume sheet should use canonical path: ${battleSheet.threeViewPath}`,
+  );
+  assert(battleSheet.prompt.includes("battle armor"), "costume sheet prompt should be the costume prompt");
+  assert(await tauri.pathExists(visualBiblePath(ROOT, battleSheet.threeViewPath)), "costume sheet artifact should exist on disk");
+  assert(canonicalCostumeSheetPath("alice", "battle") === "threeview_alice_ct_battle.png", "canonical costume sheet path helper");
+  assert(draft.characters.alice.costumeSheets?.["formal"] !== undefined, "all costumes should get a sheet");
+
+  // 换装三视图的身份参考 = 默认装三视图（role identity 在前、style 在后）
+  const costumeGeneration = generations.find((generation) => generation.prompt.includes("battle armor"));
+  assert(costumeGeneration !== undefined, "costume sheet generation should have been called");
+  assert(
+    costumeGeneration.references[0]?.role === "identity" && costumeGeneration.references[1]?.role === "style",
+    "costume sheet should reference base three-view identity + global style",
+  );
+
+  // manifest 往返保留 costumeSheets
+  await saveVisualBible(ROOT, draft);
+  const loaded = await loadVisualBible(ROOT);
+  assert(
+    loaded.visualBible?.characters.alice.costumeSheets?.["battle"]?.threeViewPath === battleSheet.threeViewPath,
+    "costume sheets should round-trip through the manifest",
+  );
+
+  // 服装三视图纳入指纹：存在时改变指纹
+  const cards = [aliceWithCostume];
+  const fpWith = await computeProjectVisualBibleFingerprint(ROOT, draft, novel(), cards);
+  const withoutSheets = {
+    ...draft,
+    characters: { alice: { ...draft.characters.alice, costumeSheets: undefined } },
+  };
+  const fpWithout = await computeProjectVisualBibleFingerprint(ROOT, withoutSheets, novel(), cards);
+  assert(fpWith !== fpWithout, "costume sheets should alter the visual-bible fingerprint");
+}
+
 async function main(): Promise<void> {
   await testManifestRoundTripAndRecovery();
   await testManifestRejectsIncompleteCharacterCacheBinding();
@@ -1123,6 +1190,7 @@ async function main(): Promise<void> {
   await testDraftAndManifestFailuresPreservePublishedBible();
   await testAnalysisUsesBoundedInputs();
   await testBothDraftSourcesCreateCanonicalArtifacts();
+  await testCostumeSheetsGeneratedAndFingerprinted();
   await testMissingStyleReferenceRejectsSheetRegeneration();
   await testRegenerateDescriptionToleratesTrailingChatter();
   await testBatchRegenerationParallelizesAndIsolatesFailures();

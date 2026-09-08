@@ -23,6 +23,7 @@ import {
   regenerateAllCharacterSheets,
   regenerateCharacterDescription,
   regenerateCharacterSheet,
+  regenerateCostumeSheet as regenerateCostumeSheetApi,
   regenerateStyleSample,
   replaceCharacterReference,
   replaceStyleReference,
@@ -747,6 +748,57 @@ function characterNeedsRegeneration(characterId: string): boolean {
   if (!character) return true;
   return character.sourceRevision !== character.sheetSourceRevision;
 }
+
+/** 角色的服装三视图锚点列表（合并卡片服装名，便于展示） */
+function costumeSheetsFor(characterId: string): { costumeId: string; name: string; sheet: import("../core/types").VisualBibleCostumeSheet }[] {
+  const character = characters.value.find((candidate) => candidate.id === characterId);
+  const sheets = bible.value?.characters[characterId]?.costumeSheets;
+  if (!sheets || !character) return [];
+  const names = new Map((character.costumes ?? []).map((ct) => [ct.id, ct.name]));
+  return Object.entries(sheets).map(([costumeId, sheet]) => ({
+    costumeId,
+    name: names.get(costumeId) ?? costumeId,
+    sheet,
+  }));
+}
+
+function characterCostumeSheetPath(characterId: string, costumeId: string): string {
+  const stored = bible.value?.characters[characterId]?.costumeSheets?.[costumeId]?.threeViewPath;
+  return vbPath(stored);
+}
+
+/** 单独重生成某套服装的三视图锚点 */
+async function regenCostumeSheet(characterId: string, costumeId: string): Promise<void> {
+  const current = bible.value;
+  const imageCfg = activeConfig("image");
+  const character = characters.value.find((candidate) => candidate.id === characterId);
+  if (!current || !outputDir.value || !character) return;
+  if (!imageCfg?.apiKey) {
+    charErrors.value[characterId] = t("重生成服装三视图需要配置图像生成 API");
+    return;
+  }
+  const costumeName = character.costumes?.find((ct) => ct.id === costumeId)?.name ?? costumeId;
+  busyKey.value = `char-sheet-ct:${characterId}:${costumeId}`;
+  charErrors.value[characterId] = "";
+  if (!window.confirm(`重新生成「${character.name}」的「${costumeName}」三视图？将覆盖当前版本（角色打回待确认），并产生 1 张图片费用。`)) {
+    busyKey.value = "";
+    return;
+  }
+  pushLog({ step: "视觉守门", message: `角色「${character.name}」服装「${costumeName}」三视图重生成开始…`, level: "info", at: Date.now() });
+  try {
+    await regenerateCostumeSheetApi(outputDir.value, current, { character, imageCfg, costumeId });
+    await refreshApprovalValidation();
+    await afterMutation();
+    pushLog({ step: "视觉守门", message: `角色「${character.name}」服装「${costumeName}」三视图已重新生成`, level: "success", at: Date.now() });
+  } catch (e) {
+    charErrors.value[characterId] = visualBibleErrorMessage(e, {
+      imageModel: imageCfg.model,
+      visionModel: activeConfig("vision")?.model,
+    });
+  } finally {
+    busyKey.value = "";
+  }
+}
 </script>
 
 <template>
@@ -932,6 +984,26 @@ function characterNeedsRegeneration(characterId: string): boolean {
                   <LazyThumb v-if="characterSheetPath(row.id)" :path="characterSheetPath(row.id)" :alt="t('三视图')" />
                   <span v-else>{{ t("未生成") }}</span>
                   <span class="thumb-label">{{ t("点击放大") }}</span>
+                </div>
+              </div>
+              <div v-if="costumeSheetsFor(row.id).length" class="vb-preview-block vb-costume-sheets">
+                <div class="vb-preview-label">{{ t("服装三视图锚点（换装用）") }}</div>
+                <div v-for="cs in costumeSheetsFor(row.id)" :key="cs.costumeId" class="vb-costume-row">
+                  <div
+                    class="vb-thumb"
+                    :class="{ missing: !characterCostumeSheetPath(row.id, cs.costumeId) }"
+                    @click="characterCostumeSheetPath(row.id, cs.costumeId) && openPreview(characterCostumeSheetPath(row.id, cs.costumeId), `${row.name} · ${cs.name} 三视图`)"
+                  >
+                    <LazyThumb v-if="characterCostumeSheetPath(row.id, cs.costumeId)" :path="characterCostumeSheetPath(row.id, cs.costumeId)" :alt="`${cs.name} 三视图`" />
+                    <span v-else>{{ t("未生成") }}</span>
+                  </div>
+                  <div class="vb-costume-meta">
+                    <span class="asset-name">{{ cs.name }}</span>
+                    <button class="btn ghost small" :disabled="!!busyKey" @click="regenCostumeSheet(row.id, cs.costumeId)">
+                      <span v-if="busyKey === `char-sheet-ct:${row.id}:${cs.costumeId}`" class="spinner" />
+                      {{ t("重生成") }}
+                    </button>
+                  </div>
                 </div>
               </div>
               <div class="vb-character-prompt">

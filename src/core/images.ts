@@ -637,10 +637,13 @@ export async function resolveImageTaskReferences(
     }
     if (!identity && bibleCharacter) {
       try {
+        // 换装任务优先引用该服装的独立三视图锚点（保证换装后身份/服装一致）
+        const costumeSheet = task.costume ? bibleCharacter.costumeSheets?.[task.costume] : undefined;
+        const fallbackPath = costumeSheet?.threeViewPath ?? bibleCharacter.threeViewPath;
         identity = await fileReference(
-          visualBibleArtifactPath(context.outputDir, bibleCharacter.threeViewPath),
+          visualBibleArtifactPath(context.outputDir, fallbackPath),
           "identity",
-          `Approved identity for ${task.characterId}`,
+          `Approved identity for ${task.characterId}${costumeSheet ? ` (costume ${task.costume})` : ""}`,
         );
       } catch (e) {
         logger.warn("images", "视觉守门参考图也缺失，改用纯文本生图", {
