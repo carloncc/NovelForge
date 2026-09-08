@@ -33,7 +33,7 @@ export const emptyChapterLight = (): ChapterLight => ({
 
 /** 单章内容是否完成（队列目标判定口径：剧本＋图像齐了即可，不含配音） */
 export function isChapterContentComplete(l: ChapterLight): boolean {
-  return l.script && l.imageTotal > 0 && l.imageDone >= l.imageTotal;
+  return l.script && (l.imageTotal === 0 || l.imageDone >= l.imageTotal);
 }
 
 export interface ChapterStatusInput {
@@ -181,27 +181,32 @@ export function useChapterStatus(input: ChapterStatusInput) {
           script = null;
         }
         if (script) {
-          // 图像覆盖率：与管线同口径（锚点除外）
-          try {
-            const tasks = buildImageTasks([script], { title: "", characters, scenes: [], items: [] } as never, {
-              figurePerCharacter: 1,
-              cgPerChapter: options.cgPerChapter ?? 0,
-              maxPerChapter: options.imageBudgetPerChapter ?? 0,
-              figureEmotions: options.figureEmotions,
-              detail: options.figureDetail ?? "full",
-              threeView: options.characterPoses !== false,
-              actions: options.characterPoses !== false,
-              styleAnchor: false,
-            }).filter((t) => t.kind !== "anchor");
-            light.imageTotal = tasks.length;
-            light.imageDone = tasks.filter((t) => {
-              if (t.kind === "background") return Boolean(assets.bg[t.id]);
-              if (t.kind === "cg") return Boolean(assets.cg[t.id]);
-              if (t.kind === "item") return Boolean(assets.item[t.id]);
-              return Boolean(assets.figure[t.id]);
-            }).length;
-          } catch {
-            /* 任务构建失败则保持 0 */
+          // 图像覆盖率：与管线同口径（锚点除外）；关闭「图像」时不统计（章节完成只看剧本）
+          if (options.useImage === false) {
+            light.imageTotal = 0;
+            light.imageDone = 0;
+          } else {
+            try {
+              const tasks = buildImageTasks([script], { title: "", characters, scenes: [], items: [] } as never, {
+                figurePerCharacter: 1,
+                cgPerChapter: options.cgPerChapter ?? 0,
+                maxPerChapter: options.imageBudgetPerChapter ?? 0,
+                figureEmotions: options.figureEmotions,
+                detail: options.figureDetail ?? "full",
+                threeView: options.characterPoses !== false,
+                actions: options.characterPoses !== false,
+                styleAnchor: false,
+              }).filter((t) => t.kind !== "anchor");
+              light.imageTotal = tasks.length;
+              light.imageDone = tasks.filter((t) => {
+                if (t.kind === "background") return Boolean(assets.bg[t.id]);
+                if (t.kind === "cg") return Boolean(assets.cg[t.id]);
+                if (t.kind === "item") return Boolean(assets.item[t.id]);
+                return Boolean(assets.figure[t.id]);
+              }).length;
+            } catch {
+              /* 任务构建失败则保持 0 */
+            }
           }
           // 配音覆盖率：无 TTS 配置则跳过显示
           if (ttsCfg && characters.length) {

@@ -651,6 +651,7 @@ function selectAllInTab(): void {
       for (const r of figureRows.value) {
         add(`threeview:${r.id}`);
         for (const e of r.emotions) add(`figure:${r.id}:${e.emo}`);
+        for (const ct of r.costumes) add(`figure:${r.id}:ct_${ct.id}`);
         for (const a of r.actions) add(`action:${r.id}:${a.id}`);
       }
       break;
@@ -1046,11 +1047,13 @@ interface ExecuteOptions {
   requireFullScriptCoverage?: boolean;
   /** 纯追加式增量加更：旧全文 + 新增文本（要求 stages 含 split+extract+script） */
   append?: { baseFullText: string; tailText: string };
+  /** 队列内部调用：允许在 queueRunning 期间执行（否则排队时外部按钮会被全部拦截） */
+  fromQueue?: boolean;
 }
 
 async function execute(opts: ExecuteOptions): Promise<boolean> {
   error.value = "";
-  if (busy.value || assetBusy.value) return false;
+  if (busy.value || assetBusy.value || (queueRunning.value && !opts.fromQueue)) return false;
   let novel = projectState.novel;
   // 需要小说正文的阶段（分章/翻译/提取/剧本）；图像/配音/组装只依赖已生成的卡片与章节，不强制 novel
   const needsNovel = opts.stages.some((s) => s === "split" || s === "translate" || s === "extract" || s === "script");
@@ -1327,6 +1330,13 @@ async function persistRunLog(): Promise<void> {
 }
 
 function start(): void {
+  if (queueRunning.value) return;
+  // 主按钮与执行方式联动：单章节模式走逐章队列（避免误触发整书＋配音的昂贵全流程）
+  if (runMode.value === "chapter") {
+    if (busy.value) return;
+    void runChapterQueue();
+    return;
+  }
   lastRunFailedTasks.value = [];
   void execute({ stages: selectedStagesList.value, clearLogsFirst: true });
 }
@@ -1600,6 +1610,7 @@ async function runChapterFullRegen(novelIdx: number): Promise<boolean> {
     rerunChapters: [novelIdx],
     rerunChaptersForce: forceAll ? [novelIdx] : undefined,
     requireFullScriptCoverage: true,
+    fromQueue: true,
   });
   scriptChapterFeedback.value[novelIdx] = "";
   void loadScripts();
@@ -1813,7 +1824,7 @@ function regenChapter(idx: number): void {
 /* ==================== 素材 Tab 操作 ==================== */
 
 async function regenCtx(): Promise<RegenContext | null> {
-  if (busy.value || assetBusy.value) return null;
+  if (busy.value || assetBusy.value || queueRunning.value) return null;
   const r = projectState.lastResult;
   if (!r) return null;
   const imageCfg = activeConfig("image");
@@ -2255,6 +2266,10 @@ async function browseOutputDir(): Promise<void> {
 }
 
 async function loadProjectState(): Promise<void> {
+  if (busy.value || assetBusy.value || queueRunning.value) {
+    error.value = t("有任务正在生成中，请等待完成或中止后再切换项目");
+    return;
+  }
   const dir = outputDirDraft.value.trim();
   if (!dir) return;
   await restoreProject(dir);
@@ -2758,9 +2773,9 @@ function fileExistsLabel(file: string | undefined): string {
 <template>
   <div class="inner">
     <PageHead :title="t('生成项目')" :sub="t('三种执行方式：整书生成 / 单阶段重跑 / 单章节生成。先在上方选方式，再看下方运行与内容。')">
-      <button class="btn" :disabled="busy || !!assetBusy" @click="start">
+      <button class="btn" :disabled="busy || !!assetBusy || queueRunning" @click="start">
         <span v-if="busy" class="spinner" />
-        {{ busy ? t("生成中…") : t("开始生成") }}
+        {{ busy ? t("生成中…") : runMode === "chapter" ? t("顺序生成未完成") : t("开始生成") }}
       </button>
       <button v-if="busy" class="btn danger" @click="stop">{{ t("停止") }}</button>
     </PageHead>
@@ -2785,9 +2800,9 @@ function fileExistsLabel(file: string | undefined): string {
         </div>
       </div>
       <div class="row">
-        <button :class="runMode === 'full' ? 'btn small' : 'btn secondary small'" @click="runMode = 'full'">{{ t("整书生成") }}</button>
-        <button :class="runMode === 'stage' ? 'btn small' : 'btn secondary small'" @click="runMode = 'stage'">{{ t("单阶段重跑") }}</button>
-        <button :class="runMode === 'chapter' ? 'btn small' : 'btn secondary small'" @click="runMode = 'chapter'">{{ t("单章节生成") }}</button>
+        <button :class="runMode === 'full' ? 'btn small' : 'btn secondary small'" :disabled="queueRunning" @click="runMode = 'full'">{{ t("整书生成") }}</button>
+        <button :class="runMode === 'stage' ? 'btn small' : 'btn secondary small'" :disabled="queueRunning" @click="runMode = 'stage'">{{ t("单阶段重跑") }}</button>
+        <button :class="runMode === 'chapter' ? 'btn small' : 'btn secondary small'" :disabled="queueRunning" @click="runMode = 'chapter'">{{ t("单章节生成") }}</button>
       </div>
     </div>
 
@@ -2796,8 +2811,8 @@ function fileExistsLabel(file: string | undefined): string {
         <span>{{ t("输出目录") }}</span>
         <div class="row">
           <input type="text" v-model="outputDirDraft" class="grow" />
-          <button class="btn secondary small shrink-0" @click="browseOutputDir">{{ t("浏览…") }}</button>
-          <button class="btn ghost small shrink-0" @click="loadProjectState">{{ t("加载该项目") }}</button>
+          <button class="btn secondary small shrink-0" :disabled="busy || !!assetBusy || queueRunning" @click="browseOutputDir">{{ t("浏览…") }}</button>
+          <button class="btn ghost small shrink-0" :disabled="busy || !!assetBusy || queueRunning" @click="loadProjectState">{{ t("加载该项目") }}</button>
         </div>
       </label>
     </div>
@@ -2946,7 +2961,7 @@ function fileExistsLabel(file: string | undefined): string {
         {{ t("未勾选的阶段会复用已有结果（卡片/剧本/素材），不会重新计费；若某阶段从未运行过则会提示需先运行。") }}
       </p>
       <div class="row mt-3">
-        <button class="btn" :disabled="busy || !!assetBusy" @click="start">
+        <button class="btn" :disabled="busy || !!assetBusy || queueRunning" @click="start">
           <span v-if="busy" class="spinner" />
           {{ busy ? t("生成中…") : t("开始生成（整书）") }}
         </button>
@@ -3365,7 +3380,7 @@ function fileExistsLabel(file: string | undefined): string {
             </span>
             <div style="display: flex; gap: 8px">
               <button class="btn small" @click="copyText(vp.videoPrompt, '视频提示词')">{{ t("复制提示词") }}</button>
-              <button class="btn small" :disabled="busy || !!assetBusy" @click="importVideo(vp)">{{ t("导入视频") }}</button>
+              <button class="btn small" :disabled="busy || !!assetBusy || queueRunning" @click="importVideo(vp)">{{ t("导入视频") }}</button>
             </div>
           </div>
           <p style="color: var(--text-dim); font-size: 12px; margin-top: 6px">{{ vp.description }}</p>
