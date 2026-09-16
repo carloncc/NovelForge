@@ -1,6 +1,6 @@
 import { reactive } from "vue";
 import type { ApiConfig, ChapterScript, GenerationOptions, NovelDoc, PipelineResult } from "../core/types";
-import { buildImageTasks } from "../core/images";
+import { chapterScopeImageTasks } from "../core/chapterAssets";
 import { buildVoiceJobs } from "../core/voice";
 import { scriptCacheRest, titleHash } from "../core/cache";
 import { parseChapterScript } from "../core/dataValidation";
@@ -44,6 +44,8 @@ export interface ChapterStatusInput {
   getTtsConfig: () => ApiConfig | undefined;
   /** 文本 LLM 是否可用（决定剧本缓存是正式版还是演示版前缀） */
   getLlmAvailable: () => boolean;
+  /** 图像生成 API 是否可用：未配置时图像灯不参与完成判定（否则章节永远差图、队列无法收敛） */
+  getImageAvailable: () => boolean;
 }
 
 interface ScriptCacheEntry {
@@ -88,17 +90,26 @@ export function useChapterStatus(input: ChapterStatusInput) {
     return { title: ch.title, text: ch.text };
   }
 
-  async function loadCards(dir: string): Promise<{ id: string; name: string }[] | null> {
+  /** 卡片（角色＋物品）：章节图像口径要按「本章出场角色/物品」收窄，所以物品也要读 */
+  async function loadCards(
+    dir: string,
+  ): Promise<{ characters: { id: string; name: string }[]; items: { id: string; name: string }[] } | null> {
     for (const f of ["cards.json", "cards_demo.json"]) {
       try {
         const { text } = await tauri.readTextFile(`${dir}/.novel2vn/${f}`);
-        const parsed = JSON.parse(text) as { characters?: { id: string; name: string }[] };
-        if (parsed && Array.isArray(parsed.characters)) return parsed.characters;
+        const parsed = JSON.parse(text) as {
+          characters?: { id: string; name: string }[];
+          items?: { id: string; name: string }[];
+        };
+        if (parsed && Array.isArray(parsed.characters)) {
+          return { characters: parsed.characters, items: Array.isArray(parsed.items) ? parsed.items : [] };
+        }
       } catch {
         /* 换下一个 */
       }
     }
-    return input.getResult()?.cards.characters ?? null;
+    const cached = input.getResult()?.cards;
+    return cached ? { characters: cached.characters, items: cached.items ?? [] } : null;
   }
 
   async function refresh(): Promise<void> {
@@ -141,13 +152,16 @@ export function useChapterStatus(input: ChapterStatusInput) {
       const expected = expectedByIndex.get(n);
       if (expected !== undefined && rest === expected) {
         picked.set(n, { pos: n, path: e.path, legacy: false });
-      } else if (!rest.includes("_t")) {
-        // 旧版无指纹：兼容保留（字典序最新），计数提示
+      } else if (!rest.includes("_t") && picked.get(n)?.legacy !== false) {
+        // 旧版无指纹：只在这一章没有指纹匹配结果时才兜底保留（字典序最新）。
+        // 必须加这道守卫：排序用的是 localeCompare，`..._t14bgja8.json` 排在 `....json` 之前，
+        // 否则旧缓存会在循环后面把刚匹配上的新剧本覆盖掉 —— 界面退化成「剧本·旧缓存」，
+        // 并用过期场景 id 算出整章的假缺失（用户报告的 76/91 就是这么来的）。
         picked.set(n, { pos: n, path: e.path, legacy: true });
-        legacyCount++;
       }
       // 失配的新格式文件＝过期残留，直接忽略（下次跑剧本阶段自动清理）
     }
+    legacyCount = [...picked.values()].filter((x) => x.legacy).length;
     legacy.count = legacyCount;
 
     // 素材映射与卡片只读一次
@@ -164,8 +178,14 @@ export function useChapterStatus(input: ChapterStatusInput) {
     } catch {
       /* 无映射则全 0 */
     }
-    const characters = (await loadCards(dir)) ?? [];
+    const cardsInfo = await loadCards(dir);
+    const characters = cardsInfo?.characters ?? [];
+    const items = cardsInfo?.items ?? [];
+    // activeConfig("tts") 永远返回一个对象（可能只是没填 Key 的默认配置），
+    // 用 apiKey 判定"是否真的能配音"，否则未配置时每章也显示「配音0/N」。
     const ttsCfg = input.getTtsConfig();
+    const ttsUsable = !!ttsCfg?.apiKey;
+    const imageAvailable = input.getImageAvailable();
 
     for (const ch of enabled) {
       const light = emptyChapterLight();
@@ -181,22 +201,17 @@ export function useChapterStatus(input: ChapterStatusInput) {
           script = null;
         }
         if (script) {
-          // 图像覆盖率：与管线同口径（锚点除外）；关闭「图像」时不统计（章节完成只看剧本）
-          if (options.useImage === false) {
+          // 图像覆盖率：只算本章自己的图（本章背景/CG ＋ 本章出场角色/物品），
+          // 与「生成本章」的实际范围一致。旧实现把全书角色的三视图/立绘/动作都算进每一章，
+          // 导致每章都是同一个大数字（如 76/91），看不出本章缺什么，还漏掉了物品。
+          // 关闭「图像」或未配置图像 API 时不统计（章节完成只看剧本）——否则图永远生不出来，
+          // 章节永远"未完成"，「顺序补全未完成」反复空转。
+          if (options.useImage === false || !imageAvailable) {
             light.imageTotal = 0;
             light.imageDone = 0;
           } else {
             try {
-              const tasks = buildImageTasks([script], { title: "", characters, scenes: [], items: [] } as never, {
-                figurePerCharacter: 1,
-                cgPerChapter: options.cgPerChapter ?? 0,
-                maxPerChapter: options.imageBudgetPerChapter ?? 0,
-                figureEmotions: options.figureEmotions,
-                detail: options.figureDetail ?? "full",
-                threeView: options.characterPoses !== false,
-                actions: options.characterPoses !== false,
-                styleAnchor: false,
-              }).filter((t) => t.kind !== "anchor");
+              const tasks = chapterScopeImageTasks(script, { title: "", characters, scenes: [], items } as never, options);
               light.imageTotal = tasks.length;
               light.imageDone = tasks.filter((t) => {
                 if (t.kind === "background") return Boolean(assets.bg[t.id]);
@@ -208,8 +223,8 @@ export function useChapterStatus(input: ChapterStatusInput) {
               /* 任务构建失败则保持 0 */
             }
           }
-          // 配音覆盖率：无 TTS 配置则跳过显示
-          if (ttsCfg && characters.length) {
+          // 配音覆盖率：未配置 TTS（无 API Key）则跳过显示
+          if (ttsUsable && characters.length) {
             try {
               const jobs = buildVoiceJobs(ttsCfg, [script], characters as never);
               light.voiceTotal = jobs.length;

@@ -100,6 +100,7 @@ async function downloadCurrentModel(): Promise<void> {
 
 async function removeCurrentModel(): Promise<void> {
   const model = currentCutoutModel.value;
+  if (!window.confirm(`删除本地 AI 抠图模型「${model.id}」？删除后需重新下载才能再用于抠图。继续吗？`)) return;
   cutoutBusy.value = true;
   cutoutError.value = "";
   try {
@@ -288,6 +289,8 @@ function setImageCapability<K extends keyof ImageModelCapabilities>(
 ): void {
   cfg.extra ??= {};
   cfg.extra.imageCapabilities = { ...editableImageCapabilities(cfg), [key]: value };
+  // 能力与模型绑定：换模型后旧能力自动作废（resolveImageModelCapabilities 只信同模型的结果）
+  cfg.extra.imageCapabilitiesModel = cfg.model;
 }
 
 function imageCapabilityConflict(cfg: ApiConfig): boolean {
@@ -555,7 +558,8 @@ watch(
                 @change="
                   (e: any) => {
                     const list = (e.target as HTMLTextAreaElement).value.split('\n').map((s: string) => s.trim()).filter(Boolean);
-                    if (list.length) cfg.extra!.voiceLibrary = list;
+                    // 允许清空：此前空值被忽略，音色库只能增不能减
+                    cfg.extra!.voiceLibrary = list;
                   }
                 "
                 placeholder="female-tianmei&#10;male-qn-qingse&#10;female-chengshu"

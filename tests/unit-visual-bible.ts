@@ -639,7 +639,7 @@ async function testCharacterOnlyReapprovalPreservesGlobalCaches(): Promise<void>
   assert(assets.bg.room && assets.cg.scene && assets.item.key && assets.figure.bob, "character-only reapproval must preserve unrelated asset mappings");
 }
 
-async function testGlobalFingerprintChangePromotesCharacterScopeBeforeApproval(): Promise<void> {
+async function testNovelOnlyFingerprintChangeKeepsExplicitCharacterScope(): Promise<void> {
   await reset();
   const originalNovel = novel();
   const changedNovel = novel("Chapter one\nThe city is now a sunlit coastal village.");
@@ -678,13 +678,19 @@ async function testGlobalFingerprintChangePromotesCharacterScopeBeforeApproval()
     styleDescription: value.styleDescription,
   });
   await refreshVisualBibleFingerprint(ROOT, value, changedFingerprint, cards);
-  assert(value.pendingInvalidation?.scope === "global", "a later novel/style fingerprint change must promote stale character scope to global");
+  // 小说正文变了 → 指纹变；但画图输入没变。绝不能升级成 global：那会把全书图片删掉重画（本次线上事故的根因）。
+  assert(
+    value.pendingInvalidation?.scope === "characters"
+    && value.pendingInvalidation.characterIds?.join(",") === "alice",
+    "a novel-only fingerprint change must not promote the explicit character scope to global",
+  );
 
   await approveVisualBible(ROOT, value, { novel: changedNovel, characters: cards });
-  assert(!(await tauri.pathExists(`${imageDir}/bg_room.png`)), "global reapproval must remove background caches after scope promotion");
-  assert(!(await tauri.pathExists(`${imageDir}/figure_bob_normal.png`)), "global reapproval must remove other-character caches after scope promotion");
+  assert(await tauri.pathExists(`${imageDir}/bg_room.png`), "novel-only reapproval must keep background caches");
+  assert(await tauri.pathExists(`${imageDir}/figure_bob_normal.png`), "novel-only reapproval must keep other-character caches");
+  assert(value.cacheBinding?.globalFingerprint === "approved-global-v1", "novel-only reapproval must keep the global cache binding");
   const assets = JSON.parse((await tauri.readTextFile(`${ROOT}/.novel2vn/assets.json`)).text) as AssetMap;
-  assert(!Object.keys(assets.bg).length && !Object.keys(assets.cg).length && !Object.keys(assets.figure).length && !Object.keys(assets.item).length, "global reapproval must clear every visual mapping");
+  assert(assets.bg.room && assets.cg.scene && assets.figure.bob && assets.item.key, "novel-only reapproval must keep every unrelated visual mapping");
 }
 
 async function testCharacterReferenceFingerprintRefreshPreservesScope(): Promise<void> {
@@ -693,7 +699,7 @@ async function testCharacterReferenceFingerprintRefreshPreservesScope(): Promise
   await writeRequiredArtifacts(value);
   value.pendingInvalidation = { scope: "characters", characterIds: ["alice"] };
   await saveVisualBible(ROOT, value);
-  await refreshVisualBibleFingerprint(ROOT, value, "changed-reference-fingerprint", [character("alice")], true);
+  await refreshVisualBibleFingerprint(ROOT, value, "changed-reference-fingerprint", [character("alice")]);
   assert(
     value.pendingInvalidation?.scope === "characters"
     && value.pendingInvalidation.characterIds?.join(",") === "alice",
@@ -1045,6 +1051,55 @@ async function testBatchRegenerationParallelizesAndIsolatesFailures(): Promise<v
   assert(manifest.characters.bob.approved === true, "失败的 bob 应保持已确认");
 }
 
+async function testBatchRegenerationRebuildsCostumeSheets(): Promise<void> {
+  await reset();
+  const value = bible();
+  // 预置一个已不存在的旧服装锚点：卡片去掉该服装后，全局重建应删掉它（与单角色重建同语义）
+  value.characters.alice.costumeSheets = {
+    old: { threeViewPath: "threeview_alice_ct_old.png", prompt: "alice old outfit", revision: 1, approved: true },
+  };
+  await writeRequiredArtifacts(value);
+  await tauri.writeFileBase64(visualBiblePath(ROOT, "threeview_alice_ct_old.png"), PNG_B64);
+  await saveVisualBible(ROOT, value);
+
+  const generations: { prompt: string; references: ImageReference[] }[] = [];
+  const dependencies: VisualBibleServiceDependencies = {
+    chatText: async () => JSON.stringify({ imagePrompt: "alice regen figure", threeViewPrompt: "alice regen turnaround" }),
+    chatVision: async () => "unused",
+    generateImage: async (_cfg, prompt, options) => {
+      generations.push({ prompt, references: options.references ?? [] });
+      return { dataB64: PNG_B64, mime: "image/png" };
+    },
+  };
+  const aliceWithCostume = character("alice");
+  aliceWithCostume.costumes = [
+    { id: "battle", name: "战斗服", prompt: "alice wearing battle armor, full body, anime style" },
+  ];
+  const result = await regenerateAllCharacterSheets(ROOT, value, {
+    characters: [aliceWithCostume],
+    imageCfg: apiConfig("image"),
+    visionCfg: apiConfig("text"),
+    dependencies,
+  });
+  assert(result.ok.length === 1 && result.failed.length === 0, "批量重建应成功");
+
+  const loaded = await loadVisualBible(ROOT);
+  const sheets = loaded.visualBible!.characters.alice.costumeSheets;
+  assert(sheets?.["battle"] !== undefined, "全局重建应为现存服装生成三视图锚点（与单角色重建一致）");
+  assert(sheets?.["old"] === undefined, "卡片已无的服装锚点应在全局重建后被清除");
+  assert(
+    await tauri.pathExists(visualBiblePath(ROOT, sheets!.battle.threeViewPath)),
+    "重建的服装锚点文件应落盘",
+  );
+  const costumeGeneration = generations.find((generation) => generation.prompt.includes("battle armor"));
+  assert(costumeGeneration !== undefined, "服装锚点生成应被调用");
+  assert(
+    costumeGeneration.references[0]?.role === "identity" && costumeGeneration.references[1]?.role === "style",
+    "服装锚点应以新默认装三视图为身份参考＋全局风格",
+  );
+  assert(loaded.visualBible!.characters.alice.approved === false, "重建后角色应打回待确认");
+}
+
 async function testLifecycleOperationsRequireFreshReview(): Promise<void> {
   await reset();
   const value = { ...bible(), status: "approved" as const, approvedAt: "2026-08-07T00:00:00.000Z" };
@@ -1183,7 +1238,7 @@ async function main(): Promise<void> {
   await testConcurrentApprovalAndReferenceReplacementSerialize();
   await testScopedInvalidation();
   await testCharacterOnlyReapprovalPreservesGlobalCaches();
-  await testGlobalFingerprintChangePromotesCharacterScopeBeforeApproval();
+  await testNovelOnlyFingerprintChangeKeepsExplicitCharacterScope();
   await testCharacterReferenceFingerprintRefreshPreservesScope();
   await testLegacyMigrationIsIdempotent();
   await testLegacyMigrationKeepsInlineDataOnConflictAndPublishFailure();
@@ -1194,6 +1249,7 @@ async function main(): Promise<void> {
   await testMissingStyleReferenceRejectsSheetRegeneration();
   await testRegenerateDescriptionToleratesTrailingChatter();
   await testBatchRegenerationParallelizesAndIsolatesFailures();
+  await testBatchRegenerationRebuildsCostumeSheets();
   await testLifecycleOperationsRequireFreshReview();
   await tauri.removePath(ROOT).catch(() => {});
   console.log("=== visual bible unit tests passed ===");

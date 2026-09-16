@@ -249,18 +249,25 @@ export function buildVoiceJobs(  cfg: ApiConfig,
   return jobs;
 }
 
-/** 执行单个配音任务（管线批处理与单句重配共用） */
+/** 执行单个配音任务（管线批处理与单句重配共用）。
+ * isAborted 返回 true 时：不再发起新的合成请求、退避等待中直接放弃（已发出的请求仍会跑完）。 */
 export async function runVoiceJob(
   cfg: ApiConfig,
   job: VoiceJob,
   cacheRoot: string,
   log: (ev: PipelineEvent) => void,
   force = false,
+  isAborted?: () => boolean,
 ): Promise<string | null> {
   const cacheDir = cacheDirFor(cacheRoot, "vocal");
   await tauri.mkdirAll(cacheDir);
   const jobConfig = job.ttsConfigId ? ttsConfigById(job.ttsConfigId) : cfg;
-  if (!jobConfig) throw new Error(`声音 ${job.voice} 绑定的 TTS 配置不存在`);
+  if (!jobConfig) {
+    // 不能 throw：单个任务的配置缺失不应打死整批（此前会冒泡中断整个批处理）
+    log({ step: "配音", message: `配音失败（跳过）：声音 ${job.voice} 绑定的 TTS 配置不存在`, level: "warn", at: Date.now() });
+    return null;
+  }
+  if (isAborted?.()) return null;
   const library = voiceLibraryFor(jobConfig);
   const fallbackVoice = library[0] || "default";
   if (!force) {
@@ -281,14 +288,17 @@ export async function runVoiceJob(
     await tauri.writeFileBase64(path, res.dataB64);
     return path;
   };
-  // 限流重试：1002 / rate limit 时等待退避后重试（最多 4 次，避免一次撞限就把整句跳过）
-  const speakWithRetry = async (voice: string): Promise<string> => {
+  // 限流重试：1002 / rate limit 时等待退避后重试（最多 4 次，避免一次撞限就把整句跳过）。
+  // 中止信号在每轮开始与退避等待后检查：点了停止就不再发起新的合成请求。
+  const speakWithRetry = async (voice: string): Promise<string | null> => {
     let lastError: unknown;
     for (let attempt = 0; attempt < 4; attempt++) {
+      if (isAborted?.()) return null;
       if (attempt > 0) {
         const backoff = 8000 + attempt * 5000;
         log({ step: "配音", message: `检测到限流，${backoff / 1000}s 后重试（第 ${attempt} 次）`, level: "warn", at: Date.now() });
         await sleep(backoff);
+        if (isAborted?.()) return null;
       }
       try {
         return await speak(voice);
@@ -408,10 +418,12 @@ export async function generateVoice(
     while (idx < pending.length) {
       if (isAborted?.()) return;
       const job = pending[idx++];
-      const path = await runVoiceJob(cfg, job, cacheRoot, log, force);
+      const path = await runVoiceJob(cfg, job, cacheRoot, log, force, isAborted);
       emitProgress(job);
       if (path) {
         vocal[job.key] = path;
+      } else if (isAborted?.()) {
+        return; // 中止：不计失败、不再派发（避免停止后失败数虚增）
       } else {
         failed.push({
           id: `vocal_${job.key}`,
@@ -445,7 +457,7 @@ export async function repairVoiceAssets(
   log: (ev: PipelineEvent) => void,
   concurrency = 3,
   isAborted?: () => boolean,
-): Promise<{ total: number; fixed: number; failed: number; purged: number; kept: number; relinked: number }> {
+): Promise<{ total: number; fixed: number; failed: number; purged: number; kept: number; relinked: number; aborted: boolean }> {
   const cacheRoot = `${outputDir.replace(/[\\/]+$/, "")}/.novel2vn/cache`;
   const cacheDir = cacheDirFor(cacheRoot, "vocal");
   await tauri.mkdirAll(cacheDir);
@@ -459,6 +471,10 @@ export async function repairVoiceAssets(
   let contentIndex: Map<string, string> | null = null;
   const relinkedPairs: Array<{ key: string; path: string }> = [];
   for (const job of jobs) {
+    if (isAborted?.()) {
+      log({ step: "配音", message: "补全缺失/错配语音已中断（检查阶段，未开始重配）", level: "warn", at: Date.now() });
+      return { total: jobs.length, fixed: 0, failed: 0, purged: 0, kept: 0, relinked, aborted: true };
+    }
     const entry = assets.vocal[job.key];
     const entryOk = !!entry
       && baseNameNoExt(entry) === baseNameNoExt(job.file)
@@ -498,11 +514,15 @@ export async function repairVoiceAssets(
     while (idx < need.length) {
       if (isAborted?.()) return;
       const job = need[idx++];
-      const path = await runVoiceJob(cfg, job, cacheRoot, log, true);
+      const path = await runVoiceJob(cfg, job, cacheRoot, log, true, isAborted);
       if (path) {
         fixed++;
-        // 串行合并防并发写丢（与 regenerate 流程一致）
-        mergeChain = mergeChain.then(() => updateAssetMap(outputDir, (map) => { map.vocal[job.key] = path; }));
+        // 串行合并防并发写丢（与 regenerate 流程一致）；catch 防止单次写失败毒化整条链
+        mergeChain = mergeChain
+          .then(() => updateAssetMap(outputDir, (map) => { map.vocal[job.key] = path; }))
+          .catch((e) => {
+            log({ step: "配音", message: `配音映射合并失败（该句未入映射，可重新补配）：${String(e).slice(0, 120)}`, level: "warn", at: Date.now() });
+          });
         await mergeChain;
         log({
           step: "配音",
@@ -510,36 +530,43 @@ export async function repairVoiceAssets(
           level: "info",
           at: Date.now(),
         });
+      } else if (isAborted?.()) {
+        return;
       } else {
         failed++;
       }
     }
   };
   await Promise.all(Array.from({ length: Math.max(1, Math.min(concurrency, need.length)) }, () => worker()));
-  // 结构归位：删除缓存中不再被 assets.json 引用的孤儿语音文件
+  const aborted = isAborted?.() === true;
+  // 结构归位：删除缓存中不再被 assets.json 引用的孤儿语音文件（已中断则不清理，避免半套状态）
   let purged = 0;
-  const finalAssets = await readAssetMap(outputDir);
-  const referenced = new Set<string>();
-  for (const p of Object.values(finalAssets.vocal)) referenced.add((p.split(/[\\/]/).pop() || "").toLowerCase());
-  try {
-    const entries = await tauri.listDir(cacheDir);
-    for (const e of entries) {
-      if (e.isDir || !/^v_/i.test(e.name)) continue;
-      if (!referenced.has(e.name.toLowerCase())) {
-        await tauri.removePath(e.path).catch(() => {});
-        purged++;
+  if (!aborted) {
+    const finalAssets = await readAssetMap(outputDir);
+    const referenced = new Set<string>();
+    for (const p of Object.values(finalAssets.vocal)) referenced.add((p.split(/[\\/]/).pop() || "").toLowerCase());
+    try {
+      const entries = await tauri.listDir(cacheDir);
+      for (const e of entries) {
+        if (e.isDir || !/^v_/i.test(e.name)) continue;
+        if (!referenced.has(e.name.toLowerCase())) {
+          await tauri.removePath(e.path).catch(() => {});
+          purged++;
+        }
       }
+    } catch {
+      /* 目录不存在等 */
     }
-  } catch {
-    /* 目录不存在等 */
   }
   log({
     step: "配音",
-    message: purged
-      ? `配音结构修复完成：孤儿认领 ${relinked} 句，重配 ${fixed} 句，失败 ${failed}，清理孤儿文件 ${purged} 个`
-      : `配音结构修复完成：孤儿认领 ${relinked} 句，重配 ${fixed} 句，失败 ${failed}（无需清理孤儿文件）`,
-    level: fixed ? "success" : "info",
+    message: aborted
+      ? `配音结构修复已中断：孤儿认领 ${relinked} 句，重配 ${fixed} 句，失败 ${failed}（孤儿文件未清理）`
+      : purged
+        ? `配音结构修复完成：孤儿认领 ${relinked} 句，重配 ${fixed} 句，失败 ${failed}，清理孤儿文件 ${purged} 个`
+        : `配音结构修复完成：孤儿认领 ${relinked} 句，重配 ${fixed} 句，失败 ${failed}（无需清理孤儿文件）`,
+    level: aborted ? "warn" : fixed ? "success" : "info",
     at: Date.now(),
   });
-  return { total, fixed, failed, purged, kept: total - need.length - relinked, relinked };
+  return { total, fixed, failed, purged, kept: total - need.length - relinked, relinked, aborted };
 }

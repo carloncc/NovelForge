@@ -23,6 +23,8 @@ export interface RenderOptions {
   figureActions?: boolean;
   /** 环境音效音量（0-100，默认 35）：旧硬编码 25 偏小，快进/手机外放下几乎听不见 */
   seVolume?: number;
+  /** 环境音效（SE，按场景氛围播放雨/雷/风等）：默认关闭；false 时不输出 playEffect，成品完全静音 */
+  useSe?: boolean;
 }
 
 export function sanitizeId(id: string): string {
@@ -355,7 +357,8 @@ export function renderChapter(
       }
     }
     // 环境音效（SE）：按场景氛围匹配播放（用户可用同名文件覆盖内置音效）
-    const se = detectSe(scene);
+    // useSe === false（默认）时完全不输出 playEffect；开启后才按氛围匹配
+    const se = opts.useSe === false ? null : detectSe(scene);
     if (se && se !== lastSe) {
       lastSe = se;
       const seVolume = opts.seVolume ?? 35;

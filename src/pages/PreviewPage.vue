@@ -6,6 +6,7 @@ import { t } from "../i18n";
 import { errMsg } from "../utils/errors";
 import { log } from "../utils/logger";
 import PageHead from "../components/PageHead.vue";
+import { goPage } from "../stores/nav";
 
 const url = ref("");
 const starting = ref(false);
@@ -40,9 +41,15 @@ async function startPreview(): Promise<void> {
 }
 
 async function stopPreview(): Promise<void> {
-  await tauri.stopPreviewServer();
-  url.value = "";
-  log.info("page", "预览服务器已停止");
+  try {
+    await tauri.stopPreviewServer();
+    url.value = "";
+    error.value = "";
+    log.info("page", "预览服务器已停止");
+  } catch (e) {
+    log.error("page", "停止预览失败", { error: errMsg(e) });
+    error.value = `停止预览失败：${errMsg(e)}（可重试；若服务已退出可忽略）`;
+  }
 }
 
 async function openInBrowser(): Promise<void> {
@@ -82,7 +89,7 @@ onBeforeUnmount(() => {
 <template>
   <div class="inner">
     <PageHead :title="t('预览')" :sub="t('内嵌 WebGAL 引擎实时试玩（本地服务器，所见即所得）')">
-      <button class="btn" :disabled="starting" @click="startPreview">
+      <button class="btn" :disabled="starting || !projectState.lastResult" @click="startPreview">
         <span v-if="starting" class="spinner" />
         {{ t("启动/刷新") }}
       </button>
@@ -104,7 +111,14 @@ onBeforeUnmount(() => {
     </div>
     <div v-else class="card empty">
       <img src="/src/assets/empty-preview.png" alt="" style="width: 280px; opacity: 0.9; margin-bottom: 12px" />
-      <p>{{ t("启动预览后在此显示游戏画面") }}</p>
+      <template v-if="projectState.lastResult">
+        <p>{{ t("启动预览后在此显示游戏画面") }}</p>
+        <button class="btn mt-3" :disabled="starting" @click="startPreview">{{ t("启动预览") }}</button>
+      </template>
+      <template v-else>
+        <p class="hint">{{ t("还没有生成结果：先在生成页跑一次生成，再回来这里试玩。") }}</p>
+        <button class="btn mt-3" @click="goPage('generate')">{{ t("去生成项目") }}</button>
+      </template>
     </div>
   </div>
 </template>

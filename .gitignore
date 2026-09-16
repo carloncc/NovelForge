@@ -17,7 +17,6 @@ public/models/
 public/onnx/
 
 # 测试临时产物（stage-runner / visual-bible-workflow / xiangxing 等跑测产生的中间缓存与输出）
-tests/.tmp-*/
-tests/.tmp-baseline-*.txt
+tests/.tmp-*
 # 跑测覆盖的 cutout 输出快照（与已跟踪的 cutout_green_bg_input.out.png 重复）
 tests/cutout-fixtures/green_bg_input.out.png

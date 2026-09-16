@@ -10,7 +10,9 @@ import { renderConfig, type WebgalLanguage } from "../core/render";
 import { errMsg } from "../utils/errors";
 import { log } from "../utils/logger";
 import { t } from "../i18n";
+import { useGenerateController } from "../stores/generate";
 import PageHead from "../components/PageHead.vue";
+import { goPage } from "../stores/nav";
 import type { ExportSettings } from "../core/types";
 
 const message = ref("");
@@ -37,6 +39,10 @@ watch(
 );
 
 const outputDir = computed(() => projectState.lastResult?.meta.outputDir ?? projectState.outputDir);
+
+const { busy: pipelineBusy, assetBusy: genAssetBusy, queueRunning: genQueueRunning } = useGenerateController();
+/** 生成/素材任务运行中禁止打包与写配置：会把写到一半的文件打进包里 */
+const runBusy = computed(() => pipelineBusy.value || !!genAssetBusy.value || genQueueRunning.value);
 
 function setMsg(m: string, ok = true): void {
   message.value = m;
@@ -67,6 +73,7 @@ async function copyPath(): Promise<void> {
 }
 
 async function runLint(): Promise<void> {
+  if (linting.value) return;
   linting.value = true;
   lintReport.value = null;
   try {
@@ -89,6 +96,14 @@ async function applySettings(): Promise<void> {
   const dir = outputDir.value;
   if (!dir) {
     setMsg(t("尚未生成项目"), false);
+    return;
+  }
+  if (!projectState.lastResult) {
+    setMsg(t("还没有生成结果：请先在「生成项目」页生成并组装后再应用设置"), false);
+    return;
+  }
+  if (runBusy.value) {
+    setMsg(t("生成任务正在运行：请等它完成后再应用设置，避免把配置写进正在写入的目录"), false);
     return;
   }
   const key = settings.value.gameKey.trim();
@@ -125,9 +140,14 @@ async function applySettings(): Promise<void> {
 }
 
 async function packZip(): Promise<void> {
+  if (packing.value) return;
   const dir = outputDir.value;
   if (!dir) {
     setMsg(t("尚未生成项目"), false);
+    return;
+  }
+  if (runBusy.value) {
+    setMsg(t("生成任务正在运行：请等它完成再打包，避免把写到一半的文件打进压缩包"), false);
     return;
   }
   // 打包前必做一次新鲜检查：用旧报告会误拦（修完没重跑）或漏拦（新改坏了没检查）
@@ -195,7 +215,7 @@ async function openExternal(url: string): Promise<void> {
   <div class="inner">
     <PageHead :title="t('导出')" :sub="t('标准 WebGAL 项目三端分发：网页版 zip / PC exe / 手机 APK')">
       <button class="btn secondary" @click="openFolder">{{ t("打开项目文件夹") }}</button>
-      <button class="btn" :disabled="packing" @click="packZip">
+      <button class="btn" :disabled="packing || !projectState.lastResult" @click="packZip">
         <span v-if="packing" class="spinner" />
         {{ packing ? t("打包中…") : t("打包网页版 zip") }}
       </button>
@@ -214,8 +234,9 @@ async function openExternal(url: string): Promise<void> {
       </p>
       <p class="hint" style="margin-top: 4px"><code>{{ projectState.lastResult.meta.outputDir }}</code></p>
     </div>
-    <div v-else class="card">
-      <p class="faint">{{ t("尚未生成项目") }}</p>
+    <div v-else class="card empty-next">
+      <p class="hint">{{ t("还没有生成结果：先去生成页跑一次整书生成，再回来打包分发。") }}</p>
+      <button class="btn small" @click="goPage('generate')">{{ t("去生成项目") }}</button>
     </div>
 
     <div class="card">
@@ -252,6 +273,7 @@ async function openExternal(url: string): Promise<void> {
             <span v-if="linting" class="spinner" />
             {{ linting ? t("检查中…") : t("运行检查") }}
           </button>
+          <button v-if="lintReport?.errors.length" class="btn ghost small" @click="goPage('generate')">{{ t("去生成页修复") }}</button>
         </div>
       </div>
       <template v-if="lintReport">

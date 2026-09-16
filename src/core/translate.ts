@@ -34,6 +34,11 @@ export async function translateChapter(
     { maxTokens: Math.min(resolveContextLength(cfg), 32_768), temperature: 0.3, onUsage },
   );
   const raw = (r.content || "").trim();
+  // 截断/空结果不能缓存复用：finish_reason=length 说明译文被砍断，静默入库会永久使用残缺译文
+  if (r.finishReason === "length") {
+    throw new Error("翻译结果被截断（达到输出上限）：请调大输出上限或缩短章节后重试");
+  }
+  if (!raw) throw new Error("翻译返回为空");
   const lines = raw.split("\n");
   const title = (lines[0] || "").replace(/^标题[:：]\s*/, "").trim() || chapter.title;
   const body = lines.slice(1).join("\n").trim();

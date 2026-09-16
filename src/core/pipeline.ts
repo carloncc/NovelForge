@@ -356,6 +356,8 @@ export class Pipeline {
   private cacheRoot = "";
   private aborted = false;
   private failedTasks: FailedTask[] = [];
+  /** 本次运行中成功产出的任务 id：跨运行收敛 failed.json（成功过的不再留在失败列表） */
+  private succeededTaskIds = new Set<string>();
   private onUsageCb?: (pt: number, ct: number) => void;
   /** 图像阶段是否有任务失败（中断/429/400）。失败时跳过组装，避免产出缺图残次品。 */
   private imageHadFailures = false;
@@ -400,7 +402,14 @@ export class Pipeline {
 
   private async persistFailedTasks(): Promise<void> {
     try {
-      await tauri.writeTextFile(this.failedFile(), JSON.stringify(this.failedTasks, null, 2));
+      // 合并而非覆盖：保留历史失败项（未在本次成功的），避免"任何一次无关的成功运行"把失败列表清空；
+      // 本次成功的任务从列表移除（失败项只在真正修复成功后才消失）
+      const prev = (await this.readCachedJson<FailedTask[]>(this.failedFile())) ?? [];
+      const merged = [
+        ...prev.filter((f) => !this.succeededTaskIds.has(f.id) && !this.failedTasks.some((n) => n.id === f.id)),
+        ...this.failedTasks,
+      ];
+      await tauri.writeTextFile(this.failedFile(), JSON.stringify(merged, null, 2));
     } catch {
       /* 失败列表落盘失败不阻断 */
     }
@@ -718,10 +727,14 @@ export class Pipeline {
 
   private applyVideoOptions(script: ChapterScript): void {
     if (this.options.useVideoPoints) {
-      const videoLimit = this.options.videoPointsPerChapter ?? 2;
-      for (const scene of script.scenes) {
-        if (scene.videoPoints && scene.videoPoints.length > videoLimit) {
-          scene.videoPoints = scene.videoPoints.slice(0, videoLimit);
+      // 0 = 不限制（与「生成内容 > 视频推荐点数上限（0 = 不限制）」文案一致）。
+      // 旧实现把 0 当上限 0，默认设置下会把所有推荐位 slice 成空数组。
+      const videoLimit = this.options.videoPointsPerChapter ?? 0;
+      if (videoLimit > 0) {
+        for (const scene of script.scenes) {
+          if (scene.videoPoints && scene.videoPoints.length > videoLimit) {
+            scene.videoPoints = scene.videoPoints.slice(0, videoLimit);
+          }
         }
       }
     } else {
@@ -820,7 +833,7 @@ export class Pipeline {
           level: "info",
           at: Date.now(),
         });
-        return cached.chapters;
+        return this.applyNovelEnabled(cached.chapters);
       }
     }
     if (!hasLlm) {
@@ -872,6 +885,18 @@ export class Pipeline {
       level: "success",
       at: Date.now(),
     });
+    return this.applyNovelEnabled(chapters);
+  }
+
+  /** split.json 不存 enabled（追加分支的注释也承认这点）：复用分章缓存/新分章结果时，
+   *  按当前小说同序号章节的标记恢复停用状态，否则默认全量流程会把停用章复活并写回成品游戏。 */
+  private applyNovelEnabled(chapters: ChapterInfo[]): ChapterInfo[] {
+    const enabledByIndex = new Map((this.input.novel.chapters || []).map((c) => [c.index, c.enabled]));
+    for (const c of chapters) {
+      const enabled = enabledByIndex.get(c.index);
+      if (enabled === false) c.enabled = false;
+      else if (enabled === true) c.enabled = true;
+    }
     return chapters;
   }
 
@@ -1047,6 +1072,7 @@ export class Pipeline {
           await tauri.writeTextFile(cacheFile, JSON.stringify(tr, null, 2));
           emitProgress(tr.title);
           results[pos] = { ...ch, title: tr.title, text: tr.text };
+          this.succeededTaskIds.add(`translate_${ch.index + 1}`);
         } catch (e) {
           this.recordFailure({
             id: `translate_${ch.index + 1}`,
@@ -1091,6 +1117,31 @@ export class Pipeline {
       }
     }
     return any ? out : null;
+  }
+
+  /** novel index → 当前 chapters 数组位置（重编号后 chapter.chapter 即位置，与图片/配音 scope 同口径）。
+   * 无章节映射（空项目）时按同值兜底，避免强制集落空。 */
+  private chapterPositions(novelIndexes: Iterable<number>): Set<number> {
+    const wanted = new Set(novelIndexes);
+    const out = new Set<number>();
+    if (!this.activeChapterIndexes.length) {
+      for (const i of wanted) out.add(i);
+      return out;
+    }
+    this.activeChapterIndexes.forEach((novelIdx, pos) => {
+      if (wanted.has(novelIdx)) out.add(pos);
+    });
+    return out;
+  }
+
+  /** 分部分重跑的章节集：rerunChapters（本次处理范围，null/undefined = 全部）
+   * 与 forceXxxChapters（只强制重跑某一部分）取并集；都为空时返回 null（=全部章节）。
+   * 让「只重画本章图」「只重配本章音」不必再连带重写整章剧本。 */
+  private requestedChapters(forceChapters?: number[]): Set<number> | null {
+    const base = Array.isArray(this.options.rerunChapters) ? this.options.rerunChapters : null;
+    const forced = Array.isArray(forceChapters) ? forceChapters : [];
+    if (base === null && forced.length === 0) return null;
+    return new Set([...(base ?? []), ...forced]);
   }
 
   async run(): Promise<PipelineResult> {
@@ -1382,11 +1433,18 @@ export class Pipeline {
       // 注意：activeChapterIndexes 在剧本收集完成后统一赋值（见下），此处不提前记录，
       // 否则缺缓存被跳过的章节会导致 novelIdx→pos 错位、分章节过滤打到错误的章
       const scriptForce = input.forceStages?.includes("script");
+      // 分部分强制：全量开关（rerunChaptersForce）与「只重写这几章剧本」（forceScriptChapters）同口径
+      const forceScriptSet = new Set([
+        ...(this.options.rerunChaptersForce ?? []),
+        ...(this.options.forceScriptChapters ?? []),
+      ]);
       // 纯追加模式：只跑新章（无视 rerunChapters，避免把旧章卷进来重写）
       const rerunSet = new Set(
         this.appendedIndexes.length
           ? [...this.appendedIndexes, ...Object.keys(this.feedback.script ?? {}).map(Number)]
-          : scriptForce ? activeChapters.map((c) => c.index) : (this.options.rerunChapters ?? activeChapters.map((c) => c.index)),
+          : scriptForce
+            ? activeChapters.map((c) => c.index)
+            : [...(this.options.rerunChapters ?? activeChapters.map((c) => c.index)), ...forceScriptSet],
       );
       if (this.appendedIndexes.length) {
         log({ step: "剧本", message: `增量追加：只生成新增的 ${this.appendedIndexes.length} 章剧本，其余 ${activeChapters.length - this.appendedIndexes.length} 章复用缓存`, level: "info", at: Date.now() });
@@ -1480,7 +1538,7 @@ export class Pipeline {
           const hasFeedback = feedbackSet.has(chapter.index);
           const selected = rerunSet.has(chapter.index);
           // 单章强制（章节盘/剧本页「全量」开关）：跳过缓存直接重写，不需要填意见
-          const chapterForce = (this.options.rerunChaptersForce ?? []).includes(chapter.index);
+          const chapterForce = forceScriptSet.has(chapter.index);
           let script: ChapterScript | null = null;
           if (!selected && !hasFeedback) {
             script = await this.readCachedJson<ChapterScript>(cacheFile);
@@ -1488,6 +1546,7 @@ export class Pipeline {
               log({ step: "剧本", message: `[缓存] 第 ${chapter.index + 1} 章（未勾选重跑，复用）：${chapter.title}`, level: "info", at: Date.now() });
               // 复用也保证核对报告存在（旧版本跑出的剧本可能没有）：有则复用，无则补算落盘
               await this.verifyAndPersistScript(chapter, script, cards!.characters, demo, styleFrag).catch(() => {});
+              this.succeededTaskIds.add(`chapter_${chapter.index + 1}`);
             } else {
               log({
                 step: "剧本",
@@ -1536,6 +1595,9 @@ export class Pipeline {
                   message: `第 ${chapter.index + 1} 章：${errMsg(e)}`,
                   at: Date.now(),
                 });
+                // 失败也必须计入「缺剧本」名单：否则组装保护（requireFullScriptCoverage）看不到它，
+                // 单章重写失败后同一次运行的组装会按内存章节重写游戏目录，把这一章的旧场景删掉。
+                this.skippedScriptChapters.push(`第 ${chapter.index + 1} 章 ${chapter.title}`);
                 log({
                   step: "剧本",
                   message: `第 ${chapter.index + 1} 章剧本失败（已跳过，可在「失败项」定位重试；其余章节继续生成）：${errMsg(e).slice(0, 100)}`,
@@ -1554,6 +1616,7 @@ export class Pipeline {
                   message: `第 ${chapter.index + 1} 章：剧本结果为空`,
                   at: Date.now(),
                 });
+                this.skippedScriptChapters.push(`第 ${chapter.index + 1} 章 ${chapter.title}`);
                 continue;
               }
               await tauri.writeTextFile(cacheFile, JSON.stringify(script, null, 2));
@@ -1610,7 +1673,8 @@ export class Pipeline {
                           }),
                       },
                     );
-                    await tauri.writeTextFile(cacheFile, JSON.stringify(script, null, 2));
+              await tauri.writeTextFile(cacheFile, JSON.stringify(script, null, 2));
+              this.succeededTaskIds.add(`chapter_${chapter.index + 1}`);
                     vr = await this.verifyAndPersistScript(chapter, script, cards!.characters, demo, styleFrag, true);
                   } catch (e) {
                     log({ step: "剧本", message: `第 ${chapter.index + 1} 章自动重写失败，保留上一版（可在剧本页手动处理）：${errMsg(e).slice(0, 100)}`, level: "warn", at: Date.now() });
@@ -1654,7 +1718,10 @@ export class Pipeline {
       const loaded = await this.loadChaptersFiltered(workingChapters, styleFragElse, demoElse);
       const cachedChapters = loaded.chapters;
       if (cachedChapters.length) {
+        // 停用章不进 chapters：assemble-only/纯资产重跑此前完全不看 enabled，会把停用章的剧本写回游戏
+        const enabledByIndex = new Map((input.novel.chapters || []).map((c) => [c.index, c.enabled]));
         for (const c of cachedChapters) {
+          if (enabledByIndex.size && enabledByIndex.get(c.chapter) === false) continue;
           this.applyVideoOptions(c);
           ensureUniqueSceneIds(c);
           chapters.push(c);
@@ -1766,23 +1833,33 @@ export class Pipeline {
         const baseSeed = imageSeedFor(cards!.title || workingNovel.fileName, this.options);
         // 单章节模式：rerunChapters（novel 原始 index）→ chapters 数组位置集合（与配音 scope 同口径）
         // 纯追加模式：只处理新章位置（无视 rerunChapters）
+        // 分部分强制：只重画点名章节的背景/CG（rerunChaptersForce 为「全量」开关，同口径并集）
+        const imageChapterForce = this.chapterPositions([
+          ...(this.options.forceImageChapters ?? []),
+          ...(this.options.rerunChaptersForce ?? []),
+        ]);
         let imageChapterScope: Set<number> | undefined;
         if (this.appendedIndexes.length) {
-          const wanted = new Set(this.appendedIndexes);
-          imageChapterScope = new Set(
-            this.activeChapterIndexes.map((novelIdx, pos) => (wanted.has(novelIdx) ? pos : -1)).filter((p) => p >= 0),
-          );
+          imageChapterScope = this.chapterPositions(this.appendedIndexes);
           log({ step: "图像", message: `增量追加：仅处理新增的 ${imageChapterScope.size} 章背景/CG，其余复用已有映射`, level: "info", at: Date.now() });
-        } else if (this.activeChapterIndexes.length && Array.isArray(this.options.rerunChapters)) {
-          const selected = new Set(this.options.rerunChapters);
-          imageChapterScope = new Set(
-            this.activeChapterIndexes.map((novelIdx, pos) => (selected.has(novelIdx) ? pos : -1)).filter((p) => p >= 0),
-          );
+        } else {
+          const requested = this.requestedChapters(this.options.forceImageChapters);
+          if (requested) {
+            imageChapterScope = this.chapterPositions(requested);
+            log({
+              step: "图像",
+              message: imageChapterScope.size > 0
+                ? `单章节模式：仅处理 ${imageChapterScope.size} 章的背景/CG，其余章节复用已有映射`
+                : "未选中任何章节，仅复用已有图像映射",
+              level: "info",
+              at: Date.now(),
+            });
+          }
+        }
+        if (imageChapterForce.size > 0) {
           log({
             step: "图像",
-            message: imageChapterScope.size > 0
-              ? `单章节模式：仅处理 ${imageChapterScope.size} 章的背景/CG，其余章节复用已有映射`
-              : "未选中任何章节，仅复用已有图像映射",
+            message: `强制重画第 ${[...imageChapterForce].map((p) => p + 1).join("、")} 章的背景/CG（跳过缓存；人物/物品是项目级资产，不受影响）`,
             level: "info",
             at: Date.now(),
           });
@@ -1815,10 +1892,16 @@ export class Pipeline {
           this.options.imageBudgetPerChapter ?? 0,
           imageChapterScope,
           this.options.figureDetail ?? "full",
-          (this.options.rerunChaptersForce?.length ?? 0) > 0,
+          imageChapterForce,
         );
         this.failedTasks.push(...failed);
         this.imageHadFailures = this.imageHadFailures || failed.length > 0;
+        // 成功产出的图像 id 记入本次成功集（failed.json 收敛用）；失败时立即增量落盘
+        for (const id of Object.keys(images.bg)) this.succeededTaskIds.add(id);
+        for (const id of Object.keys(images.cg)) this.succeededTaskIds.add(id);
+        for (const id of Object.keys(images.figure)) this.succeededTaskIds.add(id);
+        for (const id of Object.keys(images.item)) this.succeededTaskIds.add(id);
+        if (failed.length) void this.persistFailedTasks();
         // 费用按实际 API 生成数计（缓存复用/用户素材拷贝不计费），不再按映射总数估算
         this.cost.imageCount = generated;
         this.cost.imageCostYuan = this.cost.imageCount * DEFAULT_PRICES.imageYuanEach;
@@ -1853,7 +1936,9 @@ export class Pipeline {
     if (stages.has("voice")) {
       // 阶段显式包含 voice 即用户主动要求配音（手动重配不依赖 useTts 开关），仅需已配置 TTS API
       if (input.tts?.apiKey) {
-        const voiceForce = !!this.feedback.voice || input.forceStages?.includes("voice");
+        // forceVoiceChapters：只重配点名章节（与 rerunChapters 取并集）；作用域内强制跳过缓存
+        const voiceForceSet = new Set(this.options.forceVoiceChapters ?? []);
+        const voiceForce = !!this.feedback.voice || input.forceStages?.includes("voice") || voiceForceSet.size > 0;
         // 分章节生成：rerunChapters（novel 原始 index 集合）→ chapters 数组位置集合。
         // activeChapterIndexes[i] 对应重编号前的 chapters[i]，两侧同一口径。
         let chapterScope: Set<number> | undefined;
@@ -1864,11 +1949,9 @@ export class Pipeline {
             this.activeChapterIndexes.map((novelIdx, pos) => (wanted.has(novelIdx) ? pos : -1)).filter((p) => p >= 0),
           );
           log({ step: "配音", message: `增量追加：仅处理新增的 ${chapterScope.size} 章配音`, level: "info", at: Date.now() });
-        } else if (this.activeChapterIndexes.length && Array.isArray(this.options.rerunChapters)) {
-          const selected = new Set(this.options.rerunChapters);
-          chapterScope = new Set(
-            this.activeChapterIndexes.map((novelIdx, pos) => (selected.has(novelIdx) ? pos : -1)).filter((p) => p >= 0),
-          );
+        } else {
+          const requested = this.requestedChapters(this.options.forceVoiceChapters);
+          if (requested) chapterScope = this.chapterPositions(requested);
         }
         if (chapterScope?.size === 0) {
           log({ step: "配音", message: "未选中任何章节，跳过配音生成", level: "warn", at: Date.now() });
@@ -1876,6 +1959,8 @@ export class Pipeline {
           log({ step: "配音", message: "开始生成配音…", level: "info", at: Date.now() });
           const { vocal, failed: voiceFailed, chars: voiceChars } = await generateVoice(input.tts, chapters, cards!.characters, this.cacheRoot, input.log, concurrencyFor(input.tts, "tts"), voiceForce, () => this.aborted, chapterScope);
           this.failedTasks.push(...voiceFailed);
+          for (const key of Object.keys(vocal)) this.succeededTaskIds.add(`vocal_${key}`);
+          if (voiceFailed.length) void this.persistFailedTasks();
           this.cost.ttsChars = voiceChars;
           this.cost.ttsCostYuan = (this.cost.ttsChars / 1e6) * DEFAULT_PRICES.ttsYuanPer1mChars;
           // 合并而非覆盖：分章节配音重跑时保留历史配音，返回体即全量
@@ -1893,22 +1978,41 @@ export class Pipeline {
     this.checkAbort();
 
     /* ==================== ⑥ 组装 ==================== */
-    // 单章节模式保护：已有游戏成品时，若有章节因无缓存被跳过则禁止组装，
+    // 单章节模式保护：已有游戏成品时，若有章节因无缓存/生成失败而缺席则禁止组装，
     // 否则组装会删掉这些章节的旧场景文件导致游戏缩水；全新项目（无 meta）允许渐进式组装。
-    if (input.requireFullScriptCoverage && stages.has("assemble") && this.skippedScriptChapters.length > 0) {
-      const hadGame = await this.loadMeta();
-      if (hadGame) {
-        throw new Error(
-          `单章节模式已中止组装以保护已有游戏内容：以下章节缺少剧本缓存：${this.skippedScriptChapters.join("、")}。` +
-            "请先用「顺序生成未完成章节」或全量流程补齐这些章节，再重跑本章。",
-        );
+    // 缺剧本名单优先用脚本阶段记录的；未跑脚本阶段（纯组装 / 图像+组装 的续跑）时按
+    // 「启用章节 − 本次实际收集到的章节」现算——否则 assemble-only 的自动路径会绕过保护。
+    if (stages.has("assemble")) {
+      const missingTitles = this.skippedScriptChapters.length
+        ? this.skippedScriptChapters
+        : workingChapters
+            .filter((c) => c.enabled !== false && !this.activeChapterIndexes.includes(c.index))
+            .map((c) => `第 ${c.index + 1} 章 ${c.title}`);
+      if (missingTitles.length > 0) {
+        const hadGame = await this.loadMeta();
+        if (hadGame) {
+          if (input.requireFullScriptCoverage) {
+            throw new Error(
+              `单章节模式已中止组装以保护已有游戏内容：以下章节缺少剧本缓存：${missingTitles.join("、")}。` +
+                "请先用「顺序生成未完成章节」或全量流程补齐这些章节，再重跑本章。",
+            );
+          }
+          // 未要求强制覆盖时只警告：让用户知道这次组装不会包含这些章节（若它们此前在游戏里，会被移除）
+          log({
+            step: "组装",
+            message: `注意：${missingTitles.length} 个启用章节缺剧本缓存（${missingTitles.join("、")}），本次组装不会包含它们；若之前已生成过这些章节，其场景文件会被移除。建议先用「顺序补全未完成」补齐再组装`,
+            level: "warn",
+            at: Date.now(),
+          });
+        } else {
+          log({
+            step: "组装",
+            message: `渐进式组装：${missingTitles.length} 个章节暂无剧本（${missingTitles.join("、")}），先组装已有章节，后续章节生成后会自动补入`,
+            level: "warn",
+            at: Date.now(),
+          });
+        }
       }
-      log({
-        step: "组装",
-        message: `渐进式组装：${this.skippedScriptChapters.length} 个章节暂无剧本（${this.skippedScriptChapters.join("、")}），先组装已有章节，后续章节生成后会自动补入`,
-        level: "warn",
-        at: Date.now(),
-      });
     }
     let meta: ProjectMeta | null = null;
     if (stages.has("assemble") && this.imageHadFailures && stages.has("image")) {
@@ -1949,6 +2053,7 @@ export class Pipeline {
         figureEmotions: this.options.figureEmotions,
         figureActions: this.options.figureActions,
         useBgm: this.options.useBgm,
+        useSe: this.options.useSe,
         language: (this.options.language as WebgalLanguage) || "zh_CN",
         log: (m) => this.log(m, "info", "组装"),
       });

@@ -1,14 +1,17 @@
 import { reactive, watch } from "vue";
 import type {
   ChapterScript,
+  CostStats,
+  ExtractionResult,
   GenerationOptions,
   MaterialAsset,
   NovelDoc,
   PipelineEvent,
   PipelineResult,
+  ProjectMeta,
   ProjectVisualBible,
 } from "../core/types";
-import { saveProjectState, restoreProjectState } from "../utils/persist";
+import { saveProjectState, restoreProjectState, readWorkingCards } from "../utils/persist";
 import { tauri } from "../utils/tauri";
 import { log } from "../utils/logger";
 import { clearThumbCache } from "../composables/useAssetThumbs";
@@ -32,7 +35,8 @@ const DEFAULT_OPTIONS: GenerationOptions = {
   useImage: true,
   useTts: false,
   useVideoPoints: true,
-  useBgm: true,
+  useBgm: false,
+  useSe: false,
   figureEmotions: true,
   figureDetail: "full",
   figureActions: true,
@@ -51,6 +55,7 @@ const DEFAULT_OPTIONS: GenerationOptions = {
   splitMinChapterChars: 3000,
   splitKeepSpecials: false,
   extractChunkChars: 0,
+  autoCascadeDownstream: true,
 };
 
 export const projectState = reactive<ProjectState>({
@@ -109,7 +114,15 @@ export async function persistCurrentProjectState(): Promise<boolean> {
   return persistSnapshot(snapshotProjectState());
 }
 
+/** 启动恢复期间挂起自动保存：否则恢复完成前的 800ms 防抖会把"空状态"写回磁盘，
+ *  项目状态文件（含已导入小说/卡片/失败项）被静默清空（大项目恢复耗时 >800ms 时必现）。 */
+let projectSaveSuspended = false;
+export function suspendProjectSave(suspended: boolean): void {
+  projectSaveSuspended = suspended;
+}
+
 export function scheduleSave(): void {
+  if (projectSaveSuspended) return;
   if (saveTimer !== undefined) return;
   saveTimer = window.setTimeout(() => {
     saveTimer = undefined;
@@ -131,6 +144,9 @@ export async function flushPendingProjectSave(): Promise<boolean> {
 }
 
 export async function restoreProject(outputDir: string): Promise<void> {
+  // 恢复期间挂起自动保存：否则恢复完成前的 800ms 防抖会把"空状态"写回磁盘（大项目恢复 >800ms 必现，
+  // 项目状态文件被静默清空）。恢复成功才解挂；失败时保持挂起以保护原文件（重试成功会自动解挂）。
+  suspendProjectSave(true);
   const projectChanged = outputDir !== projectState.outputDir;
   if (projectChanged && !(await flushPendingProjectSave())) {
     throw new Error("当前项目保存失败，已取消切换项目");
@@ -150,25 +166,76 @@ export async function restoreProject(outputDir: string): Promise<void> {
   projectState.materials = r.materials;
   projectState.options = { ...DEFAULT_OPTIONS, ...(r.options ?? {}) };
   projectState.lastResult = null;
-  if (r.lastResult) {
+  // 卡片以磁盘上的工作副本为准（与 pipeline.loadCards 同源）：project_state.json 里的
+  // cards 只是上次保存时的快照，生成结束后不一定落盘过，重启后可能与 cards.json 不一致。
+  // 不一致会直接打断图像生成：视觉守门批准时用快照算指纹、图像阶段用磁盘算指纹，
+  // 于是「刚批准就判输入已变化 → 视觉守门失效 → 图像永不生成」。
+  const workingCards = await readWorkingCards(outputDir);
+  const snapshot = r.lastResult;
+  // 快照里连 lastResult 都没有时（上一轮生成还没保存就退出/被中断），用磁盘上的
+  // cards.json + meta.json 把它补出来：否则重启后「单阶段重跑」整块面板变成
+  // 「还没有生成结果」，视觉守门的准备/批准按钮拿不到卡片而静默失败（0 个角色），
+  // 素材页也是空的，且批准出来的指纹不含任何角色，图像阶段用磁盘卡片复算必然不一致
+  // → 视觉守门永远判「输入已变化」，图片一张也生成不出来。
+  if (snapshot || workingCards) {
     const chapters = await loadCachedChapters(outputDir);
     const failedTasks = await loadFailedTasks(outputDir);
+    const meta = snapshot?.meta ?? (await loadDiskMeta(outputDir));
     log.debug("store", "恢复项目完成", {
       hasNovel: !!r.novel,
       materials: r.materials?.length ?? 0,
       cachedChapters: chapters.length,
       failedTasks: failedTasks.length,
+      cardsFromDisk: !!workingCards,
+      resultFromSnapshot: !!snapshot,
     });
     projectState.lastResult = {
-      meta: r.lastResult.meta,
-      cards: r.lastResult.cards,
-      cost: r.lastResult.cost,
+      meta,
+      cards: workingCards ?? snapshot!.cards,
+      cost: snapshot?.cost ?? { ...EMPTY_COST },
       chapters,
       assets: {},
       failedTasks,
     };
   }
   projectState.saveError = null;
+  suspendProjectSave(false);
+}
+
+/** 磁盘上没有费用快照时的零值（避免页面把 undefined 显示成 NaN） */
+const EMPTY_COST: CostStats = {
+  llmTokens: 0,
+  imageCount: 0,
+  ttsChars: 0,
+  llmCostYuan: 0,
+  imageCostYuan: 0,
+  ttsCostYuan: 0,
+};
+
+// 项目元信息（标题/章节数/台词数/引擎版本）只在 .novel2vn/meta.json 里，
+// project_state.json 的 lastResult 快照常常不存在，缺了 meta.json 就先生成空壳。
+async function loadDiskMeta(outputDir: string): Promise<ProjectMeta> {
+  const fallback: ProjectMeta = {
+    title: "",
+    gameKey: "",
+    chapterCount: 0,
+    charCount: 0,
+    sceneCount: 0,
+    lineCount: 0,
+    outputDir,
+    webgalVersion: "",
+    generatedAt: "",
+  };
+  try {
+    const file = `${outputDir}/.novel2vn/meta.json`;
+    if (!(await tauri.pathExists(file))) return fallback;
+    const { text } = await tauri.readTextFile(file);
+    const meta = JSON.parse(text) as Partial<ProjectMeta> | null;
+    if (!meta || typeof meta !== "object") return fallback;
+    return { ...fallback, ...meta, outputDir };
+  } catch {
+    return fallback;
+  }
 }
 
 // 从 .novel2vn/failed.json 恢复失败任务（中断/崩溃/重启后「失败项」仍可定位重试）

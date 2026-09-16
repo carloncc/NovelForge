@@ -14,6 +14,7 @@ import { buildVoiceJobs, runVoiceJob } from "./voice";
 import { concurrencyFor } from "../stores/configMigration";
 import { tauri } from "../utils/tauri";
 import { updateAssetMap } from "./assetMap";
+import { dedupeSceneIdsAcrossChapters } from "./pipeline";
 
 /** 单个素材重生成的共享上下文 */
 export interface RegenContext {
@@ -75,11 +76,21 @@ async function mergeAssetMap(outputDir: string, results: RegenImageResult[]): Pr
   });
 }
 
+export interface RegenBatchStats {
+  /** 尝试后失败的任务数（不含被中断跳过的） */
+  failed: number;
+  /** 是否因中断提前结束 */
+  aborted: boolean;
+  /** 失败任务的 id/用途（供调用方登记「失败项」并支持逐条重试） */
+  failedTasks: { id: string; usage: string }[];
+}
+
 /**
  * 按条件重新生成一批图像任务（跳过缓存、覆盖旧文件）。
  * predicate 接收单个任务，返回 true 的任务会被重生成。
  * signal.aborted() 返回 true 时停止调度后续任务（进行中的单张请求无法中断，完成即止）。
  * onProgress 每完成一张回调一次（done/total/label/path），用于界面显示实时进度并逐张刷新缩略图。
+ * stats 为可选出参：批量结束后写入失败/中断统计，供调用方如实汇报（避免把失败当成功）。
  */
 export async function regenerateImages(
   ctx: RegenContext,
@@ -87,8 +98,12 @@ export async function regenerateImages(
   feedback?: string,
   signal?: { aborted: () => boolean },
   onProgress?: (done: number, total: number, label: string, path?: string) => void,
+  stats?: RegenBatchStats,
 ): Promise<RegenImageResult[]> {
   const cacheRoot = cacheRootFor(ctx.outputDir);
+  // 跨章场景 id 去重必须在重建任务前做：管线只在运行内去重（结果不落盘），重启后素材页重生成
+  // 若不去重，跨章同 id 的 bg/cg 会挤进同一个文件（互相覆盖 + 重复计费）。函数幂等。
+  dedupeSceneIdsAcrossChapters(ctx.chapters);
   const approvedBible = ctx.visualBible?.status === "approved" ? ctx.visualBible : undefined;
   const allTasks = buildImageTasks(ctx.chapters, ctx.cards, {
     figureEmotions: ctx.figureEmotions ?? true,
@@ -132,12 +147,20 @@ export async function regenerateImages(
   const results: RegenImageResult[] = [];
   // 单张失败只跳过该张、继续其余任务：此前任一任务抛错会导致 Promise.all 整体失败，
   // 中断点之后的所有任务不再执行，"补全缺失"每次都剩下一批漏网。
-  const failed: string[] = [];
+  const failed: { id: string; usage: string }[] = [];
   // 每完成一张立即增量合并进 assets.json：批量重生成过程中素材页也能逐张看到新图。
   // 用串行链防并发 read-modify-write 丢失（多 worker 同时合并会互相覆盖）。
   let mergeChain: Promise<void> = Promise.resolve();
   const mergeIncremental = (r: RegenImageResult): Promise<void> => {
-    mergeChain = mergeChain.then(() => mergeAssetMap(ctx.outputDir, [r]));
+    // .catch 防止单次映射写失败毒化整条链（否则后续所有合并被跳过、整批连带失败）
+    mergeChain = mergeChain.then(() => mergeAssetMap(ctx.outputDir, [r])).catch((e) => {
+      ctx.log({
+        step: "素材",
+        message: `素材映射合并失败（该张新图未入映射，可用「补全缺失图片」修复）：${String(e).slice(0, 120)}`,
+        level: "warn",
+        at: Date.now(),
+      });
+    });
     return mergeChain;
   };
   // 图像并发封顶 8：避免配置的 30 并发打爆第三方图片服务触发 429
@@ -191,10 +214,12 @@ export async function regenerateImages(
             visionCfg: ctx.visionCfg,
             safeRewriteCfg: ctx.safeRewriteCfg,
             styleAnchorPath: anchorPath,
+            // 把「停止」信号透传进单张任务：中止后连参考图描述/生成/重试都不再发起
+            isAborted: () => signal?.aborted() === true,
           });
         } catch (e) {
           // runImageTask 内部已记录失败详情；这里只记账并继续，不中断整批
-          failed.push(task.usage ?? task.fileName);
+          failed.push({ id: task.id, usage: task.usage ?? task.fileName });
           ctx.log({
             step: "素材",
             message: `已跳过失败任务，继续其余重生成：${task.usage ?? task.fileName}`,
@@ -202,6 +227,8 @@ export async function regenerateImages(
             at: Date.now(),
           });
         }
+        // 已中止且本任务未产出：不计进度、不上屏（避免「点了停止进度条还在涨」）
+        if (!path && signal?.aborted()) return;
         done++;
         if (path) {
           results.push({ task, path });
@@ -219,10 +246,15 @@ export async function regenerateImages(
   if (failed.length) {
     ctx.log({
       step: "素材",
-      message: `批量重生成结束，${failed.length} 个任务失败已跳过：${failed.slice(0, 8).join("、")}${failed.length > 8 ? "…" : ""}`,
+      message: `批量重生成结束，${failed.length} 个任务失败已跳过：${failed.slice(0, 8).map((f) => f.usage).join("、")}${failed.length > 8 ? "…" : ""}`,
       level: "warn",
       at: Date.now(),
     });
+  }
+  if (stats) {
+    stats.failed = failed.length;
+    stats.aborted = signal?.aborted() === true;
+    stats.failedTasks = failed.map((f) => ({ ...f }));
   }
   return results;
 }
@@ -258,8 +290,9 @@ export function regenerateCharacterFigures(
   feedback?: string,
   signal?: { aborted: () => boolean },
   onProgress?: (done: number, total: number, label: string) => void,
+  stats?: RegenBatchStats,
 ): Promise<RegenImageResult[]> {
-  return regenerateImages(ctx, (task) => task.kind === "figure" && task.characterId === charId, feedback, signal, onProgress);
+  return regenerateImages(ctx, (task) => task.kind === "figure" && task.characterId === charId, feedback, signal, onProgress, stats);
 }
 
 /** 重新生成某个角色的三视图；由于它是立绘/表情/动作的图生图基准，会级联重生成该角色全部图像 */
@@ -269,6 +302,7 @@ export function regenerateCharacterThreeView(
   feedback?: string,
   signal?: { aborted: () => boolean },
   onProgress?: (done: number, total: number, label: string) => void,
+  stats?: RegenBatchStats,
 ): Promise<RegenImageResult[]> {
   const selectedTasks = selectCharacterThreeViewRegenerationTasks(ctx, charId, feedback);
   const selectedKeys = new Set(selectedTasks.map((task) => `${task.kind}:${task.id}:${task.fileName}`));
@@ -278,6 +312,7 @@ export function regenerateCharacterThreeView(
     feedback,
     signal,
     onProgress,
+    stats,
   );
 }
 
@@ -296,8 +331,12 @@ export function selectCharacterThreeViewRegenerationTasks(
     items: [],
   }, {
     figureEmotions: ctx.figureEmotions ?? true,
+    // 与 regenerateImages 重建任务的口径完全一致：否则「联动全部」漏掉第 3 个起的动作、
+    // core 档还会多出不该生成的表情差分，选中的任务与实际重建的任务对不上
+    detail: ctx.figureDetail ?? "full",
     threeView: true,
     actions: true,
+    maxActionsPerCharacter: 0,
     style: approvedBible?.styleDescription ?? ctx.style,
     feedback,
     baseSeed: ctx.imageSeed,
@@ -313,8 +352,9 @@ export function regenerateCharacterAction(
   feedback?: string,
   signal?: { aborted: () => boolean },
   onProgress?: (done: number, total: number, label: string) => void,
+  stats?: RegenBatchStats,
 ): Promise<RegenImageResult[]> {
-  return regenerateImages(ctx, (t) => t.kind === "action" && t.id === `${charId}_act_${actionId}`, feedback, signal, onProgress);
+  return regenerateImages(ctx, (t) => t.kind === "action" && t.id === `${charId}_act_${actionId}`, feedback, signal, onProgress, stats);
 }
 
 /** 重新生成某个物品图 */
@@ -324,8 +364,9 @@ export function regenerateItemImage(
   feedback?: string,
   signal?: { aborted: () => boolean },
   onProgress?: (done: number, total: number, label: string) => void,
+  stats?: RegenBatchStats,
 ): Promise<RegenImageResult[]> {
-  return regenerateImages(ctx, (t) => t.kind === "item" && t.id === itemId, feedback, signal, onProgress);
+  return regenerateImages(ctx, (t) => t.kind === "item" && t.id === itemId, feedback, signal, onProgress, stats);
 }
 
 /** 重新生成某个场景背景图 */
@@ -335,8 +376,9 @@ export function regenerateBackground(
   feedback?: string,
   signal?: { aborted: () => boolean },
   onProgress?: (done: number, total: number, label: string) => void,
+  stats?: RegenBatchStats,
 ): Promise<RegenImageResult[]> {
-  return regenerateImages(ctx, (t) => t.kind === "background" && t.id === sceneId, feedback, signal, onProgress);
+  return regenerateImages(ctx, (t) => t.kind === "background" && t.id === sceneId, feedback, signal, onProgress, stats);
 }
 
 /** 重新生成某张 CG
@@ -350,9 +392,10 @@ export function regenerateCg(
   feedback?: string,
   signal?: { aborted: () => boolean },
   onProgress?: (done: number, total: number, label: string) => void,
+  stats?: RegenBatchStats,
 ): Promise<RegenImageResult[]> {
   void chapterNo;
-  return regenerateImages(ctx, (t) => t.kind === "cg" && t.id === sceneId, feedback, signal, onProgress);
+  return regenerateImages(ctx, (t) => t.kind === "cg" && t.id === sceneId, feedback, signal, onProgress, stats);
 }
 
 async function mergeVocal(outputDir: string, key: string, path: string): Promise<void> {
@@ -363,46 +406,51 @@ export function imageTaskIdentity(task: ImageTask): string {
   return `${task.kind}:${task.id}:${task.fileName}`;
 }
 
-/** 重新生成某一句对白的配音 */
-export async function regenerateVoiceLine(ctx: RegenContext, key: string): Promise<string | null> {
+/** 重新生成某一句对白的配音（isAborted 供批量/重试链路的停止信号透传） */
+export async function regenerateVoiceLine(ctx: RegenContext, key: string, isAborted?: () => boolean): Promise<string | null> {
   const tts = ctx.ttsCfg;
   if (!tts) return null;
   const jobs = buildVoiceJobs(tts, ctx.chapters, ctx.cards.characters);
   const job = jobs.find((j) => j.key === key);
   if (!job) return null;
-  const path = await runVoiceJob(tts, job, cacheRootFor(ctx.outputDir), ctx.log, true);
+  const path = await runVoiceJob(tts, job, cacheRootFor(ctx.outputDir), ctx.log, true, isAborted);
   if (path) await mergeVocal(ctx.outputDir, key, path);
   return path;
 }
 
-/** 重新生成某个角色的全部配音（并发执行，无依赖） */
+/** 重新生成某个角色的全部配音（并发执行，无依赖）。返回成功与失败句数，供界面如实汇报 */
 export async function regenerateCharacterVoice(
   ctx: RegenContext,
   charId: string,
   signal?: { aborted: () => boolean },
   onProgress?: (done: number, total: number, label: string) => void,
-): Promise<number> {
+): Promise<{ count: number; failed: number }> {
   const tts = ctx.ttsCfg;
-  if (!tts) return 0;
+  if (!tts) return { count: 0, failed: 0 };
   const jobs = buildVoiceJobs(tts, ctx.chapters, ctx.cards.characters).filter((j) => j.charId === charId);
   const total = jobs.length;
   const concurrency = concurrencyFor(ctx.ttsCfg, "tts");
   let done = 0;
   let count = 0;
+  let failed = 0;
   let idx = 0;
   const worker = async (): Promise<void> => {
     while (idx < jobs.length) {
       if (signal?.aborted()) return;
       const job = jobs[idx++];
-      const path = await runVoiceJob(tts, job, cacheRootFor(ctx.outputDir), ctx.log, true);
+      const path = await runVoiceJob(tts, job, cacheRootFor(ctx.outputDir), ctx.log, true, () => signal?.aborted() === true);
       done++;
       onProgress?.(done, total, `${job.voice}「${job.text.slice(0, 12)}…」`);
       if (path) {
         await mergeVocal(ctx.outputDir, job.key, path);
         count++;
+      } else if (signal?.aborted()) {
+        return; // 中止：不计失败（避免停止后失败数虚增）
+      } else {
+        failed++;
       }
     }
   };
   await Promise.all(Array.from({ length: Math.min(concurrency, jobs.length) }, () => worker()));
-  return count;
+  return { count, failed };
 }

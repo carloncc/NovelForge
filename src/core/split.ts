@@ -525,6 +525,7 @@ export function splitChaptersForFallback(fullText: string): ChapterInfo[] {
   const chapters: { title: string; lines: string[] }[] = [];
   let current: { title: string; lines: string[] } = { title: "第一章", lines: [] };
   let anyChapter = false;
+  const preambleLines: string[] = [];
 
   const isChapterTitle = (line: string): boolean => {
     const trimmed = line.trim();
@@ -544,11 +545,19 @@ export function splitChaptersForFallback(fullText: string): ChapterInfo[] {
       current = { title: raw.trim(), lines: [] };
       chapters.push(current);
       anyChapter = true;
+    } else if (!anyChapter) {
+      // 首个标题前的正文（前言/简介/引子）单独收集：此前推进 current.lines 后，
+      // 遇到首个标题整个 current 被替换 → 这段文本静默丢失
+      preambleLines.push(raw);
     } else {
       current.lines.push(raw);
     }
   }
   if (!anyChapter) chapters.push({ title: "第一章", lines });
+  // 前言并入第一章（置于其正文之前）：既不丢文本，也不改变章节数量与编号
+  if (anyChapter && preambleLines.join("").trim()) {
+    chapters[0].lines.unshift(...preambleLines);
+  }
 
   const merged: ChapterInfo[] = [];
   for (const c of chapters) {

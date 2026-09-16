@@ -21,6 +21,8 @@ export interface AssembleInput {
   /** 人物动作（入场/情绪动作/镜头震动），默认开启 */
   figureActions?: boolean;
   useBgm?: boolean;
+  /** 环境音效（SE）：默认关闭（与 useBgm 同为「声音」开关） */
+  useSe?: boolean;
   /** 界面语言（默认 zh_CN）；正文语言由翻译阶段决定 */
   language?: WebgalLanguage;
   log: (msg: string) => void;
@@ -126,6 +128,7 @@ export async function assembleProject(input: AssembleInput): Promise<{ gameDir: 
       introCard: input.introCard,
       figureEmotions: input.figureEmotions,
       figureActions: input.figureActions,
+      useSe: input.useSe,
     }, chapterCount);
     await tauri.writeTextFile(
       joinPath(normalizedOutputDir, `game/scene/ch${chapter.chapter + 1}.txt`),
@@ -187,6 +190,9 @@ export async function assembleProject(input: AssembleInput): Promise<{ gameDir: 
  * 旧实现用 process.cwd()+"/src/gameExtra/se"，打包后 cwd 非源码目录导致 SE 从未复制（playEffect 404）。
  */
 async function copyBuiltinSe(outputDir: string, input: AssembleInput): Promise<void> {
+  // useSe === false（默认关闭音效）时成品不会输出任何 playEffect，内置 SE 无需复制（省 8 个文件与一次 IPC）。
+  // 与 render 的 useSe 口径一致：undefined 视为开启（兼容旧项目），仅显式 false 跳过。
+  if (input.useSe === false) return;
   try {
     const seDir = joinPath(input.templateDir, "game/vocal");
     const entries = await tauri.listDir(seDir).catch(() => [] as FsEntry[]);

@@ -18,6 +18,20 @@ export class ReferenceImageError extends Error {
   }
 }
 
+/**
+ * 部分中转站只开放纯文本 /v1/images/generations：请求体一旦带参考图（base64）就会撞上服务端请求体上限，
+ * 并回执「exceeds ... KiB / which this route does not support / No image inputs, edits」。
+ * 这类失败重试必然失败，也不应静默丢掉参考图继续跑（参考图缺失会让角色形象不一致），
+ * 所以单独识别出来，交给上层给出可执行的修复提示。
+ */
+const REFERENCE_ROUTE_REJECTION = /exceeds \d+(?:\.\d+)?\s*KiB|this route does not support|no image (?:inputs|edits)/i;
+
+/** 命中「线路不接受带图请求」回执时返回可执行的修复提示，否则返回 undefined */
+export function referenceRouteRejection(message: string): string | undefined {
+  if (!REFERENCE_ROUTE_REJECTION.test(message)) return undefined;
+  return "当前图片线路不接受带参考图的请求（服务端限制了请求体大小，且回执明确说明不支持图像输入/图生图）。请在「API 配置 > 图片生成」对该线路重新点一次「测试连接」，让程序自动修正它的图像能力；或改选支持参考图/图生图的线路或模型。";
+}
+
 const NO_IMAGE_REFERENCES: ImageModelCapabilities = {
   maxReferenceImages: 0,
   supportsSeed: false,
@@ -71,10 +85,15 @@ export function knownImageModelCapabilities(model: string): ImageModelCapabiliti
 }
 
 export function resolveImageModelCapabilities(config: ApiConfig): ImageModelCapabilities {
-  // 优先用「测试连接」自动探测并写回配置的结果（用户无需手动配置能力）
-  return customImageCapabilities(config.extra?.imageCapabilities)
-    ?? knownImageModelCapabilities(config.model)
-    ?? { ...NO_IMAGE_REFERENCES };
+  const stored = customImageCapabilities(config.extra?.imageCapabilities);
+  const stamp = config.extra?.imageCapabilitiesModel;
+  const known = knownImageModelCapabilities(config.model);
+  // 新探测/手动写入都带模型标记：同模型直接信任；换模型后自动作废（防止旧模型能力套到新模型上）
+  if (stored && stamp === config.model) return stored;
+  // 旧版遗留（无标记）只在「内置表不认识该模型」时继续信任：内置表优先，
+  // 且不因缺少标记就丢掉未知模型上用户已有的正能力
+  if (stored && stamp === undefined && !known) return stored;
+  return known ?? { ...NO_IMAGE_REFERENCES };
 }
 
 function normalizedReferencePayload(reference: ImageReference): { payload: string; mime: string } {

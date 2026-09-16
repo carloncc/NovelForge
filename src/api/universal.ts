@@ -1,8 +1,9 @@
 import type { ApiConfig, ImageReference } from "../core/types";
-import { rawReferenceBase64, ReferenceImageError, referenceDataUrl } from "./providers";
+import { rawReferenceBase64, ReferenceImageError, referenceDataUrl, referenceRouteRejection } from "./providers";
 import { tauri } from "../utils/tauri";
 import { log } from "../utils/logger";
 import { classifyError } from "../utils/errorClassifier";
+import { normalizeProviderBaseUrl, customHeadersFor } from "./baseUrl";
 
 /* ============ 统一能力模型 ============ */
 
@@ -330,6 +331,16 @@ async function decodeResult(
   if (encoding === "none" || /^https?:\/\//i.test(value)) {
     if (/^https?:\/\//i.test(value)) {
       const res = await tauri.http({ method: "GET", url: value, timeoutSecs: 120 });
+      // 之前不检查状态码：403/404 的错误 JSON 也会被当成"图片数据"返回（静默产出损坏文件）
+      if (res.status < 200 || res.status >= 300) {
+        let detail = "";
+        try {
+          detail = utf8FromB64(res.bodyBase64).slice(0, 200);
+        } catch {
+          /* 二进制响应体 */
+        }
+        throw new Error(`下载结果文件失败 HTTP ${res.status}${detail ? `：${detail}` : ""}`);
+      }
       return { dataB64: res.bodyBase64, mime: res.contentType.split(";")[0] || "application/octet-stream" };
     }
     return { dataB64: value, mime: mime ?? "application/octet-stream" };
@@ -353,6 +364,16 @@ function referenceErrorFromResponse(raw: string): ReferenceImageError | undefine
 }
 
 const RETRY_DELAYS = [1000, 10000, 20000, 30000, 40000, 50000, 60000];
+
+/** 请求体里是否真的带了图片（data-url 或 png/jpeg/gif/webp 的 base64 magic）——只有带了图才把 413 归到「线路拒图」 */
+const IMAGE_PAYLOAD_MAGIC = /data:image\/[a-z0-9.+-]+;base64,|iVBORw0KGgo|\/9j\/|R0lGOD|UklGR/;
+function bodyCarriesImagePayload(body: Record<string, unknown>): boolean {
+  for (const value of Object.values(body)) {
+    if (typeof value !== "string" || value.length <= 1024) continue;
+    if (IMAGE_PAYLOAD_MAGIC.test(value.slice(0, 64))) return true;
+  }
+  return false;
+}
 
 /** 构造 multipart/form-data 字符串（跨 Tauri/浏览器统一，无需真实 FormData） */
 export function buildMultipartBody(
@@ -390,6 +411,7 @@ async function postJson(
       const headers: Record<string, string> = {
         ...(isForm ? {} : { "Content-Type": "application/json" }),
         ...authHeaders(cfg, template),
+        ...customHeadersFor(cfg),
         ...(template.headers ?? {}),
       };
       let payload: string;
@@ -417,6 +439,10 @@ async function postJson(
         });
         const referenceError = referenceErrorFromResponse(raw);
         if (referenceError) throw referenceError;
+        // 线路明确拒绝带图请求（请求体上限 + 不支持图像输入）：归一成类型化错误，
+        // 既不做无意义的重试/提示词改写，也不静默丢掉参考图（会让角色形象不一致）。
+        const routeHint = bodyCarriesImagePayload(body) ? referenceRouteRejection(raw) : undefined;
+        if (routeHint) throw new ReferenceImageError(routeHint, "REFERENCE_UNSUPPORTED");
       }
       if (res.status >= 500 || res.status === 429) {
         throw { status: res.status, message: `HTTP ${res.status}` };
@@ -430,7 +456,11 @@ async function postJson(
         } catch {
           /* 非 JSON 错误体 */
         }
-        throw new Error(`API 错误 ${res.status}: ${errText}`);
+        // 状态码挂到 Error 上：上层 classifyError(e, status) 双信号分类
+        // （审查 400 靠文本命中，鉴权/参数靠状态码），不带 status 会退化成纯文本分类。
+        const apiError = new Error(`API 错误 ${res.status}: ${errText}`);
+        (apiError as { status?: number }).status = res.status;
+        throw apiError;
       }
       let json: unknown;
       try {
@@ -470,7 +500,7 @@ async function getJson(cfg: ApiConfig, url: string, template: AdapterTemplate): 
   const res = await tauri.http({
     method: "GET",
     url,
-    headers: authHeaders(cfg, template),
+    headers: { ...authHeaders(cfg, template), ...customHeadersFor(cfg) },
     timeoutSecs: 60,
   });
   if (res.status >= 400) {
@@ -498,20 +528,19 @@ export function joinUrl(base: string, endpoint: string): string {
   if (/^https?:\/\//i.test(endpoint)) return endpoint;
   let b = (base || "").trim().replace(/\/+$/, "");
   let e = endpoint;
-  // base 已含 /v1（或 /v1beta 等带后缀版本）时去掉 endpoint 的同名版本前缀（避免 /v1/v1/...）
-  const versionMatch = /\/v\d+(?:alpha|beta|p\d+)?$/i.exec(b);
-  if (versionMatch) {
-    const versionPrefix = versionMatch[0].replace(/^\//, ""); // 如 v1 / v1beta
-    if (e.startsWith(`/${versionPrefix}/`)) {
-      e = e.replace(new RegExp(`^/${versionPrefix}`, "i"), "");
-    }
+  // base 已含版本段（/v1、/v4、/v1beta…）时丢掉 endpoint 自带的首个版本段：
+  // 既避免 /v1/v1，也避免 zhipu 这类 base=/paas/v4 + endpoint=/v1/... 的双版本 404
+  if (/\/v\d+(?:alpha|beta|p\d+)?$/i.test(b) && /^\/v\d+(?:alpha|beta|p\d+)?\//i.test(e)) {
+    e = e.replace(/^\/v\d+(?:alpha|beta|p\d+)?/i, "");
   }
   return `${b}${e}`;
 }
 
 export async function callUnified(ctx: CallContext): Promise<UnifiedResult> {
   const { cfg, template, vars } = ctx;
-  const url = joinUrl(cfg.baseUrl, template.endpoint.replace("{model}", String(vars.model ?? "")));
+  // 与文本/视觉同口径地补协议/应用 pathPrefix；但通用适配器端点自带版本段，不自动补 /v1
+  const base = normalizeProviderBaseUrl(cfg.baseUrl, (cfg.extra?.pathPrefix as string) || undefined);
+  const url = joinUrl(base, template.endpoint.replace("{model}", String(vars.model ?? "")));
   const body = buildRequestBody(template, vars);
 
   if (template.mode === "sync") {
@@ -520,6 +549,7 @@ export async function callUnified(ctx: CallContext): Promise<UnifiedResult> {
       const headers: Record<string, string> = {
         ...(isForm ? {} : { "Content-Type": "application/json" }),
         ...authHeaders(cfg, template),
+        ...customHeadersFor(cfg),
         ...(template.headers ?? {}),
       };
       let payload: string;
@@ -548,11 +578,14 @@ export async function callUnified(ctx: CallContext): Promise<UnifiedResult> {
         } catch {
           /* 非 JSON */
         }
-        throw new Error(`API 错误 ${res.status}: ${errText}`);
+        const apiError = new Error(`API 错误 ${res.status}: ${errText}`);
+        (apiError as { status?: number }).status = res.status;
+        throw apiError;
       }
       return {
         dataB64: res.bodyBase64,
-        mime: (template.response.mime ?? res.contentType.split(";")[0]) || "application/octet-stream",
+        // 优先真实响应的 Content-Type：模板写死的 mime（如 audio/mpeg）会把 ogg/opus/wav 结果存成 .mp3
+        mime: (res.contentType?.split(";")[0] || template.response.mime) || "application/octet-stream",
       };
     }
     const { json } = await postJson(cfg, url, body, template);
@@ -583,7 +616,7 @@ export async function callUnified(ctx: CallContext): Promise<UnifiedResult> {
     );
   }
 
-  const pollUrl = joinUrl(cfg.baseUrl, poll.endpoint.replace("{taskId}", taskId));
+  const pollUrl = joinUrl(base, poll.endpoint.replace("{taskId}", taskId));
 
   for (let i = 0; i < poll.maxPolls; i++) {
     await new Promise((r) => setTimeout(r, poll.intervalMs));

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { defineAsyncComponent, onMounted, ref } from "vue";
+import { computed, defineAsyncComponent, onMounted, ref, type Component } from "vue";
 import ImportPage from "./pages/ImportPage.vue";
 import AboutDialog from "./components/AboutDialog.vue";
 import { configReady, configState } from "./stores/config";
@@ -9,16 +9,35 @@ import { installLogFileSink } from "./utils/logFile";
 import { log } from "./utils/logger";
 import { version } from "../package.json";
 import { t, LANGS, currentLang, setLang } from "./i18n";
+import { currentPage, type PageId } from "./stores/nav";
+// 轻量运行状态模块：避免把 generate store（含管线核心）拉进主包
+import { runIsBusy, runAssetLabel, runIsQueue, runIsStopping, runFailedCount, requestRunStop } from "./stores/runStatus";
 
-const pages = [
+const pages: { id: PageId; labelKey: string; comp: Component }[] = [
   { id: "import", labelKey: "导入小说", comp: ImportPage },
   { id: "config", labelKey: "API 配置", comp: defineAsyncComponent(() => import("./pages/ConfigPage.vue")) },
   { id: "generate", labelKey: "生成项目", comp: defineAsyncComponent(() => import("./pages/GeneratePage.vue")) },
   { id: "preview", labelKey: "预览", comp: defineAsyncComponent(() => import("./pages/PreviewPage.vue")) },
   { id: "export", labelKey: "导出", comp: defineAsyncComponent(() => import("./pages/ExportPage.vue")) },
 ];
-const current = ref("import");
+const current = currentPage;
 const aboutOpen = ref(false);
+
+// 静默失败面：自动保存失败（saveError）/ 启动恢复失败（visualBibleWarnings）此前只写进状态却无人渲染，
+// 用户会以为一切正常（甚至以为项目是空的）——这里统一在顶部横幅呈现，可一键消除。
+const noticeText = computed(() => {
+  const parts: string[] = [];
+  if (projectState.saveError) parts.push(`${t("自动保存失败")}：${projectState.saveError}`);
+  parts.push(...projectState.visualBibleWarnings);
+  return parts.join("；");
+});
+function dismissNotices(): void {
+  projectState.saveError = null;
+  projectState.visualBibleWarnings = [];
+}
+
+// 全局运行态（G1/G2/G12）：离开生成页后管线仍在跑——侧栏常驻显示运行中 + 停止入口，并由导航徽标提示失败项
+const runActive = computed(() => runIsBusy.value || !!runAssetLabel.value || runIsQueue.value);
 
 const icons: Record<string, string> = {
   import: "M13.5 6H10C8.89543 6 8 6.89543 8 8V18C8 19.1046 8.89543 20 10 20H18C19.1046 20 20 19.1046 20 18V11.5M13.5 6L20 11.5M13.5 6V11.5H20M7 16H6C4.89543 16 4 15.1046 4 14V6C4 4.89543 4.89543 4 6 4H14C15.1046 4 16 4.89543 16 6V7",
@@ -40,7 +59,18 @@ onMounted(async () => {
   await configReady;
   if (configState.outputDir) {
     projectState.outputDir = configState.outputDir;
-    await restoreProject(configState.outputDir);
+    // 启动恢复失败必须留痕：以前这里不接异常，状态读不出来时 projectState.novel 会一直是 null，
+    // 生成页的「单章节生成 / 本次重跑」整块静默消失，用户只看到「还没有小说」，以为功能被删了。
+    try {
+      await restoreProject(configState.outputDir);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log.error("app", `启动恢复项目状态失败：${message}`, { outputDir: configState.outputDir });
+      projectState.visualBibleWarnings = [
+        ...projectState.visualBibleWarnings,
+        `项目状态恢复失败：${message}（可到生成页点「加载该项目」重试）`,
+      ];
+    }
   } else {
     projectState.outputDir = await tauri.getDefaultOutputDir();
     configState.outputDir = projectState.outputDir;
@@ -69,7 +99,13 @@ onMounted(async () => {
         <path :d="icons[p.id]" />
       </svg>
       <span>{{ t(p.labelKey) }}</span>
+      <span v-if="p.id === 'generate' && runFailedCount" class="nav-badge" :title="t('有失败任务未处理（点开生成页 → 失败项）')">{{ runFailedCount }}</span>
     </button>
+    <div v-if="runActive" class="run-indicator">
+      <span class="spinner" style="width: 12px; height: 12px" />
+      <span class="run-text">{{ runAssetLabel ? `${t("素材")}：${runAssetLabel}` : t("生成中…") }}</span>
+      <button class="btn danger small" :disabled="runIsStopping" @click="requestRunStop()">{{ runIsStopping ? t("正在停止…") : t("停止") }}</button>
+    </div>
     <div class="sidebar-footer">
       <select :value="currentLang" class="lang-select" @change="onLangChange">
         <option v-for="l in LANGS" :key="l.code" :value="l.code">{{ l.label }}</option>
@@ -79,7 +115,60 @@ onMounted(async () => {
     </div>
   </div>
   <div class="main">
+    <div v-if="noticeText" class="notice-bar">
+      <span class="notice-text">{{ noticeText }}</span>
+      <button class="btn ghost small" @click="dismissNotices">{{ t("知道了") }}</button>
+    </div>
     <component :is="pages.find((p) => p.id === current)!.comp" />
   </div>
   <AboutDialog :open="aboutOpen" @close="aboutOpen = false" />
 </template>
+
+<style scoped>
+.notice-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 12px 16px 0;
+  padding: 8px 12px;
+  border: 1px solid var(--err);
+  background: var(--err-soft);
+  color: var(--err);
+  border-radius: 8px;
+  font-size: 13px;
+}
+.notice-text {
+  flex: 1;
+  min-width: 0;
+}
+.nav-badge {
+  margin-left: auto;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: var(--err);
+  color: #fff;
+  font-size: 11px;
+  line-height: 18px;
+  text-align: center;
+}
+.run-indicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: auto 0 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--warn);
+  background: var(--err-soft);
+  border-radius: 8px;
+  font-size: 12px;
+}
+.run-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+</style>

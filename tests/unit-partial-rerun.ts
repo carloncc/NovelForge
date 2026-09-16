@@ -168,16 +168,19 @@ async function main(): Promise<void> {
   {
     const cacheRoot = `${root}/imgforce/.novel2vn/cache`;
     await mkdir(`${cacheRoot}/images`, { recursive: true });
-    const scope = new Set([demoScripts[0].chapter]);
+    const target = demoScripts[0].chapter;
     const tasks = buildImageTasks(demoScripts, demoCards, {
       figurePerCharacter: 1, cgPerChapter: 0, maxPerChapter: 0,
       figureEmotions: false, threeView: false, actions: false, styleAnchor: false,
-      chapterIndexes: scope,
     });
-    const bgInScope = tasks.filter((t) => t.kind === "background");
-    // cgPerChapter: 0 = 不限制（全要），目标章有 cgEvent 的场景同样会建 CG 任务
-    const bgCgInScope = tasks.filter((t) => t.kind === "background" || t.kind === "cg");
-    assert(bgInScope.length > 0, "目标章应有背景任务");
+    // 背景/CG 任务必须带章节号，否则无法按章精确强制（人物/物品是项目级资产，不带章节）
+    const bgCgTasks = tasks.filter((t) => t.kind === "background" || t.kind === "cg");
+    assert(bgCgTasks.length > 0, "应有背景/CG 任务");
+    assert(bgCgTasks.every((t) => typeof t.chapter === "number"), "背景/CG 任务应带章节号");
+    const forced = bgCgTasks.filter((t) => t.chapter === target);
+    const untouched = bgCgTasks.filter((t) => t.chapter !== target);
+    assert(forced.length > 0, "目标章应有背景/CG 任务");
+    assert(untouched.length > 0, "应有其他章节的任务，用于验证不被牵连");
     for (const t of tasks) {
       await writeFile(`${cacheRoot}/images/${t.fileName}`, pngBuffer(t.width, t.height));
     }
@@ -186,18 +189,55 @@ async function main(): Promise<void> {
       undefined, demoScripts, demoCards, [], cacheRoot, (e) => logs.push(e),
       3, false, undefined, undefined, false, false, false,
       undefined, undefined, false, undefined, undefined, undefined, undefined, 0, 0,
-      scope, "full", true,
+      undefined, "full", new Set([target]),
     );
     const progress = logs.filter((l) => (l as { progress?: unknown }).progress);
-    // 无 API 时强制的背景/CG 进执行后跳过（无映射），人物/物品静默复用（有映射、无进度）
-    assert(progress.length === bgCgInScope.length, `单章强制应只执行范围内背景/CG：${progress.length}/${bgCgInScope.length}`);
-    for (const t of bgCgInScope) {
+    // 只执行点名章节的背景/CG；其他章节与人物/物品全部静默复用（有映射、无进度）
+    assert(progress.length === forced.length, `只应强制目标章背景/CG：${progress.length}/${forced.length}`);
+    assert(r.failed.length === 0, "无 API 时强制任务应跳过而非失败");
+    // demo 剧本跨章可能出现同名 scene.id（管线内会去重，直连不会）：只对 id 唯一的强制任务断言
+    const untouchedIds = new Set(untouched.map((t) => t.id));
+    const forcedUnique = forced.filter((t) => !untouchedIds.has(t.id));
+    assert(forcedUnique.length > 0, "应有 id 唯一的强制任务，便于断言无映射");
+    for (const t of forcedUnique) {
       const section = t.kind === "cg" ? r.images.cg : r.images.bg;
       assert(section[t.id] === undefined, "强制背景/CG 无 API 时不应有映射");
     }
     const figMapped = Object.keys(r.images.figure).length;
     assert(figMapped > 0, "人物图应静默复用不断映射");
     assert(logs.some((l) => l.message.includes("缓存复用")), "应有复用总结");
+  }
+
+  /* ---------- 剧本分部分强制：只传 forceScriptChapters 也能重写指定章、不牵连其他章 ---------- */
+  {
+    const out = (await mkdtemp(join(tmpdir(), "novelforge-force-script-"))).replace(/\\/g, "/");
+    const novelText = "第一章 初见\n林澈：你好。\n嗯。\n第二章 再见\n苏晚晴：再见。\n啊。";
+    const novel = {
+      fileName: "分部分强制.txt", sourcePath: "", encoding: "UTF-8",
+      fullText: novelText, chapters: splitChapters(novelText, "分部分强制"),
+    };
+    const templateDir = `${import.meta.dirname.replace(/\\/g, "/")}/../src-tauri/templates/webgal`;
+    const first = await new Pipeline({
+      novel, materials: [], outputDir: out, templateDir,
+      options: { useImage: false, useTts: false, skipCache: false, maxConcurrent: 2 },
+      log: () => {},
+    }).run();
+    assert(first.chapters.length === 2, `首次应产出 2 章，实际 ${first.chapters.length}`);
+    const cacheDir = `${out}/.novel2vn/cache`;
+    const ch0File = scriptCacheFileName(cacheDir, true, 0, novel.chapters[0].title, novel.chapters[0].text, "");
+    const ch0Before = await readFile(ch0File, "utf8");
+
+    const logs: PipelineEvent[] = [];
+    const res = await new Pipeline({
+      novel, materials: [], outputDir: out, templateDir,
+      options: { useImage: false, useTts: false, skipCache: false, maxConcurrent: 2, forceScriptChapters: [1] },
+      stages: ["script"],
+      log: (e) => logs.push(e),
+    }).run();
+    assert(logs.some((l) => l.message.includes("生成第 2 章剧本") && l.message.includes("全量重写")), "forceScriptChapters 应强制重写第 2 章");
+    assert(!logs.some((l) => /生成第 1 章剧本/.test(l.message)), "不应重写第 1 章");
+    assert((await readFile(ch0File, "utf8")) === ch0Before, "第 1 章缓存不应被改动");
+    assert(res.chapters.length === 2, `不应丢章，实际 ${res.chapters.length}`);
   }
 
   console.log("=== partial rerun tests passed ===");

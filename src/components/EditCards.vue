@@ -13,10 +13,14 @@ import { configIsUsable } from "../api/providers";
 import { t } from "../i18n";
 import { createMiniMaxVoiceProfile, importVoiceProfile } from "../core/voiceProfiles";
 import { minimaxVoiceLabel } from "../core/minimaxVoices";
+import { useGenerateController } from "../stores/generate";
 import Disclosure from "./Disclosure.vue";
 
 const props = defineProps<{ cards: ExtractionResult }>();
 const emit = defineEmits<{ saved: [cards: ExtractionResult] }>();
+
+// 运行态：卡片保存/识别与管线并发会互相覆盖，操作前必须确认没有在跑的任务
+const { busy: pipelineBusy, assetBusy, queueRunning } = useGenerateController();
 
 const local = ref<ExtractionResult>(JSON.parse(JSON.stringify(props.cards)));
 const savedMsg = ref("");
@@ -48,6 +52,7 @@ async function recognizeChar(c: CharacterCard): Promise<void> {
     savedMsg.value = t("图片识别 API 未配置或不可用，请先在「API 配置」页配置");
     return;
   }
+  if (!window.confirm(`将调用图片识别 API 生成「${c.name}」的设定与提示词（计费）。继续吗？`)) return;
   charRecognizing.value = c.id;
   savedMsg.value = "";
   try {
@@ -166,6 +171,21 @@ function stopRecordingNow(): void {
   recordStreamRef.value = null;
 }
 
+/** 停止录音并等待 MediaRecorder 收尾：stop() 的最后一个 dataavailable 是异步派发的，
+ *  立即读取 chunks 会拿到空数组（表现为「未录制到音频」，录音克隆功能实际不可用）。 */
+function stopRecordingAndWait(recorder: MediaRecorder): Promise<void> {
+  return new Promise((resolve) => {
+    const finish = (): void => resolve();
+    recorder.addEventListener("stop", finish, { once: true });
+    recorder.addEventListener("error", finish, { once: true });
+    if (recorder.state !== "inactive") {
+      try { recorder.stop(); } catch { finish(); }
+    } else {
+      finish();
+    }
+  });
+}
+
 /** 播放视频时点击录音：捕获系统正在播放的声音（共享屏幕/窗口音频），用于生成克隆音色 */
 async function startSystemAudioRecording(card: CharacterCard): Promise<void> {
   const config = activeConfig("tts");
@@ -211,8 +231,10 @@ async function stopRecordingAndClone(card: CharacterCard): Promise<void> {
   recordingChar.value = null;
   const secs = recordingSec.value;
   if (recordTimer !== undefined) { window.clearInterval(recordTimer); recordTimer = undefined; }
-  const chunks = recordChunksRef.value;
+  // 先等 stop 事件把收尾 dataavailable 派发完，再读取录到的分片
+  await stopRecordingAndWait(recorder);
   stopRecordingNow();
+  const chunks = recordChunksRef.value;
   if (secs < 10) { savedMsg.value = `录音时长不足（${secs}s），MiniMax 要求至少 10 秒`; return; }
   if (secs > 300) { savedMsg.value = `录音过长（${secs}s），请控制在 5 分钟内`; return; }
   if (!chunks.length) { savedMsg.value = "未录制到音频"; return; }
@@ -290,6 +312,13 @@ function fileToBase64(file: File): Promise<string> {
 }
 
 async function save(): Promise<void> {
+  // 运行中禁止保存：保存会写 cards.json 并可能删除图像缓存文件，与管线并发会互相覆盖
+  if (pipelineBusy.value || assetBusy.value || queueRunning.value) {
+    savedMsg.value = t("已有生成任务在运行：请等它完成（或先点「停止」）后再保存卡片，避免与管线互相覆盖");
+    return;
+  }
+  // 「同时重写剧本」= 清空全部章节剧本缓存（下次生成重写，消耗 token）：执行前确认
+  if (invalidateScript.value && !window.confirm("已勾选「同时重写剧本」：保存会清空全部章节的剧本缓存（下次生成需重写剧本，消耗 token）。继续吗？")) return;
   busy.value = true;
   savedMsg.value = "";
   try {

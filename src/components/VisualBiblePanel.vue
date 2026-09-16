@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 import { t } from "../i18n";
 import { open } from "@tauri-apps/plugin-dialog";
 import { projectState, pushLog, scheduleSave } from "../stores/project";
@@ -35,6 +35,7 @@ import {
 } from "../core/visualBible";
 import type { VisualBibleImageInput } from "../core/visualBible";
 import { visualBibleErrorMessage } from "../core/visualBibleWorkflow";
+import { useGenerateController } from "../stores/generate";
 
 interface PendingImage {
   dataB64: string;
@@ -49,6 +50,8 @@ const emit = defineEmits<{
 }>();
 
 const { mimeOf } = useAssetThumbs();
+// 运行态锁：生成中禁止批准（批准会启动图像/配音续跑，双管线同时写同一目录会互相覆盖）
+const { busy: pipelineBusy, assetBusy, queueRunning } = useGenerateController();
 
 const styleSource = ref<StyleSource>("novel_analysis");
 const styleFileInput = ref<HTMLInputElement | null>(null);
@@ -75,8 +78,19 @@ const outputDir = computed(() => projectState.outputDir);
 const bibleNeedsReview = computed(() => !bible.value || bible.value.status !== "approved");
 const hasCards = computed(() => characters.value.length > 0);
 const stylePreviewSrc = computed(() => pendingStyleImage.value?.dataUrl || (bible.value ? vbPath(bible.value.styleReferencePath) : ""));
+// 改写类操作统一锁：主管线/素材批量/章节队列/草稿生成中，任何改写与重生成都必须禁用——
+// 双管线并发会同时写 visual-bible.json / cards 并重复计费（此前仅「批准」有三锁）
+const runLocked = computed(() => !!busyKey.value || creating.value || !!pipelineBusy.value || !!assetBusy.value || !!queueRunning.value);
+
+/** 视觉守门批量操作的取消信号：当前请求完成后不再调度后续（已完成的部分按操作语义保留），供「中断」按钮使用 */
+const vbAbort = ref(false);
+function requestVbAbort(): void {
+  vbAbort.value = true;
+  pushLog({ step: "视觉守门", message: "已请求中断：当前请求完成后停止调度后续（已完成的结果保留）", level: "warn", at: Date.now() });
+}
 const canCreateDraft = computed(() => {
   if (creating.value || !hasCards.value || !outputDir.value) return false;
+  if (pipelineBusy.value || assetBusy.value || queueRunning.value) return false;
   if (styleSource.value === "reference_image") return !!pendingStyleImage.value;
   return true;
 });
@@ -85,7 +99,10 @@ const canApprove = computed(() => {
     && bibleNeedsReview.value
     && approvalErrors.value.length === 0
     && !creating.value
-    && !busyKey.value;
+    && !busyKey.value
+    && !pipelineBusy.value
+    && !assetBusy.value
+    && !queueRunning.value;
 });
 
 const bibleStatusLabel = computed(() => {
@@ -199,8 +216,28 @@ async function refreshFingerprint(): Promise<void> {
   const cards = projectState.lastResult?.cards;
   if (!current || !novel || !cards || !outputDir.value) return;
   const fingerprint = await computeProjectVisualBibleFingerprint(outputDir.value, current, novel, cards.characters);
-  await refreshVisualBibleFingerprint(outputDir.value, current, fingerprint, cards.characters, true);
+  await refreshVisualBibleFingerprint(outputDir.value, current, fingerprint, cards.characters);
 }
+
+/**
+ * 进入面板时把草稿/失效态的指纹对齐到当前输入。
+ * 批准接口要求「存档指纹 == 当前指纹」，否则直接报 fingerprint is stale 而面板上并没有刷新入口：
+ * 项目在别处（换小说/换卡片/换风格）动过之后，用户就会卡在「点批准 → 报错 → 永远批准不了」，
+ * 图像阶段则一直判「输入已经变化」，图片始终生成不出来。
+ * 已批准（approved）的草稿不动，避免把变化过的输入悄悄重新盖章。
+ */
+async function syncFingerprintBeforeApproval(): Promise<void> {
+  if (!bible.value || bible.value.status === "approved") return;
+  try {
+    await refreshFingerprint();
+  } catch {
+    /* 指纹对齐失败不阻断面板使用：点批准时还会再报一次具体原因 */
+  }
+}
+
+onMounted(() => {
+  void syncFingerprintBeforeApproval();
+});
 
 async function refreshApprovalValidation(): Promise<void> {
   const current = bible.value;
@@ -276,8 +313,10 @@ async function createDraft(): Promise<void> {
     onProgress: (phase: "style" | "threeview", done: number, total: number) => {
       createProgress.value = { phase, done, total };
     },
+    isAborted: () => vbAbort.value,
   };
 
+  vbAbort.value = false;
   creating.value = true;
   createProgress.value = null;
   pushLog({
@@ -306,10 +345,15 @@ async function createDraft(): Promise<void> {
     await afterMutation();
     pushLog({ step: "视觉守门", message: `视觉守门草稿已生成（风格分析覆盖全书 ${novel.chapters.length} 章，${cards.characters.length} 个角色全部建档），请逐项确认后批准`, level: "success", at: Date.now() });
   } catch (e) {
-    createError.value = visualBibleErrorMessage(e, {
-      imageModel: activeConfig("image")?.model,
-      visionModel: activeConfig("vision")?.model,
-    });
+    if (vbAbort.value) {
+      pushLog({ step: "视觉守门", message: "已中断创建草稿：未保存任何内容（已完成的图片保留在缓存，可重新发起）", level: "warn", at: Date.now() });
+      createError.value = "";
+    } else {
+      createError.value = visualBibleErrorMessage(e, {
+        imageModel: activeConfig("image")?.model,
+        visionModel: activeConfig("vision")?.model,
+      });
+    }
   } finally {
     creating.value = false;
     createProgress.value = null;
@@ -473,7 +517,10 @@ async function regenerateCharacter(characterId: string): Promise<void> {
   const current = bible.value;
   const imageCfg = activeConfig("image");
   const character = characters.value.find((candidate) => candidate.id === characterId);
-  if (!current || !outputDir.value || !character) return;
+  if (!current || !outputDir.value || !character) {
+    pushLog({ step: "视觉守门", message: "三视图重生成未执行：视觉守门数据或输出目录不可用，请先创建草稿", level: "warn", at: Date.now() });
+    return;
+  }
   if (!imageCfg?.apiKey) {
     charErrors.value[characterId] = t("重新生成三视图需要配置图像生成 API");
     return;
@@ -509,7 +556,10 @@ async function regenerateCharacter(characterId: string): Promise<void> {
 async function regenerateCharacterDesc(characterId: string): Promise<void> {
   const current = bible.value;
   const character = characters.value.find((candidate) => candidate.id === characterId);
-  if (!current || !outputDir.value || !character) return;
+  if (!current || !outputDir.value || !character) {
+    pushLog({ step: "视觉守门", message: "角色描述重生成未执行：视觉守门数据或输出目录不可用，请先创建草稿", level: "warn", at: Date.now() });
+    return;
+  }
   const visionCfg = activeConfig("vision") ?? activeConfig("llm");
   if (!visionCfg?.apiKey) {
     charErrors.value[characterId] = t("重新生成角色描述需要配置视觉或文本 API");
@@ -578,6 +628,7 @@ async function syncCharactersWithCards(): Promise<void> {
   )) return;
   busyKey.value = "sync-cards";
   approvalError.value = "";
+  vbAbort.value = false;
   pushLog({
     step: "视觉守门",
     message: `同步开始：缺失 ${missing.length} 个条目待补建${extra.length ? `，多余 ${extra.length} 个待移除` : ""}…`,
@@ -593,6 +644,7 @@ async function syncCharactersWithCards(): Promise<void> {
       characters: cards.characters,
       imageCfg,
       characterReferences: refs,
+      isAborted: () => vbAbort.value,
       onProgress: (done, total) => {
         createProgress.value = { phase: "threeview", done, total };
       },
@@ -602,10 +654,10 @@ async function syncCharactersWithCards(): Promise<void> {
     await afterMutation();
     pushLog({
       step: "视觉守门",
-      message: `同步完成：补建 ${r.added.length} 个三视图条目${r.adopted.length ? `（其中 ${r.adopted.length} 个复用孤儿文件免生成：${r.adopted.join("、")}）` : ""}，移除多余 ${r.removed.length} 个`
+      message: `${vbAbort.value ? "同步已中断" : "同步完成"}：补建 ${r.added.length} 个三视图条目${r.adopted.length ? `（其中 ${r.adopted.length} 个复用孤儿文件免生成：${r.adopted.join("、")}）` : ""}，移除多余 ${r.removed.length} 个`
         + `${r.failed.length ? `，失败 ${r.failed.length} 个（${r.failed.map((f) => `${f.name}：${f.reason.slice(0, 60)}`).join("；")}）` : ""}`
         + "；被移除 id 的旧人物图孤儿请用素材页「清理无效素材」收尾",
-      level: r.failed.length ? "warn" : "success",
+      level: vbAbort.value || r.failed.length ? "warn" : "success",
       at: Date.now(),
     });
     if (r.failed.length) {
@@ -637,6 +689,7 @@ async function regenerateAllCharacters(): Promise<void> {
   }
   busyKey.value = "regenerate-all";
   approvalError.value = "";
+  vbAbort.value = false;
   const n = characters.value.length;
   const limit = Math.max(1, concurrencyFor(imageCfg, "image"));
   if (!window.confirm(`全局重新生成将为 ${n} 个角色重写描述（LLM）＋重画三视图（图像），${limit} 个一组并行，覆盖现有版本并打回待确认，下游人物图同步作废。约 ${n} 次文本调用＋${n} 张图片费用。继续吗？`)) {
@@ -657,6 +710,7 @@ async function regenerateAllCharacters(): Promise<void> {
       imageCfg,
       visionCfg,
       concurrency: limit,
+      isAborted: () => vbAbort.value,
       onProgress: (done) => {
         createProgress.value = { phase: "threeview", done, total: n };
       },
@@ -674,8 +728,8 @@ async function regenerateAllCharacters(): Promise<void> {
     await afterMutation();
     pushLog({
       step: "视觉守门",
-      message: `全局重新生成完成：成功 ${r.ok.length} 个${r.failed.length ? `，失败 ${r.failed.length} 个（${r.failed.map((f) => `${f.name}：${f.reason.slice(0, 60)}`).join("；")}）` : ""}（描述＋三视图已全量重做，均待确认）`,
-      level: r.failed.length ? "warn" : "success",
+      message: `${vbAbort.value ? "全局重新生成已中断" : "全局重新生成完成"}：成功 ${r.ok.length} 个${r.failed.length ? `，失败 ${r.failed.length} 个（${r.failed.map((f) => `${f.name}：${f.reason.slice(0, 60)}`).join("；")}）` : ""}（已重做的描述＋三视图均待确认）`,
+      level: vbAbort.value || r.failed.length ? "warn" : "success",
       at: Date.now(),
     });
     if (r.failed.length) approvalError.value = r.failed.map((f) => `${f.name}：${f.reason}`).join("；");
@@ -689,15 +743,19 @@ async function regenerateAllCharacters(): Promise<void> {
 
 async function acceptCharacter(characterId: string): Promise<void> {
   const current = bible.value;
-  if (!current || !outputDir.value) return;
+  if (!current || !outputDir.value) {
+    pushLog({ step: "视觉守门", message: "确认角色未执行：视觉守门数据或输出目录不可用", level: "warn", at: Date.now() });
+    return;
+  }
   busyKey.value = `char-accept:${characterId}`;
   charErrors.value[characterId] = "";
+  const t0 = Date.now();
   pushLog({ step: "视觉守门", message: `角色「${characters.value.find((c) => c.id === characterId)?.name ?? characterId}」确认开始…`, level: "info", at: Date.now() });
   try {
     await acceptCharacterSheet(outputDir.value, current, characterId);
     await refreshApprovalValidation();
     await afterMutation();
-    pushLog({ step: "视觉守门", message: `角色「${characters.value.find((c) => c.id === characterId)?.name ?? characterId}」三视图已确认`, level: "success", at: Date.now() });
+    pushLog({ step: "视觉守门", message: `角色「${characters.value.find((c) => c.id === characterId)?.name ?? characterId}」三视图已确认（用时 ${((Date.now() - t0) / 1000).toFixed(1)}s）`, level: "success", at: Date.now() });
   } catch (e) {
     charErrors.value[characterId] = visualBibleErrorMessage(e, {
       imageModel: activeConfig("image")?.model,
@@ -749,17 +807,24 @@ function characterNeedsRegeneration(characterId: string): boolean {
   return character.sourceRevision !== character.sheetSourceRevision;
 }
 
-/** 角色的服装三视图锚点列表（合并卡片服装名，便于展示） */
-function costumeSheetsFor(characterId: string): { costumeId: string; name: string; sheet: import("../core/types").VisualBibleCostumeSheet }[] {
+/** 角色的服装三视图锚点列表（合并卡片服装名，便于展示）。
+ * 以卡片服装为准全量列出：已有锚点的显示图，没有的显示"未生成"＋生成入口，
+ * 避免新增服装/同步漏建时面板上完全不可见、无处重建。 */
+function costumeSheetsFor(characterId: string): { costumeId: string; name: string; inCard: boolean; sheet?: import("../core/types").VisualBibleCostumeSheet }[] {
   const character = characters.value.find((candidate) => candidate.id === characterId);
-  const sheets = bible.value?.characters[characterId]?.costumeSheets;
-  if (!sheets || !character) return [];
-  const names = new Map((character.costumes ?? []).map((ct) => [ct.id, ct.name]));
-  return Object.entries(sheets).map(([costumeId, sheet]) => ({
-    costumeId,
-    name: names.get(costumeId) ?? costumeId,
-    sheet,
-  }));
+  if (!character) return [];
+  const sheets = bible.value?.characters[characterId]?.costumeSheets ?? {};
+  const rows: { costumeId: string; name: string; inCard: boolean; sheet?: import("../core/types").VisualBibleCostumeSheet }[] = [];
+  const seen = new Set<string>();
+  for (const ct of character.costumes ?? []) {
+    seen.add(ct.id);
+    rows.push({ costumeId: ct.id, name: ct.name, inCard: true, sheet: sheets[ct.id] });
+  }
+  // 兜底：锚点存在但卡片已无此服装（旧残留，待全局重建清理），只展示不给重建入口
+  for (const [costumeId, sheet] of Object.entries(sheets)) {
+    if (!seen.has(costumeId)) rows.push({ costumeId, name: costumeId, inCard: false, sheet });
+  }
+  return rows;
 }
 
 function characterCostumeSheetPath(characterId: string, costumeId: string): string {
@@ -772,15 +837,21 @@ async function regenCostumeSheet(characterId: string, costumeId: string): Promis
   const current = bible.value;
   const imageCfg = activeConfig("image");
   const character = characters.value.find((candidate) => candidate.id === characterId);
-  if (!current || !outputDir.value || !character) return;
+  if (!current || !outputDir.value || !character) {
+    pushLog({ step: "视觉守门", message: "服装三视图重生成未执行：视觉守门数据或输出目录不可用，请先创建草稿", level: "warn", at: Date.now() });
+    return;
+  }
   if (!imageCfg?.apiKey) {
     charErrors.value[characterId] = t("重生成服装三视图需要配置图像生成 API");
     return;
   }
   const costumeName = character.costumes?.find((ct) => ct.id === costumeId)?.name ?? costumeId;
+  const hasSheet = !!current.characters[characterId]?.costumeSheets?.[costumeId];
   busyKey.value = `char-sheet-ct:${characterId}:${costumeId}`;
   charErrors.value[characterId] = "";
-  if (!window.confirm(`重新生成「${character.name}」的「${costumeName}」三视图？将覆盖当前版本（角色打回待确认），并产生 1 张图片费用。`)) {
+  if (!window.confirm(hasSheet
+    ? `重新生成「${character.name}」的「${costumeName}」三视图？将覆盖当前版本（角色打回待确认），并产生 1 张图片费用。`
+    : `生成「${character.name}」的「${costumeName}」三视图？该服装暂无锚点（角色打回待确认），并产生 1 张图片费用。`)) {
     busyKey.value = "";
     return;
   }
@@ -810,6 +881,7 @@ async function regenCostumeSheet(characterId: string, costumeId: string): Promis
           <p class="vb-sub">{{ t("图像生成前的统一风格与角色三视图门禁。") }}</p>
         </div>
         <div class="row" style="justify-content: flex-end">
+          <button v-if="creating || !!busyKey" class="btn danger small" :title="t('中断正在进行的批量操作（当前请求完成后停止调度后续）')" @click="requestVbAbort">{{ t("中断") }}</button>
           <span class="tag" :class="bible?.status === 'approved' ? 'ok' : bible?.status === 'stale' ? 'err' : 'warn'">{{ bibleStatusLabel }}</span>
           <span v-if="bibleNeedsReview" class="tag warn">{{ t("待确认") }}</span>
         </div>
@@ -817,7 +889,7 @@ async function regenCostumeSheet(characterId: string, costumeId: string): Promis
 
       <div v-if="!hasCards" class="vb-empty">
         <p>{{ t("还没有角色卡片。请先运行文本阶段，生成角色/场景/物品卡。") }}</p>
-        <button class="btn" :disabled="creating" @click="emit('prepare')">{{ t("运行文本阶段") }}</button>
+        <button class="btn" :disabled="runLocked" @click="emit('prepare')">{{ t("运行文本阶段") }}</button>
       </div>
 
       <template v-else-if="!bible">
@@ -837,7 +909,7 @@ async function regenCostumeSheet(characterId: string, costumeId: string): Promis
           </div>
 
           <div v-if="styleSource === 'reference_image'" class="vb-upload-row">
-            <button class="btn secondary small" :disabled="creating" @click="pickStyleFile">
+            <button class="btn secondary small" :disabled="runLocked" @click="pickStyleFile">
               {{ pendingStyleImage ? t("更换参考图") : t("选择风格参考图") }}
             </button>
             <span v-if="pendingStyleImage" class="tag ok">{{ t("已选择") }}</span>
@@ -880,20 +952,20 @@ async function regenCostumeSheet(characterId: string, costumeId: string): Promis
                 <textarea v-model="styleDescriptionText" rows="4" :placeholder="t('英文风格 prompt 后缀')" />
               </label>
               <div class="row">
-                <button class="btn small" :disabled="!!busyKey" @click="saveStyleDescription">{{ t("保存风格") }}</button>
-                <button class="btn secondary small" :disabled="!!busyKey" @click="rewriteStyle">{{ t("AI 重写") }}</button>
+                <button class="btn small" :disabled="runLocked" @click="saveStyleDescription">{{ t("保存风格") }}</button>
+                <button class="btn secondary small" :disabled="runLocked" @click="rewriteStyle">{{ t("AI 重写") }}</button>
                 <button
                   v-if="bible.styleSource === 'novel_analysis'"
                   class="btn secondary small"
-                  :disabled="!!busyKey"
+                  :disabled="runLocked"
                   @click="regenerateSample"
                 >{{ t("重新生成示例") }}</button>
               </div>
               <div class="vb-upload-row">
-                <button class="btn ghost small" :disabled="!!busyKey" @click="pickStyleFile">
+                <button class="btn ghost small" :disabled="runLocked" @click="pickStyleFile">
                   {{ pendingStyleImage ? t("更换已选图片") : t("上传参考图（替换全局风格）") }}
                 </button>
-                <button v-if="pendingStyleImage" class="btn small" :disabled="!!busyKey" @click="replaceStyleFromUpload">
+                <button v-if="pendingStyleImage" class="btn small" :disabled="runLocked" @click="replaceStyleFromUpload">
                   {{ t("应用替换") }}
                 </button>
               </div>
@@ -916,14 +988,14 @@ async function regenCostumeSheet(characterId: string, costumeId: string): Promis
             <span class="vb-section-actions">
               <button
                 class="btn secondary small"
-                :disabled="!!busyKey"
+                :disabled="runLocked"
                 :title="t('重跑提取后角色 id 变化导致条目对不上时用：按当前卡片补建缺失条目、移除多余条目')"
                 @click="syncCharactersWithCards"
               >
                 <span v-if="busyKey === 'sync-cards'" class="spinner" />
                 {{ t("同步当前卡片") }}
               </button>
-              <button class="btn small" :disabled="!!busyKey" :title="t('全部角色：LLM 重写描述＋重画三视图，覆盖现有版本并打回待确认，下游人物图同步作废')" @click="regenerateAllCharacters">
+              <button class="btn small" :disabled="runLocked" :title="t('全部角色：LLM 重写描述＋重画三视图，覆盖现有版本并打回待确认，下游人物图同步作废')" @click="regenerateAllCharacters">
                 <span v-if="busyKey === 'regenerate-all'" class="spinner" />
                 {{ t("全局重新生成") }}
               </button>
@@ -940,45 +1012,19 @@ async function regenCostumeSheet(characterId: string, costumeId: string): Promis
                 <span v-if="characterNeedsRegeneration(row.id)" class="tag err">{{ t("需重新生成") }}</span>
               </div>
               <div class="vb-character-actions">
-                <button
-                  class="btn ghost small"
-                  :disabled="!!busyKey"
-                  :title="t('旧版 LLM 提取时把背景写死成其他颜色时使用，会强制改成纯绿幕')"
-                  @click="regenerateCharacterDesc(row.id)"
-                >
-                  <span v-if="busyKey === `char-desc:${row.id}`" class="spinner" />
-                  {{ t("重新生成描述") }}
-                </button>
-                <button class="btn small" :disabled="!!busyKey" @click="regenerateCharacter(row.id)">
+                <button class="btn small" :disabled="runLocked" @click="regenerateCharacter(row.id)">
                   <span v-if="busyKey === `char-sheet:${row.id}`" class="spinner" />
                   {{ t("重新生成三视图") }}
                 </button>
                 <button
                   class="btn secondary small"
-                  :disabled="!!busyKey || characterNeedsRegeneration(row.id)"
+                  :disabled="runLocked || characterNeedsRegeneration(row.id)"
                   @click="acceptCharacter(row.id)"
                 >{{ t("确认此角色") }}</button>
               </div>
             </div>
-            <div class="vb-character-body">
-              <div class="vb-preview-block">
-                <div class="vb-preview-label">{{ t("上传参考") }}</div>
-                <div class="vb-thumb" :class="{ missing: !characterSourcePath(row.id) && !pendingCharImages[row.id] }">
-                  <img v-if="pendingCharImages[row.id]" :src="pendingCharImages[row.id].dataUrl" :alt="t('待替换参考')" />
-                  <LazyThumb v-else-if="characterSourcePath(row.id)" :path="characterSourcePath(row.id)" :alt="t('角色参考')" />
-                  <span v-else>{{ t("未上传") }}</span>
-                </div>
-                <button class="btn ghost small" :disabled="!!busyKey" @click="pickCharacterFile(row.id)">
-                  {{ pendingCharImages[row.id] ? t("更换已选") : t("上传 / 替换") }}
-                </button>
-                <button
-                  v-if="pendingCharImages[row.id]"
-                  class="btn small"
-                  :disabled="!!busyKey"
-                  @click="replaceCharacterFromUpload(row.id)"
-                >{{ t("应用参考图") }}</button>
-              </div>
-              <div class="vb-preview-block">
+            <div class="vb-character-body vb-character-body--hero">
+              <div class="vb-preview-block vb-hero">
                 <div class="vb-preview-label">{{ t("三视图") }}</div>
                 <div class="vb-thumb" :class="{ missing: !characterSheetPath(row.id) }" @click="characterSheetPath(row.id) && openPreview(characterSheetPath(row.id), `${row.name} · 三视图`)">
                   <LazyThumb v-if="characterSheetPath(row.id)" :path="characterSheetPath(row.id)" :alt="t('三视图')" />
@@ -986,9 +1032,31 @@ async function regenCostumeSheet(characterId: string, costumeId: string): Promis
                   <span class="thumb-label">{{ t("点击放大") }}</span>
                 </div>
               </div>
-              <div v-if="costumeSheetsFor(row.id).length" class="vb-preview-block vb-costume-sheets">
-                <div class="vb-preview-label">{{ t("服装三视图锚点（换装用）") }}</div>
-                <div v-for="cs in costumeSheetsFor(row.id)" :key="cs.costumeId" class="vb-costume-row">
+              <div class="vb-preview-block">
+                <div class="vb-preview-label">{{ t("上传参考") }}</div>
+                <div class="vb-thumb" :class="{ missing: !characterSourcePath(row.id) && !pendingCharImages[row.id] }">
+                  <img v-if="pendingCharImages[row.id]" :src="pendingCharImages[row.id].dataUrl" :alt="t('待替换参考')" />
+                  <LazyThumb v-else-if="characterSourcePath(row.id)" :path="characterSourcePath(row.id)" :alt="t('角色参考')" />
+                  <span v-else>{{ t("未上传") }}</span>
+                </div>
+                <button class="btn ghost small" :disabled="runLocked" @click="pickCharacterFile(row.id)">
+                  {{ pendingCharImages[row.id] ? t("更换已选") : t("上传 / 替换") }}
+                </button>
+                <button
+                  v-if="pendingCharImages[row.id]"
+                  class="btn small"
+                  :disabled="runLocked"
+                  @click="replaceCharacterFromUpload(row.id)"
+                >{{ t("应用参考图") }}</button>
+              </div>
+            </div>
+            <details v-if="costumeSheetsFor(row.id).length" class="vb-fold">
+              <summary class="vb-fold-summary">
+                {{ t("服装三视图锚点（换装用）") }}
+                <span class="vb-section-hint">{{ costumeSheetsFor(row.id).length }}{{ t("套") }}</span>
+              </summary>
+              <div class="vb-costume-grid">
+                <div v-for="cs in costumeSheetsFor(row.id)" :key="cs.costumeId" class="vb-costume-cell">
                   <div
                     class="vb-thumb"
                     :class="{ missing: !characterCostumeSheetPath(row.id, cs.costumeId) }"
@@ -999,18 +1067,30 @@ async function regenCostumeSheet(characterId: string, costumeId: string): Promis
                   </div>
                   <div class="vb-costume-meta">
                     <span class="asset-name">{{ cs.name }}</span>
-                    <button class="btn ghost small" :disabled="!!busyKey" @click="regenCostumeSheet(row.id, cs.costumeId)">
+                    <span v-if="!cs.sheet" class="tag warn">{{ t("未生成") }}</span>
+                    <button v-if="cs.inCard" class="btn ghost small" :disabled="runLocked" @click="regenCostumeSheet(row.id, cs.costumeId)">
                       <span v-if="busyKey === `char-sheet-ct:${row.id}:${cs.costumeId}`" class="spinner" />
-                      {{ t("重生成") }}
+                      {{ cs.sheet ? t("重生成") : t("生成") }}
                     </button>
                   </div>
                 </div>
               </div>
-              <div class="vb-character-prompt">
-                <span class="vb-preview-label">{{ t("三视图提示词") }}</span>
+            </details>
+            <details class="vb-fold">
+              <summary class="vb-fold-summary">{{ t("三视图提示词") }}</summary>
+              <div class="vb-prompt-body">
                 <code>{{ bible.characters[row.id]?.prompt || t("暂无") }}</code>
+                <button
+                  class="btn ghost small"
+                  :disabled="runLocked"
+                  :title="t('旧版 LLM 提取时把背景写死成其他颜色时使用，会强制改成纯绿幕')"
+                  @click="regenerateCharacterDesc(row.id)"
+                >
+                  <span v-if="busyKey === `char-desc:${row.id}`" class="spinner" />
+                  {{ t("重新生成描述") }}
+                </button>
               </div>
-            </div>
+            </details>
             <p v-if="charErrors[row.id]" class="vb-error">{{ charErrors[row.id] }}</p>
           </div>
         </div>

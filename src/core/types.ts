@@ -163,6 +163,19 @@ export interface VisualBibleCacheBinding {
   characterRevisions: Record<string, number>;
 }
 
+/**
+ * 视觉输入签名：出图相关输入按「画风 + 逐角色」拆开的哈希（口径与
+ * computeVisualBibleFingerprint 一致，但不含小说正文/分章）。
+ *
+ * 批准时记录到 ProjectVisualBible.visualInputs，作为「现存图片是按哪些输入画出来的」基线：
+ * 之后指纹变化时用它判断是真有画图输入变了（→ 判废对应范围），还是只是小说正文/分章变了
+ * （→ 一张图都不该删）。
+ */
+export interface VisualInputSignature {
+  style: string;
+  characters: Record<string, string>;
+}
+
 export interface ProjectVisualBible {
   version: 1;
   status: VisualBibleStatus;
@@ -173,6 +186,8 @@ export interface ProjectVisualBible {
   inputFingerprint: string;
   pendingInvalidation?: VisualBiblePendingInvalidation;
   cacheBinding?: VisualBibleCacheBinding;
+  /** 上次批准时记下的视觉输入签名；缺失（旧项目/未批准）时不做指纹推断，只认显式作废范围。 */
+  visualInputs?: VisualInputSignature;
   approvedAt?: string;
 }
 
@@ -290,6 +305,8 @@ export interface ChapterScript {
 export interface ImageTask {
   kind: "figure" | "background" | "cg" | "item" | "threeview" | "action" | "anchor";
   id: string;
+  /** 该任务所属章节（仅背景/CG：ChapterScript.chapter，0-based 连续编号）；用于按章精确强制重画 */
+  chapter?: number;
   characterId?: string;
   prompt: string;
   references?: ImageReference[];
@@ -416,6 +433,8 @@ export interface GenerationOptions {
   useTts: boolean;
   useVideoPoints: boolean;
   useBgm: boolean;
+  /** 环境音效（SE）：按场景氛围播放内置雨/雷/风等音效；默认关闭，需要氛围音时再打开 */
+  useSe?: boolean;
   figureEmotions: boolean;
   /** 人物图详细度：core=标准5表情＋无服装差分（省图省钱）；full=AI全量表情＋服装＋动作（默认，保持现状） */
   figureDetail?: FigureDetail;
@@ -452,10 +471,20 @@ export interface GenerationOptions {
   /** 提取分段字数上限（0/缺省 = 自动：按语种估算，上限 15 万字）。
    * 中转网关常有单请求 ~70 秒超时墙：大段必 500 时手动调小（如 40000），段小单次必能跑完。 */
   extractChunkChars?: number;
+  /** 单阶段重跑成功后自动补齐下游缺失的资产阶段（图像/配音/组装）：复用缓存只补缺失项，
+   * 执行前统一二次确认并明示规模。默认 true；置 false 恢复旧的「严格单阶段」语义（下游需手动依次重跑）。
+   * 旧项目缺该字段时按「非 false 即开启」处理。 */
+  autoCascadeDownstream?: boolean;
   rerunChapters?: number[];
   /** 单章强制重跑（与 rerunChapters 同口径的 novel index）：这些章节跳过剧本缓存直接重写，
    * 不需要填意见；图像阶段同范围背景/CG 同步强制。由章节盘/剧本页「全量」开关传入。 */
   rerunChaptersForce?: number[];
+  /** 只强制重写这些章节的剧本（novel index，与 rerunChapters 同口径）；不牵连其他章节与图像 */
+  forceScriptChapters?: number[];
+  /** 只强制重画这些章节的背景/CG（novel index）；人物/物品是项目级资产，不受章节影响 */
+  forceImageChapters?: number[];
+  /** 只强制重配这些章节的台词配音（novel index） */
+  forceVoiceChapters?: number[];
 }
 
 export interface PipelineEvent {

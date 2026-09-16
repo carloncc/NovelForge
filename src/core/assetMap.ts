@@ -1,5 +1,6 @@
 import type { AssetMap } from "./types";
 import { tauri } from "../utils/tauri";
+import { log } from "../utils/logger";
 
 const updateChains = new Map<string, Promise<void>>();
 
@@ -31,7 +32,16 @@ export async function readAssetMap(outputDir: string): Promise<AssetMap> {
   const path = `${outputDir}/.novel2vn/assets.json`;
   if (!(await tauri.pathExists(path))) return emptyAssetMap();
   const { text } = await tauri.readTextFile(path);
-  return parseAssetMap(JSON.parse(text));
+  try {
+    return parseAssetMap(JSON.parse(text));
+  } catch (e) {
+    // 损坏的 assets.json 此前让整条管线不可运行（JSON.parse 直接抛）。隔离损坏文件后从空映射继续，
+    // 原文件保留为 .corrupt-<ts>.json 供人工找回；调用方的备份/补全流程可继续工作
+    const backup = `${path}.corrupt-${Date.now()}.json`;
+    await tauri.writeTextFile(backup, text).catch(() => {});
+    log.warn("assetMap", `assets.json 解析失败，已隔离为 ${backup} 并从空映射继续：${String(e).slice(0, 140)}`, { outputDir });
+    return emptyAssetMap();
+  }
 }
 
 export function updateAssetMap(outputDir: string, mutate: (assets: AssetMap) => void): Promise<void> {

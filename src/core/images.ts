@@ -16,7 +16,7 @@ import type {
 } from "./types";
 import type { ApiConfig } from "./types";
 import { generateImage, ReferenceImageError, VisionApiError, setImageConcurrency, chatCompletion } from "../api/openaiCompatible";
-import { resolveImageModelCapabilities } from "../api/providers";
+import { referenceRouteRejection, resolveImageModelCapabilities } from "../api/providers";
 import { verifyImage } from "./selfcheck";
 import { describeReferenceImageCached } from "./recognize";
 import { tauri } from "../utils/tauri";
@@ -42,6 +42,41 @@ function nameContains(name: string, keywords: string[]): boolean {
 }
 
 const FIGURE_EMOTIONS = ["normal", "happy", "sad", "angry", "surprised"];
+
+/**
+ * 本章出现的角色 id：台词说话人（含分支选项）＋场景出场表；旁白不算。
+ * 单章模式的图像任务裁剪与章节灯（chapterAssets）共用同一口径，两边一致才能收敛。
+ */
+export function chapterCharacterIds(chapter: ChapterScript): Set<string> {
+  const out = new Set<string>();
+  const add = (id?: string): void => {
+    if (!id || id === "narrator") return;
+    out.add(id);
+  };
+  for (const scene of chapter.scenes) {
+    for (const id of scene.figures ?? []) add(id);
+    for (const line of scene.lines ?? []) {
+      if (line.type === "dialogue") add(line.characterId);
+    }
+    for (const choice of scene.choices ?? []) {
+      for (const line of choice.lines ?? []) {
+        if (line.type === "dialogue") add(line.characterId);
+      }
+    }
+  }
+  return out;
+}
+
+/** 本章 itemEvents 引用到的物品 id。 */
+export function chapterItemIds(chapter: ChapterScript): Set<string> {
+  const out = new Set<string>();
+  for (const scene of chapter.scenes) {
+    for (const ev of scene.itemEvents ?? []) {
+      if (ev.itemId) out.add(ev.itemId);
+    }
+  }
+  return out;
+}
 
 // 情绪提示词：必须足够明确（五官/眉/嘴），否则模型会把不同情绪画成雷同的笑脸；
 // 所有情绪统一约束自然站姿+手臂下垂，避免模型给表情加戏配怪手势。
@@ -366,6 +401,7 @@ export function buildImageTasks(
       tasks.push({
         kind: "background",
         id: scene.id,
+        chapter: chapter.chapter,
         prompt: (scene.bgPrompt || `${scene.location} ${scene.atmosphere}, anime background`) + style + (useAnchor ? STYLE_ANCHOR_HINT : "") + BACKGROUND_EMPTY_SUFFIX,
         fileName: `bg_${sanitizeId(scene.id)}.png`,
         width: 1536,
@@ -383,6 +419,7 @@ export function buildImageTasks(
         tasks.push({
           kind: "cg",
           id: scene.id,
+          chapter: chapter.chapter,
           prompt: scene.cgEvent.imagePrompt + style + (useAnchor ? STYLE_ANCHOR_HINT : ""),
           fileName: `cg_${sanitizeId(scene.id)}.png`,
           width: 1536,
@@ -569,6 +606,12 @@ export interface ImageRunOptions {
   negativePrompt?: string;
   /** 生成失败重试次数（默认 3 次，含首次；网络/临时错误自动重试） */
   retryCount?: number;
+  /**
+   * 协作式中止检查（与 generateImages 同口径）：返回 true 时不再发起任何新的付费请求
+   * （参考图描述 / 图像生成 / 提示词改写 / 退避重试 / 自检）。已在途的请求无法撤回，
+   * 其结果是已付费产物，仍会保留落盘。缺省（undefined）表示不中止。
+   */
+  isAborted?: () => boolean;
   /** 重试间隔毫秒（默认 3000，每次翻倍） */
   retryDelayMs?: number;
 }
@@ -771,6 +814,9 @@ export async function runImageTask(
   log: (ev: PipelineEvent) => void,
   opts: ImageRunOptions = {},
 ): Promise<string | null> {
+  /** 协作式中止：已中止则整任务直接跳过（管线会统一给出中止说明，这里不重复刷日志） */
+  const aborted = (): boolean => opts.isAborted?.() === true;
+  if (aborted()) return null;
   const cacheDir = cacheDirFor(cacheRoot, "images");
   await tauri.mkdirAll(cacheDir);
   let path: string | null = null;
@@ -814,6 +860,8 @@ export async function runImageTask(
   }
   // 缓存未命中/缓存已作废 → 用户素材或 AI 生成
   if (!path) {
+    // 已中止：连素材拷贝与「生成中」日志都不再发起
+    if (aborted()) return null;
     const mat = findMaterial(opts.materials ?? [], task);
     if (mat) {
       const useAsItemReference = !!cfg && task.kind === "item" && opts.visualBible?.status === "approved";
@@ -867,6 +915,8 @@ export async function runImageTask(
         const referenceBlocks: string[] = [];
         for (const reference of resolvedReferences) {
           if (!reference.dataB64) continue;
+          // 已中止：不再调用视觉模型描述参考图（每个参考图一次付费调用）
+          if (aborted()) return null;
           try {
             let description = await describeReferenceImageCached(opts.visionCfg, reference.dataB64);
             if (description) {
@@ -923,6 +973,8 @@ export async function runImageTask(
       // 提示词超长压缩：服务端报错携带上限时按上限压缩重试 1 次（覆盖未预设上限的服务）
       let promptFitted = false;
       for (let attempt = 0; ; attempt++) {
+        // 已中止：不再发起新的付费生成请求（本书最主要的花钱点）
+        if (aborted()) return null;
         try {
           img = await generateImage(cfg, prompt, {
             references: resolvedReferences,
@@ -932,6 +984,8 @@ export async function runImageTask(
           });
           break;
         } catch (e) {
+          // 已中止：不再做提示词改写/退避重试等任何后续（每次都是新的付费调用）
+          if (aborted()) return null;
           const status = typeof (e as { status?: number }).status === "number" ? (e as { status?: number }).status : undefined;
           const rawMessage = e instanceof Error ? e.message : String(e);
 
@@ -950,6 +1004,18 @@ export async function runImageTask(
           }
 
           const cls = classifyError(e, status);
+
+          // 线路不接受带参考图的请求：重试/改写都不会成功，静默丢参考图又会破坏角色一致性
+          // → 直接失败并给出可执行的修复提示（重新探测该线路的图像能力 / 换线路）。
+          if (e instanceof ReferenceImageError && e.code === "REFERENCE_UNSUPPORTED" && resolvedReferences.length > 0) {
+            log({
+              step: "图像",
+              message: `生成失败（当前线路不接受参考图）：${task.usage}。${referenceRouteRejection(rawMessage) ?? errMsg(e)}`,
+              level: "error",
+              at: Date.now(),
+            });
+            throw e;
+          }
 
           // 内容审查：阶梯式改写提示词重试，最大化过审概率（严格模型连「战斗」「剑」都拒）
           if (cls === "content_moderation" && moderationStage < 3) {
@@ -1029,7 +1095,12 @@ export async function runImageTask(
             level: "warn",
             at: Date.now(),
           });
-          await new Promise((r) => setTimeout(r, delay));
+          // 退避期间分段检查中止，避免最长 60s 的无效等待
+          const resumeAt = Date.now() + delay;
+          while (!aborted() && Date.now() < resumeAt) {
+            await new Promise((r) => setTimeout(r, Math.min(250, resumeAt - Date.now())));
+          }
+          if (aborted()) return null;
         }
       }
       const ext = img.mime.includes("jpeg") ? "jpg" : "png";
@@ -1046,7 +1117,7 @@ export async function runImageTask(
   }
 
   // 多模态自检：核对图片是否符合描述，不合格自动重生成 1 次（有参考图时一并核对角色/画风一致性）
-  if (path && opts.verifyCfg && source === "AI 生成") {
+  if (path && opts.verifyCfg && source === "AI 生成" && !aborted()) {
     try {
       const b64 = await tauri.readFileBase64(path);
       const { ok, reason } = await verifyImage(
@@ -1108,8 +1179,8 @@ export async function generateImages(
   maxPerChapter = 0,
   chapterScope?: Set<number>,
   figureDetail: FigureDetail = "full",
-  /** 单章强制：仅当 chapterScope 限定单章模式时生效，范围内背景/CG 跳过缓存直接重画（人物/物品不受影响） */
-  chapterForce = false,
+  /** 单章强制：这些章节（与 chapterScope 同口径的章节编号）的背景/CG 跳过缓存直接重画（人物/物品不受影响） */
+  chapterForce: Set<number> = new Set(),
 ): Promise<{ images: ImageResultMap; failed: FailedTask[]; generated: number }> {
   const result: ImageResultMap = { bg: {}, cg: {}, figure: {}, item: {} };
   const failed: FailedTask[] = [];
@@ -1134,10 +1205,54 @@ export async function generateImages(
   // 根本不建任务（而非建完再跳过）——400+ 任务的 stat 开销与"顺手生成计费"一并消除。
   // 新角色（无三视图）、新物品、视觉守门修订、force/意见、全量模式不受影响。
   let taskCards = cards;
+  // 单章/多选模式：人物图与物品图先收窄到本次范围章节真正用到的角色/物品。
+  // 章节灯（chapterScopeImageTasks）按同一口径计数，两边一致才不会出现
+  // 「灯显示差图、单章却永远补不上」。
+  if (chapterScope) {
+    const scopedChapters = chapters.filter((c) => chapterScope.has(c.chapter));
+    if (scopedChapters.length) {
+      const usedChars = new Set<string>();
+      const usedItems = new Set<string>();
+      for (const scoped of scopedChapters) {
+        for (const id of chapterCharacterIds(scoped)) usedChars.add(id);
+        for (const id of chapterItemIds(scoped)) usedItems.add(id);
+      }
+      const charactersInScope = taskCards.characters.filter((c) => usedChars.has(c.id));
+      const itemsInScope = taskCards.items.filter((it) => usedItems.has(it.id));
+      if (charactersInScope.length < taskCards.characters.length || itemsInScope.length < taskCards.items.length) {
+        const beforeChars = taskCards.characters.length;
+        const beforeItems = taskCards.items.length;
+        taskCards = { ...taskCards, characters: charactersInScope, items: itemsInScope };
+        log({
+          step: "图像",
+          message: `单章模式：人物/物品图按本次章节的出场范围收窄（角色 ${beforeChars}→${charactersInScope.length}、物品 ${beforeItems}→${itemsInScope.length}）；未出场角色的图画到对应章节时再生成`,
+          level: "info",
+          at: Date.now(),
+        });
+      }
+    }
+  }
   if (chapterScope && !force && !feedback && globalCacheCurrent) {
+    /** 该角色在完整档下应有的全部差分/服装/动作文件名（与 buildImageTasks 命名逐字一致）。 */
+    const derivativeFileNames = (c: CharacterCard): string[] => {
+      const names: string[] = [];
+      const emoList = !figureEmotions
+        ? ["normal"]
+        : figureDetail === "core"
+          ? FIGURE_EMOTIONS
+          : (c.emotions?.length ? c.emotions : FIGURE_EMOTIONS);
+      for (const emo of emoList) names.push(`figure_${sanitizeId(c.id)}_${emo}.png`);
+      if (threeView && figureDetail !== "core") {
+        for (const ct of c.costumes ?? []) names.push(`figure_${sanitizeId(c.id)}_ct_${sanitizeId(ct.id)}_normal.png`);
+      }
+      if (threeView && withActions) {
+        for (const a of c.actions ?? []) names.push(`figure_${sanitizeId(c.id)}_act_${sanitizeId(a.id)}.png`);
+      }
+      return names;
+    };
     const keepChars: CharacterCard[] = [];
     let skippedChars = 0;
-    for (const c of cards.characters) {
+    for (const c of taskCards.characters) {
       const revised = !!approvedCacheBinding
         && storedCacheBinding?.characterRevisions[c.id] !== approvedCacheBinding.characterRevisions[c.id];
       let hasThree: string | null = null;
@@ -1146,12 +1261,26 @@ export async function generateImages(
       } catch {
         hasThree = null;
       }
-      if (!hasThree || revised) keepChars.push(c);
-      else skippedChars++;
+      if (!hasThree || revised) {
+        keepChars.push(c);
+        continue;
+      }
+      // 只有三视图还不够：开启表情差分 / 切到完整档 / 新增服装动作后，
+      // 缺的差分若因为"三视图存在"被一起裁掉，单章和队列都永远补不上。
+      let complete = true;
+      for (const name of derivativeFileNames(c)) {
+        const hit = await cacheHit(imageCacheDir, name).catch(() => null);
+        if (!hit) {
+          complete = false;
+          break;
+        }
+      }
+      if (complete) skippedChars++;
+      else keepChars.push(c);
     }
     const keepItems: ItemCard[] = [];
     let skippedItems = 0;
-    for (const it of cards.items) {
+    for (const it of taskCards.items) {
       let hasItem: string | null = null;
       try {
         hasItem = await cacheHit(imageCacheDir, `item_${sanitizeId(it.id)}.png`);
@@ -1162,10 +1291,10 @@ export async function generateImages(
       else skippedItems++;
     }
     if (skippedChars > 0 || skippedItems > 0) {
-      taskCards = { ...cards, characters: keepChars, items: keepItems };
+      taskCards = { ...taskCards, characters: keepChars, items: keepItems };
       log({
         step: "图像",
-        message: `单章模式：${skippedChars} 个角色的人物基础图、${skippedItems} 个物品图已有成品，本次不构建任务（未重生成、0 计费）`,
+        message: `单章模式：${skippedChars} 个角色（三视图与全部差分/服装/动作均已有成品）、${skippedItems} 个物品图已有成品，本次不构建任务（未重生成、0 计费）`,
         level: "info",
         at: Date.now(),
       });
@@ -1190,8 +1319,9 @@ export async function generateImages(
   await tauri.mkdirAll(cacheDirFor(cacheRoot, "images"));
   const imageForceFor = (task: ImageTask): boolean => {
     if (force || !globalCacheCurrent) return true;
-    // 单章强制：scope 内的背景/CG 直接重画（人物/物品是项目级的，不动）
-    if (chapterForce && chapterScope && (task.kind === "background" || task.kind === "cg")) return true;
+    // 单章强制：只重画点名章节的背景/CG（人物/物品是项目级的，不动）
+    if (chapterForce.size > 0 && (task.kind === "background" || task.kind === "cg")
+      && task.chapter !== undefined && chapterForce.has(task.chapter)) return true;
     if (!task.characterId || !approvedCacheBinding) return false;
     return storedCacheBinding?.characterRevisions[task.characterId]
       !== approvedCacheBinding.characterRevisions[task.characterId];
@@ -1375,6 +1505,7 @@ export async function generateImages(
           const p = await runImageTask(cfg, task, cacheRoot, log, {
             materials,
             force: imageForceFor(task),
+            isAborted,
             figureBase: result.figure,
             visualBible: approvedBible,
             outputDir: projectOutputDir,
@@ -1391,6 +1522,9 @@ export async function generateImages(
             // 新图映射已写入 → 素材页真正「生成一张显示一个」。
             // （旧顺序先 emitProgress 后 persistIncremental，前端读到旧数据导致中途不刷新）
             await write();
+          } else if (isAborted?.()) {
+            // 已中止且本任务未产出：不计进度、不上屏（避免停止后进度条继续涨）
+            return;
           }
           emitProgress(task);
         } catch (e) {
@@ -1425,6 +1559,7 @@ export async function generateImages(
     const p = await runImageTask(cfg, anchorTask, cacheRoot, log, {
       materials,
       force: imageForceFor(anchorTask),
+      isAborted,
       figureBase: result.figure,
       visualBible: approvedBible,
       outputDir: projectOutputDir,
@@ -1604,6 +1739,8 @@ export interface RepairImageReport {
   purgedFiles: number;
   /** 剪掉的"映射有、文件无"条目（下次运行自动补生成） */
   missingDropped: number;
+  /** 是否因中断提前结束（映射变更可能只完成了一部分） */
+  aborted: boolean;
 }
 
 const MANAGED_IMAGE_PREFIXES = ["bg_", "cg_", "figure_", "item_", "threeview_", "anchor_"];
@@ -1629,12 +1766,18 @@ export async function repairImageAssets(
     maxPerChapter?: number;
   },
   log: (ev: PipelineEvent) => void,
+  isAborted?: () => boolean,
 ): Promise<RepairImageReport> {
-  const report: RepairImageReport = { prunedRefs: 0, migratedCg: 0, purgedFiles: 0, missingDropped: 0 };
+  const report: RepairImageReport = { prunedRefs: 0, migratedCg: 0, purgedFiles: 0, missingDropped: 0, aborted: false };
   const cacheRoot = `${outputDir.replace(/[\\/]+$/, "")}/.novel2vn/cache`;
   const imageCacheDir = cacheDirFor(cacheRoot, "images");
   await tauri.mkdirAll(imageCacheDir);
   const map = await readAssetMap(outputDir);
+  if (isAborted?.()) {
+    report.aborted = true;
+    log({ step: "图像", message: "清理无效素材已中断（未执行任何操作）", level: "warn", at: Date.now() });
+    return report;
+  }
 
   // 期望 key 集合（仅当调用方给出完整上下文时才用于剪枝）
   let bgKeep: Set<string> | null = null;
@@ -1671,6 +1814,7 @@ export async function repairImageAssets(
     // 跨扩展名兼容：映射存 .png 而盘存 .jpg（API 常回 jpeg）不算缺失；
     // 找到变体时把映射修正到实际文件，避免误删映射。
     for (const [k, p] of Object.entries(section)) {
+      if (isAborted?.()) return;
       try {
         if (await tauri.pathExists(p)) continue;
       } catch {
@@ -1732,6 +1876,7 @@ export async function repairImageAssets(
   try {
     const entries = await tauri.listDir(imageCacheDir);
     for (const e of entries) {
+      if (isAborted?.()) break;
       if (e.isDir) continue;
       const m = /^cg_\d+_(.+\.(png|jpg|jpeg|webp))$/i.exec(e.name);
       if (!m) continue;
@@ -1761,6 +1906,7 @@ export async function repairImageAssets(
   try {
     const entries = await tauri.listDir(imageCacheDir);
     for (const e of entries) {
+      if (isAborted?.()) break;
       if (e.isDir) continue;
       const lower = e.name.toLowerCase();
       if (lower.startsWith("anchor_")) continue;
@@ -1774,6 +1920,8 @@ export async function repairImageAssets(
     /* 目录不存在等 */
   }
 
+  const aborted = isAborted?.() === true;
+  report.aborted = aborted;
   await updateAssetMap(outputDir, (assets) => {
     assets.bg = map.bg;
     assets.cg = map.cg;
@@ -1782,8 +1930,10 @@ export async function repairImageAssets(
   });
   log({
     step: "图像",
-    message: `无效素材清理完成：剪枝过期映射 ${report.prunedRefs} 项，迁移旧版 CG ${report.migratedCg} 项，删除孤儿文件 ${report.purgedFiles} 个，清理缺文件映射 ${report.missingDropped} 项（缺失项下次运行自动补生成）`,
-    level: "success",
+    message: aborted
+      ? `无效素材清理已中断：已完成部分（剪枝 ${report.prunedRefs} 项，迁移旧版 CG ${report.migratedCg} 项，删除孤儿文件 ${report.purgedFiles} 个，清理缺文件映射 ${report.missingDropped} 项）`
+      : `无效素材清理完成：剪枝过期映射 ${report.prunedRefs} 项，迁移旧版 CG ${report.migratedCg} 项，删除孤儿文件 ${report.purgedFiles} 个，清理缺文件映射 ${report.missingDropped} 项（缺失项下次运行自动补生成）`,
+    level: aborted ? "warn" : "success",
     at: Date.now(),
   });
   return report;

@@ -265,7 +265,13 @@ export async function vfsCollectFiles(
   const out: { path: string; data: ArrayBuffer }[] = [];
   for (const key of keys) {
     if (!key.startsWith(prefix + "/")) continue;
-    if (excludePrefixes.some((ep) => key.startsWith(normalizePath(ep)))) continue;
+    const relative = key.slice(prefix.length + 1);
+    // exclude 同时支持绝对路径与"相对 root 的目录名"（如 ".novel2vn"）：此前相对名永远匹配不上，
+    // Web 打包会把内部缓存/状态一起打进 zip
+    if (excludePrefixes.some((ep) => {
+      const norm = normalizePath(ep).replace(/^\/+/, "");
+      return relative === norm || relative.startsWith(`${norm}/`) || key.startsWith(normalizePath(ep));
+    })) continue;
     const node = await txGet(key);
     if (node?.kind === "file") {
       out.push({ path: key.slice(prefix.length + 1), data: node.data });

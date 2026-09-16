@@ -4,6 +4,8 @@ import { tauri } from "../utils/tauri";
 import { errMsg } from "../utils/errors";
 import { extname, normalizePath, safeFilename } from "../utils/path";
 import { buildImageTasks, stripBackground } from "./images";
+import { sanitizePrompt, appendSafeStyleSuffix } from "../utils/promptRewriter";
+import { classifyError } from "../utils/errorClassifier";
 import { concurrencyFor } from "../stores/configMigration";
 import type {
   ApiConfig,
@@ -17,6 +19,7 @@ import type {
   VisualBibleCharacter,
   VisualBibleCostumeSheet,
   VisualBiblePendingInvalidation,
+  VisualInputSignature,
 } from "./types";
 import { updateAssetMap } from "./assetMap";
 
@@ -97,6 +100,8 @@ interface VisualBibleDraftBase {
   characterReferences?: Record<string, VisualBibleImageInput>;
   /** 生成进度回调：phase 为 "style"（风格分析）| "threeview"（角色三视图） */
   onProgress?: (phase: "style" | "threeview", done: number, total: number) => void;
+  /** 取消信号：返回 true 时在下一个调度点中止（已完成的内容按各自语义保留或丢弃） */
+  isAborted?: () => boolean;
 }
 
 export type CreateVisualBibleDraftInput = VisualBibleDraftBase & (
@@ -491,7 +496,7 @@ async function generateCostumeSheets(
         visualBibleArtifactPath(artifactDir, baseSheetPath),
         `Base three-view for ${card.id}`,
       );
-      const generated = await dependencies.generateImage(
+      const generated = await generateImageWithModerationRetry(
         imageCfg,
         characterThreeViewPrompt(ctPrompt, styleDescription),
         {
@@ -501,6 +506,7 @@ async function generateCostumeSheets(
           ],
           size: "1024x1024",
         },
+        dependencies,
       );
       const ctPath = revisionedArtifactPath(canonicalCostumeSheetPath(card.id, ct.id), artifactRevision);
       await writeGeneratedImage(visualBibleArtifactPath(artifactDir, ctPath), generated);
@@ -518,6 +524,36 @@ function characterThreeViewPrompt(identityPrompt: string, styleDescription: stri
   // 不剥会与后面的纯绿幕后缀冲突（环境采样图那边要完整风格，不动它，只在这里剥）
   const style = stripBackground(normalizeStyleDescription(styleDescription));
   return `${identity}. ${style}. Character turnaround sheet showing exactly the same person in front, side, and back orthographic full-body views, neutral pose, consistent proportions and clothing, solid chroma key green background (pure #00FF00 green filling the entire background, no gradient, no pattern, no text), no extra figures, no text.`;
+}
+
+/**
+ * 视觉守门图像生成的内容审查自动改写重试（与 images.ts runImageTask 同阶梯的无 LLM 版）：
+ * 原提示词 → 规则改写（sanitizePrompt）→ 追加全年龄安全后缀，全程最多 3 次尝试。
+ * 非审查错误直接抛出；改写后仍失败时抛出原错误（调用方展示原始 400 文案）。
+ */
+async function generateImageWithModerationRetry(
+  cfg: ApiConfig,
+  prompt: string,
+  options: { references?: ImageReference[]; size?: string; seed?: number; negativePrompt?: string },
+  dependencies: VisualBibleServiceDependencies,
+): Promise<{ dataB64: string; mime: string }> {
+  let current = prompt;
+  for (let stage = 0; ; stage++) {
+    try {
+      return await dependencies.generateImage(cfg, current, options);
+    } catch (e) {
+      const status = typeof (e as { status?: number }).status === "number"
+        ? (e as { status?: number }).status
+        : undefined;
+      if (classifyError(e, status) !== "content_moderation" || stage >= 2) throw e;
+      if (stage === 0) {
+        const { prompt: safe, replaced } = sanitizePrompt(prompt);
+        current = replaced === 0 || safe === prompt ? appendSafeStyleSuffix(safe) : safe;
+      } else {
+        current = appendSafeStyleSuffix(current);
+      }
+    }
+  }
 }
 
 function characterImageTasks(character: CharacterCard) {
@@ -626,10 +662,11 @@ async function createDraftStyle(
     (done, total) => input.onProgress?.("style", done, total),
   );
   const referencePath = revisionedArtifactPath("style-sample.png", artifactRevision);
-  const sample = await dependencies.generateImage(
+  const sample = await generateImageWithModerationRetry(
     input.imageCfg,
     `${description}. Environment-only visual style sample, no people, no characters, no faces, no text, coherent palette and lighting.`,
     { size: "1024x576" },
+    dependencies,
   );
   await writeGeneratedImage(visualBibleArtifactPath(artifactDir, referencePath), sample);
   return { description, referencePath };
@@ -663,6 +700,8 @@ async function createDraftCharacters(
   let idx = 0;
   const worker = async (): Promise<void> => {
     while (idx < cards.length) {
+      // 取消：草稿创建是「全有或全无」——中止直接抛，避免落盘半套角色草稿
+      if (input.isAborted?.()) throw new Error("已中止");
       const pos = idx++;
       const card = cards[pos];
       const reference = await resolveCharacterReference(input, card, artifactDir, artifactRevision);
@@ -677,10 +716,10 @@ async function createDraftCharacters(
         }] : []),
         { ...styleReference, required: !reference.dataB64 },
       ];
-      const generated = await dependencies.generateImage(input.imageCfg, characterThreeViewPrompt(prompt, styleDescription), {
+      const generated = await generateImageWithModerationRetry(input.imageCfg, characterThreeViewPrompt(prompt, styleDescription), {
         references,
         size: "1024x1024",
-      });
+      }, dependencies);
       const threeViewPath = revisionedArtifactPath(canonicalThreeViewPath(card.id), artifactRevision);
       await writeGeneratedImage(visualBibleArtifactPath(artifactDir, threeViewPath), generated);
       // 每套服装独立三视图锚点（以默认装三视图为身份参考，换装立绘可引用）
@@ -718,8 +757,10 @@ export async function createVisualBibleDraft(
     setLlmConcurrency(input.visionCfg, concurrencyFor(input.visionCfg, "vision"));
   }
   validateCharacterAssetKeys(input.cards.characters);
+  if (input.isAborted?.()) throw new Error("已中止");
   const published = await mutateAndPublishVisualBible(input.outputDir, async (artifactDir, artifactRevision) => {
     const style = await createDraftStyle(input, dependencies, artifactDir, artifactRevision);
+    if (input.isAborted?.()) throw new Error("已中止");
     const characters = await createDraftCharacters(
       input,
       style.description,
@@ -803,10 +844,11 @@ export async function regenerateStyleSample(
 ): Promise<string> {
   const published = await mutateAndPublishVisualBible(outputDir, async (artifactDir, artifactRevision) => {
     if (bible.styleSource !== "novel_analysis") throw new Error("Uploaded style references cannot be regenerated as samples");
-    const generated = await dependencies.generateImage(
+    const generated = await generateImageWithModerationRetry(
       imageCfg,
       `${bible.styleDescription}. Environment-only visual style sample, no people, no characters, no faces, no text, coherent palette and lighting.`,
       { size: "1024x576" },
+      dependencies,
     );
     const next = cloneVisualBible(bible);
     markGlobalBibleChanged(next);
@@ -836,7 +878,7 @@ export async function regenerateCostumeSheet(
     const baseSheet = await readReferenceFile(visualBibleArtifactPath(artifactDir, baseSheetPath), `Base three-view for ${characterId}`);
     const styleReferencePath = visualBiblePath(outputDir, bible.styleReferencePath);
     const styleReference = await readReferenceFile(styleReferencePath, "Global style reference");
-    const generated = await dependencies.generateImage(
+    const generated = await generateImageWithModerationRetry(
       imageCfg,
       characterThreeViewPrompt(normalizeStyleDescription(costume.prompt), bible.styleDescription),
       {
@@ -846,6 +888,7 @@ export async function regenerateCostumeSheet(
         ],
         size: "1024x1024",
       },
+      dependencies,
     );
     const next = cloneVisualBible(bible);
     const nextCharacter = next.characters[characterId];
@@ -899,7 +942,7 @@ export async function regenerateCharacterSheet(
     }
     const styleReferencePath = visualBiblePath(outputDir, bible.styleReferencePath);
     const styleReference = await readReferenceFile(styleReferencePath, "Global style reference");
-    const generated = await dependencies.generateImage(
+    const generated = await generateImageWithModerationRetry(
       imageCfg,
       characterThreeViewPrompt(promptForGen!, bible.styleDescription),
       {
@@ -914,6 +957,7 @@ export async function regenerateCharacterSheet(
         ],
         size: "1024x1024",
       },
+      dependencies,
     );
     const next = cloneVisualBible(bible);
     let nextCharacter = next.characters[characterId];
@@ -961,6 +1005,8 @@ export interface RegenerateAllSheetsRequest {
   concurrency?: number;
   onProgress?: (done: number, total: number, label: string) => void;
   dependencies?: VisualBibleServiceDependencies;
+  /** 取消信号：返回 true 时不再调度后续角色（已完成的按既有语义持久化保留） */
+  isAborted?: () => boolean;
 }
 
 export interface RegenerateAllSheetsResult {
@@ -1017,6 +1063,7 @@ export async function regenerateAllCharacterSheets(
   const failed: RegenerateAllSheetsResult["failed"] = [];
   let done = 0;
   await runWithLimit(request.characters, limit, async (characterCard) => {
+    if (request.isAborted?.()) return;
     const label = characterCard.name || characterCard.id;
     try {
       // ① 描述重写（可选，与 regenerateCharacterDescription 同口径）
@@ -1045,7 +1092,7 @@ export async function regenerateAllCharacterSheets(
         const sourceReference = await readReferenceFile(referencePath, `Character reference for ${characterCard.id}`);
         identityReference = { role: "identity", ...sourceReference, sourcePath: referencePath };
       }
-      const generated = await dependencies.generateImage(
+      const generated = await generateImageWithModerationRetry(
         request.imageCfg,
         characterThreeViewPrompt(promptForGen, bible.styleDescription),
         {
@@ -1055,6 +1102,7 @@ export async function regenerateAllCharacterSheets(
           ],
           size: "1024x1024",
         },
+        dependencies,
       );
       succeeded.push({ character: characterCard, rewrote, imagePrompt: imagePrompt ?? "", threeViewPrompt: threeViewPrompt ?? "", promptForGen, generated });
     } catch (e) {
@@ -1097,6 +1145,21 @@ export async function regenerateAllCharacterSheets(
         nextCharacter.threeViewPath = revisionedArtifactPath(canonicalThreeViewPath(characterId), artifactRevision);
         nextCharacter.sheetSourceRevision = characterSourceRevision(nextCharacter);
         await writeGeneratedImage(visualBibleArtifactPath(artifactDir, nextCharacter.threeViewPath), s.generated);
+        // 服装锚点同步重建（与单角色 regenerateCharacterSheet 同语义）：
+        // 以新默认装三视图为身份参考逐套重画，单套失败回退用默认装三视图；
+        // 卡片已无服装时删掉过期锚点，避免旧服装图残留导致面板新旧底色混杂。
+        const costumeSheets = await generateCostumeSheets(
+          request.imageCfg,
+          s.character,
+          nextCharacter.threeViewPath,
+          bible.styleDescription,
+          { role: "style", ...styleReference, sourcePath: styleReferencePath },
+          artifactDir,
+          artifactRevision,
+          dependencies,
+        );
+        if (Object.keys(costumeSheets).length) nextCharacter.costumeSheets = costumeSheets;
+        else delete nextCharacter.costumeSheets;
       }
       reconcileCacheBindingKeys(next);
       return {
@@ -1118,6 +1181,8 @@ export interface BibleCharacterSyncRequest {
   characterReferences?: Record<string, VisualBibleImageInput>;
   onProgress?: (done: number, total: number, label: string) => void;
   dependencies?: VisualBibleServiceDependencies;
+  /** 取消信号：返回 true 时不再补建后续缺失条目（已建条目保留） */
+  isAborted?: () => boolean;
 }
 
 export interface BibleCharacterSyncResult {
@@ -1183,6 +1248,7 @@ export async function syncBibleCharactersWithCards(
     for (const id of removed) delete next.characters[id];
     let done = 0;
     for (const card of missing) {
+      if (request.isAborted?.()) break;
       const label = `${card.name || card.id}`;
       try {
         const prompt = normalizeStyleDescription(card.threeViewPrompt || card.imagePrompt);
@@ -1208,12 +1274,24 @@ export async function syncBibleCharactersWithCards(
             sheetSourceRevision: 0,
           };
           markCharacterBibleChanged(next, card.id);
+          // 孤儿认领同样补建服装锚点（以认领的三视图为身份参考），否则该角色换装无锚点可用
+          const adoptedCostumes = await generateCostumeSheets(
+            request.imageCfg!,
+            card,
+            orphan,
+            bible.styleDescription,
+            { role: "style", ...styleReference, sourcePath: styleReferencePath },
+            artifactDir,
+            artifactRevision,
+            dependencies,
+          );
+          if (Object.keys(adoptedCostumes).length) next.characters[card.id].costumeSheets = adoptedCostumes;
           adopted.push(card.id);
           continue;
         }
         const refInput = { outputDir, characterReferences: request.characterReferences } as CreateVisualBibleDraftInput;
         const reference = await resolveCharacterReference(refInput, card, artifactDir, artifactRevision);
-        const generated = await dependencies.generateImage(
+        const generated = await generateImageWithModerationRetry(
           // 缺失循环只在 missing 非空时执行，前置守卫已保证此时 imageCfg 存在
           request.imageCfg!,
           characterThreeViewPrompt(prompt, bible.styleDescription),
@@ -1226,15 +1304,29 @@ export async function syncBibleCharactersWithCards(
             ],
             size: "1024x1024",
           },
+          dependencies,
         );
         const threeViewPath = revisionedArtifactPath(canonicalThreeViewPath(card.id), artifactRevision);
         await writeGeneratedImage(visualBibleArtifactPath(artifactDir, threeViewPath), generated);
+        // 新补建角色同样生成每套服装的三视图锚点（与创建草稿同语义），否则换装立绘无锚点可引
+        const addedCostumes = await generateCostumeSheets(
+          // 缺失循环只在 missing 非空时执行，前置守卫已保证此时 imageCfg 存在
+          request.imageCfg!,
+          card,
+          threeViewPath,
+          bible.styleDescription,
+          { role: "style", ...styleReference, sourcePath: styleReferencePath },
+          artifactDir,
+          artifactRevision,
+          dependencies,
+        );
         const sourceRevision = reference.relativePath ? 1 : 0;
         next.characters[card.id] = {
           ...(reference.relativePath ? { sourceReferencePath: reference.relativePath } : {}),
           threeViewPath,
           prompt,
           ...(actionIds.length ? { actionIds } : {}),
+          ...(Object.keys(addedCostumes).length ? { costumeSheets: addedCostumes } : {}),
           approved: false,
           revision: 1,
           sourceRevision,
@@ -1249,6 +1341,14 @@ export async function syncBibleCharactersWithCards(
         done++;
         request.onProgress?.(done, missing.length, label);
       }
+    }
+    // pendingInvalidation.characterIds 必须仍存在于 characters（isPendingInvalidation 会校验），
+    // 否则移除条目后整个 manifest 发布会抛 "invalid pending invalidation scope" 使同步整体失败
+    if (next.pendingInvalidation?.scope === "characters" && removed.length) {
+      const removedSet = new Set(removed);
+      const keptIds = next.pendingInvalidation.characterIds.filter((id) => !removedSet.has(id) && !!next.characters[id]);
+      if (keptIds.length) next.pendingInvalidation = { scope: "characters", characterIds: keptIds };
+      else delete next.pendingInvalidation;
     }
     reconcileCacheBindingKeys(next);
     return { bible: next, cards: request.characters };
@@ -1572,6 +1672,7 @@ function parseManifest(rawManifest: unknown): ProjectVisualBible {
     throw new Error("invalid pending invalidation scope");
   }
   if (!isCacheBinding(candidate.cacheBinding, candidate.characters)) throw new Error("invalid cache binding");
+  if (!isVisualInputSignature(candidate.visualInputs)) throw new Error("invalid visual input signature");
   validateCharacterAssetKeys(characterCardsFromVisualBible(candidate as ProjectVisualBible));
   if (candidate.approvedAt !== undefined && typeof candidate.approvedAt !== "string") throw new Error("invalid approval timestamp");
   return candidate as ProjectVisualBible;
@@ -1605,6 +1706,7 @@ function manifestForSave(bible: ProjectVisualBible): ProjectVisualBible {
     inputFingerprint: bible.inputFingerprint,
     ...(bible.pendingInvalidation ? { pendingInvalidation: clonePendingInvalidation(bible.pendingInvalidation) } : {}),
     ...(bible.cacheBinding ? { cacheBinding: cloneCacheBinding(bible.cacheBinding) } : {}),
+    ...(bible.visualInputs ? { visualInputs: cloneVisualInputSignature(bible.visualInputs) } : {}),
     ...(bible.approvedAt ? { approvedAt: bible.approvedAt } : {}),
   });
 }
@@ -1650,6 +1752,17 @@ function cloneCacheBinding(binding: VisualBibleCacheBinding): VisualBibleCacheBi
   };
 }
 
+function cloneVisualInputSignature(signature: VisualInputSignature): VisualInputSignature {
+  return { style: signature.style, characters: { ...signature.characters } };
+}
+
+function isVisualInputSignature(signature: VisualInputSignature | undefined): boolean {
+  if (signature === undefined) return true;
+  if (!signature || typeof signature !== "object") return false;
+  if (typeof signature.style !== "string" || !signature.style) return false;
+  if (!signature.characters || typeof signature.characters !== "object" || Array.isArray(signature.characters)) return false;
+  return Object.values(signature.characters).every((value) => typeof value === "string" && !!value);
+}
 async function readManifestAtPath(path: string): Promise<ProjectVisualBible | null> {
   try {
     const { text } = await tauri.readTextFile(path);
@@ -1727,7 +1840,15 @@ async function recoverTemporaryManifest(outputDir: string, artifactDir: string):
   return [`Temporary visual-bible manifest was retained because it could not be validated: ${temporaryManifest}`];
 }
 
-export async function loadVisualBible(outputDir: string): Promise<VisualBibleLoadResult> {
+/**
+ * 读取视觉守门清单。
+ * activeCharacterIds：当前项目实际使用的角色 id（来自磁盘 cards.json）。
+ * 只校验这些角色——项目换过小说/重新提取后，清单里常残留上一版的角色，
+ * 它们永远不会有 approved 标记；若一并校验，每次读完都会把 approved 打回 stale，
+ * 于是「刚批准就失效 → 图像阶段永远拿不到守门通过 → 图片一张也生成不出来」。
+ * 省略该参数时保持旧行为（校验清单里的全部角色）。
+ */
+export async function loadVisualBible(outputDir: string, activeCharacterIds?: string[]): Promise<VisualBibleLoadResult> {
   let warnings: string[];
   try {
     warnings = await recoverVisualBibleStorage(outputDir);
@@ -1743,7 +1864,11 @@ export async function loadVisualBible(outputDir: string): Promise<VisualBibleLoa
     const { text } = await tauri.readTextFile(manifestPath);
     const visualBible = parseManifest(JSON.parse(text));
     if (visualBible.status === "approved") {
-      const validation = await validateVisualBibleForApproval(outputDir, visualBible, Object.keys(visualBible.characters));
+      const known = new Set(Object.keys(visualBible.characters));
+      const scoped = activeCharacterIds
+        ? [...new Set(activeCharacterIds)].filter((id) => known.has(id))
+        : Object.keys(visualBible.characters);
+      const validation = await validateVisualBibleForApproval(outputDir, visualBible, scoped);
       if (!validation.valid) {
         visualBible.status = "stale";
         delete visualBible.approvedAt;
@@ -1875,6 +2000,7 @@ function cloneVisualBible(bible: ProjectVisualBible): ProjectVisualBible {
     ...bible,
     ...(bible.pendingInvalidation ? { pendingInvalidation: clonePendingInvalidation(bible.pendingInvalidation) } : {}),
     ...(bible.cacheBinding ? { cacheBinding: cloneCacheBinding(bible.cacheBinding) } : {}),
+    ...(bible.visualInputs ? { visualInputs: cloneVisualInputSignature(bible.visualInputs) } : {}),
     characters: Object.fromEntries(Object.entries(bible.characters).map(([id, character]) => [id, {
       ...character,
       ...(character.actionIds ? { actionIds: [...character.actionIds] } : {}),
@@ -1903,6 +2029,8 @@ function syncVisualBible(target: ProjectVisualBible, source: ProjectVisualBible)
   else delete target.pendingInvalidation;
   if (source.cacheBinding) target.cacheBinding = cloneCacheBinding(source.cacheBinding);
   else delete target.cacheBinding;
+  if (source.visualInputs) target.visualInputs = cloneVisualInputSignature(source.visualInputs);
+  else delete target.visualInputs;
   if (source.approvedAt) target.approvedAt = source.approvedAt;
   else delete target.approvedAt;
 }
@@ -2017,6 +2145,86 @@ async function readCharacterReferencePayloads(
   return payloads;
 }
 
+/**
+ * 角色视觉输入签名：三视图提示词优先、否则立绘提示词。口径与 createDraftCharacters 存进
+ * bible.characters[id].prompt 的值完全一致，因此可以直接比较。
+ */
+export function characterVisualSignature(
+  card: Pick<CharacterCard, "imagePrompt" | "threeViewPrompt">,
+  referenceB64?: string,
+  costumeSheets?: Record<string, { revision: number; prompt: string }>,
+): string {
+  const costumes = Object.entries(costumeSheets ?? {})
+    .map(([costumeId, sheet]) => `${costumeId}:${sheet.revision}:${normalizeStyleDescription(sheet.prompt)}`)
+    .sort();
+  return stableHash(JSON.stringify({
+    imagePrompt: normalizeStyleDescription(card.imagePrompt),
+    threeViewPrompt: normalizeStyleDescription(card.threeViewPrompt ?? ""),
+    referenceHash: referenceB64 ? imagePayloadHash(referenceB64) : "",
+    costumes,
+  }));
+}
+
+/** 画风级视觉输入签名：风格来源、风格描述、风格参考图内容。 */
+export function styleVisualSignature(input: {
+  styleSource: StyleSource;
+  styleDescription: string;
+  sourceReferenceB64?: string;
+}): string {
+  return stableHash(JSON.stringify({
+    styleSource: input.styleSource,
+    styleDescription: normalizeStyleDescription(input.styleDescription),
+    sourceReferenceHash: input.sourceReferenceB64 ? imagePayloadHash(input.sourceReferenceB64) : "",
+  }));
+}
+
+export function buildVisualInputSignature(input: {
+  characters: readonly CharacterCard[];
+  styleSource: StyleSource;
+  styleDescription: string;
+  sourceReferenceB64?: string;
+  characterReferenceB64?: Record<string, string>;
+  costumeSheets?: Record<string, Record<string, { revision: number; prompt: string }>>;
+}): VisualInputSignature {
+  const characters: Record<string, string> = {};
+  for (const card of input.characters) {
+    characters[card.id] = characterVisualSignature(
+      card,
+      input.characterReferenceB64?.[card.id],
+      input.costumeSheets?.[card.id],
+    );
+  }
+  return {
+    style: styleVisualSignature({
+      styleSource: input.styleSource,
+      styleDescription: input.styleDescription,
+      sourceReferenceB64: input.sourceReferenceB64,
+    }),
+    characters,
+  };
+}
+
+/**
+ * 指纹变化后真正需要作废的图像范围：把「当前视觉输入签名」与「上次批准时记录的基线」对比。
+ *
+ * previous 缺失（旧项目还没有基线）时返回 undefined —— 没有任何依据时绝不猜「全书作废」：
+ * 换画风/重生成三视图/换参考图这些真正的视觉改动，本身就会在对应接口里排队显式范围，
+ * 这里的指纹推断只是兜底。
+ *
+ * 只比「看得见的输入」：小说正文改动、重新分章这类与画风无关的指纹变化不再清空任何图像。
+ */
+export function visualInvalidationScope(
+  previous: VisualInputSignature | undefined,
+  current: VisualInputSignature,
+): VisualBiblePendingInvalidation | undefined {
+  if (!previous) return undefined;
+  if (previous.style !== current.style) return { scope: "global" };
+  const changed = Object.keys(current.characters)
+    .filter((characterId) => previous.characters[characterId] !== current.characters[characterId])
+    .sort();
+  return changed.length ? { scope: "characters", characterIds: changed } : undefined;
+}
+
 export function computeVisualBibleFingerprint(input: VisualBibleFingerprintInput): string {
   const chapters = input.novel.chapters
     .filter((chapter) => chapter.enabled !== false)
@@ -2043,12 +2251,17 @@ export function computeVisualBibleFingerprint(input: VisualBibleFingerprintInput
   }))}`;
 }
 
-export async function computeProjectVisualBibleFingerprint(
+interface VisualInputPayloads {
+  sourceReferenceB64?: string;
+  characterReferenceB64: Record<string, string>;
+}
+
+/** 读取出图输入里的参考图载荷（风格参考图 + 逐角色身份参考图）。 */
+async function gatherVisualInputPayloads(
   outputDir: string,
-  bible: Pick<ProjectVisualBible, "styleSource" | "styleDescription" | "styleReferencePath" | "characters">,
-  novel: NovelDoc,
-  characters: CharacterCard[],
-): Promise<string> {
+  bible: Pick<ProjectVisualBible, "styleSource" | "styleReferencePath" | "characters">,
+  characters: readonly CharacterCard[],
+): Promise<VisualInputPayloads> {
   const sourceReferenceB64 = bible.styleSource === "reference_image"
     ? await tauri.readFileBase64(visualBiblePath(outputDir, bible.styleReferencePath))
     : undefined;
@@ -2061,6 +2274,40 @@ export async function computeProjectVisualBibleFingerprint(
       characterReferenceB64[card.id] = parseLegacyImage(card.referenceImage).dataB64;
     }
   }
+  return { sourceReferenceB64, characterReferenceB64 };
+}
+
+/**
+ * 与出图输入一一对应的视觉签名（不含小说正文/分章）。
+ * 批准时写进 ProjectVisualBible.visualInputs，之后指纹变化时用它判断影响范围。
+ */
+export async function computeProjectVisualInputSignature(
+  outputDir: string,
+  bible: Pick<ProjectVisualBible, "styleSource" | "styleDescription" | "styleReferencePath" | "characters">,
+  characters: readonly CharacterCard[],
+): Promise<VisualInputSignature> {
+  const payloads = await gatherVisualInputPayloads(outputDir, bible, characters);
+  const costumeSheets: Record<string, Record<string, { revision: number; prompt: string }>> = {};
+  for (const [characterId, character] of Object.entries(bible.characters)) {
+    costumeSheets[characterId] = character.costumeSheets ?? {};
+  }
+  return buildVisualInputSignature({
+    characters,
+    styleSource: bible.styleSource,
+    styleDescription: bible.styleDescription,
+    sourceReferenceB64: payloads.sourceReferenceB64,
+    characterReferenceB64: payloads.characterReferenceB64,
+    costumeSheets,
+  });
+}
+
+export async function computeProjectVisualBibleFingerprint(
+  outputDir: string,
+  bible: Pick<ProjectVisualBible, "styleSource" | "styleDescription" | "styleReferencePath" | "characters">,
+  novel: NovelDoc,
+  characters: CharacterCard[],
+): Promise<string> {
+  const { sourceReferenceB64, characterReferenceB64 } = await gatherVisualInputPayloads(outputDir, bible, characters);
   // 服装三视图纳入指纹：增删服装 / 重生成服装锚点都会使视觉守门过期待确认；
   // 无服装时保持原指纹，避免升级后误判全部项目过期
   const costumeEntries = Object.entries(bible.characters)
@@ -2115,27 +2362,30 @@ export async function validateVisualBibleForApproval(
   if (!normalizeStyleDescription(bible.styleDescription)) errors.push("Style description is empty");
   const styleError = await validateImageArtifact(outputDir, bible.styleReferencePath, "Style reference");
   if (styleError) errors.push(styleError);
-  for (const id of [...new Set(mainCharacterIds)].sort()) {
+  // 9 角色就是 20+ 次读盘：逐角色串行 await 会把"确认此角色"拖慢成"半天"，
+  // 改为按角色并发读盘（错误仍按角色排序回填，顺序与之前完全一致）。
+  const ids = [...new Set(mainCharacterIds)].sort();
+  const perCharacter = await Promise.all(ids.map(async (id): Promise<string[]> => {
     const character = bible.characters[id];
-    if (!character) {
-      errors.push(`Character ${id} is missing from the visual bible`);
-      continue;
-    }
-    if (!character.approved) errors.push(`Character ${id} has not been accepted`);
+    if (!character) return [`Character ${id} is missing from the visual bible`];
+    const errs: string[] = [];
+    if (!character.approved) errs.push(`Character ${id} has not been accepted`);
     if (characterSourceRevision(character) !== characterSheetSourceRevision(character)) {
-      errors.push(`Character ${id} three-view does not match the current source revision`);
+      errs.push(`Character ${id} three-view does not match the current source revision`);
     }
     const sheetError = await validateImageArtifact(outputDir, character.threeViewPath, `Character ${id} three-view`);
-    if (sheetError) errors.push(sheetError);
+    if (sheetError) errs.push(sheetError);
     if (character.sourceReferencePath) {
       const sourceError = await validateImageArtifact(
         outputDir,
         character.sourceReferencePath,
         `Character ${id} source reference`,
       );
-      if (sourceError) errors.push(sourceError);
+      if (sourceError) errs.push(sourceError);
     }
-  }
+    return errs;
+  }));
+  for (const errs of perCharacter) errors.push(...errs);
   return { valid: errors.length === 0, errors };
 }
 
@@ -2170,18 +2420,29 @@ export async function approveVisualBible(
       return staleRejectedMutation(bible, `Visual bible cannot be approved: ${validation.errors.join("; ")}`);
     }
     const approved = cloneVisualBible(bible);
-    const pendingInvalidation = approved.pendingInvalidation ?? { scope: "global" as const };
+    const pendingInvalidation = approved.pendingInvalidation;
+    // 从未绑定过图像缓存（典型：刚建好的草稿）= 现存图片都不是按本守门画的，必须全部判废。
+    // 否则只按显式范围判废；连范围都没有 = 本次批准没有任何视觉输入变化（例如只是小说正文变了），
+    // 只盖章、不动缓存。绝不能回退成 global —— 那会把已付费的全书图片全删掉重画。
+    const invalidateAll = pendingInvalidation === undefined
+      ? !approved.cacheBinding
+      : pendingInvalidation.scope === "global";
+    const characterScope = pendingInvalidation?.scope === "characters" ? pendingInvalidation : undefined;
     approved.status = "approved";
     approved.inputFingerprint = currentFingerprint;
     approved.approvedAt = (request.now ?? (() => new Date().toISOString()))();
-    approved.cacheBinding = cacheBindingAfterApproval(approved, pendingInvalidation, currentFingerprint);
+    approved.cacheBinding = cacheBindingAfterApproval(approved, invalidateAll, currentFingerprint);
+    // 记下这次批准采用的视觉输入，作为「现存图片是按什么画的」基线
+    approved.visualInputs = await computeProjectVisualInputSignature(outputDir, approved, request.characters);
     delete approved.pendingInvalidation;
     return {
       bible: approved,
       cards: request.characters,
-      afterPublish: pendingInvalidation.scope === "global"
+      afterPublish: invalidateAll
         ? () => invalidateGlobalCaches(outputDir)
-        : () => invalidateCharacterScopes(outputDir, bible, request.characters, pendingInvalidation.characterIds),
+        : characterScope
+          ? () => invalidateCharacterScopes(outputDir, bible, request.characters, characterScope.characterIds)
+          : undefined,
     };
   }, bible);
   return bible;
@@ -2202,8 +2463,14 @@ export async function refreshVisualBibleFingerprint(
   bible: ProjectVisualBible,
   currentFingerprint: string,
   characters: CharacterCard[],
-  preservePendingScope = false,
 ): Promise<ProjectVisualBible> {
+  // 指纹真变了才算视觉差异，并读参考图算出当前签名；没变就不做任何 I/O。
+  const detected = bible.inputFingerprint && bible.inputFingerprint !== currentFingerprint
+    ? visualInvalidationScope(
+      bible.visualInputs,
+      await computeProjectVisualInputSignature(outputDir, bible, characters),
+    )
+    : undefined;
   await mutateAndPublishVisualBible(outputDir, async () => {
     const refreshed = cloneVisualBible(bible);
     if (refreshed.inputFingerprint && refreshed.inputFingerprint !== currentFingerprint) {
@@ -2211,12 +2478,20 @@ export async function refreshVisualBibleFingerprint(
         refreshed.status = "stale";
         delete refreshed.approvedAt;
       }
-      if (preservePendingScope) {
-        if (!refreshed.pendingInvalidation || refreshed.pendingInvalidation.scope === "global") {
-          refreshed.pendingInvalidation = { scope: "global" };
-        }
-      } else {
+      if (refreshed.pendingInvalidation?.scope === "global" || detected?.scope === "global") {
+        // 显式全局作废（画风/风格参考图变了）保持全局，绝不降级成角色范围
         refreshed.pendingInvalidation = { scope: "global" };
+      } else {
+        // 已有显式范围与指纹推断出的范围取并集：既不吞掉显式作废，也不把范围降级。
+        const existing = refreshed.pendingInvalidation?.scope === "characters"
+          ? refreshed.pendingInvalidation.characterIds
+          : [];
+        const announced = detected?.scope === "characters" ? detected.characterIds : [];
+        const merged = [...new Set([...existing, ...announced])]
+          .filter((characterId) => !!refreshed.characters[characterId])
+          .sort();
+        if (merged.length) refreshed.pendingInvalidation = { scope: "characters", characterIds: merged };
+        else delete refreshed.pendingInvalidation;
       }
     }
     refreshed.inputFingerprint = currentFingerprint;
@@ -2288,12 +2563,14 @@ function reconcileCacheBindingKeys(bible: ProjectVisualBible): void {
 
 function cacheBindingAfterApproval(
   bible: ProjectVisualBible,
-  pending: VisualBiblePendingInvalidation,
+  invalidateAll: boolean,
   currentFingerprint: string,
 ): VisualBibleCacheBinding {
-  const globalFingerprint = pending.scope === "characters" && bible.cacheBinding
-    ? bible.cacheBinding.globalFingerprint
-    : currentFingerprint;
+  // 只有「全部判废」才把绑定推进到新指纹。否则必须保留旧指纹——现存的图就是按旧指纹画的，
+  // 写成新指纹会让 .visual-bible-fingerprint 标记对不上 → globalCacheCurrent=false → 全书重画。
+  const globalFingerprint = invalidateAll || !bible.cacheBinding
+    ? currentFingerprint
+    : bible.cacheBinding.globalFingerprint;
   return cacheBindingFromBible(bible, globalFingerprint);
 }
 

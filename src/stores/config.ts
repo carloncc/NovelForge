@@ -73,10 +73,14 @@ export function defaultApiConfig(kind: ChannelKey): ApiConfig {
 
 export function voiceLibraryFor(cfg: ApiConfig | undefined): string[] {
   const lib = cfg?.extra?.voiceLibrary;
-  const base = Array.isArray(lib) && lib.length ? (lib as string[]) : DEFAULT_VOICE_LIBRARY;
-  // 合并模板自带音色
+  if (Array.isArray(lib)) {
+    // 显式列表（含被用户清空成 []）以用户为准，不再回填 17 个默认音色（此前清空无效）；
+    // 清空后配音会自动回退 "default"（runVoiceJob 的 fallbackVoice 逻辑）
+    return Array.from(new Set((lib as string[]).map((v) => String(v)).filter(Boolean)));
+  }
+  // 未设置过（undefined）：默认音色 + 适配器模板音色
   const tplVoices = cfg?.adapter ? (getTemplate(cfg.adapter)?.voices ?? []) : [];
-  return Array.from(new Set([...base, ...tplVoices]));
+  return Array.from(new Set([...DEFAULT_VOICE_LIBRARY, ...tplVoices]));
 }
 
 /** 应用服务商模板：填入 base_url / model / adapter / 音色库 */
@@ -129,6 +133,11 @@ export const configState = reactive<ConfigFile>({
 });
 let configPersistenceBlocked = false;
 let lastPersistedContent = "";
+/** 上次成功落盘的密钥签名：仅改/清空 apiKey 时脱敏 content 不变，必须靠它识别"真有变化" */
+let lastPersistedSecrets = "";
+function secretsSignature(): string {
+  return JSON.stringify(configSecrets(configState));
+}
 let pendingMigrationContent = "";
 let pendingMigrationSecrets: Record<string, string> = {};
 let migrationRetryTimer: number | undefined;
@@ -156,6 +165,7 @@ async function loadPersisted() {
       scheduleMigrationRetry();
     } else {
       lastPersistedContent = serializeConfigFile(parsed);
+      lastPersistedSecrets = JSON.stringify(configSecrets(parsed));
     }
     if (loaded.secretStoreError) {
       secretStoreUnavailable = true;
@@ -223,6 +233,7 @@ async function retryMigrationPersistence(): Promise<void> {
   pendingMigrationContent = "";
   pendingMigrationSecrets = {};
   lastPersistedContent = migratedContent;
+  lastPersistedSecrets = JSON.stringify(configSecrets(configState));
   configPersistenceBlocked = secretStoreUnavailable;
   configPersistenceError.value = secretStoreUnavailable ? configPersistenceError.value : "";
   const currentContent = persistedConfigContent();
@@ -249,16 +260,19 @@ watch(
     }),
   () => {
     if (configPersistenceBlocked) return;
-    if (persistedConfigContent() === lastPersistedContent) return;
+    // 密钥也参与比较：仅改/清空 apiKey 时脱敏 content 不变，此前会被误判为"无变化"而不落盘
+    if (persistedConfigContent() === lastPersistedContent && secretsSignature() === lastPersistedSecrets) return;
     if (saveTimer) return;
     saveTimer = (typeof window === "undefined" ? globalThis.setTimeout : window.setTimeout)(() => {
       saveTimer = undefined;
       const content = persistedConfigContent();
-      if (content === lastPersistedContent) return;
+      const secrets = configSecrets(configState);
+      const secretsSig = JSON.stringify(secrets);
+      if (content === lastPersistedContent && secretsSig === lastPersistedSecrets) return;
       void tauri
-        .writeApiSecrets(configSecrets(configState))
+        .writeApiSecrets(secrets)
         .then(() => tauri.writeConfig(content))
-        .then(() => { lastPersistedContent = content; })
+        .then(() => { lastPersistedContent = content; lastPersistedSecrets = secretsSig; })
         .catch((error) => {
           configPersistenceError.value = `配置自动保存失败：${error instanceof Error ? error.message : String(error)}`;
         });

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { ref } from "vue";
 import { t } from "../i18n";
 import { tauri } from "../utils/tauri";
 import { brandDomain, brandName, brandUrl } from "../utils/branding";
@@ -7,11 +8,14 @@ import { version } from "../../package.json";
 defineProps<{ open: boolean }>();
 const emit = defineEmits<{ close: [] }>();
 
+const linkError = ref("");
 async function openExternal(url: string): Promise<void> {
+  linkError.value = "";
   try {
     await tauri.openUrl(url);
-  } catch {
-    /* 打开失败静默 */
+  } catch (e) {
+    // 此前静默吞错：外链失败用户完全无感知（看起来像点了没反应）
+    linkError.value = `打开链接失败：${e instanceof Error ? e.message : String(e)}（可手动复制：${url}）`;
   }
 }
 </script>

@@ -529,10 +529,14 @@ export function demoScriptAll(chapters: ChapterInfo[], cards: ExtractionResult):
 /** 说话动词：与演示模式 parseParagraph 同规则 */
 export const SPEECH_VERBS = /(说|道|答|喊|叹|笑|问|吩咐|回应|开口|沉声道|缓缓道)/;
 
-/** 原文「」引用计数 */
+/** 原文引用计数：中文「」/『』优先；西文/译入文本按弯引号与直引号配对计数（避免只认「」导致 keptRatio 恒为 1 的假通过） */
 export function countSourceQuotes(text: string): number {
-  const m = (text || "").match(/「[^」]*」/g);
-  return m ? m.length : 0;
+  const src = text || "";
+  const cjk = src.match(/[「『][^」』]*[」』]/g)?.length ?? 0;
+  if (cjk) return cjk;
+  const curly = src.match(/“[^”]*”/g)?.length ?? 0;
+  const straight = src.match(/"[^"\n]*"/g)?.length ?? 0;
+  return curly + straight;
 }
 
 /** 角色名别名：全名＋前二字＋后二字（原文常用简称，如 西园寺樱月→樱月、佐野优斗→优斗） */

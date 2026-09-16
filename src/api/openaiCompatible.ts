@@ -1,6 +1,9 @@
 import { tauri } from "../utils/tauri";
+import { version as APP_VERSION } from "../../package.json";
 import type { ApiConfig, ChannelKey, ImageModelCapabilities, ImageReference } from "../core/types";
 import { unifiedImage, unifiedTts, utf8FromB64 } from "./universal";
+import { normalizeBaseUrl, customHeadersFor } from "./baseUrl";
+export { normalizeBaseUrl } from "./baseUrl";
 import { resolveTemplate, getTemplate } from "./templates";
 import { ConcurrencyLimiter } from "../utils/performance";
 import { classifyError } from "../utils/errorClassifier";
@@ -96,7 +99,7 @@ export function setLlmConcurrency(cfg: ApiConfig, n: number): void {
     url,
     headers: {
       Accept: "application/json",
-      ...(cfg.apiKey ? { Authorization: `Bearer ${cfg.apiKey}` } : {}),
+      ...headersFor(cfg),
     },
     timeoutSecs: 20,
   });
@@ -156,27 +159,55 @@ const BUILTIN_CHANNEL_MODELS: Partial<Record<ProviderId, Partial<Record<ChannelK
   },
 };
 
-export function normalizeBaseUrl(baseUrl: string, pathPrefix?: string): string {
-  let b = (baseUrl || "").trim().replace(/\/+$/, "");
-  if (!b) throw new Error("base_url 为空");
-  if (!b.startsWith("http")) {
-    b = "http://" + b;
+/* normalizeBaseUrl 已移至 ./baseUrl（与通用适配器共用，避免循环依赖） */
+
+/**
+ * opencode.ai「OpenCode Go」网关要求客户端为每个会话携带稳定的 x-opencode-session
+ * 与自定义 User-Agent（否则返回 400 MissingSessionID，见 https://opencode.ai/docs/go/）。
+ * 会话 ID 每次应用启动生成一次并全程复用，满足“稳定会话 ID”的要求。
+ */
+const OPENCODE_HOST = /(?:^|\.)opencode\.ai$/i;
+const DEFAULT_USER_AGENT = `NovelForge/${APP_VERSION}`;
+let opencodeSessionId = "";
+
+function sessionIdFor(baseUrl: string | undefined): string | undefined {
+  let host = "";
+  try {
+    host = new URL(baseUrl ?? "").hostname;
+  } catch {
+    /* 非法 URL 跳过 */
   }
-  if (pathPrefix) {
-    b = b.replace(/\/+$/, "") + "/" + pathPrefix.replace(/^\/+|\/+$/g, "");
-  } else if (!/\/v\d+$/i.test(b) && !/\/v\d+\//i.test(b)) {
-    b = b + "/v1";
+  if (!OPENCODE_HOST.test(host)) return undefined;
+  if (!opencodeSessionId) {
+    try {
+      if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+        opencodeSessionId = crypto.randomUUID();
+      }
+    } catch {
+      /* 回退随机串 */
+    }
+    if (!opencodeSessionId) {
+      opencodeSessionId = `nf-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 14)}`;
+    }
   }
-  return b;
+  return opencodeSessionId;
 }
 
-function headersFor(cfg: ApiConfig): Record<string, string> {
-  return {
+/* customHeadersFor 已移至 ./baseUrl（文本/视觉/图像/配音所有通道共用） */
+
+export function headersFor(cfg: ApiConfig): Record<string, string> {
+  const headers: Record<string, string> = {
     "Content-Type": "application/json",
     ...(cfg.apiKey ? { Authorization: `Bearer ${cfg.apiKey}` } : {}),
+    ...customHeadersFor(cfg),
   };
+  const session = sessionIdFor(cfg.baseUrl);
+  if (session) {
+    headers["x-opencode-session"] = session;
+    if (!headers["User-Agent"]) headers["User-Agent"] = DEFAULT_USER_AGENT;
+  }
+  return headers;
 }
-
 export interface ChatOptions {
   temperature?: number;
   maxTokens?: number;
@@ -1003,7 +1034,12 @@ export async function testVision(cfg: ApiConfig): Promise<string> {
 }
 
 export async function testTts(cfg: ApiConfig): Promise<void> {
-  const r = await ttsSpeech(cfg, "测试", "default", 60);
+  // 之前硬编码 "default"：MiniMax/OpenAI 的真实音色列表里没有它，测试连接必然失败。
+  // 优先适配器模板音色，其次用户音色库第一个，最后才回退 "default"。
+  const tplVoices = cfg.adapter ? (getTemplate(cfg.adapter)?.voices ?? []) : [];
+  const lib = Array.isArray(cfg.extra?.voiceLibrary) ? (cfg.extra!.voiceLibrary as string[]) : [];
+  const voice = tplVoices[0] || lib[0] || "default";
+  const r = await ttsSpeech(cfg, "测试", voice, 60);
   if (!r.dataB64 || r.dataB64.length < 100) {
     throw new Error("TTS 返回数据异常");
   }
@@ -1011,11 +1047,18 @@ export async function testTts(cfg: ApiConfig): Promise<void> {
 
 /** 带参考图的能力探测：用一张纯色小图作为参考图请求图生图，成功说明该模型支持参考图/图生图 */
 async function probeImageEditSupport(cfg: ApiConfig): Promise<{ ok: boolean; detail: string }> {
+  // 探针必须真正把参考图发出去才能判断能力。未知模型此前没有能力值，
+  // routeImageReferences 会在发请求前就把 required 参考图拒掉（REFERENCE_UNSUPPORTED），
+  // 导致"永远探不出支持"。这里临时给一份宽松能力让请求真正发出，finally 还原。
+  const prevCaps = cfg.extra?.imageCapabilities;
+  const base = knownImageModelCapabilities(cfg.model) ?? { maxReferenceImages: 0, supportsSeed: false, supportsImageEdit: false, referenceEncoding: "raw-base64" as const };
+  cfg.extra ??= {};
+  cfg.extra.imageCapabilities = { ...base, supportsImageEdit: true, maxReferenceImages: 3 };
   try {
     const probe = await generateImage(
       cfg,
       "a simple red square next to the reference image, same style",
-      { references: [{ role: "structure", dataB64: VISION_TEST_PNG_B64, mime: "image/png" }], size: "512x512" },
+      { references: [{ role: "structure", required: true, dataB64: VISION_TEST_PNG_B64, mime: "image/png" }], size: "512x512" },
     );
     if (!probe.dataB64 || probe.dataB64.length < 500) {
       return { ok: false, detail: "返回数据异常" };
@@ -1023,6 +1066,9 @@ async function probeImageEditSupport(cfg: ApiConfig): Promise<{ ok: boolean; det
     return { ok: true, detail: "" };
   } catch (e) {
     return { ok: false, detail: e instanceof Error ? e.message : String(e) };
+  } finally {
+    if (prevCaps === undefined) delete cfg.extra.imageCapabilities;
+    else cfg.extra.imageCapabilities = prevCaps;
   }
 }
 
@@ -1034,21 +1080,29 @@ export async function testImage(cfg: ApiConfig): Promise<{ imageOk: boolean; edi
   // 自动探测该模型是否支持参考图/图生图，并把结果写回配置，避免手动改配置。
   // 合并而不是覆盖已知能力表，保留准确配置（如 Qwen 的 supportsSeed / data-url 编码）。
   const probe = await probeImageEditSupport(cfg);
-  const known = knownImageModelCapabilities(cfg.model);
-  const base = known ?? { maxReferenceImages: 0, supportsSeed: false, supportsImageEdit: false, referenceEncoding: "raw-base64" as const };
-  const capabilities: ImageModelCapabilities = {
-    ...base,
-    supportsImageEdit: probe.ok,
-    maxReferenceImages: probe.ok ? 3 : 0,
-  };
-  cfg.extra ??= {};
-  cfg.extra.imageCapabilities = capabilities;
-  log.info("api", "图像模型能力自动探测完成", {
-    model: cfg.model,
-    supportsImageEdit: probe.ok,
-    supportsSeed: capabilities.supportsSeed,
-    referenceEncoding: capabilities.referenceEncoding,
-    detail: probe.detail.slice(0, 120),
-  });
+  if (probe.ok) {
+    const known = knownImageModelCapabilities(cfg.model);
+    const base = known ?? { maxReferenceImages: 0, supportsSeed: false, supportsImageEdit: false, referenceEncoding: "raw-base64" as const };
+    const capabilities: ImageModelCapabilities = {
+      ...base,
+      supportsImageEdit: true,
+      maxReferenceImages: 3,
+    };
+    cfg.extra ??= {};
+    cfg.extra.imageCapabilities = capabilities;
+    // 能力与模型绑定：换模型后旧探测结果自动作废（resolveImageModelCapabilities 只信同模型）
+    cfg.extra.imageCapabilitiesModel = cfg.model;
+    log.info("api", "图像模型能力自动探测完成", {
+      model: cfg.model,
+      supportsImageEdit: true,
+      supportsSeed: capabilities.supportsSeed,
+      referenceEncoding: capabilities.referenceEncoding,
+      detail: probe.detail.slice(0, 120),
+    });
+  } else {
+    // 探测未通过（网络抖动/限流/模型拒绝参考图）时不能把已有能力写成 0：一次失败就把参考图生成静默
+    // 禁掉是本末倒置。保留上次成功探测或内置能力表；真正不支持参考图的模型会在生成时由 required 参考图明确报错。
+    log.warn("api", "图像能力探测未通过，保留原有能力配置", { model: cfg.model, detail: probe.detail.slice(0, 120) });
+  }
   return { imageOk: true, editOk: probe.ok, detail: probe.detail };
 }

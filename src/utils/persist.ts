@@ -83,6 +83,76 @@ export function stateFile(outputDir: string): string {
   return `${outputDir}/.novel2vn/project_state.json`;
 }
 
+/**
+ * 磁盘上的 cards.json / cards_demo.json 是本次运行的「工作副本」：提取阶段、卡片编辑页、
+ * 追加合并、id 对齐都只写这里。project_state.json 里的 cards 只是上次保存时的快照，
+ * 可能与它不一致；而视觉守门的批准与图像阶段的复算都以卡片为输入，
+ * 两边各读一份就会出现「刚批准就被判输入已变化 → 视觉守门失效 → 图片永远生成不出来」。
+ * 读取顺序与 pipeline.loadCards 保持一致。
+ */
+export async function readWorkingCards(outputDir: string): Promise<ExtractionResult | null> {
+  for (const name of ["cards.json", "cards_demo.json"]) {
+    try {
+      const path = `${outputDir}/.novel2vn/${name}`;
+      if (!(await tauri.pathExists(path))) continue;
+      const { text } = await tauri.readTextFile(path);
+      const cards = JSON.parse(text) as ExtractionResult;
+      if (cards && Array.isArray(cards.characters) && cards.characters.length) return cards;
+    } catch {
+      /* 读不到就退回快照 */
+    }
+  }
+  return null;
+}
+
+/**
+ * 源文件不可读时的兜底：用 .novel2vn/split.json（分章缓存，含每章正文）重建小说。
+ * 没有它，重启/「加载该项目」后 projectState.novel 会是 null，
+ * 「单章节生成」与「本次重跑 / 分章节生成章节」整块消失（页面只剩「还没有小说」提示），
+ * 而分章/提取/剧本/图像其实都还在磁盘上、本该可以继续逐章生成。
+ */
+async function restoreNovelFromSplitCache(
+  outputDir: string,
+  fallbackFileName: string,
+  fallbackEncoding: string,
+  savedChapters?: { index: number; title: string; enabled?: boolean }[],
+): Promise<NovelDoc | null> {
+  const path = `${outputDir}/.novel2vn/split.json`;
+  if (!(await tauri.pathExists(path).catch(() => false))) return null;
+  let raw: unknown;
+  try {
+    raw = (JSON.parse((await tauri.readTextFile(path)).text) as { chapters?: unknown }).chapters;
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(raw)) return null;
+  const saved = new Map((savedChapters ?? []).map((chapter) => [chapter.index, chapter]));
+  const chapters: ChapterInfo[] = [];
+  for (const [position, entry] of raw.entries()) {
+    if (!entry || typeof entry !== "object") continue;
+    const record = entry as Record<string, unknown>;
+    const text = typeof record.text === "string" ? record.text : "";
+    if (!text) continue;
+    const index = Number.isInteger(record.index) ? (record.index as number) : position;
+    const restored = saved.get(index);
+    chapters.push({
+      index,
+      title: restored?.title || (typeof record.title === "string" && record.title ? record.title : `第 ${position + 1} 章`),
+      text,
+      charCount: text.length,
+      enabled: restored ? restored.enabled : record.enabled !== false,
+    });
+  }
+  if (!chapters.length) return null;
+  return {
+    fileName: fallbackFileName,
+    sourcePath: "",
+    encoding: fallbackEncoding,
+    fullText: chapters.map((chapter) => chapter.text).join("\n\n"),
+    chapters,
+  };
+}
+
 export async function saveProjectState(state: {
   novel: NovelDoc | null;
   materials: MaterialAsset[];
@@ -147,7 +217,8 @@ export async function restoreProjectState(outputDir: string): Promise<{
   warnings: string[];
   loadError?: string;
 }> {
-  const loadedBible = await loadVisualBible(outputDir);
+  const workingCards = await readWorkingCards(outputDir);
+  const loadedBible = await loadVisualBible(outputDir, workingCards?.characters.map((character) => character.id));
   const empty = {
     novel: null as NovelDoc | null,
     materials: [] as MaterialAsset[],
@@ -198,30 +269,47 @@ export async function restoreProjectState(outputDir: string): Promise<{
       novel = fresh;
     }
 
+    // 源文件缺失/不可读（重命名、移动、清理过下载目录，或导入时就没有真实路径）时，
+    // 用分章缓存把小说重建出来，而不是让重启后的生成页丢掉整个「按章节生成」入口。
+    let novelRestoredFromSplitCache = false;
+    if (!novel) {
+      novel = await restoreNovelFromSplitCache(
+        outputDir,
+        persistedState.novel?.fileName || "已生成项目",
+        persistedState.novel?.encoding || "utf-8",
+        persistedState.novel?.chapters,
+      );
+      novelRestoredFromSplitCache = !!novel;
+    }
+
     const warnings = [...loadedBible.warnings];
+    if (novelRestoredFromSplitCache) {
+      warnings.push("源小说文件不可读，已用分章缓存重建小说：分章/剧本/图像/逐章生成可继续使用，但「重新分章」等依赖原文的操作需要重新导入小说");
+    }
+    const persistedCards = workingCards ?? persistedState.lastResult?.cards;
     let visualBible = loadedBible.visualBible;
-    if (visualBible && persistedState.lastResult) {
+    if (visualBible && persistedCards) {
       try {
-        validateCharacterAssetKeys(persistedState.lastResult.cards.characters);
+        validateCharacterAssetKeys(persistedCards.characters);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         warnings.push(`Visual bible could not be restored because character asset keys conflict: ${message}`);
         visualBible = null;
       }
     }
-    if (visualBible && novel && persistedState.lastResult) {
+    if (visualBible && novel && persistedCards) {
       try {
         const currentFingerprint = await computeProjectVisualBibleFingerprint(
           outputDir,
           visualBible,
           novel,
-          persistedState.lastResult.cards.characters,
+          persistedCards.characters,
         );
         await refreshVisualBibleFingerprint(
           outputDir,
           visualBible,
           currentFingerprint,
-          persistedState.lastResult.cards.characters,
+          persistedCards.characters,
         );
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);

@@ -14,6 +14,16 @@ import { errMsg } from "../utils/errors";
 import { log } from "../utils/logger";
 import { t } from "../i18n";
 import PageHead from "../components/PageHead.vue";
+import { goPage } from "../stores/nav";
+// 轻量运行状态：避免把 generate store（含管线核心）拉进主包
+import { runIsBusy, runAssetLabel, runIsQueue } from "../stores/runStatus";
+
+/** 运行中守卫：导入/加载示例/换项目会替换 novel 或输出目录，与运行中的管线并发会互相覆盖 */
+function guardRunning(action: string): boolean {
+  if (!runBusy.value) return true;
+  error.value = `已有生成任务在运行：${action}未执行，请等它完成（或先到生成页点「停止」）后再试`;
+  return false;
+}
 
 /** 移除素材引用（只删引用关系，不删磁盘文件），二次确认防点错 */
 function confirmRemoveMaterial(path: string, name: string): void {
@@ -26,6 +36,8 @@ const importing = ref(false);
 const novelInput = ref<HTMLInputElement | null>(null);
 const materialInput = ref<HTMLInputElement | null>(null);
 
+const runBusy = computed(() => runIsBusy.value || !!runAssetLabel.value || runIsQueue.value);
+
 onMounted(async () => {
   if (!projectState.outputDir) {
     projectState.outputDir = await tauri.getDefaultOutputDir();
@@ -33,6 +45,7 @@ onMounted(async () => {
 });
 
 async function pickNovel(): Promise<void> {
+  if (!guardRunning(t("导入小说"))) return;
   if (!isTauri()) {
     novelInput.value?.click();
     return;
@@ -65,6 +78,7 @@ async function onNovelFile(e: Event): Promise<void> {
   const files = input.files ? [...input.files] : [];
   input.value = "";
   if (!files.length) return;
+  if (!guardRunning(t("导入小说"))) return;
   if (projectState.novel && !window.confirm(`将覆盖当前已导入的「${projectState.novel.fileName}」。继续吗？`)) return;
   error.value = "";
   importing.value = true;
@@ -86,6 +100,7 @@ async function onNovelFile(e: Event): Promise<void> {
 }
 
 async function loadDemo(): Promise<void> {
+  if (!guardRunning(t("加载示例"))) return;
   if (projectState.novel && !window.confirm("加载示例小说将覆盖当前已导入的小说（标题修改/章节停用一并丢失）。继续吗？")) return;
   const doc: NovelDoc = {
     fileName: "星陨之城的守夜人.txt",
@@ -189,6 +204,7 @@ function updateChapterTitle(i: number, title: string): void {
 }
 
 function toggleChapter(i: number): void {
+  if (!guardRunning(t("章节启停"))) return;
   const doc = projectState.novel;
   if (!doc) return;
   doc.chapters[i].enabled = !(doc.chapters[i].enabled !== false);
@@ -209,10 +225,7 @@ const projectRows = computed(() => {
 
 async function openProject(dir: string): Promise<void> {
   error.value = "";
-  if (projectState.running) {
-    error.value = t("有任务正在生成中，请等待完成或中止后再切换项目");
-    return;
-  }
+  if (!guardRunning(t("打开项目"))) return;
   try {
     await restoreProject(dir);
     configState.outputDir = dir;
@@ -229,16 +242,19 @@ function removeProject(id: string): void {
   removeProjectEntry(id);
 }
 
+/** 最近目录的「移除记录」此前没有确认，与注册项目的同名按钮行为不一致 */
+function removeRecent(dir: string): void {
+  if (!window.confirm(`将从最近列表移除「${dir}」？只删记录，磁盘文件保留。`)) return;
+  removeRecentOutputDir(dir);
+}
+
 async function newProject(): Promise<void> {
   error.value = "";
   if (!isTauri()) {
     error.value = t("Web 版输出目录固定，暂不支持新建项目目录");
     return;
   }
-  if (projectState.running) {
-    error.value = t("有任务正在生成中，请等待完成或中止后再切换项目");
-    return;
-  }
+  if (!guardRunning(t("新建项目"))) return;
   const picked = await open({ directory: true, multiple: false });
   if (!picked || typeof picked !== "string") return;
   const snap = await readDirNovelIdentity(picked);
@@ -284,14 +300,16 @@ async function guardNovelDir(doc: { fileName: string; chapters: { title: string 
       <input v-if="!isTauri()" ref="novelInput" type="file" accept=".txt,text/plain" multiple style="display: none" @change="onNovelFile" />
     </PageHead>
 
+    <p v-if="error" class="err-text mt-2">{{ error }}</p>
+
     <div class="card">
       <div class="card-head">
         <h3>{{ t("小说文件") }}</h3>
         <div class="card-actions">
           <button v-if="projectState.novel" class="btn secondary small" @click="pickNovel">{{ t("重新导入") }}</button>
+          <button v-if="projectState.novel" class="btn small" @click="goPage('generate')">{{ t("去生成项目") }}</button>
         </div>
       </div>
-      <p v-if="error" class="err-text mt-2">{{ error }}</p>
       <p v-if="projectState.novel" class="muted">
         {{ projectState.novel.fileName }} · {{ t("编码") }} {{ projectState.novel.encoding }} · {{ t("共") }}
         {{ projectState.novel.fullText.length.toLocaleString() }} {{ t("字") }}
@@ -397,7 +415,7 @@ async function guardNovelDir(doc: { fileName: string; chapters: { title: string 
           </span>
           <button class="btn secondary small" @click="openProject(row.dir)">{{ t("打开") }}</button>
           <button v-if="row.id" class="btn ghost small" :title="t('只从列表移除记录，不删除磁盘文件')" @click="removeProject(row.id)">{{ t("移除记录") }}</button>
-          <button v-else class="btn ghost small" :title="t('只从列表移除记录，不删除磁盘文件')" @click="removeRecentOutputDir(row.dir)">{{ t("移除记录") }}</button>
+          <button v-else class="btn ghost small" :title="t('只从列表移除记录，不删除磁盘文件')" @click="removeRecent(row.dir)">{{ t("移除记录") }}</button>
         </div>
       </div>
       <p v-else class="faint small">{{ t("暂无项目：导入小说后点生成即自动建档，或点右上新建项目") }}</p>
