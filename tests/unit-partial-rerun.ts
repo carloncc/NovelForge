@@ -42,7 +42,7 @@ async function main(): Promise<void> {
     const cacheRoot = `${root}/img/.novel2vn/cache`;
     await mkdir(`${cacheRoot}/images`, { recursive: true });
     const tasks = buildImageTasks(demoScripts, demoCards, {
-      figurePerCharacter: 1, cgPerChapter: 0, maxPerChapter: 0,
+      cgPerChapter: 0, maxPerChapter: 0,
       figureEmotions: false, threeView: false, actions: false, styleAnchor: false,
     });
     assert(tasks.length > 0, "应有图像任务");
@@ -170,7 +170,7 @@ async function main(): Promise<void> {
     await mkdir(`${cacheRoot}/images`, { recursive: true });
     const target = demoScripts[0].chapter;
     const tasks = buildImageTasks(demoScripts, demoCards, {
-      figurePerCharacter: 1, cgPerChapter: 0, maxPerChapter: 0,
+      cgPerChapter: 0, maxPerChapter: 0,
       figureEmotions: false, threeView: false, actions: false, styleAnchor: false,
     });
     // 背景/CG 任务必须带章节号，否则无法按章精确强制（人物/物品是项目级资产，不带章节）

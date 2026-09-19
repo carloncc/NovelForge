@@ -5,13 +5,13 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>NovelForge 鉴赏室 · Appreciation Gallery</title>
 <style>
-  :root { --bg:#101014; --card:#1b1b22; --border:#2c2c36; --txt:#e8e8ee; --dim:#9a9aa8; --accent:#8b5cf6; }
+  :root { --bg:#101014; --card:#1b1b22; --border:#2c2c36; --txt:#e8e8ee; --dim:#9a9aa8; --accent:#8b5cf6; color-scheme: dark; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: var(--bg); color: var(--txt); font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif; min-height: 100vh; }
   header { display: flex; align-items: center; gap: 12px; padding: 14px 20px; border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--bg); z-index: 5; }
   header h1 { font-size: 16px; font-weight: 600; }
   header .sub { color: var(--dim); font-size: 12px; }
-  .tabs { display: flex; gap: 8px; margin-left: auto; }
+  .tabs { display: flex; gap: 8px; margin-left: auto; flex-wrap: wrap; }
   .tab { padding: 6px 14px; border-radius: 8px; border: 1px solid var(--border); background: transparent; color: var(--dim); cursor: pointer; font-size: 13px; }
   .tab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
   .lang { padding: 6px 10px; border-radius: 8px; border: 1px solid var(--border); background: transparent; color: var(--dim); cursor: pointer; font-size: 12px; }
@@ -25,10 +25,25 @@
   .stage-controls { flex: 1 1 280px; display: flex; flex-direction: column; gap: 12px; }
   .ctl { display: flex; flex-direction: column; gap: 6px; }
   .ctl label { font-size: 12px; color: var(--dim); }
-  select, input[type="range"] { width: 100%; padding: 7px 10px; border-radius: 8px; border: 1px solid var(--border); background: #15151b; color: var(--txt); font-size: 13px; }
-  .btn { padding: 7px 12px; border-radius: 8px; border: 1px solid var(--border); background: #15151b; color: var(--txt); cursor: pointer; font-size: 13px; }
-  .btn:hover { border-color: var(--accent); }
-  /* 图鉴 / CG */
+  select { width: 100%; padding: 8px 34px 8px 12px; border-radius: 10px; border: 1px solid var(--border); background: #15151b; color: var(--txt); font-size: 13px; appearance: none; -webkit-appearance: none;
+    background-image: linear-gradient(45deg, transparent 50%, #9a9aa8 50%), linear-gradient(135deg, #9a9aa8 50%, transparent 50%);
+    background-position: calc(100% - 18px) 55%, calc(100% - 13px) 55%; background-size: 5px 5px, 5px 5px; background-repeat: no-repeat; cursor: pointer; }
+  select:hover, select:focus-visible { border-color: rgba(167, 139, 250, 0.6); outline: none; }
+  select option { background: #15151b; color: var(--txt); }
+  select:disabled { opacity: 0.45; cursor: not-allowed; }
+  input[type="range"] { -webkit-appearance: none; appearance: none; width: 100%; height: 6px; padding: 0; border: 0; border-radius: 999px; background: rgba(255, 255, 255, 0.12); cursor: pointer; }
+  input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 18px; height: 18px; border-radius: 50%; background: linear-gradient(135deg, #c4b5fd, #8b5cf6); border: 2px solid #fff; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5); }
+  input[type="range"]::-moz-range-thumb { width: 16px; height: 16px; border-radius: 50%; background: #8b5cf6; border: 2px solid #fff; }
+  input[type="checkbox"] { -webkit-appearance: none; appearance: none; width: 16px; height: 16px; border: 1px solid var(--border); border-radius: 4px; background: #15151b; position: relative; vertical-align: -2px; cursor: pointer; }
+  input[type="checkbox"]:checked { background: var(--accent); border-color: var(--accent); }
+  input[type="checkbox"]:checked::after { content: "✓"; position: absolute; inset: 0; display: grid; place-items: center; color: #fff; font-size: 11px; }
+  audio { filter: invert(0.88) hue-rotate(180deg); border-radius: 8px; }
+  .btn { padding: 7px 12px; border-radius: 8px; border: 1px solid var(--border); background: #15151b; color: var(--txt); cursor: pointer; font-size: 13px; transition: background-color .2s, border-color .2s, color .2s; }
+  .btn:hover { border-color: var(--accent); background: rgba(139, 92, 246, 0.18); color: #fff; }
+  .tab, .lang { transition: background-color .2s, border-color .2s, color .2s; }
+  .tab:hover, .lang:hover { background: rgba(139, 92, 246, 0.18); border-color: rgba(167, 139, 250, 0.6); color: #fff; }
+  .stage-empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--dim); font-size: 13px; text-align: center; padding: 0 24px; line-height: 1.8; pointer-events: none; }
+  /* 图鉴 / CG / 背景 */
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 14px; }
   .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
   .card img { width: 100%; height: 220px; object-fit: cover; background: repeating-conic-gradient(#1f1f27 0% 25%, #191921 0% 50%) 50% / 18px 18px; }
@@ -40,6 +55,20 @@
   .lightbox.open { display: flex; }
   .lightbox img { max-width: 94vw; max-height: 94vh; object-fit: contain; }
   .lightbox .close { position: absolute; top: 16px; right: 20px; font-size: 28px; cursor: pointer; color: var(--dim); }
+  /* 灯箱切换/缩放：左右切换 + 键盘 ←→/Esc + 滚轮/双击缩放 */
+  .lb-nav { position: absolute; top: 50%; transform: translateY(-50%); width: 48px; height: 48px; border-radius: 50%; border: 1px solid var(--border); background: rgba(20, 20, 26, 0.78); color: var(--txt); font-size: 22px; line-height: 1; cursor: pointer; display: grid; place-items: center; }
+  .lb-nav:hover { border-color: var(--accent); color: #fff; background: rgba(139, 92, 246, 0.35); }
+  .lb-nav.prev { left: 18px; }
+  .lb-nav.next { right: 18px; }
+  .lb-count { position: absolute; bottom: 18px; left: 50%; transform: translateX(-50%); color: var(--dim); font-size: 12.5px; max-width: 80vw; text-align: center; }
+  .lightbox img { cursor: zoom-in; transition: transform 0.15s ease; }
+  /* 章节筛选 */
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+  .chip { padding: 5px 12px; border-radius: 999px; border: 1px solid var(--border); background: transparent; color: var(--dim); font-size: 12px; cursor: pointer; }
+  .chip:hover { border-color: rgba(167, 139, 250, 0.6); color: #fff; }
+  .chip.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .stats { color: var(--dim); font-size: 12px; margin-left: 8px; }
+  .card img.char-img { cursor: pointer; }
   .bgm-row { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border: 1px solid var(--border); border-radius: 10px; margin-bottom: 8px; }
   .bgm-row audio { flex: 1; height: 34px; }
   .empty { color: var(--dim); font-size: 13px; padding: 30px 0; text-align: center; }
@@ -48,9 +77,11 @@
 <body>
 <header>
   <h1>NovelForge <span class="sub" data-i18n="subtitle">鉴赏室 / Appreciation</span></h1>
+  <span class="stats" id="stats"></span>
   <div class="tabs">
     <button class="tab active" data-tab="figure" data-i18n="t-figure">立绘鉴赏</button>
     <button class="tab" data-tab="cg" data-i18n="t-cg">CG 画廊</button>
+    <button class="tab" data-tab="bg" data-i18n="t-bg">背景画廊</button>
     <button class="tab" data-tab="char" data-i18n="t-char">角色图鉴</button>
     <button class="tab" data-tab="bgm" data-i18n="t-bgm">音乐鉴赏</button>
   </div>
@@ -60,11 +91,12 @@
 <main>
   <div class="panel active" id="panel-figure">
     <div class="stage">
-      <div class="stage-view"><img id="figImg" alt="" /></div>
+      <div class="stage-view"><img id="figImg" alt="" /><div class="stage-empty" id="stageEmpty">该角色尚未生成立绘<br />生成后回到本页即可鉴赏</div></div>
       <div class="stage-controls">
         <div class="ctl"><label data-i18n="c-char">角色</label><select id="figChar"></select></div>
         <div class="ctl"><label data-i18n="c-costume">服装</label><select id="figCostume"></select></div>
         <div class="ctl"><label data-i18n="c-emotion">表情</label><select id="figEmotion"></select></div>
+        <div class="ctl"><label data-i18n="c-action">动作</label><select id="figAction"></select></div>
         <div class="ctl"><label data-i18n="c-zoom">远近 / 缩放</label><input type="range" id="figZoom" min="50" max="200" value="100" /></div>
         <div class="ctl"><label><input type="checkbox" id="figBg" checked /> <span data-i18n="c-bg">显示背景色</span></label></div>
         <div style="display:flex; gap:8px; flex-wrap:wrap">
@@ -77,7 +109,13 @@
   </div>
 
   <div class="panel" id="panel-cg">
+    <div class="chips" id="cgChips"></div>
     <div class="grid" id="cgGrid"></div>
+  </div>
+
+  <div class="panel" id="panel-bg">
+    <div class="chips" id="bgChips"></div>
+    <div class="grid" id="bgGrid"></div>
   </div>
 
   <div class="panel" id="panel-char">
@@ -89,158 +127,391 @@
   </div>
 </main>
 
-<div class="lightbox" id="lightbox"><span class="close" id="lbClose">&times;</span><img id="lbImg" alt="" /></div>
+<div class="lightbox" id="lightbox">
+  <span class="close" id="lbClose">&times;</span>
+  <button class="lb-nav prev" id="lbPrev" aria-label="Previous">&#8249;</button>
+  <img id="lbImg" alt="" />
+  <button class="lb-nav next" id="lbNext" aria-label="Next">&#8250;</button>
+  <span class="lb-count" id="lbCount"></span>
+</div>
 
 <script src="./appreciation-data.js"></script>
 <script>
 (function () {
-  var D = window.APPRECIATION_DATA || { characters: [], cgs: [], bgms: [] };
+  var D = window.APPRECIATION_DATA || { lang: "", characters: [], cgs: [], bgs: [], bgms: [] };
+  if (!D.cgs) D.cgs = [];
+  if (!D.bgs) D.bgs = [];
+  if (!D.bgms) D.bgms = [];
+
+  /** 与生成端 render.ts sanitizeId 同一规则：路径两段（角色/服装/动作）都必须消毒，否则特殊字符盲拼必 404（UI105） */
+  function nfSanitize(id) {
+    return String(id == null ? "" : id).replace(/[^a-zA-Z0-9_-]/g, "_") || "unnamed";
+  }
+
   var I18N = {
-    zh: { subtitle: "鉴赏室", "t-figure": "立绘鉴赏", "t-cg": "CG 画廊", "t-char": "角色图鉴", "t-bgm": "音乐鉴赏",
-      "c-char": "角色", "c-costume": "服装", "c-emotion": "表情", "c-zoom": "远近 / 缩放", "c-bg": "显示背景色",
-      "c-prev": "上一张", "c-next": "下一张", "c-fit": "复位", empty: "暂无内容", voice: "音色", desc: "简介", cloth: "服装" },
-    en: { subtitle: "Appreciation", "t-figure": "Sprites", "t-cg": "CG Gallery", "t-char": "Character Encyclopedia", "t-bgm": "Music",
-      "c-char": "Character", "c-costume": "Costume", "c-emotion": "Expression", "c-zoom": "Zoom", "c-bg": "Show background",
-      "c-prev": "Previous", "c-next": "Next", "c-fit": "Reset", empty: "Nothing here yet", voice: "Voice", desc: "About", cloth: "Outfit" }
+    zh_CN: { subtitle: "鉴赏室", "t-figure": "立绘鉴赏", "t-cg": "CG 画廊", "t-bg": "背景画廊", "t-char": "角色图鉴", "t-bgm": "音乐鉴赏",
+      "c-char": "角色", "c-costume": "服装", "c-emotion": "表情", "c-action": "动作", "c-zoom": "远近 / 缩放", "c-bg": "显示背景色",
+      "c-prev": "上一张", "c-next": "下一张", "c-fit": "复位", "a-none": "无动作", empty: "暂无内容", voice: "音色", desc: "简介", cloth: "服装",
+      "c-default": "默认服装", "e-normal": "默认", "e-happy": "开心", "e-sad": "悲伤", "e-angry": "愤怒", "e-surprised": "惊讶",
+      ch: "第 {n} 章", other: "其他", all: "全部",
+      collected: "收录：{chars} 角色 · {cgs} CG · {bgs} 背景 · {bgms} 音乐",
+      "nf-figure": "该角色尚未生成立绘，生成后回到本页即可鉴赏", "nf-costume": "该服装立绘尚未生成（可在图像阶段补齐）",
+      "nf-action": "该动作立绘尚未生成（可在图像阶段补齐）", "nf-emotion": "该表情差分尚未生成（可在图像阶段补齐）",
+      "nf-file": "图片文件不存在，可能未生成或已被删除", "bad-combo": "该组合不存在（服装差分只有默认表情）" },
+    zh_TW: { subtitle: "鑑賞室", "t-figure": "立繪鑑賞", "t-cg": "CG 畫廊", "t-bg": "背景畫廊", "t-char": "角色圖鑑", "t-bgm": "音樂鑑賞",
+      "c-char": "角色", "c-costume": "服裝", "c-emotion": "表情", "c-action": "動作", "c-zoom": "遠近 / 縮放", "c-bg": "顯示背景色",
+      "c-prev": "上一張", "c-next": "下一張", "c-fit": "復位", "a-none": "無動作", empty: "暫無內容", voice: "音色", desc: "簡介", cloth: "服裝",
+      "c-default": "預設服裝", "e-normal": "預設", "e-happy": "開心", "e-sad": "悲傷", "e-angry": "憤怒", "e-surprised": "驚訝",
+      ch: "第 {n} 章", other: "其他", all: "全部",
+      collected: "收錄：{chars} 角色 · {cgs} CG · {bgs} 背景 · {bgms} 音樂",
+      "nf-figure": "該角色尚未生成立繪，生成後回到本頁即可鑑賞", "nf-costume": "該服裝立繪尚未生成（可在圖像階段補齊）",
+      "nf-action": "該動作立繪尚未生成（可在圖像階段補齊）", "nf-emotion": "該表情差分尚未生成（可在圖像階段補齊）",
+      "nf-file": "圖片檔案不存在，可能未生成或已被刪除", "bad-combo": "該組合不存在（服裝差分只有預設表情）" },
+    en: { subtitle: "Appreciation", "t-figure": "Sprites", "t-cg": "CG Gallery", "t-bg": "Backgrounds", "t-char": "Characters", "t-bgm": "Music",
+      "c-char": "Character", "c-costume": "Costume", "c-emotion": "Expression", "c-action": "Pose", "c-zoom": "Zoom", "c-bg": "Show background",
+      "c-prev": "Previous", "c-next": "Next", "c-fit": "Reset", "a-none": "No pose", empty: "Nothing here yet", voice: "Voice", desc: "About", cloth: "Outfit",
+      "c-default": "Default outfit", "e-normal": "Normal", "e-happy": "Happy", "e-sad": "Sad", "e-angry": "Angry", "e-surprised": "Surprised",
+      ch: "Ch. {n}", other: "Other", all: "All",
+      collected: "Collected: {chars} chars · {cgs} CG · {bgs} backgrounds · {bgms} tracks",
+      "nf-figure": "This character has no sprite yet. Generate images to see it here.", "nf-costume": "This costume sprite has not been generated yet.",
+      "nf-action": "This pose sprite has not been generated yet.", "nf-emotion": "This expression variant has not been generated yet.",
+      "nf-file": "Image file is missing (not generated or deleted).", "bad-combo": "This combination does not exist (costume variants only have the default expression)." },
+    ja: { subtitle: "鑑賞室", "t-figure": "立ち絵鑑賞", "t-cg": "CGギャラリー", "t-bg": "背景ギャラリー", "t-char": "キャラ図鑑", "t-bgm": "音楽鑑賞",
+      "c-char": "キャラクター", "c-costume": "衣装", "c-emotion": "表情", "c-action": "ポーズ", "c-zoom": "ズーム", "c-bg": "背景色を表示",
+      "c-prev": "前へ", "c-next": "次へ", "c-fit": "リセット", "a-none": "ポーズなし", empty: "まだ何もありません", voice: "ボイス", desc: "紹介", cloth: "衣装",
+      "c-default": "デフォルト衣装", "e-normal": "通常", "e-happy": "笑顔", "e-sad": "悲しい", "e-angry": "怒り", "e-surprised": "驚き",
+      ch: "第 {n} 章", other: "その他", all: "全て",
+      collected: "収録：キャラ {chars} · CG {cgs} · 背景 {bgs} · 音楽 {bgms}",
+      "nf-figure": "このキャラクターの立ち絵はまだありません", "nf-costume": "この衣装の立ち絵はまだ生成されていません",
+      "nf-action": "このポーズの立ち絵はまだ生成されていません", "nf-emotion": "この表情差分はまだ生成されていません",
+      "nf-file": "画像ファイルが存在しません（未生成または削除済み）", "bad-combo": "この組み合わせは存在しません（衣装差分はデフォルト表情のみ）" },
+    ko: { subtitle: "감상실", "t-figure": "스프라이트 감상", "t-cg": "CG 갤러리", "t-bg": "배경 갤러리", "t-char": "캐릭터 도감", "t-bgm": "음악 감상",
+      "c-char": "캐릭터", "c-costume": "의상", "c-emotion": "표정", "c-action": "포즈", "c-zoom": "확대/축소", "c-bg": "배경색 표시",
+      "c-prev": "이전", "c-next": "다음", "c-fit": "초기화", "a-none": "포즈 없음", empty: "아직 내용이 없습니다", voice: "음성", desc: "소개", cloth: "의상",
+      "c-default": "기본 의상", "e-normal": "기본", "e-happy": "기쁨", "e-sad": "슬픔", "e-angry": "분노", "e-surprised": "놀람",
+      ch: "제 {n} 장", other: "기타", all: "전체",
+      collected: "수록: 캐릭터 {chars} · CG {cgs} · 배경 {bgs} · 음악 {bgms}",
+      "nf-figure": "이 캐릭터의 스프라이트가 아직 없습니다", "nf-costume": "이 의상 스프라이트가 아직 생성되지 않았습니다",
+      "nf-action": "이 포즈 스프라이트가 아직 생성되지 않았습니다", "nf-emotion": "이 표정 차분이 아직 생성되지 않았습니다",
+      "nf-file": "이미지 파일이 없습니다(미생성 또는 삭제됨)", "bad-combo": "존재하지 않는 조합입니다(의상 차분은 기본 표정만 지원)" }
   };
-  var lang = navigator.language && navigator.language.toLowerCase().startsWith("zh") ? "zh" : "en";
+  var LANGS = ["zh_CN", "zh_TW", "en", "ja", "ko"];
+  var LANG_SHORT = { zh_CN: "简中", zh_TW: "繁中", en: "EN", ja: "日本語", ko: "한국어" };
+
+  /** 把 BCP-47 / 任意写法归一到本页支持的 5 种语言码 */
+  function normalizeLang(code) {
+    var c = String(code || "").toLowerCase();
+    if (!c) return "";
+    if (c.indexOf("zh") === 0) return /tw|hk|hant/.test(c) ? "zh_TW" : "zh_CN";
+    if (c.indexOf("ja") === 0) return "ja";
+    if (c.indexOf("ko") === 0) return "ko";
+    if (c.indexOf("en") === 0) return "en";
+    return "";
+  }
+
+  // UI97：初始语言用作品语言（appreciation-data.js 的 lang，与 config Default_Language 同口径），
+  // 数据缺失时才退回浏览器语言；不再只看浏览器且仅中/英。
+  var lang = normalizeLang(D.lang) || normalizeLang(navigator.language) || "zh_CN";
+
+  function t(key, vars) {
+    var table = I18N[lang] || I18N.zh_CN;
+    var s = table[key] != null ? table[key] : I18N.zh_CN[key];
+    if (s == null) s = key;
+    if (vars) Object.keys(vars).forEach(function (k) { s = s.split("{" + k + "}").join(vars[k]); });
+    return s;
+  }
+  /** 表情名翻译：未收录的自定义表情 id 原样显示（t() 会回显 key，这里单独处理） */
+  function emotionLabel(e) {
+    var table = I18N[lang] || I18N.zh_CN;
+    return table["e-" + e] || I18N.zh_CN["e-" + e] || e;
+  }
+
   function applyLang(l) {
     lang = l;
     document.querySelectorAll("[data-i18n]").forEach(function (el) {
-      el.textContent = (I18N[l] && I18N[l][el.getAttribute("data-i18n")]) || el.textContent;
+      el.textContent = t(el.getAttribute("data-i18n"));
     });
-    document.getElementById("langBtn").textContent = l === "zh" ? "EN" : "中";
+    var idx = LANGS.indexOf(l);
+    document.getElementById("langBtn").textContent = LANG_SHORT[LANGS[(idx + 1) % LANGS.length]] || "EN";
+    document.documentElement.lang = l.replace("_", "-");
     renderAll();
   }
-  document.getElementById("langBtn").addEventListener("click", function () { applyLang(lang === "zh" ? "en" : "zh"); });
+  document.getElementById("langBtn").addEventListener("click", function () {
+    var idx = LANGS.indexOf(lang);
+    applyLang(LANGS[(idx + 1) % LANGS.length]);
+  });
 
-  /* ---- 立绘鉴赏 ---- */
+  /* ---- 立绘鉴赏（UI105/108：只列真实存在的文件；服装×表情×动作展平成序列供前后切换）---- */
   var figImg = document.getElementById("figImg");
   var selChar = document.getElementById("figChar");
   var selCostume = document.getElementById("figCostume");
   var selEmotion = document.getElementById("figEmotion");
+  var selAction = document.getElementById("figAction");
   var zoom = document.getElementById("figZoom");
   var bgChk = document.getElementById("figBg");
-  var figs = [];
-  function figuresFor(char, costume, emotion) {
-    var out = [];
-    var base = char.id;
-    var ctag = costume ? "_ct_" + costume : "";
-    var etag = emotion && emotion !== "normal" ? "_" + emotion : "_normal";
-    out.push("game/figure/figure_" + base + ctag + etag + ".png");
-    return out;
+  var stageEmpty = document.getElementById("stageEmpty");
+  var figSeq = [];
+  var figSeqIndex = -1;
+
+  function option(value, label) {
+    var o = document.createElement("option");
+    o.value = value;
+    o.textContent = label;
+    return o;
   }
-  function renderAll() {
-    selChar.innerHTML = "";
-    D.characters.forEach(function (c, i) {
-      var o = document.createElement("option");
-      o.value = i; o.textContent = c.name || c.id;
-      selChar.appendChild(o);
-    });
-    if (D.characters.length) { selChar.value = 0; syncCostume(); }
-    renderCg(); renderChars(); renderBgm();
+  function currentChar() {
+    var i = Number(selChar.value);
+    return Number.isFinite(i) ? D.characters[i] : null;
   }
-  function syncCostume() {
-    var c = D.characters[selChar.value];
-    if (!c) return;
+  /** 兼容旧数据（无 variants 字段）：只回退默认 normal 路径（按 sanitizeId 规则消毒） */
+  function charVariants(c) {
+    if (c.variants && c.variants.length) return c.variants.slice();
+    return [{ file: "figure_" + nfSanitize(c.id) + "_normal.png", emotion: "normal" }];
+  }
+  function declared(list, id) {
+    return (list || []).some(function (x) { return x.id === id; });
+  }
+  function hasEmotionFile(emotion) {
+    return figSeq.some(function (v) { return !v.action && !v.costume && (v.emotion || "normal") === emotion; });
+  }
+  function findVariant(costume, emotion, action) {
+    for (var i = 0; i < figSeq.length; i++) {
+      var v = figSeq[i];
+      if (action) { if (v.action === action) return i; continue; }
+      if (v.action) continue;
+      if ((v.costume || "") !== (costume || "")) continue;
+      if ((v.emotion || "normal") !== (emotion || "normal")) continue;
+      return i;
+    }
+    return -1;
+  }
+  function setEmpty(msg) {
+    figImg.removeAttribute("src");
+    stageEmpty.textContent = msg;
+    stageEmpty.style.display = "grid";
+  }
+  function applyZoom() { figImg.style.transform = "scale(" + (zoom.value / 100) + ")"; }
+  function loadFig(file) {
+    var src = "game/figure/" + file;
+    var probe = new Image();
+    probe.onload = function () { figImg.src = src; stageEmpty.style.display = "none"; applyZoom(); };
+    probe.onerror = function () { setEmpty(t("nf-file")); };
+    probe.src = src;
+  }
+  function showVariant(i) {
+    if (i < 0 || i >= figSeq.length) return;
+    figSeqIndex = i;
+    var v = figSeq[i];
+    loadFig(v.file);
+    if (v.action) {
+      selAction.value = v.action;
+      selCostume.value = "";
+      selEmotion.value = "normal";
+    } else {
+      selAction.value = "";
+      selCostume.value = v.costume || "";
+      selEmotion.value = v.emotion || "normal";
+    }
+    selEmotion.disabled = !!selCostume.value;
+  }
+  function populateChar(c) {
     selCostume.innerHTML = "";
-    var o = document.createElement("option"); o.value = ""; o.textContent = "默认";
-    selCostume.appendChild(o);
+    selCostume.appendChild(option("", t("c-default")));
     (c.costumes || []).forEach(function (ct) {
-      var o2 = document.createElement("option"); o2.value = ct.id; o2.textContent = ct.name || ct.id;
-      selCostume.appendChild(o2);
+      selCostume.appendChild(option(ct.id, ct.name || ct.id));
     });
-    syncEmotion();
-  }
-  function syncEmotion() {
-    var c = D.characters[selChar.value];
-    if (!c) return;
+    var emos = (c.emotions && c.emotions.length) ? c.emotions : ["normal", "happy", "sad", "angry", "surprised"];
+    if (emos.indexOf("normal") < 0) emos = ["normal"].concat(emos);
     selEmotion.innerHTML = "";
-    var emos = (c.emotions && c.emotions.length ? c.emotions : ["normal", "happy", "sad", "angry", "surprised"]);
-    emos.forEach(function (e) {
-      var o = document.createElement("option"); o.value = e; o.textContent = e;
-      selEmotion.appendChild(o);
+    emos.forEach(function (e) { selEmotion.appendChild(option(e, emotionLabel(e))); });
+    selAction.innerHTML = "";
+    selAction.appendChild(option("", t("a-none")));
+    (c.actions || []).forEach(function (a) {
+      selAction.appendChild(option(a.id, a.name || a.id));
     });
-    updateFig();
+  }
+  function onCharChange() {
+    var c = currentChar();
+    if (!c) { figSeq = []; setEmpty(t("nf-figure")); return; }
+    populateChar(c);
+    figSeq = charVariants(c);
+    var i = findVariant("", "normal", "");
+    if (i < 0) i = 0;
+    if (figSeq.length) showVariant(i);
+    else setEmpty(t("nf-figure"));
   }
   function updateFig() {
-    var c = D.characters[selChar.value];
-    if (!c) return;
-    var files = figuresFor(c, selCostume.value, selEmotion.value);
-    var src = files[0];
-    var img = new Image();
-    img.onload = function () { figImg.src = src; };
-    img.onerror = function () { figImg.removeAttribute("src"); };
-    img.src = src;
-    figImg.style.transform = "scale(" + (zoom.value / 100) + ")";
+    var c = currentChar();
+    if (!c) { setEmpty(t("nf-figure")); return; }
+    var action = selAction.value;
+    var costume = selCostume.value;
+    var emotion = selEmotion.value || "normal";
+    selEmotion.disabled = !!costume;
+    // UI105：服装差分只有 normal 姿态（换装期间表情差分暂停），选中服装时回退默认表情
+    if (costume && emotion !== "normal") {
+      selEmotion.value = "normal";
+      emotion = "normal";
+    }
+    var i = findVariant(costume, emotion, action);
+    if (i >= 0) { showVariant(i); return; }
+    if (action) { setEmpty(declared(c.actions, action) ? t("nf-action") : t("bad-combo")); return; }
+    if (costume) { setEmpty(declared(c.costumes, costume) ? t("nf-costume") : t("bad-combo")); return; }
+    if (emotion !== "normal" && !hasEmotionFile(emotion)) { setEmpty(t("nf-emotion")); return; }
+    setEmpty(t("nf-figure"));
   }
-  selChar.addEventListener("change", syncCostume);
-  selCostume.addEventListener("change", syncEmotion);
+  selChar.addEventListener("change", onCharChange);
+  selCostume.addEventListener("change", updateFig);
   selEmotion.addEventListener("change", updateFig);
-  zoom.addEventListener("input", function () { figImg.style.transform = "scale(" + (zoom.value / 100) + ")"; });
+  selAction.addEventListener("change", updateFig);
+  zoom.addEventListener("input", applyZoom);
   bgChk.addEventListener("change", function () {
     document.querySelector(".stage-view").style.background = bgChk.checked
       ? "repeating-conic-gradient(#1f1f27 0% 25%, #191921 0% 50%) 50% / 22px 22px"
       : "none";
   });
   document.getElementById("figPrev").addEventListener("click", function () {
-    var idx = parseInt(selEmotion.value === "normal" ? "0" : "0", 10);
-    var c = D.characters[selChar.value];
-    if (!c) return;
-    var emos = c.emotions && c.emotions.length ? c.emotions : ["normal", "happy", "sad", "angry", "surprised"];
-    var i = Math.max(0, emos.indexOf(selEmotion.value) - 1);
-    selEmotion.value = emos[i] || "normal"; updateFig();
+    if (!figSeq.length) return;
+    showVariant((figSeqIndex - 1 + figSeq.length) % figSeq.length);
   });
   document.getElementById("figNext").addEventListener("click", function () {
-    var c = D.characters[selChar.value];
-    if (!c) return;
-    var emos = c.emotions && c.emotions.length ? c.emotions : ["normal", "happy", "sad", "angry", "surprised"];
-    var i = Math.min(emos.length - 1, emos.indexOf(selEmotion.value) + 1);
-    selEmotion.value = emos[i] || "normal"; updateFig();
+    if (!figSeq.length) return;
+    showVariant((figSeqIndex + 1) % figSeq.length);
   });
-  document.getElementById("figFit").addEventListener("click", function () { zoom.value = 100; figImg.style.transform = "scale(1)"; });
+  document.getElementById("figFit").addEventListener("click", function () { zoom.value = 100; applyZoom(); });
 
-  /* ---- CG 画廊 ---- */
-  function renderCg() {
-    var g = document.getElementById("cgGrid");
-    g.innerHTML = "";
-    if (!D.cgs.length) { g.innerHTML = '<div class="empty">' + (I18N[lang].empty) + "</div>"; return; }
-    D.cgs.forEach(function (cg) {
+  /* ---- 画廊（CG / 背景共用：按章节分组 + IntersectionObserver 懒加载 + 灯箱切换/缩放）---- */
+  var galleryFilters = { cg: "all", bg: "all" };
+  var galleryLists = { cg: [], bg: [] };
+  var lbKind = "cg";
+  var lbIndex = -1;
+  var lbZoom = 1;
+
+  function galleryData(kind) { return kind === "cg" ? D.cgs : D.bgs; }
+  function chapterKey(item) { return item.chapter != null ? String(item.chapter) : "0"; }
+  function chapterLabel(key) {
+    if (key === "0") return t("other");
+    return t("ch", { n: key });
+  }
+  function makeLazyObserver() {
+    if (!("IntersectionObserver" in window)) return null;
+    return new IntersectionObserver(function (entries, obs) {
+      entries.forEach(function (en) {
+        if (!en.isIntersecting) return;
+        var im = en.target;
+        if (im.getAttribute("data-src") && !im.getAttribute("src")) im.src = im.getAttribute("data-src");
+        obs.unobserve(im);
+      });
+    }, { rootMargin: "320px" });
+  }
+  function renderGallery(kind) {
+    var list = galleryData(kind);
+    var grid = document.getElementById(kind + "Grid");
+    var chips = document.getElementById(kind + "Chips");
+    grid.innerHTML = "";
+    chips.innerHTML = "";
+    if (!list.length) { grid.innerHTML = '<div class="empty">' + t("empty") + "</div>"; return; }
+    var groups = [];
+    list.forEach(function (item) {
+      var key = chapterKey(item);
+      if (groups.indexOf(key) < 0) groups.push(key);
+    });
+    groups.sort(function (a, b) { return parseInt(a, 10) - parseInt(b, 10); });
+    var filter = galleryFilters[kind];
+    if (filter !== "all" && groups.indexOf(filter) < 0) { filter = "all"; galleryFilters[kind] = "all"; }
+    var all = document.createElement("button");
+    all.className = "chip" + (filter === "all" ? " active" : "");
+    all.textContent = t("all");
+    all.addEventListener("click", function () { galleryFilters[kind] = "all"; renderGallery(kind); });
+    chips.appendChild(all);
+    if (groups.length > 1) groups.forEach(function (key) {
+      var chip = document.createElement("button");
+      chip.className = "chip" + (filter === key ? " active" : "");
+      chip.textContent = chapterLabel(key);
+      chip.addEventListener("click", function () { galleryFilters[kind] = key; renderGallery(kind); });
+      chips.appendChild(chip);
+    });
+    var shown = list.filter(function (item) { return filter === "all" || chapterKey(item) === filter; });
+    galleryLists[kind] = shown.slice();
+    var io = makeLazyObserver();
+    shown.forEach(function (item, i) {
       var div = document.createElement("div");
       div.className = "card";
       var img = document.createElement("img");
       img.className = "cg-img";
-      img.src = "game/background/" + cg.file;
-      img.alt = cg.name || "";
-      img.addEventListener("click", function () {
-        document.getElementById("lbImg").src = img.src;
-        document.getElementById("lightbox").classList.add("open");
-      });
+      img.alt = item.name || "";
+      img.loading = "lazy";
+      img.setAttribute("data-src", "game/background/" + item.file);
+      if (io) io.observe(img); else img.src = "game/background/" + item.file;
+      img.addEventListener("click", function () { openLb(kind, i); });
       var info = document.createElement("div");
       info.className = "info";
       var name = document.createElement("div");
       name.className = "name";
-      name.textContent = cg.name || cg.file;
+      name.textContent = item.name || item.file;
       info.appendChild(name);
       div.appendChild(img); div.appendChild(info);
-      g.appendChild(div);
+      grid.appendChild(div);
+    });
+  }
+  function openLb(kind, i) {
+    var list = galleryLists[kind];
+    if (!list || !list.length) return;
+    lbKind = kind;
+    lbIndex = ((i % list.length) + list.length) % list.length;
+    var item = list[lbIndex];
+    lbZoom = 1;
+    var im = document.getElementById("lbImg");
+    im.src = "game/background/" + item.file;
+    im.style.transform = "scale(1)";
+    document.getElementById("lbCount").textContent = (lbIndex + 1) + " / " + list.length + " · " + (item.name || item.file);
+    document.getElementById("lightbox").classList.add("open");
+  }
+  function closeLb() { document.getElementById("lightbox").classList.remove("open"); }
+  function stepLb(d) { if (lbIndex >= 0) openLb(lbKind, lbIndex + d); }
+  function applyLbZoom() {
+    var v = Math.max(0.5, Math.min(4, lbZoom));
+    lbZoom = v;
+    document.getElementById("lbImg").style.transform = "scale(" + v + ")";
+  }
+
+  /* ---- 收集度：已收录角色 / CG / 背景 / 音乐数量 ---- */
+  function renderStats() {
+    var el = document.getElementById("stats");
+    if (!el) return;
+    el.textContent = t("collected", {
+      chars: D.characters.length,
+      cgs: D.cgs.length,
+      bgs: D.bgs.length,
+      bgms: D.bgms.length,
     });
   }
 
-  /* ---- 角色图鉴 ---- */
+  /* ---- 角色图鉴（UI96：IntersectionObserver + loading="lazy"）---- */
   function renderChars() {
     var g = document.getElementById("charGrid");
     g.innerHTML = "";
-    if (!D.characters.length) { g.innerHTML = '<div class="empty">' + I18N[lang].empty + "</div>"; return; }
+    if (!D.characters.length) { g.innerHTML = '<div class="empty">' + t("empty") + "</div>"; return; }
+    var io = makeLazyObserver();
     D.characters.forEach(function (c) {
       var div = document.createElement("div");
       div.className = "card";
       var img = document.createElement("img");
-      img.src = "game/figure/figure_" + c.id + "_normal.png";
+      img.className = "char-img";
       img.alt = c.name || "";
+      img.loading = "lazy";
+      var def = null;
+      (c.variants || []).forEach(function (v) {
+        if (!v.action && !v.costume && (v.emotion || "normal") === "normal") def = v.file;
+      });
+      if (!def && c.variants && c.variants.length) def = c.variants[0].file;
+      if (!def) def = "figure_" + nfSanitize(c.id) + "_normal.png";
+      img.setAttribute("data-src", "game/figure/" + def);
+      if (io) io.observe(img); else img.src = "game/figure/" + def;
       img.addEventListener("click", function () {
-        document.getElementById("lbImg").src = img.src;
-        document.getElementById("lightbox").classList.add("open");
+        // 跳转立绘鉴赏并选中该角色
+        switchPanel("figure");
+        selChar.value = String(D.characters.indexOf(c));
+        onCharChange();
       });
       var info = document.createElement("div");
       info.className = "info";
@@ -249,7 +520,7 @@
       name.textContent = (c.name || c.id) + (c.isNpc ? " · NPC" : "");
       var desc = document.createElement("div");
       desc.className = "desc";
-      desc.textContent = [I18N[lang].cloth + ": " + (c.clothing || ""), I18N[lang].desc + ": " + (c.appearance || "")].join("  ");
+      desc.textContent = [t("cloth") + ": " + (c.clothing || ""), t("desc") + ": " + (c.appearance || "")].join("  ");
       info.appendChild(name); info.appendChild(desc);
       div.appendChild(img); div.appendChild(info);
       g.appendChild(div);
@@ -260,7 +531,7 @@
   function renderBgm() {
     var g = document.getElementById("bgmList");
     g.innerHTML = "";
-    if (!D.bgms.length) { g.innerHTML = '<div class="empty">' + I18N[lang].empty + "</div>"; return; }
+    if (!D.bgms.length) { g.innerHTML = '<div class="empty">' + t("empty") + "</div>"; return; }
     D.bgms.forEach(function (b) {
       var row = document.createElement("div");
       row.className = "bgm-row";
@@ -274,19 +545,64 @@
     });
   }
 
-  document.querySelectorAll(".tab").forEach(function (b) {
-    b.addEventListener("click", function () {
-      document.querySelectorAll(".tab").forEach(function (x) { x.classList.remove("active"); });
-      b.classList.add("active");
-      document.querySelectorAll(".panel").forEach(function (p) { p.classList.remove("active"); });
-      document.getElementById("panel-" + b.getAttribute("data-tab")).classList.add("active");
+  function pauseAllAudio() {
+    document.querySelectorAll("audio").forEach(function (a) {
+      try { a.pause(); } catch (e) { /* 暂停失败不影响切页 */ }
     });
+  }
+  function switchPanel(tab) {
+    document.querySelectorAll(".tab").forEach(function (x) { x.classList.toggle("active", x.getAttribute("data-tab") === tab); });
+    document.querySelectorAll(".panel").forEach(function (p) { p.classList.toggle("active", p.id === "panel-" + tab); });
+    // UI96：切 tab 时暂停所有试听音频，避免离开音乐页后继续播放
+    pauseAllAudio();
+  }
+  document.querySelectorAll(".tab").forEach(function (b) {
+    b.addEventListener("click", function () { switchPanel(b.getAttribute("data-tab")); });
   });
-  document.getElementById("lbClose").addEventListener("click", function () {
-    document.getElementById("lightbox").classList.remove("open");
-  });
+
+  function renderAll() {
+    var prevChar = selChar.value;
+    selChar.innerHTML = "";
+    D.characters.forEach(function (c, i) {
+      selChar.appendChild(option(String(i), c.name || c.id));
+    });
+    if (D.characters.length) {
+      selChar.value = prevChar !== "" && D.characters[Number(prevChar)] ? prevChar : "0";
+      onCharChange();
+    } else {
+      figSeq = [];
+      setEmpty(t("nf-figure"));
+    }
+    renderStats();
+    renderGallery("cg");
+    renderGallery("bg");
+    renderChars();
+    renderBgm();
+  }
+
+  document.getElementById("lbClose").addEventListener("click", closeLb);
   document.getElementById("lightbox").addEventListener("click", function (e) {
-    if (e.target === this) this.classList.remove("open");
+    if (e.target === this) closeLb();
+  });
+  document.getElementById("lbPrev").addEventListener("click", function (e) { e.stopPropagation(); stepLb(-1); });
+  document.getElementById("lbNext").addEventListener("click", function (e) { e.stopPropagation(); stepLb(1); });
+  document.getElementById("lbImg").addEventListener("dblclick", function (e) {
+    e.stopPropagation();
+    lbZoom = lbZoom > 1 ? 1 : 2;
+    applyLbZoom();
+  });
+  document.getElementById("lbImg").addEventListener("wheel", function (e) {
+    e.preventDefault();
+    lbZoom += e.deltaY < 0 ? 0.15 : -0.15;
+    applyLbZoom();
+  }, { passive: false });
+  document.addEventListener("keydown", function (e) {
+    if (!document.getElementById("lightbox").classList.contains("open")) return;
+    if (e.key === "Escape") closeLb();
+    else if (e.key === "ArrowLeft") stepLb(-1);
+    else if (e.key === "ArrowRight") stepLb(1);
+    else if (e.key === "+" || e.key === "=") { lbZoom += 0.25; applyLbZoom(); }
+    else if (e.key === "-" || e.key === "_") { lbZoom -= 0.25; applyLbZoom(); }
   });
   applyLang(lang);
 })();

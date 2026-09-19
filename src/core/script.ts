@@ -43,6 +43,10 @@ interface ScriptModel {
       action?: string;
       costume?: string;
       monologue?: boolean;
+      /** 配音语速（0.5-2，模型可标注） */
+      speed?: number;
+      /** 配音情绪（happy/sad/angry/calm/whisper/surprised 等，传给 TTS） */
+      ttsEmotion?: string;
       text: string;
     }[];
     choices?: {
@@ -55,6 +59,8 @@ interface ScriptModel {
         action?: string;
         costume?: string;
         monologue?: boolean;
+        speed?: number;
+        ttsEmotion?: string;
         text: string;
       }[];
     }[];
@@ -78,9 +84,10 @@ const SYSTEM_PROMPT = `你是视觉小说编剧。根据小说章节文本与角
     - 可选 action: 当该句台词有明显动作姿态（抬手指、拔剑、挥手、抱臂、蹲下等）时，从该角色的"动作列表"(见角色卡)中选最贴切的一个填 action: "动作id"；没有合适的动作就省略该字段
     - 可选 costume: 仅当剧情明确写了换装（换上礼服/战斗服/睡衣等）时，从该角色的"服装列表"(见角色卡)中选填 costume: "服装id"；换装后该角色后续台词自动沿用该服装直到再次标注，没有换装情节就省略该字段
    - narration: {type:"narration", text}
-   - 内心独白: {type:"narration", monologue:true, text}（数量要少，每章最多 2 条）
-5. CG 事件：挑本章 1-3 个最具画面感的"名场面"（战斗高潮、重要相遇、宏大场景），
-   为其中最多一个场景写 cg：{title, description(一两句), imagePrompt(整幅插画，含人物，电影构图，动漫风)}
+   - 内心独白: {type:"narration", monologue:true, text}（按原文比例保留，不要机械砍数量）
+5. CG 事件：挑本章最具画面感的"名场面"（战斗高潮、重要相遇、宏大场景），
+   只为一个场景写 cg（每章最多 1 个，多写的会被系统丢弃）：
+   {title, description(一两句), imagePrompt(整幅插画，含人物，电影构图，动漫风)}
 6. 视频推荐点 videoPoints：对本章最具"动感"的名场面（战斗、追逐、大雨、重要转身等）标记 1-3 个视频推荐点（按剧情需要，不设上限）：
    {id: 短标识(如 op1、ch2_battle), title, description(一两句), videoPrompt(可直接用于 AI 视频生成平台的英文提示词：画面内容/运镜/时长/风格), durationSecs: 建议时长秒数}
    注意：视频只是"推荐位"，不要因为标记视频而删减 CG 或台词。推荐点对应场景必须有足够的动态画面描写。
@@ -162,73 +169,94 @@ export async function scriptChapter(
   const model = await chatJson<ScriptModel>(cfg, SYSTEM_PROMPT, user, { maxTokens: scriptOutputTokens, onUsage, timeoutSecs: 300 });
 
   const resolveSceneId = makeSceneIdResolver(cards, chapter.index);
+  const mapLine = (l: ScriptModel["scenes"][number]["lines"][number]): Line => {
+    // speed/ttsEmotion 透传给配音：旧实现整段丢弃，模型标注的语速/情绪永远到不了 TTS；
+    // 非法值静默降级为缺省（speed 仅接受 0.5-2 的数字，ttsEmotion 仅接受非空字符串）
+    const speed = typeof l.speed === "number" && Number.isFinite(l.speed) && l.speed >= 0.5 && l.speed <= 2
+      ? l.speed
+      : undefined;
+    const ttsEmotion = typeof l.ttsEmotion === "string" && l.ttsEmotion.trim() ? l.ttsEmotion.trim() : undefined;
+    if (l.type !== "dialogue") {
+      return {
+        type: "narration" as const,
+        text: l.text,
+        monologue: !!l.monologue,
+      };
+    }
+    // UI101：characterId 缺失/非法（空、narrator 占位、不在角色卡中）时降级为旁白并保留原句。
+    // 旧实现静默归给 characters[0]，朗读者会看到错误的人名/立绘/音色。
+    const charId = typeof l.characterId === "string" ? l.characterId.trim() : "";
+    if (!charId || charId === "narrator" || !cards.characters.some((c) => c.id === charId)) {
+      return { type: "narration" as const, text: l.text };
+    }
+    return {
+      type: "dialogue" as const,
+      characterId: charId,
+      emotion: l.emotion || "normal",
+      action: l.action || undefined,
+      costume: l.costume || undefined,
+      speed,
+      ttsEmotion,
+      text: l.text,
+    };
+  };
+  // 分支/CG 每章配额（与 prompt 规则一致，超出部分丢弃并告警——静默丢剧情比丢 CG 更难察觉）
+  let chapterChoiceUsed = false;
+  let chapterCgUsed = false;
   const scenes: SceneJSON[] = (model.scenes || []).map((s, i) => {
     const lines: Line[] = (s.lines || [])
       // 过滤空文本行：LLM 可能输出无 text 的 narration/dialogue，会令渲染阶段 esc(undefined) 崩溃
       .filter((l) => typeof l?.text === "string" && l.text.trim().length > 0)
-      .map((l) =>
-        l.type === "dialogue"
-          ? {
-              type: "dialogue" as const,
-              characterId: l.characterId || cards.characters[0]?.id || "narrator",
-              emotion: l.emotion || "normal",
-              action: l.action || undefined,
-              costume: l.costume || undefined,
-              text: l.text,
-            }
-          : {
-              type: "narration" as const,
-              text: l.text,
-              monologue: !!l.monologue,
-            },
-      );
+      .map(mapLine);
 
-    const itemEvents: ItemEvent[] = (s.itemEvents || []).map((ie, j) => ({
-      triggerIndex: Math.min(j * 2 + 1, Math.max(lines.length - 1, 0)),
+    const rawItemEvents = s.itemEvents || [];
+    const itemEvents: ItemEvent[] = rawItemEvents.map((ie, j) => ({
+      // 均匀分布到场景时间轴（旧公式 j*2+1 与剧情无关，且多事件时被钳到最后一行堆叠）：
+      // 渲染端支持同一行多事件，这里保证事件按顺序散开。
+      triggerIndex: lines.length
+        ? Math.min(lines.length - 1, Math.floor(((j + 1) * lines.length) / (rawItemEvents.length + 1)))
+        : 0,
       itemId: ie.itemId,
       action: ie.action || "show",
       description: ie.description || "",
     }));
 
-    const cgEvent: CgEvent | undefined = s.cg
-      ? {
+    let cgEvent: CgEvent | undefined;
+    if (s.cg) {
+      if (chapterCgUsed) {
+        logger.warn("script", "CG 超过每章 1 个，已丢弃多余 CG", { scene: s.id || i, title: s.cg.title });
+      } else {
+        chapterCgUsed = true;
+        cgEvent = {
           triggerIndex: Math.max(0, Math.floor(lines.length / 3)),
           title: s.cg.title,
           description: s.cg.description,
           imagePrompt: s.cg.imagePrompt,
           videoSuggestion: undefined,
-        }
-      : undefined;
-
-    const mapLine = (l: ScriptModel["scenes"][number]["lines"][number]): Line =>
-      l.type === "dialogue"
-        ? {
-            type: "dialogue" as const,
-            characterId: l.characterId || cards.characters[0]?.id || "narrator",
-            emotion: l.emotion || "normal",
-            action: l.action || undefined,
-            costume: l.costume || undefined,
-            text: l.text,
-          }
-        : {
-            type: "narration" as const,
-            text: l.text,
-            monologue: !!l.monologue,
-          };
-
-    const choices: Choice[] = (s.choices || []).slice(0, 3).map((c, k) => ({
-      id: c.id || `choice_${s.id || i}_${k}`,
-      prompt: (c.prompt || "继续").slice(0, 20),
-      lines: (c.lines || []).filter((l) => typeof l?.text === "string" && l.text.trim().length > 0).slice(0, 6).map(mapLine),
-    }));
-    // 截断告警：prompt 约定每场景≤1分支、每分支≤6句，超限静默丢剧情很难察觉，此处打日志提示
-    if ((s.choices || []).length > 3) {
-      logger.warn("script", "分支选项超限截断", { scene: s.id || i, total: (s.choices || []).length, kept: 3 });
+        };
+      }
     }
-    for (const [ci, c] of (s.choices || []).entries()) {
-      if ((c.lines || []).length > 6) {
-        logger.warn("script", "分支台词超限截断", { scene: s.id || i, choice: ci, total: (c.lines || []).length, kept: 6 });
-        break;
+
+    // 分支：prompt 约定一个场景最多 1 次、每章最多 1 次；代码按同一口径执行（旧实现每场景留 3 条，与文案矛盾）
+    const rawChoices = s.choices || [];
+    let choices: Choice[] = [];
+    if (rawChoices.length > 0) {
+      if (chapterChoiceUsed) {
+        logger.warn("script", "分支选项超过每章 1 次，已丢弃多余分支", { scene: s.id || i, total: rawChoices.length });
+      } else {
+        if (rawChoices.length > 1) {
+          logger.warn("script", "分支选项超过每场景 1 次，已截断", { scene: s.id || i, total: rawChoices.length, kept: 1 });
+        }
+        chapterChoiceUsed = true;
+        choices = rawChoices.slice(0, 1).map((c, k) => ({
+          id: c.id || `choice_${s.id || i}_${k}`,
+          prompt: (c.prompt || "继续").slice(0, 20),
+          lines: (c.lines || []).filter((l) => typeof l?.text === "string" && l.text.trim().length > 0).slice(0, 6).map(mapLine),
+        }));
+        const first = rawChoices[0];
+        if (first && (first.lines || []).length > 6) {
+          logger.warn("script", "分支台词超限截断", { scene: s.id || i, choice: 0, total: (first.lines || []).length, kept: 6 });
+        }
       }
     }
 
@@ -241,13 +269,17 @@ export async function scriptChapter(
       bgm: s.bgm || "",
       cgEvent,
       itemEvents,
-      videoPoints: (s.videoPoints || []).map((vp, k) => ({
-        id: vp.id || `vp_${s.id || i}_${k}`,
-        title: vp.title,
-        description: vp.description || "",
-        videoPrompt: vp.videoPrompt,
-        durationSecs: vp.durationSecs || 5,
-      })),
+      // 过滤缺 title/videoPrompt 的残条：dataValidation 会校验必填字段，
+      // 写出残条会导致整章剧本缓存下次加载被判损坏（丢掉整章比丢一个视频位更糟）
+      videoPoints: (s.videoPoints || [])
+        .filter((vp) => vp && typeof vp.title === "string" && vp.title.trim() && typeof vp.videoPrompt === "string" && vp.videoPrompt.trim())
+        .map((vp, k) => ({
+          id: vp.id || `vp_${s.id || i}_${k}`,
+          title: vp.title,
+          description: vp.description || "",
+          videoPrompt: vp.videoPrompt,
+          durationSecs: vp.durationSecs || 5,
+        })),
       lines,
       figures: [],
       choices: choices.length ? choices : undefined,
@@ -397,7 +429,7 @@ function bgmFor(atmosphere: string): string {
   return "";
 }
 
-export function demoScriptChapter(chapter: ChapterInfo, cards: ExtractionResult): ChapterScript {
+function demoScriptChapter(chapter: ChapterInfo, cards: ExtractionResult): ChapterScript {
   const charMap = new Map<string, string>();
   for (const c of cards.characters) charMap.set(c.name, c.id);
 
@@ -527,7 +559,7 @@ export function demoScriptAll(chapters: ChapterInfo[], cards: ExtractionResult):
 /* ==================== 剧本保真自检（原文 ↔ 生成剧本二遍校验） ==================== */
 
 /** 说话动词：与演示模式 parseParagraph 同规则 */
-export const SPEECH_VERBS = /(说|道|答|喊|叹|笑|问|吩咐|回应|开口|沉声道|缓缓道)/;
+const SPEECH_VERBS = /(说|道|答|喊|叹|笑|问|吩咐|回应|开口|沉声道|缓缓道)/;
 
 /** 原文引用计数：中文「」/『』优先；西文/译入文本按弯引号与直引号配对计数（避免只认「」导致 keptRatio 恒为 1 的假通过） */
 export function countSourceQuotes(text: string): number {
@@ -587,14 +619,22 @@ export function verifyScriptAgainstSource(
   characters: { id: string; name: string }[],
 ): ScriptVerifyResult {
   const src = chapterText || "";
-  const aliasToId = new Map<string, string>();
+  const aliasOwners = new Map<string, Set<string>>();
   const idToNames = new Map<string, string[]>();
   for (const c of characters) {
     const aliases = nameAliases(c.name);
     idToNames.set(c.id, [c.name, ...aliases]);
     for (const a of aliases) {
-      if (!aliasToId.has(a)) aliasToId.set(a, c.id);
+      const owners = aliasOwners.get(a) ?? new Set<string>();
+      owners.add(c.id);
+      aliasOwners.set(a, owners);
     }
+  }
+  // 只有唯一归属的别名才能用于自动建议；同一别名指向多个角色（如「小明」同属「小明」与「王小明」）时
+  // 旧实现 first-wins 会给出确定性错误建议，改为只标注「别名歧义」不自动建议
+  const aliasToId = new Map<string, string>();
+  for (const [alias, owners] of aliasOwners) {
+    if (owners.size === 1) aliasToId.set(alias, [...owners][0]);
   }
   const idToName = new Map(characters.map((c) => [c.id, c.name]));
   const originalQuoteCount = countSourceQuotes(src);
@@ -604,16 +644,28 @@ export function verifyScriptAgainstSource(
   const speakerIssues: SpeakerIssue[] = [];
   let cursor = 0;
 
-  const guessFromContext = (pos: number, needleLen: number): string | undefined => {
+  interface ContextGuess {
+    id?: string;
+    ambiguousAlias?: string;
+    ambiguousOwnerIds?: string[];
+  }
+  const guessFromContext = (pos: number, needleLen: number): ContextGuess => {
     const before = src.slice(Math.max(0, pos - 14), pos);
     const after = src.slice(pos + needleLen, pos + needleLen + 14);
     for (const [alias, id] of aliasToId) {
-      if (before.includes(alias)) return id;
+      if (before.includes(alias)) return { id };
     }
     for (const [alias, id] of aliasToId) {
-      if (after.startsWith(alias) && SPEECH_VERBS.test(after.slice(alias.length, alias.length + 6))) return id;
+      if (after.startsWith(alias) && SPEECH_VERBS.test(after.slice(alias.length, alias.length + 6))) return { id };
     }
-    return undefined;
+    // 上下文里出现歧义别名：不返回建议，只把歧义信息带出去供调用方标注
+    for (const [alias, owners] of aliasOwners) {
+      if (owners.size < 2) continue;
+      const hit = before.includes(alias)
+        || (after.startsWith(alias) && SPEECH_VERBS.test(after.slice(alias.length, alias.length + 6)));
+      if (hit) return { ambiguousAlias: alias, ambiguousOwnerIds: [...owners] };
+    }
+    return {};
   };
 
   scenes.forEach((scene, si) => {
@@ -681,17 +733,32 @@ export function verifyScriptAgainstSource(
         }
       }
       const guessed = guessFromContext(pos, needleLen);
-      if (guessed && guessed !== line.characterId) {
+      if (guessed.id && guessed.id !== line.characterId) {
         speakerIssues.push({
           sceneIndex: si,
           lineIndex: li,
           text: text.slice(0, 60),
           llmSpeakerId: line.characterId || "",
           llmSpeakerName: speakerName,
-          suggestedSpeakerId: guessed,
-          suggestedSpeakerName: idToName.get(guessed) || guessed,
+          suggestedSpeakerId: guessed.id,
+          suggestedSpeakerName: idToName.get(guessed.id) || guessed.id,
           reason: "context-mismatch",
-          detail: `原文上下文指向${idToName.get(guessed) || guessed}，剧本归属${speakerName}`,
+          detail: `原文上下文指向${idToName.get(guessed.id) || guessed.id}，剧本归属${speakerName}`,
+        });
+      } else if (
+        !guessed.id
+        && guessed.ambiguousAlias
+        && !(guessed.ambiguousOwnerIds ?? []).includes(line.characterId || "")
+      ) {
+        // 别名歧义：上下文别名对应多个角色且当前说话人不在其中——不自动给建议，只标注请人工确认
+        speakerIssues.push({
+          sceneIndex: si,
+          lineIndex: li,
+          text: text.slice(0, 60),
+          llmSpeakerId: line.characterId || "",
+          llmSpeakerName: speakerName,
+          reason: "context-mismatch",
+          detail: `原文别名「${guessed.ambiguousAlias}」同时对应${(guessed.ambiguousOwnerIds ?? []).map((id) => idToName.get(id) || id).join("/")}，别名歧义无法自动建议说话人，请人工确认`,
         });
       }
       if (needleLen > 0) cursor = pos + needleLen;

@@ -5,7 +5,7 @@
  * 下载官方 WebGAL 网页版包 → 解压 → 裁剪 demo 内容 → src-tauri/templates/webgal
  */
 import { createWriteStream } from "node:fs";
-import { copyFile, mkdir, readdir, rm, stat } from "node:fs/promises";
+import { copyFile, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -51,13 +51,32 @@ async function exists(p) {
   }
 }
 
+/**
+ * 内容一致判断：先比大小，再比字节内容。
+ * 旧的 mtime 相等判断不可靠——copyFile 之后目标 mtime 是新写入时间，与源永远不同，
+ * 导致每次构建都重拷；而仅比较 mtime 也可能漏掉"内容变了但时间戳恰好一致"的情况。
+ */
+async function sameContent(a, b) {
+  const [sa, sb] = await Promise.all([stat(a), stat(b)]);
+  if (sa.size !== sb.size) return false;
+  const [ba, bb] = await Promise.all([readFile(a), readFile(b)]);
+  return ba.equals(bb);
+}
+
+/** 幂等同步：目标缺失或内容不一致时才 copyFile */
+async function syncFile(src, dest, label) {
+  if (!(await exists(dest)) || !(await sameContent(src, dest))) {
+    await copyFile(src, dest);
+    console.log(label);
+  }
+}
+
 /** 鉴赏室页面随模板一起分发（web 模式 / include_dir 内嵌共用这一份），幂等确保存在 */
 async function ensureAppreciation() {
   const src = join(ROOT, "src", "gameExtra", "appreciation.html");
   const dest = join(TARGET, "appreciation.html");
-  if (await exists(src) && (!(await exists(dest)) || (await stat(src)).mtimeMs !== (await stat(dest)).mtimeMs)) {
-    await copyFile(src, dest);
-    console.log("鉴赏室页面已同步：appreciation.html");
+  if (await exists(src)) {
+    await syncFile(src, dest, "鉴赏室页面已同步：appreciation.html");
   }
 }
 
@@ -78,10 +97,25 @@ async function ensureGameUi() {
     const dest = join(TARGET, relDest);
     if (!(await exists(src))) continue;
     await mkdir(dirname(dest), { recursive: true });
-    if (!(await exists(dest)) || (await stat(src)).mtimeMs !== (await stat(dest)).mtimeMs) {
-      await copyFile(src, dest);
-      console.log(`游戏界面定制已同步：${relDest}`);
-    }
+    await syncFile(src, dest, `游戏界面定制已同步：${relDest}`);
+  }
+}
+
+/**
+ * 内置音效（SE）随模板分发：组装时 project.ts 会从模板 game/vocal 复制 se_*.wav，
+ * 而下载包里的 game/vocal 已被 REMOVE 裁掉，必须从 src/gameExtra/se 回填。
+ * 否则全新检出 / CI 构建出的发布包开启 SE 后会出现 playEffect 指向不存在的音频。
+ */
+async function ensureBuiltinSe() {
+  const srcDir = join(ROOT, "src", "gameExtra", "se");
+  if (!(await exists(srcDir))) return;
+  const destDir = join(TARGET, "game", "vocal");
+  await mkdir(destDir, { recursive: true });
+  for (const name of await readdir(srcDir)) {
+    if (!name.endsWith(".wav")) continue;
+    const src = join(srcDir, name);
+    const dest = join(destDir, name);
+    await syncFile(src, dest, `内置音效已同步：game/vocal/${name}`);
   }
 }
 
@@ -91,14 +125,24 @@ async function ensureGameUi() {
  * 幂等：仅当文件中仍为 ud.no 时替换，重下载模板后自动重新应用。
  */
 async function ensureVoiceInterruptionPatch() {
-  const entry = join(TARGET, "assets", "index-EZxLQxgv.js");
-  if (!(await exists(entry))) return;
-  const { readFile, writeFile } = await import("node:fs/promises");
+  const assetsDir = join(TARGET, "assets");
+  if (!(await exists(assetsDir))) {
+    console.warn("[novelforge] 警告: 模板缺少 assets 目录，跳过配音中断定制");
+    return;
+  }
+  // 引擎入口 JS 带内容哈希（index-<hash>.js），不能硬编码；用目录扫描定位，
+  // 找不到时显式警告（WebGAL 升级改了产物结构时这里要跟着调整）
+  const entryName = (await readdir(assetsDir)).find((name) => /^index-.*\.js$/.test(name));
+  if (!entryName) {
+    console.warn("[novelforge] 警告: 未找到 assets/index-*.js，跳过配音中断定制（引擎包结构可能已变化）");
+    return;
+  }
+  const entry = join(assetsDir, entryName);
   let text = await readFile(entry, "utf8");
   if (text.includes("voiceInterruption:ud.no")) {
     text = text.replaceAll("voiceInterruption:ud.no", "voiceInterruption:ud.yes");
     await writeFile(entry, text, "utf8");
-    console.log("配音中断定制已应用：voiceInterruption 默认 -> yes（快进时语音会被中断）");
+    console.log(`配音中断定制已应用(${entryName})：voiceInterruption 默认 -> yes（快进时语音会被中断）`);
   }
 }
 
@@ -107,6 +151,7 @@ async function main() {
   if (await exists(index)) {
     await ensureAppreciation();
     await ensureGameUi();
+    await ensureBuiltinSe();
     await ensureVoiceInterruptionPatch();
     console.log(`引擎模板已存在：${TARGET}`);
     return;
@@ -174,6 +219,7 @@ async function main() {
 
   await ensureAppreciation();
   await ensureGameUi();
+  await ensureBuiltinSe();
   await ensureVoiceInterruptionPatch();
   console.log(`引擎模板就绪：${TARGET}`);
 }

@@ -51,9 +51,12 @@ const versionText = `v${version}`;
 
 function onLangChange(e: Event): void {
   setLang((e.target as HTMLSelectElement).value as typeof currentLang.value);
+  // 同步 <html lang>（屏幕阅读器/拼写检查依赖）：i18n 模块不在本次修改范围，故在这里跟随切换更新
+  document.documentElement.lang = currentLang.value;
 }
 
 onMounted(async () => {
+  document.documentElement.lang = currentLang.value;
   const logPath = await installLogFileSink();
   log.info("app", "应用启动，日志已落盘", { logPath });
   await configReady;
@@ -115,7 +118,7 @@ onMounted(async () => {
     </div>
   </div>
   <div class="main">
-    <div v-if="noticeText" class="notice-bar">
+    <div v-if="noticeText" class="notice-bar" role="alert">
       <span class="notice-text">{{ noticeText }}</span>
       <button class="btn ghost small" @click="dismissNotices">{{ t("知道了") }}</button>
     </div>
@@ -129,7 +132,8 @@ onMounted(async () => {
   display: flex;
   align-items: center;
   gap: 12px;
-  margin: 12px 16px 0;
+  /* 不再额外加左右 16px：.main 已有 32px 内边距，之前横幅比页面内容多缩进 16px 不对齐 */
+  margin: 12px 0 0;
   padding: 8px 12px;
   border: 1px solid var(--err);
   background: var(--err-soft);
@@ -157,7 +161,8 @@ onMounted(async () => {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin: auto 0 6px;
+  /* 底部固定吸在页脚上方；margin-top 不用 auto（会与 .sidebar-footer 的 auto 平分空白，位置漂移） */
+  margin: 0 0 6px;
   padding: 8px 10px;
   border: 1px solid var(--warn);
   background: var(--err-soft);

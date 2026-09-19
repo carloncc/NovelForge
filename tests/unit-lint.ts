@@ -33,6 +33,11 @@ async function main(): Promise<void> {
     ].join("\n"),
   );
   await tauri.writeTextFile(`${DIR}/game/scene/ch2.txt`, `label:ch2_第二章;\nchangeBg:none;`);
+  // 演出指令回归：filmMode / setFilter 必须被识别为指令（此前会被当台词且不校验）
+  await tauri.writeTextFile(
+    `${DIR}/game/scene/ch3.txt`,
+    [`label:ch3_第三章;`, `filmMode:true;`, `setFilter:{"oldFilm":0.35} -target=bg-main -next;`, `:旁白;`].join("\n"),
+  );
 
   const report = await lintProject(DIR);
 
@@ -47,6 +52,9 @@ async function main(): Promise<void> {
   assert(report.errors.some((e) => e.message.includes("无法解析")), "应检出坏语法");
   // 空章警告
   assert(report.warnings.some((w) => w.message.includes("没有任何台词")), "应警告空章节");
+  // 演出指令识别：filmMode / setFilter 不得报错、不得计入台词
+  assert(!report.errors.some((e) => e.scope.includes("ch3.txt")), "filmMode/setFilter 不应报错");
+  assert(report.summary.lines === 3, `台词计数应为 3（ch1×2 + ch3×1），实际 ${report.summary.lines}`);
 
   // 修复后通过
   await tauri.writeFileBase64(`${DIR}/game/background/missing_bg.png`, Buffer.from("fake").toString("base64"));

@@ -14,6 +14,20 @@ function isChapterTitle(line: string): boolean {
   return false;
 }
 
+/**
+ * 小说正文归一化（导入链与追加拼接 joinAppendText 共用，B12）：
+ * 清 BOM/回车符、折叠 3 个以上连续换行为一个空行、去首尾空白。
+ * 追加拼接与「重启后按源文件重新导入」必须得到完全一致的 fullText——
+ * 否则指纹差异会被误判成小说内容变化，触发重分章并作废剧本/卡片缓存。
+ */
+export function normalizeNovelText(text: string): string {
+  return text
+    .replace(/^\uFEFF/, "")
+    .replace(/\r/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 export function splitChapters(fullText: string, baseTitle: string): ChapterInfo[] {
   const lines = fullText.split(/\r?\n/);
   const chapters: { title: string; lines: string[] }[] = [];
@@ -54,11 +68,6 @@ export function splitChapters(fullText: string, baseTitle: string): ChapterInfo[
     merged[0].title = baseTitle || "第一章";
   }
   return merged;
-}
-
-export interface ChapterAdjust {
-  chapterIndex: number;
-  newTitle: string;
 }
 
 export async function importNovelFile(path: string): Promise<NovelDoc> {
@@ -106,10 +115,12 @@ export async function importNovelFiles(paths: string[]): Promise<NovelDoc> {
   if (nonEmpty.length === 0) {
     throw new Error("所选文件均为空，无法导入");
   }
+  // B12：与 joinAppendText 共用同一归一化函数，分隔统一为 \n\n（各部分已折叠 3+ 换行），
+  // 保证「追加拼接」与「重启后重新导入」得到同一 fullText（指纹一致，不误触重分章）
   const fullText = nonEmpty
-    .map((p) => p.text.replace(/^\uFEFF/, "").replace(/\r/g, "").replace(/\n{3,}/g, "\n\n").trim())
+    .map((p) => normalizeNovelText(p.text))
     .filter(Boolean)
-    .join("\n\n\n");
+    .join("\n\n");
   const fileName = parts.length === 1 ? parts[0].fileName : `${parts.length} 个文件合并`;
   const baseTitle = basenameWithoutExt(nonEmpty[0].path);
   // 合并导入不切章：仅作为单一章节占位，运行时分章阶段会替换

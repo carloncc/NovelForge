@@ -1,4 +1,5 @@
 import { tauri } from "../utils/tauri";
+import { TTS_SPEECH_MAX_CHARS } from "./render";
 
 export interface LintIssue {
   level: "error" | "warning";
@@ -20,7 +21,8 @@ export interface LintReport {
   };
 }
 
-const CMD_RE = /^(changeBg|changeFigure|intro|bgm|playEffect|end|changeScene|unlockCg|unlockBgm|label|jumpLabel|choose|miniAvatar|playVideo|setAnimation|setTempAnimation|setTransform|setTransition|setComplexAnimation):.*;$/;
+// 白名单 = render.ts 实际会输出的指令集合（含 filmMode/setFilter），避免把指令误判成台词。
+const CMD_RE = /^(changeBg|changeFigure|intro|bgm|playEffect|end|changeScene|unlockCg|unlockBgm|label|jumpLabel|choose|playVideo|filmMode|setFilter|setAnimation|setTempAnimation|setTransform):.*;$/;
 const END_RE = /^end;$/;
 const LINE_RE = /^(?:[^:;\\]|\\[:;,\.`\\])*:(.*);$/;
 
@@ -135,10 +137,10 @@ export async function lintProject(outputDir: string): Promise<LintReport> {
             err(`素材(${f.name})`, `配音缺失：${v}（game/vocal/ 中不存在）`);
           }
         }
-        // 超长台词告警：单句过长会导致 TTS 音频过长，快进时必被截断，建议拆句
+        // 超长台词告警：与 TTS 合成上限同口径（超限会按句自动拆段配音，仍建议人工拆句以优化阅读）
         const textPart = line.split(":").slice(1).join(":").replace(/ -[^ ]+\.(mp3|ogg|opus|wav|flac|m4a);$/, "");
-        if (textPart.length > 200) {
-          warn(`体验(${f.name})`, `超长台词（${textPart.length}字）快进易被截断，建议拆成短句`);
+        if (textPart.length > TTS_SPEECH_MAX_CHARS) {
+          warn(`体验(${f.name})`, `超长台词（${textPart.length}字 > ${TTS_SPEECH_MAX_CHARS}）：已按句自动拆分配音，仍建议拆句`);
         }
         continue;
       }

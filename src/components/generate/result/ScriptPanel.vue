@@ -2,7 +2,7 @@
 import { computed } from "vue";
 import { t } from "../../../i18n";
 import { projectState } from "../../../stores/project";
-import { tauri, isTauri } from "../../../utils/tauri";
+import { tauri } from "../../../utils/tauri";
 import { SCRIPT_MIN_KEPT_RATIO } from "../../../core/script";
 import { useGenerateController } from "../../../stores/generate";
 
@@ -31,6 +31,14 @@ const {
 
 /** 只列启用章节：停用章不参与生成，列出来点了也只会报"已停用" */
 const enabledChapters = computed(() => projectState.novel?.chapters.filter((c) => c.enabled !== false) ?? []);
+
+/** 章节显示名：标题已带「第X章」前缀时不再重复拼接 */
+function chapterLabel(rep: { chapterIndex: number; title: string }): string {
+  const base = (rep.title ?? "").trim() || t("未命名");
+  return /^第\s*[0-9一二三四五六七八九十百千零〇两]+\s*[章回节]/.test(base)
+    ? base
+    : `${t("第")}${rep.chapterIndex + 1}${t("章")} ${base}`;
+}
 /** 逐章重写/核对操作锁：管线/队列/素材任务任一在跑时都禁用（runChapterFullRegen 的 fromQueue
  *  会绕过队列检查，队列间隙点击会插进第二条链） */
 const regenLocked = computed(() => busy.value || queueRunning.value || !!assetBusy.value);
@@ -58,7 +66,10 @@ function clearScriptOpinions(): void {
     </div>
       <p class="hint mb-3">{{ t("选择章节 → 填写意见（填了才按意见重写）或勾全量（直接重写）→ 点击「重新生成此章」。都不选=只补缺失。其余章节自动复用缓存。") }}</p>
     <div v-for="ch in enabledChapters" :key="ch.index" class="stage-row mb-2">
-      <div class="stage-row-label"><b>{{ ch.title }}</b></div>
+      <!-- min-width:0 + text-ellipsis：长章节标题此前会把整行撑破；title 保留全文可悬浮查看 -->
+      <div class="stage-row-label" style="min-width: 0">
+        <b class="text-ellipsis" :title="ch.title">{{ ch.title }}</b>
+      </div>
       <input type="text" v-model="scriptChapterFeedback[ch.index]" :placeholder="t('意见（可选）：这一章节奏太慢，希望更快推进…')" />
       <label class="opt-item mb-0" :title="t('勾选后该章跳过缓存直接重写，不需要填意见')">
         <input type="checkbox" v-model="chapterForce[ch.index]" :disabled="regenLocked" />
@@ -80,7 +91,7 @@ function clearScriptOpinions(): void {
     <p class="hint mb-3">{{ t("只改你确认的问题：说话人错→接受建议（免费改缓存）；多余的句→删除；误报→忽略。改完重跑「组装」刷新预览，配音在素材页补配。覆盖率低于 {pct}% 的章节管线已自动重写过一次。", { pct: Math.round(SCRIPT_MIN_KEPT_RATIO * 100) }) }}</p>
     <div v-for="rep in verifyReports" :key="rep.chapterIndex" class="mb-3">
       <div class="stage-row-label" style="margin-bottom: 6px">
-        <b>{{ t("第") }}{{ rep.chapterIndex + 1 }}{{ t("章") }} {{ rep.title }}</b>
+        <b>{{ chapterLabel(rep) }}</b>
         <span class="tag" :class="rep.keptRatio >= SCRIPT_MIN_KEPT_RATIO ? 'ok' : 'warn'">{{ t("覆盖率") }}{{ Math.round(rep.keptRatio * 100) }}%（{{ rep.dialogueCount }}/{{ rep.originalQuoteCount }}）</span>
         <span v-if="visibleVerifyIssues(rep).length" class="tag err">{{ t("存疑") }}{{ visibleVerifyIssues(rep).length }}</span>
         <span v-else class="tag ok">{{ t("无存疑") }}</span>

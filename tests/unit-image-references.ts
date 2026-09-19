@@ -36,6 +36,18 @@ function reference(role: ImageReference["role"], dataB64: string, mime = "image/
   return { role, dataB64, mime };
 }
 
+/** 构造带指定尺寸的最小 PNG 头（签名 + IHDR 宽高）：缓存尺寸校验会解析文件头，
+ * 用非图片占位内容写缓存会被判不合格而重生成（B85 行为），故测试夹具需给定合法头。 */
+function fakePngHeader(width: number, height: number): string {
+  const buf = Buffer.alloc(24);
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(buf, 0);
+  buf.writeUInt32BE(13, 8);
+  buf.write("IHDR", 12, "ascii");
+  buf.writeUInt32BE(width, 16);
+  buf.writeUInt32BE(height, 20);
+  return buf.toString("base64");
+}
+
 function character(id: string): CharacterCard {
   return {
     id,
@@ -204,7 +216,7 @@ function testCapabilitiesDedupAndLimits(): void {
   assert(contradictory instanceof ReferenceImageError && contradictory.code === "REFERENCE_UNSUPPORTED", "contradictory custom capability settings should be rejected");
 }
 
-async function testMissingReferencesDegradeToTextOnly(): Promise<void> {
+async function testMissingReferencesFailLoudly(): Promise<void> {
   await tauri.removePath(ROOT).catch(() => {});
   const bible: ProjectVisualBible = {
     version: 1,
@@ -227,13 +239,15 @@ async function testMissingReferencesDegradeToTextOnly(): Promise<void> {
     width: 1024,
     height: 1024,
   };
-  // 生成的参考图与圣经参考图都缺失时：降级为纯文本生图，不再抛 REFERENCE_MISSING，
-  // 避免上游任务失败/中断导致整批任务连环失败（曾出现 20+ 任务全部 REFERENCE_MISSING）。
-  const degraded = await resolveImageTaskReferences(task, { outputDir: ROOT, visualBible: bible, figureBase: {} });
-  assert(
-    Array.isArray(degraded) && degraded.every((reference) => reference.role !== "identity"),
-    "missing generated and bible identities should degrade to text-only generation without throwing",
-  );
+  // 生成的参考图与圣经参考图都缺失时：显式抛 REFERENCE_MISSING（进入「失败项」可逐条补图），
+  // 不再静默降级纯文生图——静默降级会造成角色形象与已批准三视图漂移（违背 README 承诺）
+  let missingIdentity = false;
+  try {
+    await resolveImageTaskReferences(task, { outputDir: ROOT, visualBible: bible, figureBase: {} });
+  } catch (e) {
+    missingIdentity = e instanceof ReferenceImageError && e.code === "REFERENCE_MISSING";
+  }
+  assert(missingIdentity, "missing generated and bible identities should throw REFERENCE_MISSING instead of degrading silently");
 
   const requests: Record<string, unknown>[] = [];
   const originalHttp = tauri.http;
@@ -553,9 +567,9 @@ async function testCacheBindingForcesOnlyChangedCharacter(): Promise<void> {
   await tauri.writeFileBase64(`${ROOT}/.novel2vn/visual-bible/style.png`, Buffer.from("style").toString("base64"));
   await tauri.writeFileBase64(`${ROOT}/.novel2vn/visual-bible/alice.png`, Buffer.from("alice-id").toString("base64"));
   await tauri.writeFileBase64(`${ROOT}/.novel2vn/visual-bible/bob.png`, Buffer.from("bob-id").toString("base64"));
-  await tauri.writeFileBase64(`${cacheRoot}/images/figure_alice_normal.png`, Buffer.from("old-alice").toString("base64"));
-  await tauri.writeFileBase64(`${cacheRoot}/images/figure_bob_normal.png`, Buffer.from("old-bob").toString("base64"));
-  await tauri.writeFileBase64(`${cacheRoot}/images/item_relic.png`, Buffer.from("old-item").toString("base64"));
+  await tauri.writeFileBase64(`${cacheRoot}/images/figure_alice_normal.png`, fakePngHeader(1024, 1024));
+  await tauri.writeFileBase64(`${cacheRoot}/images/figure_bob_normal.png`, fakePngHeader(1024, 1024));
+  await tauri.writeFileBase64(`${cacheRoot}/images/item_relic.png`, fakePngHeader(1024, 1024));
   await tauri.writeTextFile(`${cacheRoot}/images/.visual-bible-fingerprint`, JSON.stringify({
     globalFingerprint: "global-v1",
     characterRevisions: { alice: 1, bob: 1 },
@@ -603,8 +617,8 @@ async function testIncompleteManifestCacheBindingForcesMissingCharacter(): Promi
   await tauri.writeFileBase64(`${ROOT}/.novel2vn/visual-bible/style.png`, Buffer.from("style").toString("base64"));
   await tauri.writeFileBase64(`${ROOT}/.novel2vn/visual-bible/alice.png`, Buffer.from("alice-id").toString("base64"));
   await tauri.writeFileBase64(`${ROOT}/.novel2vn/visual-bible/bob.png`, Buffer.from("bob-id").toString("base64"));
-  await tauri.writeFileBase64(`${cacheRoot}/images/figure_alice_normal.png`, Buffer.from("old-alice").toString("base64"));
-  await tauri.writeFileBase64(`${cacheRoot}/images/figure_bob_normal.png`, Buffer.from("old-bob").toString("base64"));
+  await tauri.writeFileBase64(`${cacheRoot}/images/figure_alice_normal.png`, fakePngHeader(1024, 1024));
+  await tauri.writeFileBase64(`${cacheRoot}/images/figure_bob_normal.png`, fakePngHeader(1024, 1024));
   await tauri.writeTextFile(`${cacheRoot}/images/.visual-bible-fingerprint`, JSON.stringify({
     globalFingerprint: "global-v1",
     characterRevisions: { alice: 1 },
@@ -892,7 +906,8 @@ async function testThreeViewRegenerationExecutesReferenceCascadeInOrder(): Promi
   const originalHttp = tauri.http;
   tauri.http = async (request) => {
     requests.push(JSON.parse(request.body ?? "{}") as Record<string, unknown>);
-    const generated = Buffer.from(`generated-${requests.length}`).toString("base64");
+    // 带 PNG 文件头的假图：现在结果数据会校验图片 magic（拦截「文本被当成图片」的回归）
+    const generated = Buffer.concat([Buffer.from(PNG_B64, "base64").slice(0, 8), Buffer.from(`generated-${requests.length}`)]).toString("base64");
     generatedPayloads.push(generated);
     return {
       status: 200,
@@ -967,7 +982,7 @@ async function main(): Promise<void> {
   await testQwenUsesThreeOrderedDataUrls();
   await testCustomAdapterReceivesRawBase64();
   testCapabilitiesDedupAndLimits();
-  await testMissingReferencesDegradeToTextOnly();
+  await testMissingReferencesFailLoudly();
   await testWrongSizeCacheIsRegeneratedInsteadOfSkipped();
   await testLocalReferenceCapabilityErrorIsTypedAndNotRetried();
   await testSelfCheckSendsEveryReferenceInRoleOrder();

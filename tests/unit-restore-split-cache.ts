@@ -7,6 +7,7 @@
  */
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { restoreProjectState } from "../src/utils/persist";
+import { tauri } from "../src/utils/tauri";
 
 const ROOT = `${process.cwd().replace(/\\/g, "/")}/tests/.tmp-restore-split-cache`;
 
@@ -104,12 +105,72 @@ async function testNoNovelWithoutEitherSource(): Promise<void> {
   assert(restored.novel === null, "没有源文件也没有分章缓存时应保持 novel 为 null");
 }
 
+/** 源文件存在但导入抛错（编码损坏/读取竞态）→ 不能整体失败，必须降级到分章缓存并附 loadError 警告 */
+async function testImportFailureFallsBackToSplitCache(): Promise<void> {
+  const outputDir = `${ROOT}/import-failure`;
+  seedProject(outputDir, {
+    materials: [],
+    outputDir,
+    options: {},
+    novel: {
+      sourcePath: `${outputDir}/novel.txt`,
+      fileName: "novel.txt",
+      encoding: "utf-8",
+      chapters: [{ index: 0, title: "第一章" }, { index: 1, title: "第二章" }, { index: 2, title: "第三章" }],
+    },
+  }, splitCache());
+  writeFileSync(`${outputDir}/novel.txt`, "第一章 甲\n正文甲\n", "utf8");
+
+  const originalReadTextFile = tauri.readTextFile;
+  tauri.readTextFile = async (path) => {
+    if (path.endsWith("/novel.txt")) throw new Error("injected decode failure");
+    return originalReadTextFile(path);
+  };
+  let restored: Awaited<ReturnType<typeof restoreProjectState>>;
+  try {
+    restored = await restoreProjectState(outputDir);
+  } finally {
+    tauri.readTextFile = originalReadTextFile;
+  }
+  assert(restored.novel, "源文件导入异常时应降级用分章缓存重建小说");
+  assert(restored.novel.chapters.length === 3, `应恢复 3 章，实际 ${restored.novel.chapters.length}`);
+  assert(
+    restored.warnings.some((warning) => warning.includes("导入失败") && warning.includes("分章缓存")),
+    `导入失败降级应给出带原始错误的警告，实际 ${JSON.stringify(restored.warnings)}`,
+  );
+}
+
+/** 源文件不可读且完全没有分章缓存 → 返回明确 warning（旧实现静默 novel=null） */
+async function testMissingSourceWithoutCacheWarns(): Promise<void> {
+  const outputDir = `${ROOT}/missing-source-no-cache`;
+  seedProject(outputDir, {
+    materials: [],
+    outputDir,
+    options: {},
+    novel: {
+      sourcePath: `${outputDir}/missing.txt`,
+      fileName: "missing.txt",
+      encoding: "utf-8",
+      chapters: [{ index: 0, title: "第一章" }],
+    },
+  });
+
+  const restored = await restoreProjectState(outputDir);
+  assert(restored.novel === null, "没有任何来源时应保持 novel 为 null");
+  assert(
+    restored.warnings.some((warning) => warning.includes("没有可用的分章缓存")),
+    `无缓存时必须给出明确警告，实际 ${JSON.stringify(restored.warnings)}`,
+  );
+}
+
 async function main(): Promise<void> {
   rmSync(ROOT, { recursive: true, force: true });
   try {
     await testNovelRebuiltFromSplitCache();
     await testReadableSourceWins();
     await testNoNovelWithoutEitherSource();
+    await testImportFailureFallsBackToSplitCache();
+    await testMissingSourceWithoutCacheWarns();
   } finally {
     rmSync(ROOT, { recursive: true, force: true });
   }

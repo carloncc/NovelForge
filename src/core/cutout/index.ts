@@ -4,13 +4,12 @@
  * 运行时按模型懒加载并复用；onnxruntime-web 首次推理才加载。
  */
 import { decontaminatePixels, estimateBackgroundColor } from "./despill";
-import { CutoutRuntime, ModelNotInstalledError } from "./runtime";
+import { CutoutRuntime } from "./runtime";
 import { findCutoutModel } from "./models";
 import { cutoutModelLocalUrl } from "./download";
 
 export * from "./models";
 export * from "./download";
-export { ModelNotInstalledError } from "./runtime";
 
 export interface AiCutoutResult {
   dataB64: string;

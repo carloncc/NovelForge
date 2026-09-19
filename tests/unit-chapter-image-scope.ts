@@ -49,7 +49,6 @@ for (const script of scripts) {
 
   // 章节口径必须是「按本章收窄」，不会多于全书口径
   const wholeBook = buildImageTasks([script], cards, {
-    figurePerCharacter: 1,
     cgPerChapter: 0,
     maxPerChapter: 0,
     styleAnchor: false,

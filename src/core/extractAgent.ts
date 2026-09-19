@@ -5,6 +5,7 @@ import { inputCharBudgetForText, resolveContextLength } from "../api/providers";
 import { voiceLibraryFor } from "../stores/config";
 import { normalizeExtractionResult } from "./extract";
 import { extractFromNovel } from "./extract";
+import { normalizeEntityId } from "./ids";
 import { log as logger } from "../utils/logger";
 
 /**
@@ -62,6 +63,8 @@ export type AgentChatFn = (messages: ChatMessage[], tools: ChatTool[], opts: { j
 
 /** 每段扫描的最大往返轮数（防止模型陷入死循环） */
 const MAX_ROUNDS_PER_CHUNK = 40;
+/** 「当前已收录卡片」摘要字符上限：超长按卡数结构化截断，保证仍是合法 JSON */
+const MAX_STATE_SUMMARY_CHARS = 12000;
 /** 文本协议每次输出一个动作；tools 为空时即走文本协议 */
 const TEXT_ACTION_RE = /^\s*\{\s*"action"\s*:\s*"([a-z_]+)"\s*(?:,\s*"data"\s*:\s*(\{.*\}))?\s*\}\s*$/s;
 
@@ -94,6 +97,53 @@ function pickNonEmpty<T extends Record<string, unknown>>(o: T): Partial<T> {
     out[k] = v;
   }
   return out as Partial<T>;
+}
+
+/** 卡片数组字段并集：按 id 去重，后出现的同 id 项覆盖先出现的（模型后给的更完整） */
+function unionById<T extends { id?: string }>(base?: T[], patch?: T[]): T[] | undefined {
+  if (!base && !patch) return base;
+  const map = new Map<string, T>();
+  for (const item of [...(base ?? []), ...(patch ?? [])]) {
+    if (item?.id) map.set(item.id, item);
+  }
+  return [...map.values()];
+}
+
+/** 字符串数组并集（去重保序，过滤非字符串/空串） */
+function unionStrings(base?: string[], patch?: string[]): string[] | undefined {
+  if (!base && !patch) return base;
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const s of [...(base ?? []), ...(patch ?? [])]) {
+    if (typeof s !== "string" || !s || seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+  }
+  return out;
+}
+
+/** 角色补丁合并（重复 add_character 共用）：
+ * 标量字段只接受非空新值（旧实现 Object.assign 会把缺省/空字段直接写进去，抹掉已收集信息），
+ * 数组字段（actions/costumes 按 id、emotions 按值）并集而非整体覆盖。 */
+function mergeCharacterPatch(target: CharacterCard, patch: Record<string, unknown>): void {
+  const clean = pickNonEmpty(patch);
+  for (const [k, v] of Object.entries(clean)) {
+    if (k === "id" || k === "name") continue;
+    // 非数组垃圾值直接忽略，避免展开失败或把已有数组清空（模型偶尔把数组写成字符串）
+    if (k === "actions") {
+      if (Array.isArray(v)) target.actions = unionById(target.actions, v as CharacterAction[]);
+      continue;
+    }
+    if (k === "costumes") {
+      if (Array.isArray(v)) target.costumes = unionById(target.costumes, v as CharacterCostume[]);
+      continue;
+    }
+    if (k === "emotions") {
+      if (Array.isArray(v)) target.emotions = unionStrings(target.emotions, v as string[]);
+      continue;
+    }
+    (target as unknown as Record<string, unknown>)[k] = v;
+  }
 }
 
 /* ==================== 工具定义（OpenAI 兼容 function calling） ==================== */
@@ -129,7 +179,7 @@ function charParams(required: string[]): Record<string, unknown> {
   };
 }
 
-export const SCAN_TOOLS: ChatTool[] = [
+const SCAN_TOOLS: ChatTool[] = [
   {
     type: "function",
     function: {
@@ -207,10 +257,11 @@ export function applyTool(state: ExtractAgentState, call: AgentToolCall): AgentT
       case "add_character": {
         const name = str(call.args.name).trim();
         if (!name) return fail("add_character 缺少 name");
-        const id = str(call.args.id).trim().toLowerCase().replace(/[^a-z0-9_-]/g, "_") || `c${state.characters.size + 1}`;
+        const id = normalizeEntityId(call.args.id, "c") || `c${state.characters.size + 1}`;
         const existing = state.characters.get(id);
         if (existing) {
-          Object.assign(existing, omit(call.args, "id", "name"));
+          // 重复 add_character 不整体覆盖：只并入非空字段、数组按 id 并集（见 mergeCharacterPatch）
+          mergeCharacterPatch(existing, call.args);
           existing.name = existing.name || name;
           return ok(`角色「${name}」(${id}) 已存在，已合并补充字段，当前共 ${state.characters.size} 个角色`);
         }
@@ -227,6 +278,9 @@ export function applyTool(state: ExtractAgentState, call: AgentToolCall): AgentT
           threeViewPrompt: "",
           actions: [],
         };
+        // 首次 add 参数里可能直接带数组字段（如 costumes，schema 支持）：按同一并集口径并入，
+        // 否则这些字段要等重复调用才生效（首次静默丢失）
+        mergeCharacterPatch(card, call.args);
         state.characters.set(id, card);
         return ok(`已收录角色「${name}」(${id})，当前共 ${state.characters.size} 个角色`);
       }
@@ -243,7 +297,15 @@ export function applyTool(state: ExtractAgentState, call: AgentToolCall): AgentT
       case "add_scene": {
         const location = str(call.args.location).trim();
         if (!location) return fail("add_scene 缺少 location");
-        const id = str(call.args.id).trim().toLowerCase().replace(/[^a-z0-9_-]/g, "_") || `s${state.scenes.size + 1}`;
+        const id = normalizeEntityId(call.args.id, "s") || `s${state.scenes.size + 1}`;
+        const existing = state.scenes.get(id);
+        if (existing) {
+          // 已有场景不整体覆盖（旧实现无条件 set，重复调用会用空字段抹掉已有信息）：只补缺字段
+          if (!existing.location && location) existing.location = location;
+          if (!existing.atmosphere && str(call.args.atmosphere)) existing.atmosphere = str(call.args.atmosphere);
+          if (!existing.time && str(call.args.time)) existing.time = str(call.args.time);
+          return ok(`场景「${existing.location || location}」(${id}) 已存在，已补齐缺失字段，当前共 ${state.scenes.size} 个场景`);
+        }
         state.scenes.set(id, {
           id,
           location,
@@ -256,7 +318,15 @@ export function applyTool(state: ExtractAgentState, call: AgentToolCall): AgentT
       case "add_item": {
         const name = str(call.args.name).trim();
         if (!name) return fail("add_item 缺少 name");
-        const id = str(call.args.id).trim().toLowerCase().replace(/[^a-z0-9_-]/g, "_") || `i${state.items.size + 1}`;
+        const id = normalizeEntityId(call.args.id, "i") || `i${state.items.size + 1}`;
+        const existing = state.items.get(id);
+        if (existing) {
+          // 已有物品不整体覆盖：只补缺字段，避免重复调用把外观/意义/图形提示清空
+          if (!existing.name && name) existing.name = name;
+          if (!existing.appearance && str(call.args.appearance)) existing.appearance = str(call.args.appearance);
+          if (!existing.note && str(call.args.note)) existing.note = str(call.args.note);
+          return ok(`物品「${existing.name || name}」(${id}) 已存在，已补齐缺失字段，当前共 ${state.items.size} 个物品`);
+        }
         state.items.set(id, {
           id,
           name,
@@ -327,20 +397,44 @@ export function splitNovelForAgent(novelText: string, budget: number): string[] 
 /* ==================== 扫描循环 ==================== */
 
 export function stateSummary(state: ExtractAgentState): string {
-  const compact = {
-    characters: [...state.characters.values()].map((c) => ({
-      id: c.id,
-      name: c.name,
-      appearance: c.appearance,
-      clothing: c.clothing,
-      personality: c.personality,
-      voiceDesc: c.voiceDesc,
-    })),
-    scenes: [...state.scenes.values()].map((s) => ({ id: s.id, location: s.location, atmosphere: s.atmosphere, time: s.time })),
-    items: [...state.items.values()].map((i) => ({ id: i.id, name: i.name, note: i.note })),
+  // 结构化摘要：字段先限长，仍超长时按卡数截断（场景→物品→角色）。
+  // 旧实现直接对 JSON 字符串 slice(0, 12000)，会截出半截 JSON，模型无法解析
+  // 「当前已收录卡片」→ 误判已有角色、重复建卡。
+  const clip = (v: unknown, max: number): string => {
+    const s = typeof v === "string" ? v : "";
+    return s.length > max ? `${s.slice(0, max)}…` : s;
   };
-  const json = JSON.stringify(compact);
-  return json.length > 12000 ? json.slice(0, 12000) + "\n……(摘要截断)" : json;
+  let characters = [...state.characters.values()].map((c) => ({
+    id: c.id,
+    name: c.name,
+    appearance: clip(c.appearance, 120),
+    clothing: clip(c.clothing, 120),
+    personality: clip(c.personality, 120),
+    voiceDesc: clip(c.voiceDesc, 60),
+  }));
+  let scenes = [...state.scenes.values()].map((s) => ({
+    id: s.id,
+    location: s.location,
+    atmosphere: clip(s.atmosphere, 80),
+    time: s.time,
+  }));
+  let items = [...state.items.values()].map((i) => ({ id: i.id, name: i.name, note: clip(i.note, 80) }));
+  const build = (): string => JSON.stringify({ characters, scenes, items });
+  let json = build();
+  while (json.length > MAX_STATE_SUMMARY_CHARS && scenes.length) {
+    scenes = scenes.slice(0, -1);
+    json = build();
+  }
+  while (json.length > MAX_STATE_SUMMARY_CHARS && items.length) {
+    items = items.slice(0, -1);
+    json = build();
+  }
+  while (json.length > MAX_STATE_SUMMARY_CHARS && characters.length > 1) {
+    characters = characters.slice(0, -1);
+    json = build();
+  }
+  // 极端兜底（单卡字段仍超大时）；此时截断不可避免，但字段已限长一般不会走到这里
+  return json.length > MAX_STATE_SUMMARY_CHARS ? json.slice(0, MAX_STATE_SUMMARY_CHARS) : json;
 }
 
 /**
@@ -412,6 +506,8 @@ export function normalizeName(name: string): string {  return (name || "").trim(
 }
 
 /** 单角色合并（增量追加共用）：缺字段补齐，动作/服装按 id 并集，表情按字符串并集。
+ * 同 id 的动作/服装保留已有卡（人工编辑优先），新卡只补新 id——旧实现“后者覆盖”
+ * 会让重提/追加的新值把用户在卡片页编辑过的动作提示词冲掉。
  * 旧人物在新章节换装/新增表情（新形态）时，老卡片自动收录，不丢。 */
 export function mergeCharacter(target: CharacterCard, source: CharacterCard): void {
   for (const k of ["appearance", "clothing", "personality", "voiceDesc", "imagePrompt", "threeViewPrompt", "color"] as const) {
@@ -419,15 +515,17 @@ export function mergeCharacter(target: CharacterCard, source: CharacterCard): vo
   }
   if (!target.voiceName && source.voiceName) target.voiceName = source.voiceName;
   if (!target.gender && source.gender) target.gender = source.gender;
+  // isNpc 旧卡片可能没有该字段：仅当 target 缺失时补（false 是默认值，无法区分“明确主要角色”）
+  if (target.isNpc == null && source.isNpc != null) target.isNpc = source.isNpc;
   const actionMap = new Map<string, CharacterAction>();
   for (const a of [...(target.actions ?? []), ...(source.actions ?? [])]) {
-    if (a?.id) actionMap.set(a.id, a);
+    if (a?.id && !actionMap.has(a.id)) actionMap.set(a.id, a);
   }
   target.actions = [...actionMap.values()];
-  // 服装差分（旧人物新形态：换装）按 id 并集
+  // 服装差分（旧人物新形态：换装）按 id 并集；同 id 同样已有卡优先
   const costumeMap = new Map<string, CharacterCostume>();
   for (const c of [...(target.costumes ?? []), ...(source.costumes ?? [])]) {
-    if (c?.id) costumeMap.set(c.id, c);
+    if (c?.id && !costumeMap.has(c.id)) costumeMap.set(c.id, c);
   }
   const mergedCostumes = [...costumeMap.values()];
   if (mergedCostumes.length || target.costumes || source.costumes) target.costumes = mergedCostumes;
@@ -442,7 +540,10 @@ export function mergeCharacter(target: CharacterCard, source: CharacterCard): vo
   }
 }
 
-/** 跨片段合并：同名（归一化后一致）角色视为同一人，保留先收录的更完整字段 */
+/** 跨片段合并：同名角色视为同一人。
+ * 安全版：归一化后同名也可能确实是两个不同角色（如「小北」与「小 北」），
+ * 仅在「名字完全一致（去首尾空白）」时才并卡，其余保留多卡交人工处理；
+ * 保留先收录的更完整字段（人工编辑优先）。 */
 export function mergeCandidates(state: ExtractAgentState): void {
   const byName = new Map<string, string[]>();
   for (const [id, c] of state.characters) {
@@ -454,14 +555,27 @@ export function mergeCandidates(state: ExtractAgentState): void {
   }
   for (const ids of byName.values()) {
     if (ids.length < 2) continue;
-    const keep = ids[0];
-    const kept = state.characters.get(keep);
-    if (!kept) continue;
-    for (let i = 1; i < ids.length; i++) {
-      const other = state.characters.get(ids[i]);
-      if (!other) continue;
-      mergeCharacter(kept, other);
-      state.characters.delete(ids[i]);
+    // 精确名分组：id 相同不可能同现（Map key 唯一），故只按完整名字一致性并卡
+    const exactGroups = new Map<string, string[]>();
+    for (const id of ids) {
+      const card = state.characters.get(id);
+      if (!card) continue;
+      const exact = (card.name || "").trim();
+      const group = exactGroups.get(exact) ?? [];
+      group.push(id);
+      exactGroups.set(exact, group);
+    }
+    for (const group of exactGroups.values()) {
+      if (group.length < 2) continue;
+      const keep = group[0];
+      const kept = state.characters.get(keep);
+      if (!kept) continue;
+      for (let i = 1; i < group.length; i++) {
+        const other = state.characters.get(group[i]);
+        if (!other) continue;
+        mergeCharacter(kept, other);
+        state.characters.delete(group[i]);
+      }
     }
   }
 }
@@ -481,10 +595,11 @@ const ENRICH_SYSTEM = `你是视觉小说美术与制作总监。下面给出从
 - appearance（外貌描述）、clothing（服装描述）、personality（性格特征）
 - voiceDesc（适合的音色描述）
 - voiceName（必须从"可用音色列表"中选最接近的一个，不要编造列表外的值）
-- imagePrompt：用于 AI 绘画生成立绘的完整英文 prompt，只描述人物本身（全身像、服装、发型、表情），姿态必须为自然放松站姿、双臂自然下垂，不要设计任何手势动作，禁止写任何背景/底色/场地/环境描述（系统会自动附加纯绿幕背景），风格统一为"动漫风格，精美立绘"
+- imagePrompt：用于 AI 绘画生成立绘的完整英文 prompt，只描述人物本身（全身像、服装、发型、表情）。构图必须是全身：prompt 里明确写 "full body, head to toe, entire figure in frame, shoes visible"，绝对不要写 "half body / portrait / close-up / waist-up / bust shot" 这类裁切构图词；姿态必须为自然放松站姿、双臂自然下垂，不要设计任何手势动作，禁止写任何背景/底色/场地/环境描述（系统会自动附加纯绿幕背景），风格统一为"动漫风格，精美立绘"
 - threeViewPrompt：用于生成该角色"三视图参考图"（正面/侧面/背面）的完整英文 prompt：同一角色设定、站姿自然、表情平静、全身可见，同样禁止写任何背景/底色描述（系统会自动附加纯绿幕背景），务必与人物的 imagePrompt 描述完全一致
 - actions：该角色可能做出的经典自然动作 [{id, name, prompt}]（prompt 为英文，保持人物外观完全一致，纯色背景，全身可见，动漫风格；不要设计夸张手势，表情类动作只描述面部表情、身体保持自然站姿不加手部动作；数量不限，按角色特点给出）
 - costumes：该角色的服装差分 [{id, name, prompt}]（数量按剧情决定、不设上限；剧情出现换装就要收录；prompt 为英文，人物外貌一致 + 服装款式颜色材质，全身可见，纯色背景）
+- emotions：该角色剧情中实际需要的表情差分（英文小写 id，如 happy/sad/angry/surprised/shy/embarrassed/cry 等，控制在 6-10 个；不需要包含 normal）
 - color：十六进制主题色
 - isNpc：布尔值。次要角色/NPC（有台词但戏份少）填 true；主要角色填 false
 
@@ -518,37 +633,98 @@ async function enrichCards(
     { maxTokens: outputTokens, onUsage },
   );
 
+  // 返回卡 id 一律先归一化再对齐 state：
+  // ① 未知 id 不新增——补全阶段不该造新卡（模型偶尔改名/编 id，新增会与扫描结果重复并多计费）；
+  // ② 若返回卡与 state 中某卡同名/同归一化 id，则并入该卡而不是另起一张；
+  // ③ 模型漏回的卡原样保留（防丢卡），但关键字段仍为空的打 warn 方便排查。
   if (Array.isArray(enriched.characters)) {
-    const next = new Map<string, CharacterCard>();
-    for (const c of enriched.characters) {
-      if (!c || !c.id) continue;
-      const prev = state.characters.get(c.id);
-      const name = c.name || prev?.name || c.id;
-      next.set(c.id, { ...(prev ?? {}), ...pickNonEmpty(c as unknown as Record<string, unknown>), id: c.id, name } as CharacterCard);
+    const byName = new Map<string, string>();
+    for (const [id, c] of state.characters) {
+      const key = normalizeName(c.name);
+      if (key && !byName.has(key)) byName.set(key, id);
     }
-    // 模型漏掉的卡保留原样（避免丢卡）
-    for (const [id, card] of state.characters) if (!next.has(id)) next.set(id, card);
-    state.characters = next;
+    const returnedIds = new Set<string>();
+    for (const c of enriched.characters) {
+      if (!c || typeof c !== "object") continue;
+      const rawId = str(c.id);
+      if (!rawId) continue;
+      const normalizedId = normalizeEntityId(rawId, "c");
+      const targetId = state.characters.has(normalizedId)
+        ? normalizedId
+        : state.characters.has(rawId)
+          ? rawId
+          : byName.get(normalizeName(str(c.name)));
+      if (!targetId) continue;
+      const target = state.characters.get(targetId)!;
+      returnedIds.add(targetId);
+      // 补全字段：非空新值优先（保持旧行为），数组并集；已有卡的 name 不被覆盖成空
+      mergeCharacterPatch(target, c as unknown as Record<string, unknown>);
+      target.name = target.name || str(c.name) || targetId;
+      target.id = targetId;
+    }
+    for (const [id, card] of state.characters) {
+      if (!returnedIds.has(id) && !card.imagePrompt) {
+        logger.warn("extractAgent", `补全未返回角色卡「${card.name || id}」且 imagePrompt 仍为空，将使用基础提示`, { id });
+      }
+    }
   }
   if (Array.isArray(enriched.scenes)) {
-    const next = new Map<string, SceneCard>();
-    for (const s of enriched.scenes) {
-      if (!s || !s.id) continue;
-      const prev = state.scenes.get(s.id);
-      next.set(s.id, { ...(prev ?? {}), ...pickNonEmpty(s as unknown as Record<string, unknown>), id: s.id } as SceneCard);
+    const byLocation = new Map<string, string>();
+    for (const [id, s] of state.scenes) {
+      const key = normalizeName(s.location);
+      if (key && !byLocation.has(key)) byLocation.set(key, id);
     }
-    for (const [id, card] of state.scenes) if (!next.has(id)) next.set(id, card);
-    state.scenes = next;
+    const returnedIds = new Set<string>();
+    for (const s of enriched.scenes) {
+      if (!s || typeof s !== "object") continue;
+      const rawId = str(s.id);
+      if (!rawId) continue;
+      const normalizedId = normalizeEntityId(rawId, "s");
+      const targetId = state.scenes.has(normalizedId)
+        ? normalizedId
+        : state.scenes.has(rawId)
+          ? rawId
+          : byLocation.get(normalizeName(str(s.location)));
+      if (!targetId) continue;
+      const target = state.scenes.get(targetId)!;
+      returnedIds.add(targetId);
+      Object.assign(target, pickNonEmpty(s as unknown as Record<string, unknown>));
+      target.id = targetId;
+    }
+    for (const [id, card] of state.scenes) {
+      if (!returnedIds.has(id) && !card.imagePrompt) {
+        logger.warn("extractAgent", `补全未返回场景卡「${card.location || id}」且 imagePrompt 仍为空，将使用基础提示`, { id });
+      }
+    }
   }
   if (Array.isArray(enriched.items)) {
-    const next = new Map<string, ItemCard>();
-    for (const it of enriched.items) {
-      if (!it || !it.id) continue;
-      const prev = state.items.get(it.id);
-      next.set(it.id, { ...(prev ?? {}), ...pickNonEmpty(it as unknown as Record<string, unknown>), id: it.id } as ItemCard);
+    const byName = new Map<string, string>();
+    for (const [id, it] of state.items) {
+      const key = normalizeName(it.name);
+      if (key && !byName.has(key)) byName.set(key, id);
     }
-    for (const [id, card] of state.items) if (!next.has(id)) next.set(id, card);
-    state.items = next;
+    const returnedIds = new Set<string>();
+    for (const it of enriched.items) {
+      if (!it || typeof it !== "object") continue;
+      const rawId = str(it.id);
+      if (!rawId) continue;
+      const normalizedId = normalizeEntityId(rawId, "i");
+      const targetId = state.items.has(normalizedId)
+        ? normalizedId
+        : state.items.has(rawId)
+          ? rawId
+          : byName.get(normalizeName(str(it.name)));
+      if (!targetId) continue;
+      const target = state.items.get(targetId)!;
+      returnedIds.add(targetId);
+      Object.assign(target, pickNonEmpty(it as unknown as Record<string, unknown>));
+      target.id = targetId;
+    }
+    for (const [id, card] of state.items) {
+      if (!returnedIds.has(id) && !card.imagePrompt) {
+        logger.warn("extractAgent", `补全未返回物品卡「${card.name || id}」且 imagePrompt 仍为空，将使用基础提示`, { id });
+      }
+    }
   }
 }
 
@@ -569,8 +745,12 @@ export function finalizeState(state: ExtractAgentState, lib: string[], title: st
 
 export function isToolUnsupportedError(e: unknown): boolean {
   const msg = e instanceof Error ? e.message : String(e);
-  if (!/400|error|失败|不支持|unsupported/i.test(msg)) return false;
-  return /tools|function|tool_call|函数|工具/i.test(msg);
+  // 放开关键字门槛：只要错误信息提到 tools/function/工具/函数，并且是
+  // 400/不支持/unsupported/unknown 一类「不支持/无法识别」语义就判定为工具不可用，
+  // 不必凑齐固定的两组词（各网关的报错文案差异很大，旧条件漏判会导致整段提取失败）
+  if (!/tools|function|tool_call|函数|工具/i.test(msg)) return false;
+  // not support(s) 与 unsupported 同义（如 "model does not support tools"），一并纳入
+  return /400|不支持|unsupported|unknown|not\s+supports?/i.test(msg);
 }
 
 function scanSystemPrompt(feedback?: string): string {

@@ -11,7 +11,8 @@
 }
 
 .Choose_item {
-  font-family: "资源圆体", "WebgalUI", sans-serif;
+  /* UI103：模板实际注册字体 + 韩文系统兜底（韩文项目选项文字缺字形时不至于掉到衬线体） */
+  font-family: "资源圆体", "WebgalUI", "Malgun Gothic", "Noto Sans KR", sans-serif;
   cursor: pointer;
   min-width: 46%;
   max-width: 76%;
@@ -40,7 +41,7 @@
 }
 
 .Choose_item_disabled {
-  font-family: "资源圆体", "WebgalUI", sans-serif;
+  font-family: "资源圆体", "WebgalUI", "Malgun Gothic", "Noto Sans KR", sans-serif;
   cursor: not-allowed;
   min-width: 46%;
   padding: 0.42em 1.4em;

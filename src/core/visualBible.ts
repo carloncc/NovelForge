@@ -3,9 +3,11 @@ import { setLlmConcurrency } from "../api/openaiCompatible";
 import { tauri } from "../utils/tauri";
 import { errMsg } from "../utils/errors";
 import { extname, normalizePath, safeFilename } from "../utils/path";
+import { imageMimeForPath } from "../utils/mime";
 import { buildImageTasks, stripBackground } from "./images";
 import { sanitizePrompt, appendSafeStyleSuffix } from "../utils/promptRewriter";
 import { classifyError } from "../utils/errorClassifier";
+import { log as logger } from "../utils/logger";
 import { concurrencyFor } from "../stores/configMigration";
 import type {
   ApiConfig,
@@ -151,6 +153,32 @@ interface VisualBibleMutation {
   bible: ProjectVisualBible;
   cards?: CharacterCard[];
   afterPublish?: () => Promise<void>;
+  /**
+   * B81：显式「发布后拒绝」——清单仍按 commit 语义落盘（通常是 status=stale），
+   * 全部提交动作完成后调用方收到带此消息的错误并展示给用户。
+   * 旧实现把拒绝塞进 afterPublish 抛错，与「缓存失效等真实副作用失败」混在一起且理由不可见。
+   */
+  rejection?: string;
+}
+
+/** B79：发布前检测到清单被并发写入且本事务基于旧快照时抛出，提示刷新重试而不是静默覆盖。 */
+export class VisualBibleConcurrencyError extends Error {
+  readonly code = "VISUAL_BIBLE_CONCURRENCY" as const;
+
+  constructor(message: string) {
+    super(`VISUAL_BIBLE_CONCURRENCY: ${message}`);
+    this.name = "VisualBibleConcurrencyError";
+  }
+}
+
+/** B81：发布后拒绝（清单已落盘为 stale）的显式错误 */
+export class VisualBibleMutationRejectedError extends Error {
+  readonly code = "VISUAL_BIBLE_MUTATION_REJECTED" as const;
+
+  constructor(message: string) {
+    super(`VISUAL_BIBLE_MUTATION_REJECTED: ${message}（清单已按拒绝语义落盘，刷新即可看到最新状态）`);
+    this.name = "VisualBibleMutationRejectedError";
+  }
 }
 
 let artifactSequence = 0;
@@ -200,11 +228,11 @@ function visualBibleArtifactPath(artifactDir: string, storedPath: string): strin
   return `${normalizePath(artifactDir).replace(/\/$/, "")}/${normalized.replace(/^\.\//, "")}`;
 }
 
-export function sanitizeVisualBibleId(id: string): string {
+function sanitizeVisualBibleId(id: string): string {
   return safeFilename(id, 80) || "character";
 }
 
-export function canonicalThreeViewPath(characterId: string): string {
+function canonicalThreeViewPath(characterId: string): string {
   return `threeview_${sanitizeVisualBibleId(characterId)}.png`;
 }
 
@@ -213,11 +241,11 @@ export function canonicalCostumeSheetPath(characterId: string, costumeId: string
   return `threeview_${sanitizeVisualBibleId(characterId)}_ct_${sanitizeVisualBibleId(costumeId)}.png`;
 }
 
-export function canonicalCharacterReferencePath(characterId: string, extension: string): string {
+function canonicalCharacterReferencePath(characterId: string, extension: string): string {
   return `character-reference_${sanitizeVisualBibleId(characterId)}${normalizeImageExtension(extension)}`;
 }
 
-export function canonicalStyleReferencePath(extension: string): string {
+function canonicalStyleReferencePath(extension: string): string {
   return `style-reference${normalizeImageExtension(extension)}`;
 }
 
@@ -226,7 +254,7 @@ function revisionedArtifactPath(basePath: string, revision: string): string {
   return `${basePath.slice(0, -extension.length)}.rev-${revision}${extension}`;
 }
 
-export function normalizeStyleDescription(description: string): string {
+function normalizeStyleDescription(description: string): string {
   return description.trim().replace(/\s+/g, " ");
 }
 
@@ -251,13 +279,6 @@ async function resolveImageInput(image: VisualBibleImageInput): Promise<{ dataB6
 function imageExtension(image: VisualBibleImageInput): string {
   const pathExtension = image.sourcePath ? extname(image.sourcePath) : "";
   return normalizeImageExtension(pathExtension || image.mime);
-}
-
-function imageMimeForPath(path: string): string {
-  const extension = extname(path).toLowerCase();
-  if (extension === ".webp") return "image/webp";
-  if (extension === ".jpg" || extension === ".jpeg") return "image/jpeg";
-  return "image/png";
 }
 
 async function readReferenceFile(path: string, label: string): Promise<{ dataB64: string; mime: string }> {
@@ -314,7 +335,7 @@ export async function analyzeReferenceStyle(
   return requireNonEmptyStyle(description, "Reference-image analysis");
 }
 
-export function chunkNovelForStyleAnalysis(novel: NovelDoc, maxChars = NOVEL_CHUNK_LIMIT): string[] {
+function chunkNovelForStyleAnalysis(novel: NovelDoc, maxChars = NOVEL_CHUNK_LIMIT): string[] {
   if (!Number.isInteger(maxChars) || maxChars < 500) throw new Error("Novel style chunk limit must be at least 500 characters");
   const chunks: string[] = [];
   let current = "";
@@ -488,6 +509,8 @@ async function generateCostumeSheets(
   dependencies: VisualBibleServiceDependencies,
 ): Promise<Record<string, VisualBibleCostumeSheet>> {
   const sheets: Record<string, VisualBibleCostumeSheet> = {};
+  // B73：失败列表集中记录，循环后统一 warn（旧实现空 catch 吞错，锚点缺失且无任何原因可见）
+  const failedCostumes: { costumeId: string; name: string; reason: string }[] = [];
   for (const ct of card.costumes ?? []) {
     const ctPrompt = normalizeStyleDescription(ct.prompt || "");
     if (!ctPrompt) continue;
@@ -511,9 +534,20 @@ async function generateCostumeSheets(
       const ctPath = revisionedArtifactPath(canonicalCostumeSheetPath(card.id, ct.id), artifactRevision);
       await writeGeneratedImage(visualBibleArtifactPath(artifactDir, ctPath), generated);
       sheets[ct.id] = { threeViewPath: ctPath, prompt: ctPrompt, revision: 1, approved: false };
-    } catch {
+    } catch (e) {
       // 服装三视图失败不阻断：该服装换装立绘回退用默认装三视图
+      failedCostumes.push({
+        costumeId: ct.id,
+        name: ct.name || ct.id,
+        reason: errMsg(e).slice(0, 200),
+      });
     }
+  }
+  if (failedCostumes.length) {
+    logger.warn("visualBible", "服装三视图锚点生成失败（换装立绘将回退默认装三视图）", {
+      characterId: card.id,
+      failed: failedCostumes,
+    });
   }
   return sheets;
 }
@@ -1118,60 +1152,82 @@ export async function regenerateAllCharacterSheets(
     const s = byId.get(c.id);
     return s ? { ...c, imagePrompt: s.imagePrompt, threeViewPrompt: s.threeViewPrompt } : c;
   });
-  const invalidationCharacters = succeeded.map((s) => characterWithHistoricalActions(bible, s.character));
+  // B80：逐角色隔离落盘——旧实现任一角色的 writeGeneratedImage/服装锚点抛错会让整次 mutate 失败，
+  // 其余角色已写盘的新三视图不会进清单（整批丢弃）。现在单角色失败只记入 failed，
+  // 成功者照常写进同一份清单（仍是一次提交，不丢并发更新）。
+  const persistedIds = new Set<string>();
+  const publishFailures: RegenerateAllSheetsResult["failed"] = [];
   if (succeeded.length) {
     await mutateAndPublishVisualBible(outputDir, async (artifactDir, artifactRevision) => {
       const next = cloneVisualBible(bible);
       for (const s of succeeded) {
         const characterId = s.character.id;
+        const created = !next.characters[characterId];
         let nextCharacter = next.characters[characterId];
-        if (!nextCharacter) {
-          const actionIds = productionActionIds(s.character);
-          nextCharacter = next.characters[characterId] = {
-            threeViewPath: "",
-            prompt: s.promptForGen,
-            ...(actionIds.length ? { actionIds } : {}),
-            approved: false,
-            revision: 1,
-            sourceRevision: 0,
-            sheetSourceRevision: 0,
-          };
-        } else if (s.rewrote && s.imagePrompt) {
-          // persist 同语义：描述重写后 prompt 取新 imagePrompt；没重写保持视觉守门原值
-          nextCharacter.prompt = s.imagePrompt;
+        try {
+          if (!nextCharacter) {
+            const actionIds = productionActionIds(s.character);
+            nextCharacter = next.characters[characterId] = {
+              threeViewPath: "",
+              prompt: s.promptForGen,
+              ...(actionIds.length ? { actionIds } : {}),
+              approved: false,
+              revision: 1,
+              sourceRevision: 0,
+              sheetSourceRevision: 0,
+            };
+          } else if (s.rewrote && s.imagePrompt) {
+            // persist 同语义：描述重写后 prompt 取新 imagePrompt；没重写保持视觉守门原值
+            nextCharacter.prompt = s.imagePrompt;
+          }
+          const threeViewPath = revisionedArtifactPath(canonicalThreeViewPath(characterId), artifactRevision);
+          // 先落盘再改清单：写失败时条目保持旧成品，不能指向不存在的文件
+          await writeGeneratedImage(visualBibleArtifactPath(artifactDir, threeViewPath), s.generated);
+          // 打回待确认＋修订号＋1（mark 内处理）
+          markCharacterBibleChanged(next, characterId);
+          nextCharacter.threeViewPath = threeViewPath;
+          nextCharacter.sheetSourceRevision = characterSourceRevision(nextCharacter);
+          // 服装锚点同步重建（与单角色 regenerateCharacterSheet 同语义）：
+          // 以新默认装三视图为身份参考逐套重画，单套失败回退用默认装三视图；
+          // 卡片已无服装时删掉过期锚点，避免旧服装图残留导致面板新旧底色混杂。
+          const costumeSheets = await generateCostumeSheets(
+            request.imageCfg,
+            s.character,
+            nextCharacter.threeViewPath,
+            bible.styleDescription,
+            { role: "style", ...styleReference, sourcePath: styleReferencePath },
+            artifactDir,
+            artifactRevision,
+            dependencies,
+          );
+          if (Object.keys(costumeSheets).length) nextCharacter.costumeSheets = costumeSheets;
+          else delete nextCharacter.costumeSheets;
+          persistedIds.add(characterId);
+        } catch (e) {
+          // 新建条目但没落盘成功：删除占位，避免清单出现指向空路径的非法条目
+          if (created) delete next.characters[characterId];
+          publishFailures.push({
+            id: characterId,
+            name: s.character.name || characterId,
+            reason: `三视图落盘失败：${errMsg(e).slice(0, 160)}`,
+          });
         }
-        // 打回待确认＋修订号＋1（mark 内处理）
-        markCharacterBibleChanged(next, characterId);
-        nextCharacter.threeViewPath = revisionedArtifactPath(canonicalThreeViewPath(characterId), artifactRevision);
-        nextCharacter.sheetSourceRevision = characterSourceRevision(nextCharacter);
-        await writeGeneratedImage(visualBibleArtifactPath(artifactDir, nextCharacter.threeViewPath), s.generated);
-        // 服装锚点同步重建（与单角色 regenerateCharacterSheet 同语义）：
-        // 以新默认装三视图为身份参考逐套重画，单套失败回退用默认装三视图；
-        // 卡片已无服装时删掉过期锚点，避免旧服装图残留导致面板新旧底色混杂。
-        const costumeSheets = await generateCostumeSheets(
-          request.imageCfg,
-          s.character,
-          nextCharacter.threeViewPath,
-          bible.styleDescription,
-          { role: "style", ...styleReference, sourcePath: styleReferencePath },
-          artifactDir,
-          artifactRevision,
-          dependencies,
-        );
-        if (Object.keys(costumeSheets).length) nextCharacter.costumeSheets = costumeSheets;
-        else delete nextCharacter.costumeSheets;
       }
       reconcileCacheBindingKeys(next);
+      const persistedInvalidations = succeeded
+        .filter((s) => persistedIds.has(s.character.id))
+        .map((s) => characterWithHistoricalActions(bible, s.character));
       return {
         bible: next,
         cards: updatedCards,
         afterPublish: async () => {
-          for (const c of invalidationCharacters) await invalidateCharacterCaches(outputDir, c);
+          for (const c of persistedInvalidations) await invalidateCharacterCaches(outputDir, c);
         },
       };
     }, bible);
   }
-  return { ok: succeeded.map((s) => s.character.id), failed, updatedCards };
+  for (const f of publishFailures) failed.push(f);
+  return { ok: [...persistedIds], failed, updatedCards };
 }
 
 export interface BibleCharacterSyncRequest {
@@ -1890,8 +1946,18 @@ export async function loadVisualBible(outputDir: string, activeCharacterIds?: st
 
 function parseLegacyImage(rawImage: string): { dataB64: string; mime: string } {
   const match = /^data:(image\/[a-z0-9.+-]+);base64,(.+)$/is.exec(rawImage.trim());
-  const dataB64 = (match?.[2] ?? rawImage).replace(/\s+/g, "");
-  if (!dataB64 || dataB64.length > MAX_IMAGE_BASE64_LENGTH || dataB64.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(dataB64)) {
+  // B84：旧实现要求 length % 4 === 0，直接拒绝无 padding 的 base64；
+  // 部分第三方/旧版数据是 URL-safe（-_）且省略 padding 的，先规范化再校验。
+  let dataB64 = (match?.[2] ?? rawImage)
+    .replace(/\s+/g, "")
+    .replace(/-/g, "+")
+    .replace(/_/g, "/");
+  if (!dataB64) throw new Error("Image payload is not valid bounded base64 data");
+  const remainder = dataB64.length % 4;
+  if (remainder === 1) throw new Error("Image payload is not valid bounded base64 data");
+  if (remainder === 2) dataB64 += "==";
+  else if (remainder === 3) dataB64 += "=";
+  if (dataB64.length > MAX_IMAGE_BASE64_LENGTH || !/^[A-Za-z0-9+/]+={0,2}$/.test(dataB64)) {
     throw new Error("Image payload is not valid bounded base64 data");
   }
   const mime = dataB64.startsWith("/9j/") ? "image/jpeg" : dataB64.startsWith("UklGR") ? "image/webp" : "image/png";
@@ -1941,6 +2007,16 @@ async function validateStoredArtifacts(
       `Character ${characterId} three-view`,
     );
     if (sheetError) errors.push(sheetError);
+    // B72：服装锚点也要做存在性/可解码校验——缺失时换装立绘会回退默认装三视图，
+    // 但守门面板与批准流程必须明确暴露缺失，否则批准后玩家看到的换装形象与设定不符。
+    for (const [costumeId, sheet] of Object.entries(character.costumeSheets ?? {})) {
+      const costumeError = await validateImageArtifactAtDir(
+        artifactDir,
+        sheet.threeViewPath,
+        `Character ${characterId} costume "${costumeId}" three-view`,
+      );
+      if (costumeError) errors.push(costumeError);
+    }
     if (character.sourceReferencePath) {
       const sourceError = await validateImageArtifactAtDir(
         artifactDir,
@@ -2058,6 +2134,25 @@ async function mutateAndPublishVisualBible(
   }
 }
 
+/** B79：清单状态签名（规范化后的完整 JSON）。基线与当前都走同一序列化口径，避免字段顺序误报。 */
+async function manifestStateSignatureAt(outputDir: string): Promise<string | null> {
+  const manifest = await readManifestAtPath(visualBibleManifestPath(outputDir));
+  if (!manifest) return null;
+  try {
+    return JSON.stringify(manifestForSave(manifest));
+  } catch {
+    return null;
+  }
+}
+
+function manifestStateSignatureOf(bible: ProjectVisualBible): string | null {
+  try {
+    return JSON.stringify(manifestForSave(bible));
+  } catch {
+    return null;
+  }
+}
+
 async function publishVisualBibleMutation(
   outputDir: string,
   work: (artifactDir: string, artifactRevision: string) => Promise<VisualBibleMutation>,
@@ -2065,8 +2160,20 @@ async function publishVisualBibleMutation(
 ): Promise<ProjectVisualBible> {
   const artifactDir = visualBibleDir(outputDir);
   await tauri.mkdirAll(artifactDir);
+  // B79：记录 work（可能长达数分钟：LLM/图像生成）开始前的清单基线。
+  // 清单是整单覆盖写，若 work 期间清单被其他写入改动，基于旧快照发布会把并发变更静默覆盖。
+  const baselineSignature = await manifestStateSignatureAt(outputDir);
   const artifactRevision = `${Date.now().toString(36)}-${++artifactSequence}`;
   const mutation = await work(artifactDir, artifactRevision);
+  // work 期间清单被改动：若调用方快照（syncTarget）已被同进程前序发布同步为当前状态，视为已合并继续；
+  // 否则拒绝本次覆盖并提示刷新重试（外部写入/异源旧快照），避免静默丢失并发变更。
+  const currentSignature = await manifestStateSignatureAt(outputDir);
+  if (currentSignature !== baselineSignature) {
+    const snapshotSignature = syncTarget ? manifestStateSignatureOf(syncTarget) : null;
+    if (!snapshotSignature || snapshotSignature !== currentSignature) {
+      throw new VisualBibleConcurrencyError("清单在本次操作期间被其他操作修改，为避免覆盖这些变更已放弃提交；请刷新后重试");
+    }
+  }
   const manifest = manifestForSave(mutation.bible);
   syncManifestActionIds(manifest, mutation.cards ?? []);
   const migrations = await prepareLegacyMigrations(
@@ -2082,7 +2189,14 @@ async function publishVisualBibleMutation(
     delete migration.card.referenceImage;
   }
   if (syncTarget) syncVisualBible(syncTarget, canonicalManifest);
-  await mutation.afterPublish?.();
+  try {
+    await mutation.afterPublish?.();
+  } catch (error) {
+    // B81：清单此时已落盘，错误信息必须让调用方知道状态已变更（而不是像完全没提交一样）
+    throw new Error(`视觉守门清单已发布，但发布后处理失败（状态已落盘，刷新后可继续）：${errMsg(error)}`);
+  }
+  // B81：显式「发布后拒绝」——清单已按 commit 语义落盘（stale），此处再抛给调用方展示原因
+  if (mutation.rejection) throw new VisualBibleMutationRejectedError(mutation.rejection);
   return canonicalManifest;
 }
 
@@ -2115,7 +2229,7 @@ export async function saveVisualBible(
   }), bible);
 }
 
-function stableHash(input: string): string {
+function visualInputHash(input: string): string {
   let hash = 0xcbf29ce484222325n;
   const prime = 0x100000001b3n;
   const bytes = new TextEncoder().encode(input);
@@ -2128,7 +2242,7 @@ function stableHash(input: string): string {
 
 function imagePayloadHash(imageB64: string): string {
   const payload = parseLegacyImage(imageB64).dataB64;
-  return stableHash(payload);
+  return visualInputHash(payload);
 }
 
 async function readCharacterReferencePayloads(
@@ -2157,7 +2271,7 @@ export function characterVisualSignature(
   const costumes = Object.entries(costumeSheets ?? {})
     .map(([costumeId, sheet]) => `${costumeId}:${sheet.revision}:${normalizeStyleDescription(sheet.prompt)}`)
     .sort();
-  return stableHash(JSON.stringify({
+  return visualInputHash(JSON.stringify({
     imagePrompt: normalizeStyleDescription(card.imagePrompt),
     threeViewPrompt: normalizeStyleDescription(card.threeViewPrompt ?? ""),
     referenceHash: referenceB64 ? imagePayloadHash(referenceB64) : "",
@@ -2166,12 +2280,12 @@ export function characterVisualSignature(
 }
 
 /** 画风级视觉输入签名：风格来源、风格描述、风格参考图内容。 */
-export function styleVisualSignature(input: {
+function styleVisualSignature(input: {
   styleSource: StyleSource;
   styleDescription: string;
   sourceReferenceB64?: string;
 }): string {
-  return stableHash(JSON.stringify({
+  return visualInputHash(JSON.stringify({
     styleSource: input.styleSource,
     styleDescription: normalizeStyleDescription(input.styleDescription),
     sourceReferenceHash: input.sourceReferenceB64 ? imagePayloadHash(input.sourceReferenceB64) : "",
@@ -2241,7 +2355,7 @@ export function computeVisualBibleFingerprint(input: VisualBibleFingerprintInput
   const characterReferenceHashes = Object.entries(input.characterReferenceB64 ?? {})
     .map(([characterId, payload]) => ({ characterId, hash: imagePayloadHash(payload) }))
     .sort((a, b) => a.characterId.localeCompare(b.characterId));
-  return `v1-${stableHash(JSON.stringify({
+  return `v1-${visualInputHash(JSON.stringify({
     chapters,
     characters,
     styleSource: input.styleSource,
@@ -2322,7 +2436,7 @@ export async function computeProjectVisualBibleFingerprint(
     sourceReferenceB64,
     characterReferenceB64,
   });
-  return costumeEntries.length ? `${baseFingerprint}-ct${stableHash(JSON.stringify(costumeEntries))}` : baseFingerprint;
+  return costumeEntries.length ? `${baseFingerprint}-ct${visualInputHash(JSON.stringify(costumeEntries))}` : baseFingerprint;
 }
 
 export function assertVisualBibleApprovalStatus(
@@ -2375,6 +2489,16 @@ export async function validateVisualBibleForApproval(
     }
     const sheetError = await validateImageArtifact(outputDir, character.threeViewPath, `Character ${id} three-view`);
     if (sheetError) errs.push(sheetError);
+    // B72：批准校验覆盖 costumeSheets[*].threeViewPath——服装锚点缺失必须给出明确错误、
+    // 不允许带着缺失锚点通过批准（换装立绘会静默回退默认装，与面板不一致）。
+    for (const [costumeId, sheet] of Object.entries(character.costumeSheets ?? {})) {
+      const costumeError = await validateImageArtifact(
+        outputDir,
+        sheet.threeViewPath,
+        `Character ${id} costume "${costumeId}" three-view`,
+      );
+      if (costumeError) errs.push(costumeError);
+    }
     if (character.sourceReferencePath) {
       const sourceError = await validateImageArtifact(
         outputDir,
@@ -2454,7 +2578,8 @@ function staleRejectedMutation(bible: ProjectVisualBible, message: string): Visu
   delete stale.approvedAt;
   return {
     bible: stale,
-    afterPublish: async () => { throw new Error(message); },
+    // B81：拒绝走显式字段而不是 afterPublish 抛错，理由随错误一起展示给调用方
+    rejection: message,
   };
 }
 
@@ -2616,7 +2741,10 @@ async function invalidateCharacterCaches(
   character: CharacterCard,
 ): Promise<void> {
   const owned = characterOwnedImageTasks(character);
-  await removeCachedImages(outputDir, (name) => owned.fileNames.has(name));
+  // B69：旁路参数元数据 `<图>.meta.json` 随图一起失效，避免残留 meta 与新图张冠李戴
+  const ownedFile = (name: string): boolean => owned.fileNames.has(name)
+    || (name.endsWith(".meta.json") && owned.fileNames.has(name.slice(0, -".meta.json".length)));
+  await removeCachedImages(outputDir, ownedFile);
   if (!(await assetMapExists(outputDir))) return;
   await updateAssetMap(outputDir, (assets) => {
     assets.figure = Object.fromEntries(

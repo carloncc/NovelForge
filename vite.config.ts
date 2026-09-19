@@ -1,8 +1,8 @@
 import { defineConfig, type Plugin, type Connect } from "vite";
 import vue from "@vitejs/plugin-vue";
-import { unzipSync } from "fflate";
-import { readFile, readdir, mkdir, writeFile, stat, rm } from "node:fs/promises";
-import { createReadStream } from "node:fs";
+import { Unzip, UnzipInflate } from "fflate";
+import { readFile, readdir, mkdir, stat, rm } from "node:fs/promises";
+import { closeSync, createReadStream, mkdirSync, openSync, writeSync } from "node:fs";
 import { join, dirname, normalize, extname, relative, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer, type Server as HttpServer } from "node:http";
@@ -25,11 +25,16 @@ const PREVIEW_DIR = join(tmpdir(), "novelforge-preview");
 const SESSION_TOKEN = randomBytes(32).toString("hex");
 const PROXY_BODY_LIMIT = 64 * 1024 * 1024;
 const PROXY_RESPONSE_LIMIT = 64 * 1024 * 1024;
+/** B118：以下上限是磁盘/文件数防线；流式解压后内存峰值不再随 zip 解压总大小增长 */
 const PREVIEW_ZIP_LIMIT = 256 * 1024 * 1024;
 const PREVIEW_EXPANDED_LIMIT = 1024 * 1024 * 1024;
 const PREVIEW_FILE_LIMIT = 20_000;
 const PREVIEW_FILE_SIZE_LIMIT = 256 * 1024 * 1024;
+/** 预览上传请求体上限（zip 经 base64 约膨胀 4/3 倍 + JSON 包装余量）：
+ * readBody 会按 content-length/累计长度在超限时尽早拒绝，不把超限请求读完整 */
 const PREVIEW_REQUEST_LIMIT = Math.ceil(PREVIEW_ZIP_LIMIT * 4 / 3) + 1024 * 1024;
+/** 流式解压时每次喂给 Unzip 的 base64 字符数：必须是 4 的倍数（4 字符 = 3 字节） */
+const PREVIEW_B64_CHUNK = 256 * 1024;
 let previewServer: HttpServer | undefined;
 let previewPort = 0;
 
@@ -73,8 +78,38 @@ function spawnModelInstall(modelId: string): void {
     });
 }
 
+/** 安全解析请求 URL：畸形请求目标（如原始 socket 发送非法绝对 URL）会抛 TypeError，
+ * 不能让未捕获异常打死 dev/preview 进程（Node 15+ 未处理 rejection 默认终止进程）。 */
+function parseRequestUrl(req: Connect.IncomingMessage): URL | null {
+  try {
+    return new URL(req.url ?? "/", "http://localhost");
+  } catch {
+    return null;
+  }
+}
+
+/** 中间件统一异常边界：async handler 的未捕获异常返回 500，而不是成为 unhandled rejection */
+function safeHandler(
+  handler: (req: Connect.IncomingMessage, res: Connect.ServerResponse) => Promise<void>,
+): (req: Connect.IncomingMessage, res: Connect.ServerResponse) => void {
+  return (req, res) => {
+    handler(req, res).catch((e: unknown) => {
+      console.error("[novelforge] middleware handler error:", e);
+      if (!res.headersSent) {
+        sendJson(res, 500, { error: e instanceof Error ? e.message : String(e) });
+      } else {
+        res.end();
+      }
+    });
+  };
+}
+
 async function handleModelRequest(req: Connect.IncomingMessage, res: Connect.ServerResponse): Promise<void> {
-  const u = new URL(req.url ?? "/", "http://localhost");
+  const u = parseRequestUrl(req);
+  if (!u) {
+    sendJson(res, 400, { error: "bad request" });
+    return;
+  }
   const pathname = u.pathname.replace(/^\/__novelforge\/model/, "") || "/";
   const modelId = u.searchParams.get("model") ?? "";
   const model = findCutoutModel(modelId);
@@ -118,7 +153,10 @@ async function handleModelRequest(req: Connect.IncomingMessage, res: Connect.Ser
     sendJson(res, 200, { ok: true });
     return;
   }
-  if (pathname === "/file") { if (!isSameOriginRequest(req)) { sendJson(res, 403, { error: "forbidden" }); return; }
+  if (pathname === "/file") {
+    // B120：与 /status /install /remove 一致要求会话令牌（旧实现只查 isSameOriginRequest，
+    // 本机其他进程可伪造 Host 头绕过）；onnxruntime-web 无法加请求头，故额外接受会话 Cookie
+    if (!authorizeGet(req, res, true)) return;
     const file = modelPath(model.filename);
     try {
       await stat(file);
@@ -210,7 +248,27 @@ export function validateProxyUrl(raw: string): URL {
   return url;
 }
 
-function isLocalHost(host: unknown): boolean { let h = String(host || "").toLowerCase(); if (h.startsWith("[")) { const end = h.indexOf("]"); h = end >= 0 ? h.slice(0, end + 1) : h.split(":")[0]; } else { h = h.split(":")[0]; } const name = h.replace(/^\[|\]$/g, ""); return name === "localhost" || name === "127.0.0.1" || name === "::1"; } function isSameOriginRequest(req: Connect.IncomingMessage): boolean { const host = req.headers.host; if (!host || !isLocalHost(host)) return false; const origin = req.headers.origin as string | undefined; const referer = req.headers.referer as string | undefined; const expectHttp = "http://" + host; const expectHttps = "https://" + host; if (origin && origin !== expectHttp && origin !== expectHttps) return false; if (!origin && referer) { try { const r = new URL(referer); if (r.host !== String(host)) return false; } catch { return false; } } return true; } function authorizeGet(req: Connect.IncomingMessage, res: Connect.ServerResponse): boolean { if (!isLocalHost(req.headers.host)) { sendJson(res, 403, { error: "forbidden" }); return false; } if (req.headers["x-novelforge-token"] !== SESSION_TOKEN) { sendJson(res, 403, { error: "forbidden" }); return false; } if (!isSameOriginRequest(req)) { sendJson(res, 403, { error: "invalid origin" }); return false; } return true; } function authorize(req: Connect.IncomingMessage, res: Connect.ServerResponse): boolean {
+function isLocalHost(host: unknown): boolean { let h = String(host || "").toLowerCase(); if (h.startsWith("[")) { const end = h.indexOf("]"); h = end >= 0 ? h.slice(0, end + 1) : h.split(":")[0]; } else { h = h.split(":")[0]; } const name = h.replace(/^\[|\]$/g, ""); return name === "localhost" || name === "127.0.0.1" || name === "::1"; } function isSameOriginRequest(req: Connect.IncomingMessage): boolean { const host = req.headers.host; if (!host || !isLocalHost(host)) return false; const origin = req.headers.origin as string | undefined; const referer = req.headers.referer as string | undefined; const expectHttp = "http://" + host; const expectHttps = "https://" + host; if (origin && origin !== expectHttp && origin !== expectHttps) return false; if (!origin && referer) { try { const r = new URL(referer); if (r.host !== String(host)) return false; } catch { return false; } } return true; } /** B120：/file 的请求由 onnxruntime-web 内部 fetch 发出，无法附加 X-NovelForge-Token 头；
+ * 因此 /session 会额外下发 SameSite=Strict 会话 Cookie，这里作为等价凭据读取
+ * （同源自动携带，跨站子请求不会发送）。 */
+function readSessionCookie(req: Connect.IncomingMessage): string | undefined {
+  const header = req.headers.cookie;
+  if (!header) return undefined;
+  for (const part of String(header).split(";")) {
+    const eq = part.indexOf("=");
+    if (eq > 0 && part.slice(0, eq).trim() === "novelforge_session") return part.slice(eq + 1).trim();
+  }
+  return undefined;
+}
+function authorizeGet(req: Connect.IncomingMessage, res: Connect.ServerResponse, allowSessionCookie = false): boolean {
+  if (!isLocalHost(req.headers.host)) { sendJson(res, 403, { error: "forbidden" }); return false; }
+  const hasToken = req.headers["x-novelforge-token"] === SESSION_TOKEN
+    || (allowSessionCookie && readSessionCookie(req) === SESSION_TOKEN);
+  if (!hasToken) { sendJson(res, 403, { error: "forbidden" }); return false; }
+  if (!isSameOriginRequest(req)) { sendJson(res, 403, { error: "invalid origin" }); return false; }
+  return true;
+}
+function authorize(req: Connect.IncomingMessage, res: Connect.ServerResponse): boolean {
   if (!isLocalHost(req.headers.host)) { sendJson(res, 403, { error: "forbidden" }); return false; } if (req.headers["x-novelforge-token"] !== SESSION_TOKEN) {
     sendJson(res, 403, { error: "forbidden" });
     return false;
@@ -302,7 +360,11 @@ async function handleProxy(req: Connect.IncomingMessage, res: Connect.ServerResp
 
 /** 模板资源：浏览器按需从 dev server 拉取 WebGAL 引擎文件 */
 async function handleTemplate(req: Connect.IncomingMessage, res: Connect.ServerResponse): Promise<void> {
-  const u = new URL(req.url ?? "/", "http://localhost");
+  const u = parseRequestUrl(req);
+  if (!u) {
+    sendJson(res, 400, { error: "bad request" });
+    return;
+  }
   const rel = (u.searchParams.get("path") ?? "").replace(/^\/+/, "");
   const target = normalize(join(TEMPLATE_DIR, rel));
   if (!isPathInside(TEMPLATE_DIR, target)) {
@@ -334,6 +396,107 @@ async function handleTemplate(req: Connect.IncomingMessage, res: Connect.ServerR
   }
 }
 
+/** B118：流式解压预览 zip 并逐文件写盘。
+ * 旧实现 unzipSync 会先把全部文件解压进内存对象再逐个写盘，峰值是
+ * 「JSON 整串 + base64 全量 Buffer + 全量解压对象」三份叠加（极端情况数百 MB）。
+ * 现在按 PREVIEW_B64_CHUNK 分块解码 → fflate 流式 Unzip → 单文件边解压边写盘：
+ * 内存峰值降为两份（JSON.parse 期间的整串 + payload.zip），单文件占用与文件大小无关。 */
+async function extractPreviewZip(zipBase64: string, dest: string): Promise<void> {
+  // body 上限允许 base64 略高于 zip 上限（含 JSON 包装余量），这里按解码后大小精确复核
+  if (zipBase64.length > Math.ceil(PREVIEW_ZIP_LIMIT * 4 / 3)) {
+    throw new Error("preview archive exceeds 256 MiB");
+  }
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let fileCount = 0;
+    let expandedSize = 0;
+    let openFd: number | null = null;
+    let openFileSize = 0;
+
+    const closeOpenFd = (): void => {
+      if (openFd === null) return;
+      try {
+        closeSync(openFd);
+      } catch {
+        /* 关闭失败无需处理 */
+      }
+      openFd = null;
+    };
+    const fail = (error: unknown): void => {
+      if (settled) return;
+      settled = true;
+      closeOpenFd();
+      reject(error instanceof Error ? error : new Error(String(error)));
+    };
+
+    const unzip = new Unzip((file) => {
+      if (settled) return;
+      if (file.name.endsWith("/")) {
+        // 目录条目不写盘（文件写盘前会 mkdir 父目录）
+        file.ondata = () => {};
+        file.start();
+        return;
+      }
+      try {
+        fileCount++;
+        if (fileCount > PREVIEW_FILE_LIMIT) throw new Error("preview archive has too many files");
+        const full = normalize(join(dest, file.name));
+        if (!isPathInside(dest, full)) throw new Error(`unsafe preview path: ${file.name}`);
+        mkdirSync(dirname(full), { recursive: true });
+        closeOpenFd(); // 防御损坏 zip 时上一文件未收到 final 导致的 fd 泄漏
+        openFd = openSync(full, "w");
+        openFileSize = 0;
+      } catch (error) {
+        fail(error);
+        return;
+      }
+      file.ondata = (error, chunk, final) => {
+        if (settled) return;
+        try {
+          if (error) throw error;
+          if (chunk.length > 0) {
+            openFileSize += chunk.length;
+            expandedSize += chunk.length;
+            if (openFileSize > PREVIEW_FILE_SIZE_LIMIT) throw new Error(`preview file is too large: ${file.name}`);
+            if (expandedSize > PREVIEW_EXPANDED_LIMIT) throw new Error("preview archive expands beyond 1 GiB");
+            if (openFd !== null) writeSync(openFd, chunk);
+          }
+          if (final) closeOpenFd();
+        } catch (writeError) {
+          fail(writeError);
+        }
+      };
+      file.start();
+    });
+    unzip.register(UnzipInflate);
+
+    const total = zipBase64.length;
+    const step = (offset: number): void => {
+      if (settled) return;
+      try {
+        const end = Math.min(offset + PREVIEW_B64_CHUNK, total);
+        const chunk = Buffer.from(zipBase64.slice(offset, end), "base64");
+        // fflate 流式解压对非 zip 数据不报错，这里显式校验 ZIP 签名（PK\x03\x04 / PK\x05\x06）
+        if (offset === 0 && (chunk.length < 4 || chunk[0] !== 0x50 || chunk[1] !== 0x4b)) {
+          throw new Error("preview archive is not a valid zip");
+        }
+        unzip.push(chunk, end >= total);
+        if (settled) return;
+        if (end >= total) {
+          settled = true;
+          resolve();
+        } else {
+          // 分块解压+写盘是同步 CPU/IO：让出事件循环，避免长时间阻塞 dev server
+          setImmediate(() => step(end));
+        }
+      } catch (error) {
+        fail(error);
+      }
+    };
+    step(0);
+  });
+}
+
 /** 预览：接收前端 zip 打包的游戏 → 解压到临时目录 → 返回访问 URL */
 async function handlePreviewUpload(req: Connect.IncomingMessage, res: Connect.ServerResponse): Promise<void> {
   let raw: string;
@@ -350,36 +513,25 @@ async function handlePreviewUpload(req: Connect.IncomingMessage, res: Connect.Se
     sendJson(res, 400, { error: "bad request" });
     return;
   }
+  // B118：尽早释放完整请求串引用，后续只保留 payload.zip 一份大字符串
+  raw = "";
   if (!payload.name || !payload.zip) {
     sendJson(res, 400, { error: "missing name/zip" });
     return;
   }
   try {
     const safeName = normalize(payload.name).replace(/^\/+/, "").replace(/[^\w\-.]/g, "_") || "game";
+    // 目录名必须落在 PREVIEW_DIR 内部：`..` 会被 normalize 保留，join 后即父目录，
+    // 随后的 rm(recursive) 会递归删除系统临时目录（破坏性路径穿越）
     const dest = join(PREVIEW_DIR, safeName);
+    if (safeName === "." || safeName === ".." || normalize(dest) === normalize(PREVIEW_DIR) || !isPathInside(PREVIEW_DIR, dest)) {
+      sendJson(res, 400, { error: "invalid name" });
+      return;
+    }
     await rm(dest, { recursive: true, force: true });
     await mkdir(dest, { recursive: true });
-    const archive = Buffer.from(payload.zip, "base64");
-    if (archive.byteLength > PREVIEW_ZIP_LIMIT) throw new Error("preview archive exceeds 256 MiB");
-    let fileCount = 0;
-    let expandedSize = 0;
-    const files = unzipSync(archive, {
-      filter(file) {
-        fileCount++;
-        expandedSize += file.originalSize;
-        if (fileCount > PREVIEW_FILE_LIMIT) throw new Error("preview archive has too many files");
-        if (file.originalSize > PREVIEW_FILE_SIZE_LIMIT) throw new Error(`preview file is too large: ${file.name}`);
-        if (expandedSize > PREVIEW_EXPANDED_LIMIT) throw new Error("preview archive expands beyond 1 GiB");
-        if (!isPathInside(dest, join(dest, file.name))) throw new Error(`unsafe preview path: ${file.name}`);
-        return !file.name.endsWith("/");
-      },
-    });
-    for (const [path, data] of Object.entries(files)) {
-      const full = normalize(join(dest, path));
-      if (!isPathInside(dest, full)) throw new Error(`unsafe preview path: ${path}`);
-      await mkdir(dirname(full), { recursive: true });
-      await writeFile(full, data);
-    }
+    // 分块解码 + 流式解压 + 逐文件写盘（B118，不再整块 Buffer.from 与 unzipSync）
+    await extractPreviewZip(payload.zip, dest);
     await ensurePreviewServer();
     sendJson(res, 200, { url: `http://127.0.0.1:${previewPort}/${encodeURIComponent(safeName)}/index.html` });
   } catch (e) {
@@ -389,8 +541,21 @@ async function handlePreviewUpload(req: Connect.IncomingMessage, res: Connect.Se
 
 /** 预览静态资源服务 */
 async function handlePreviewStatic(req: Connect.IncomingMessage, res: Connect.ServerResponse): Promise<void> {
-  const u = new URL(req.url ?? "/", "http://localhost");
-  const rel = decodeURIComponent(u.pathname.replace(/^\/+/, ""));
+  const u = parseRequestUrl(req);
+  if (!u) {
+    res.statusCode = 400;
+    res.end("bad request");
+    return;
+  }
+  let rel: string;
+  try {
+    rel = decodeURIComponent(u.pathname.replace(/^\/+/, ""));
+  } catch {
+    // 畸形百分号编码（%zz、%E4% 等）：400 而不是未捕获异常终止进程
+    res.statusCode = 400;
+    res.end("bad encoding");
+    return;
+  }
   const target = normalize(join(PREVIEW_DIR, rel));
   if (!isPathInside(PREVIEW_DIR, target)) {
     res.statusCode = 400;
@@ -418,7 +583,7 @@ async function handlePreviewStatic(req: Connect.IncomingMessage, res: Connect.Se
 function ensurePreviewServer(): Promise<void> {
   if (previewServer && previewPort) return Promise.resolve();
   return new Promise((resolve, reject) => {
-    const server = createServer((req, res) => { void handlePreviewStatic(req, res); });
+    const server = createServer(safeHandler(handlePreviewStatic));
     server.once("error", reject);
     server.listen(0, "127.0.0.1", () => {
       const address = server.address();
@@ -444,7 +609,12 @@ async function handleOnnxAsset(req: Connect.IncomingMessage, res: Connect.Server
     res.end();
     return;
   }
-  const u = new URL(req.url ?? "/", "http://localhost");
+  const u = parseRequestUrl(req);
+  if (!u) {
+    res.statusCode = 400;
+    res.end("bad request");
+    return;
+  }
   const rel = u.pathname.replace(/^\/onnx\//, "");
   if (rel === "" || !/^[\w.-]+$/.test(rel)) {
     res.statusCode = 400;
@@ -471,9 +641,7 @@ async function handleOnnxAsset(req: Connect.IncomingMessage, res: Connect.Server
 
 function webPlugin(): Plugin {
   const mount = (server: { middlewares: Connect.Server }) => {
-    server.middlewares.use("/onnx/", (req, res) => {
-      void handleOnnxAsset(req, res);
-    });
+    server.middlewares.use("/onnx/", safeHandler(handleOnnxAsset));
     server.middlewares.use("/__novelforge/proxy", (req, res) => {
       if (req.method !== "POST") {
         res.statusCode = 405;
@@ -481,7 +649,7 @@ function webPlugin(): Plugin {
         return;
       }
       if (!authorize(req, res)) return;
-      void handleProxy(req, res);
+      safeHandler(handleProxy)(req, res);
     });
     server.middlewares.use("/__novelforge/session", (req, res) => {
       if (req.method !== "GET") {
@@ -489,10 +657,15 @@ function webPlugin(): Plugin {
         res.end();
         return;
       }
-      if (!isSameOriginRequest(req)) { sendJson(res, 403, { error: "forbidden" }); return; } res.setHeader("Cache-Control", "no-store"); sendJson(res, 200, { token: SESSION_TOKEN });
+      if (!isSameOriginRequest(req)) { sendJson(res, 403, { error: "forbidden" }); return; }
+      // B120：一并下发会话 Cookie，供 onnxruntime-web 加载 /model/file 时携带（它无法自定义请求头）。
+      // SameSite=Strict：仅同站请求自动携带，跨站请求不会带上；HttpOnly 防止脚本读取。
+      res.setHeader("Set-Cookie", `novelforge_session=${SESSION_TOKEN}; Path=/; SameSite=Strict; HttpOnly`);
+      res.setHeader("Cache-Control", "no-store");
+      sendJson(res, 200, { token: SESSION_TOKEN });
     });
     server.middlewares.use("/__novelforge/template", (req, res) => { if (!authorizeGet(req, res)) return;
-      void handleTemplate(req, res);
+      safeHandler(handleTemplate)(req, res);
     });
     server.middlewares.use("/__novelforge/preview", (req, res) => {
       if (req.method !== "POST") {
@@ -501,11 +674,9 @@ function webPlugin(): Plugin {
         return;
       }
       if (!authorize(req, res)) return;
-      void handlePreviewUpload(req, res);
+      safeHandler(handlePreviewUpload)(req, res);
     });
-    server.middlewares.use("/__novelforge/model", (req, res) => {
-      void handleModelRequest(req, res);
-    });
+    server.middlewares.use("/__novelforge/model", safeHandler(handleModelRequest));
     server.httpServer?.once("close", () => {
       previewServer?.close();
       previewServer = undefined;

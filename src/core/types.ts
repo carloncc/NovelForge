@@ -452,6 +452,25 @@ export interface GenerationOptions {
   /** 每章视频推荐点数上限（0 = 不限制，默认） */
   videoPointsPerChapter: number;
   characterIntroCard: boolean;
+  /** 标题封面：auto=按主题自动生成（默认）/none=不使用/custom=用 titleCoverPath */
+  titleCoverMode?: "auto" | "none" | "custom";
+  /** 自定义封面图片（绝对路径）；mode=custom 时生效 */
+  titleCoverPath?: string;
+  /** 标题 Logo：auto=自动生成文字 Logo（默认）/none=不显示/custom=用 titleLogoPath */
+  titleLogoMode?: "auto" | "none" | "custom";
+  titleLogoPath?: string;
+  /** 标题曲：game/bgm 下的文件名；"none"=不播放；空=自动匹配宁静曲目 */
+  titleBgmFile?: string;
+  /** 导出标题（导出页设置；留空用卡片标题） */
+  exportTitle?: string;
+  /** 导出 Game_key（6-10 位字母数字；留空按标题自动生成） */
+  exportGameKey?: string;
+  /** 标题菜单开关（默认均开）：继续游戏 / 流程图 / 鉴赏室 */
+  titleEnableContinue?: boolean;
+  titleEnableFlowchart?: boolean;
+  titleEnableAppreciation?: boolean;
+  /** 主题色随画风：从风格锚点/首张背景提取主色生成每部作品的界面主题（默认开） */
+  themeFromArtwork?: boolean;
   /** 统一画风描述（英文/中文均可），用于让所有立绘/背景/CG 保持同一画风；留空使用默认画风 */
   imageStyle?: string;
   /** 图片固定种子：0=按小说标题自动派生（同一种子生成结果更稳定一致，利于统一画风） */
@@ -492,7 +511,6 @@ export interface PipelineEvent {
   message: string;
   level: "info" | "success" | "warn" | "error";
   at: number;
-  costDelta?: Partial<CostStats>;
   taskId?: string;
   taskKind?: "llm" | "image" | "tts" | "script";
   /** 实时进度（如 图片 12/45）：done/total + 当前生成内容 label */
@@ -512,5 +530,3 @@ export interface ExportSettings {
   gameKey: string;
   language: "zh_CN" | "zh_TW" | "en" | "ja";
 }
-
-export type LogSink = (ev: PipelineEvent) => void;

@@ -2,6 +2,7 @@ import type { ApiConfig } from "./types";
 import { chatVision } from "../api/openaiCompatible";
 import { extractJson } from "../api/openaiCompatible";
 import { log } from "../utils/logger";
+import { stableHash } from "./ids";
 
 const STYLE_SYSTEM = `你是画风分析专家。分析用户给出的图片的视觉风格，输出一段可直接用于 AI 绘图的英文风格约束。
 要求：
@@ -89,7 +90,7 @@ export async function recognizeCharacter(
 }
 
 /** 用多模态模型把参考图描述成英文提示词片段（供后续图生图严格还原参考图）。失败返回空串。 */
-export async function describeReferenceImage(
+async function describeReferenceImage(
   cfg: ApiConfig,
   imageB64: string,
   onUsage?: (pt: number, ct: number) => void,
@@ -125,10 +126,6 @@ const REF_DESC_MAX_CONSECUTIVE_FAILS = 2;
 let refDescConsecutiveFails = 0;
 let refDescDisabled = false;
 
-export function isReferenceDescriptionDisabled(): boolean {
-  return refDescDisabled;
-}
-
 // 简单信号量：同时最多 1 个参考图描述请求在途（视觉通道限流敏感，串行最稳）
 let refDescInFlight = 0;
 const refDescWaiters: Array<() => void> = [];
@@ -142,11 +139,20 @@ function acquireRefDescSlot(): Promise<void> {
 function releaseRefDescSlot(): void {
   refDescInFlight--;
   const next = refDescWaiters.shift();
-  if (next) next();
+  if (next) {
+    // B55：把名额直接移交给被唤醒的等待者——先补回 inFlight 再唤醒。
+    // 旧实现唤醒时 inFlight 已经是 0，被唤醒者没有占用名额，新的 acquire 也会立即通过，
+    // 串行信号量被击穿（多个参考图描述请求并发打视觉 API）。
+    refDescInFlight++;
+    next();
+  }
 }
 
-function referenceDescKey(imageB64: string): string {
-  return `${imageB64.length}:${imageB64.slice(0, 256)}`;
+function referenceDescKey(cfg: ApiConfig, imageB64: string): string {
+  // B60：整图内容哈希 + 视觉配置标识。旧实现只取「长度 + 前 256 字符」，
+  // 前缀相同/长图会被不同参考图互相串用描述；换模型/换通道后也必须重新描述。
+  const visionId = cfg.id || `${cfg.baseUrl ?? ""}|${cfg.model ?? ""}`;
+  return `${visionId}|${imageB64.length}:${stableHash(imageB64)}`;
 }
 
 export function describeReferenceImageCached(
@@ -156,7 +162,7 @@ export function describeReferenceImageCached(
 ): Promise<string> {
   // 健康开关已触发：直接降级（返回空描述），不再调用视觉 API
   if (refDescDisabled) return Promise.resolve("");
-  const key = referenceDescKey(imageB64);
+  const key = referenceDescKey(cfg, imageB64);
   const hit = referenceDescCache.get(key);
   if (hit) return hit;
   // 失败冷却期内直接降级（返回空描述），避免同一参考图反复触发视觉 API 加重限流

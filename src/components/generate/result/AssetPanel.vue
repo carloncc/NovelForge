@@ -70,6 +70,19 @@ const {
  * 生成进行中点单项按钮会走到 regenCtx 被拦，只留一条警告日志，看起来像按钮没反应）。 */
 const regenLocked = computed(() => busy.value || queueRunning.value || !!assetBusy.value);
 
+/** assetBusy 存的是内部任务键（batch:3 项 / cutout:xxx / repair-voice…），直接显示会向用户
+ * 暴露内部标识；这里只做显示层映射，未知前缀原样显示以便排查。 */
+function assetBusyLabel(raw: string): string {
+  if (raw.startsWith("batch:")) return `${t("批量重生成")}（${raw.slice(6)}）`;
+  if (raw.startsWith("cutout:")) return t("抠图");
+  if (raw === "repair-voice") return t("补配配音");
+  if (raw === "cleanup-images") return t("清理图片缓存");
+  if (raw === "restore-map") return t("恢复映射");
+  if (raw.startsWith("voice:")) return `${t("配音：")}${raw.slice(6)}`;
+  if (raw.startsWith("retry:")) return `${t("重试：")}${raw.slice(6)}`;
+  return raw;
+}
+
 // 切换素材子标签时清空选择：选择集跨标签保留会让「重新生成已选」命中当前不可见的行（看不见的花费）
 watch(assetTab, () => {
   clearSelected();
@@ -85,7 +98,7 @@ watch(assetTab, () => {
   </div>
   <template v-else>
     <div v-if="assetBusy" class="asset-regen-status">
-      <span style="font-size: 12px; font-weight: 600; flex-shrink: 0">{{ assetBusy }}</span>
+      <span style="font-size: 12px; font-weight: 600; flex-shrink: 0">{{ assetBusyLabel(assetBusy) }}</span>
       <div class="progress-bar">
         <div class="progress-fill" :style="{ width: regenPct + '%' }"></div>
       </div>
@@ -114,7 +127,8 @@ watch(assetTab, () => {
       </div>
       <div v-else class="asset-toolbar-right">
         <span v-if="selectedVoiceCount" class="tag ok">{{ t("已选") }} {{ selectedVoiceCount }}</span>
-        <button class="btn ghost small" @click="selectAllVoice(voiceRowsShown.map((r) => r.key))">{{ t("全选本区") }}</button>
+        <!-- 必须用全部 voiceRows：voiceRowsShown 只含前 100 条，用它会导致「全选」漏掉后续台词 -->
+        <button class="btn ghost small" @click="selectAllVoice(voiceRows.map((r) => r.key))">{{ t("全选本区") }}</button>
         <button class="btn ghost small" :disabled="!selectedVoiceCount" @click="clearVoiceSelected">{{ t("清空") }}</button>
         <button
           class="btn small"
@@ -145,13 +159,13 @@ watch(assetTab, () => {
           </div>
           <div class="asset-thumb-row">
             <div v-if="row.threeView" class="asset-thumb" :title="t('三视图（点击放大；有参考图时将基于参考图生成）')" @click="openPreview(row.threeView, `${row.name} · 三视图`)">
-              <label class="asset-sel" @click.stop><input type="checkbox" :checked="selected.has(`threeview:${row.id}`)" @change="toggleSelect(`threeview:${row.id}`)" /></label>
+              <label class="asset-sel" @click.stop><input type="checkbox" :aria-label="`${row.name} · ${t('三视图')}`" :checked="selected.has(`threeview:${row.id}`)" @change="toggleSelect(`threeview:${row.id}`)" /></label>
               <LazyThumb :path="row.threeView" :alt="t('三视图')" />
               <span class="thumb-label">{{ t("三视图") }}</span>
               <button class="btn ghost small" :disabled="regenLocked" @click.stop="reCutout('figure', `${row.id}_threeview`, row.threeView)">{{ t("抠图") }}</button>
             </div>
             <div v-for="e in row.emotions" :key="e.emo" class="asset-thumb" :class="{ missing: !e.file }" :title="`${EMOTION_LABELS[e.emo] ?? e.emo}（点击放大）`" @click="e.file && openPreview(e.file, `${row.name} · ${EMOTION_LABELS[e.emo] ?? e.emo}`)">
-              <label class="asset-sel" @click.stop><input type="checkbox" :checked="selected.has(`figure:${row.id}:${e.emo}`)" @change="toggleSelect(`figure:${row.id}:${e.emo}`)" /></label>
+              <label class="asset-sel" @click.stop><input type="checkbox" :aria-label="`${row.name} · ${EMOTION_LABELS[e.emo] ?? e.emo}`" :checked="selected.has(`figure:${row.id}:${e.emo}`)" @change="toggleSelect(`figure:${row.id}:${e.emo}`)" /></label>
               <LazyThumb v-if="e.file" :path="e.file" :alt="EMOTION_LABELS[e.emo] ?? e.emo" />
               <span class="thumb-label">{{ EMOTION_LABELS[e.emo] ?? e.emo }}</span>
               <button class="btn ghost small" :disabled="regenLocked" @click.stop="regenFigureEmotion(row.id, e.emo)">{{ t("重生成") }}</button>
@@ -161,7 +175,7 @@ watch(assetTab, () => {
           <div v-if="row.costumes.length" style="border-top: 1px dashed var(--border); margin-top: 8px; padding-top: 8px">
             <div class="asset-thumb-row">
               <div v-for="ct in row.costumes" :key="ct.id" class="asset-thumb" :class="{ missing: !ct.file }" :title="`${ct.name}（点击放大）`" @click="ct.file && openPreview(ct.file, `${row.name} · ${ct.name}`)">
-                <label class="asset-sel" @click.stop><input type="checkbox" :checked="selected.has(`figure:${row.id}:ct_${ct.id}`)" @change="toggleSelect(`figure:${row.id}:ct_${ct.id}`)" /></label>
+                <label class="asset-sel" @click.stop><input type="checkbox" :aria-label="`${row.name} · ${ct.name}`" :checked="selected.has(`figure:${row.id}:ct_${ct.id}`)" @change="toggleSelect(`figure:${row.id}:ct_${ct.id}`)" /></label>
                 <LazyThumb v-if="ct.file" :path="ct.file" :alt="ct.name" />
                 <span class="thumb-label">{{ ct.name }}</span>
                 <button class="btn ghost small" :disabled="regenLocked" @click.stop="regenCostume(row.id, ct.id, ct.name)">{{ t("重生成") }}</button>
@@ -172,7 +186,7 @@ watch(assetTab, () => {
           <div v-if="row.actions.length" style="border-top: 1px dashed var(--border); margin-top: 8px; padding-top: 8px">
             <div class="asset-thumb-row">
               <div v-for="a in row.actions" :key="a.id" class="asset-thumb" :class="{ missing: !a.file }" :title="`${a.name}（点击放大）`" @click="a.file && openPreview(a.file, `${row.name} · ${a.name}`)">
-                <label class="asset-sel" @click.stop><input type="checkbox" :checked="selected.has(`action:${row.id}:${a.id}`)" @change="toggleSelect(`action:${row.id}:${a.id}`)" /></label>
+                <label class="asset-sel" @click.stop><input type="checkbox" :aria-label="`${row.name} · ${a.name}`" :checked="selected.has(`action:${row.id}:${a.id}`)" @change="toggleSelect(`action:${row.id}:${a.id}`)" /></label>
                 <LazyThumb v-if="a.file" :path="a.file" :alt="a.name" />
                 <span class="thumb-label">{{ a.name }}</span>
                 <button class="btn ghost small" :disabled="regenLocked" @click.stop="regenAction(row.id, a.id, a.name)">{{ t("重生成") }}</button>
@@ -197,7 +211,7 @@ watch(assetTab, () => {
             <button class="btn small" :disabled="regenLocked" @click="regenItem(row.id)">{{ t("重新生成") }}</button>
           </div>
           <div class="asset-thumb-row">
-            <div class="asset-thumb" :title="t('点击放大')" @click="row.file && openPreview(row.file, `${row.name} · 物品图`)">
+            <div class="asset-thumb" :class="{ missing: !row.file }" :title="row.file ? t('点击放大') : t('未生成')" @click="row.file && openPreview(row.file, `${row.name} · 物品图`)">
               <LazyThumb v-if="row.file" :path="row.file" :alt="row.name" />
               <span class="thumb-label">{{ t("物品图") }}</span>
               <button v-if="row.file" class="btn ghost small" :disabled="regenLocked" @click.stop="reCutout('item', row.id, row.file)">{{ t("抠图") }}</button>
@@ -221,7 +235,7 @@ watch(assetTab, () => {
             <button class="btn small" :disabled="regenLocked" @click="regenBg(row.sceneId)">{{ t("重新生成") }}</button>
           </div>
           <div class="asset-thumb-row">
-            <div class="asset-thumb" :title="t('点击放大')" @click="row.file && openPreview(row.file, `背景 · ${row.location}`)">
+            <div class="asset-thumb" :class="{ missing: !row.file }" :title="row.file ? t('点击放大') : t('未生成')" @click="row.file && openPreview(row.file, `背景 · ${row.location}`)">
               <LazyThumb v-if="row.file" :path="row.file" :alt="row.location" />
               <span class="thumb-label">{{ t("背景图") }}</span>
             </div>
@@ -244,7 +258,7 @@ watch(assetTab, () => {
             <button class="btn small" :disabled="regenLocked" @click="regenCgRow(row.chapter, row.sceneId)">{{ t("重新生成") }}</button>
           </div>
           <div class="asset-thumb-row">
-            <div class="asset-thumb" :title="t('点击放大')" @click="row.file && openPreview(row.file, `CG · ${row.title}`)">
+            <div class="asset-thumb" :class="{ missing: !row.file }" :title="row.file ? t('点击放大') : t('未生成')" @click="row.file && openPreview(row.file, `CG · ${row.title}`)">
               <LazyThumb v-if="row.file" :path="row.file" :alt="row.title" />
               <span class="thumb-label">CG</span>
             </div>
@@ -317,3 +331,43 @@ watch(assetTab, () => {
   </template>
 </div>
 </template>
+
+<style scoped>
+/* 下面三个类此前在组件和全局样式里都没有定义：工具栏没有左右布局，批量选择复选框也直接挤在缩略图内容流里 */
+.asset-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+/* 工具栏内左组不再自带下边距（全局 .asset-subtabs 是给上下布局用的） */
+.asset-toolbar .asset-subtabs {
+  margin-bottom: 0;
+}
+.asset-toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  margin-left: auto;
+}
+/* .asset-thumb 作为定位锚点，让复选框浮在缩略图右上角 */
+.asset-thumb {
+  position: relative;
+}
+.asset-sel {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.88);
+  line-height: 0;
+  cursor: pointer;
+}
+</style>

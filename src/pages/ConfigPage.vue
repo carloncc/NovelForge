@@ -15,7 +15,7 @@ import { templatesForCapability } from "../api/templates";
 import { fetchMiniMaxVoices } from "../core/voiceProfiles";
 import { errMsg } from "../utils/errors";
 import { log } from "../utils/logger";
-import { t } from "../i18n";
+import { currentLang, t } from "../i18n";
 import PageHead from "../components/PageHead.vue";
 import { knownImageModelCapabilities } from "../api/providers";
 import { resolveContextLength, inputCharBudget } from "../api/providers";
@@ -100,7 +100,7 @@ async function downloadCurrentModel(): Promise<void> {
 
 async function removeCurrentModel(): Promise<void> {
   const model = currentCutoutModel.value;
-  if (!window.confirm(`删除本地 AI 抠图模型「${model.id}」？删除后需重新下载才能再用于抠图。继续吗？`)) return;
+  if (!window.confirm(t("删除本地 AI 抠图模型「{name}」？删除后需重新下载才能再用于抠图。继续吗？", { name: model.id }))) return;
   cutoutBusy.value = true;
   cutoutError.value = "";
   try {
@@ -140,16 +140,22 @@ function fmtTtsParam(value: unknown, fallback: number): string {
   return String(Math.round(n * 10) / 10);
 }
 
+/** UI15：token/字符数按当前界面语言本地化；渲染时读取 currentLang，切语言后自动重渲染 */
+function fmtNumber(n: number): string {
+  return n.toLocaleString(currentLang.value);
+}
+
 const voiceFetching = ref<string | null>(null);
-const voiceFetchMsg = ref<Record<string, string>>({});
+// 成败用布尔保存：此前靠 includes('失败') 猜，非简体界面翻译后失败也显示绿色
+const voiceFetchMsg = ref<Record<string, { ok: boolean; msg: string }>>({});
 
 /** 从 MiniMax 拉取系统音色 + 用户克隆/设计音色，填入该 TTS 配置的音色库 */
 async function fetchVoicesFor(cfg: ApiConfig): Promise<void> {
   voiceFetching.value = cfg.id;
-  voiceFetchMsg.value[cfg.id] = "";
+  voiceFetchMsg.value[cfg.id] = { ok: false, msg: "" };
   try {
     const remote = await fetchMiniMaxVoices(cfg, "all");
-    if (!remote.length) throw new Error("MiniMax 未返回任何音色");
+    if (!remote.length) throw new Error(t("MiniMax 未返回任何音色"));
     cfg.extra ??= {};
     const current = Array.isArray(cfg.extra.voiceLibrary) ? (cfg.extra.voiceLibrary as string[]) : [];
     const ids = remote.map((v) => v.voice_id);
@@ -160,14 +166,17 @@ async function fetchVoicesFor(cfg: ApiConfig): Promise<void> {
       design: t("设计音色"),
     };
     const count = (kind: string) => remote.filter((v) => v.kind === kind).length;
-    voiceFetchMsg.value[cfg.id] = t("已获取音色：系统 {sys} 个，克隆 {clone} 个，设计 {design} 个", {
-      sys: String(count("system")),
-      clone: String(count("clone")),
-      design: String(count("design")),
-    });
+    voiceFetchMsg.value[cfg.id] = {
+      ok: true,
+      msg: t("已获取音色：系统 {sys} 个，克隆 {clone} 个，设计 {design} 个", {
+        sys: String(count("system")),
+        clone: String(count("clone")),
+        design: String(count("design")),
+      }),
+    };
     void kinds;
   } catch (error) {
-    voiceFetchMsg.value[cfg.id] = t("获取音色失败：{error}", { error: errMsg(error) });
+    voiceFetchMsg.value[cfg.id] = { ok: false, msg: t("获取音色失败：{error}", { error: errMsg(error) }) };
   } finally {
     voiceFetching.value = null;
   }
@@ -183,6 +192,11 @@ const channels = computed<{ key: ChannelKey; label: string; desc: string; icon: 
 const testing = ref<{ key: ChannelKey; id: string } | null>(null);
 const testResult = ref<{ key: ChannelKey; id: string; ok: boolean; msg: string } | null>(null);
 const customOpen = ref<Record<string, boolean>>({});
+
+/** 修改 Base URL/模型后旧的「测试连接正常」不再代表当前配置：清掉徽标，避免误导 */
+function invalidateTest(cfg: ApiConfig): void {
+  if (testResult.value?.id === cfg.id) testResult.value = null;
+}
 
 const modelFetching = ref<string | null>(null);
 const modelFetchError = ref<Record<string, string>>({});
@@ -212,21 +226,22 @@ function showTemplateError(): void {
 async function runTest(kind: ChannelKey, cfg: ApiConfig): Promise<void> {
   // 测试是真实调用（扣费）：图像通道含文生图＋图生图探测共 2 张，先确认
   const costHint = kind === "image"
-    ? "将真实调用图像 API（含文生图 1 张＋图生图探测 1 张，共约 2 张额度）"
+    ? t("将真实调用图像 API（含文生图 1 张＋图生图探测 1 张，共约 2 张额度）")
     : kind === "tts"
-      ? "将真实合成一句测试语音（扣少量字符额度）"
-      : "将真实调用一次（扣少量 token 额度）";
-  if (!window.confirm(`测试连接将${costHint}。继续吗？`)) return;
+      ? t("将真实合成一句测试语音（扣少量字符额度）")
+      : t("将真实调用一次（扣少量 token 额度）");
+  // costHint 本身已以「将」开头（如「将真实调用…」），这里不能再拼一个，否则出现「将将」
+  if (!window.confirm(t("测试连接{costHint}。继续吗？", { costHint }))) return;
   testing.value = { key: kind, id: cfg.id };
   testResult.value = null;
   log.info("page", `测试连接 ${kind}`, { model: cfg.model, baseUrl: cfg.baseUrl });
   try {
     if (kind === "llm") {
       const reply = await testLlm(cfg);
-      testResult.value = { key: kind, id: cfg.id, ok: true, msg: `正常：${reply.slice(0, 40)}` };
+      testResult.value = { key: kind, id: cfg.id, ok: true, msg: t("正常：{reply}", { reply: reply.slice(0, 40) }) };
     } else if (kind === "vision") {
       const description = await testVision(cfg);
-      testResult.value = { key: kind, id: cfg.id, ok: true, msg: `视觉识别正常：${description.slice(0, 60)}` };
+      testResult.value = { key: kind, id: cfg.id, ok: true, msg: t("视觉识别正常：{desc}", { desc: description.slice(0, 60) }) };
     } else if (kind === "tts") {
       await testTts(cfg);
       testResult.value = { key: kind, id: cfg.id, ok: true, msg: t("正常，语音合成可用") };
@@ -234,7 +249,7 @@ async function runTest(kind: ChannelKey, cfg: ApiConfig): Promise<void> {
       const result = await testImage(cfg);
       const editMsg = result.editOk
         ? t("正常（已消耗约 2 张额度：文生图＋图生图探测）；已自动探测：支持参考图/图生图")
-        : `正常（已消耗约 2 张额度：文生图＋图生图探测）；已自动探测：不支持参考图${result.detail ? `（${result.detail.slice(0, 80)}）` : ""}`;
+        : t("正常（已消耗约 2 张额度：文生图＋图生图探测）；已自动探测：不支持参考图{detail}", { detail: result.detail ? `（${result.detail.slice(0, 80)}）` : "" });
       testResult.value = { key: kind, id: cfg.id, ok: true, msg: editMsg };
     }
     log.info("page", `测试连接 ${kind} 成功`);
@@ -254,14 +269,14 @@ function cfgActive(kind: ChannelKey, id: string): boolean {
 function confirmRemovePreset(id: string): void {
   const preset = configState.presets.find((p) => p.id === id);
   const n = preset ? Object.values(preset.channels).flat().length : 0;
-  if (!window.confirm(`删除配置组「${preset?.name ?? id}」（含 ${n} 个 API 配置，不可恢复）？`)) return;
+  if (!window.confirm(t("删除配置组「{name}」（含 {n} 个 API 配置，不可恢复）？", { name: preset?.name ?? id, n }))) return;
   removePreset(id);
 }
 
 /** 删除单个 API 配置：切走正在用的通道，二次确认 */
 function confirmRemoveConfig(kind: ChannelKey, id: string, label: string): void {
   const inUse = activePreset().active[kind] === id;
-  if (!window.confirm(`删除${inUse ? "（正在使用，将自动切换到同通道第一个）" : ""}「${label}」？不可恢复。`)) return;
+  if (!window.confirm(t("删除{inUsePart}「{label}」？不可恢复。", { inUsePart: inUse ? t("（正在使用，将自动切换到同通道第一个）") : "", label }))) return;
   removeConfig(kind, id);
 }
 
@@ -322,6 +337,7 @@ function onModelSelect(kind: ChannelKey, cfg: ApiConfig, e: Event): void {
   }
   customModelOpen.value[cfg.id] = false;
   cfg.model = value;
+  invalidateTest(cfg);
 }
 
 /** 自动拉取模型：跟随 baseUrl / 路径前缀 / API Key 变化（600ms 防抖） */
@@ -463,7 +479,7 @@ watch(
           <div class="cfg-row">
             <label class="field">
               <span>Base URL</span>
-              <input type="text" v-model="cfg.baseUrl" placeholder="https://api.deepseek.com" />
+              <input type="text" v-model="cfg.baseUrl" placeholder="https://api.deepseek.com" @input="invalidateTest(cfg)" />
             </label>
           </div>
           <div class="cfg-row">
@@ -477,7 +493,7 @@ watch(
                   <option value="__custom__">{{ t("✏️ 自定义…") }}</option>
                 </select>
               </div>
-              <input v-if="customModelOpen[cfg.id]" type="text" v-model="cfg.model" :placeholder="t('输入模型名，例如 deepseek-chat')" />
+              <input v-if="customModelOpen[cfg.id]" type="text" v-model="cfg.model" :placeholder="t('输入模型名，例如 deepseek-chat')" @input="invalidateTest(cfg)" />
               <span v-if="modelFetchError[cfg.id]" class="cfg-model-error">{{ modelFetchError[cfg.id] }}</span>
             </label>
           </div>
@@ -526,8 +542,8 @@ watch(
               <label class="field">
                 <span>{{ t("当前解析值") }}</span>
                 <div class="cfg-context-resolved">
-                  <code>{{ resolveContextLength(cfg).toLocaleString() }}</code>
-                  <span class="cfg-context-budget">{{ t("输入预算") }}：{{ inputCharBudget(cfg).toLocaleString() }} {{ t("字符") }}</span>
+                  <code>{{ fmtNumber(resolveContextLength(cfg)) }}</code>
+                  <span class="cfg-context-budget">{{ t("输入预算") }}：{{ fmtNumber(inputCharBudget(cfg)) }} {{ t("字符") }}</span>
                 </div>
               </label>
             </div>
@@ -569,7 +585,11 @@ watch(
               <button class="btn secondary small" :disabled="voiceFetching === cfg.id || !cfg.apiKey" @click="fetchVoicesFor(cfg)">
                 {{ voiceFetching === cfg.id ? t("获取中…") : t("从 MiniMax 获取音色") }}
               </button>
-              <span v-if="voiceFetchMsg[cfg.id]" class="cfg-test-result" :class="voiceFetchMsg[cfg.id].includes('失败') ? 'err' : 'ok'">{{ voiceFetchMsg[cfg.id] }}</span>
+              <span
+                v-if="voiceFetchMsg[cfg.id]?.msg"
+                class="cfg-test-result"
+                :class="voiceFetchMsg[cfg.id]?.ok ? 'ok' : 'err'"
+              >{{ voiceFetchMsg[cfg.id]?.msg }}</span>
             </div>
           </details>
           <details v-if="ch.key === 'tts' && cfg.adapter === 'minimax-tts'" class="cfg-details">
@@ -581,9 +601,9 @@ watch(
                   :value="cfg.model ?? 'speech-2.6-hd'"
                   @change="(e: any) => { cfg.model = (e.target as HTMLSelectElement).value; }"
                 >
-                  <option value="speech-2.8-hd">speech-2.8-hd（最新高质量）</option>
-                  <option value="speech-2.8-turbo">speech-2.8-turbo（低延迟）</option>
-                  <option value="speech-2.6-hd">speech-2.6-hd（默认）</option>
+                  <option value="speech-2.8-hd">speech-2.8-hd{{ t("（最新高质量）") }}</option>
+                  <option value="speech-2.8-turbo">speech-2.8-turbo{{ t("（低延迟）") }}</option>
+                  <option value="speech-2.6-hd">speech-2.6-hd{{ t("（默认）") }}</option>
                   <option value="speech-2.6-turbo">speech-2.6-turbo</option>
                   <option value="speech-02-hd">speech-02-hd</option>
                   <option value="speech-02-turbo">speech-02-turbo</option>
@@ -645,7 +665,7 @@ watch(
                   :value="(cfg.extra!.ttsFormat as string | undefined) ?? 'mp3'"
                   @change="(e: any) => { cfg.extra!.ttsFormat = (e.target as HTMLSelectElement).value; }"
                 >
-                  <option value="mp3">mp3（推荐）</option>
+                  <option value="mp3">mp3{{ t("（推荐）") }}</option>
                   <option value="wav">wav</option>
                   <option value="flac">flac</option>
                 </select>

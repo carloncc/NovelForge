@@ -35,9 +35,13 @@ const PATTERNS: Record<Exclude<ErrorClass, "unknown">, RegExp[]> = {
     /too many requests/i,
     /rate.?limit/i,
     /quota/i,
-    /exceed/i,
+    // 旧实现用 /exceed/i 兜底：任何 "exceed"（如 "prompt exceeds maximum length"）都被当限流无限退避重试。
+    // 这里只保留「超出配额/余额/频率」的明确组合，超长/超限类永久错误交给 invalid_param 命中。
+    /exceed(?:ed|s|ing)?.{0,30}(quota|rate|balance|credits?|requests? per|tokens? per|frequency|频率|限额)/i,
+    /(quota|balance|credits?|rate limit|usage limit|请求过于频繁|访问频繁|频率限制|限额).{0,30}(exceed|exhaust|depleted|reached|不足|超)/i,
+    /tokens? per min/i,
     /insufficient.{0,10}(balance|quota)/i,
-    /余额不足|额度不足|配额|限流|触发限制|并发超限/i,
+    /余额不足|额度不足|配额|限流|触发限制|并发超限|请求过于频繁|访问过于频繁|频率超限/i,
   ],
   auth: [
     /\b401\b|\b403\b/i,
@@ -59,6 +63,13 @@ const PATTERNS: Record<Exclude<ErrorClass, "unknown">, RegExp[]> = {
     /does not exist/i,
     /not found/i,
     /prompt (is )?(too|must)/i,
+    // 「超长/超限」类永久错误（context window、输出上限等）：必须在配额判定之前被识别，
+    // 否则会被旧版 /exceed/ 误判成限流反复退避重试。
+    /exceed(?:ed|s|ing)?.{0,30}(max(?:imum)?|context|length|tokens?|size|images?|characters?)/i,
+    /(max(?:imum)?|context|length|prompt).{0,30}(exceed|too long|too large|超过|超长)/i,
+    /too (long|large)\b/i,
+    /too many (images|characters|tokens|pixels)/i,
+    /超过.{0,8}(上限|最大|长度|限制)|超长|过长/i,
     /参数错误|参数不合法|格式错误|不存在|不支持/i,
     /错误[：:]\s*4\d\d/i,
   ],
@@ -91,9 +102,12 @@ export function classifyError(e: unknown, status?: number): ErrorClass {
     if (status === 401 || status === 403) return "auth";
     if (status >= 500) return "network";
     if (status >= 400) {
-      // 4xx 默认参数错，但若有审查/限流信号则优先
+      // 4xx 默认参数错，但若有审查/限流信号则优先。
+      // B94：部分服务把限流也回成 400（文本里带 "rate limit exceeded"），必须先查 rate_limit，
+      // 否则会被当成 invalid_param 直接失败，失去退避重试机会。
       const text = String(e instanceof Error ? e.message : e);
       if (hasAny(text, PATTERNS.content_moderation)) return "content_moderation";
+      if (hasAny(text, PATTERNS.rate_limit)) return "rate_limit";
       return "invalid_param";
     }
   }

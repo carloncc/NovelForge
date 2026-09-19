@@ -182,10 +182,12 @@ export interface SplitStats {
 }
 
 export interface AiSplitOptions {
-  /** 碎章合并阈值（默认 3000；0 = 不合并，特殊小章独立成章） */
+  /** 碎章合并阈值（默认 3000，0 = 不合并；特殊小章独立成章） */
   minChapterChars?: number;
-  /** 保留特殊章节：后记/番外/特典/插图等不被当杂项丢弃，独立成章 */
+  /** 保留特殊章节（插图/后记/特典/封面等不参与丢弃，独立成章） */
   keepSpecials?: boolean;
+  /** 递归深度（内部使用）：超长章递归找内层标题最多 3 层，防止模型输出稳定时无限递归 */
+  depth?: number;
 }
 
 /** 特殊章节首行特征：这类块即使被 AI 标成杂项也要留（用户要的 26 章里就有它们）。
@@ -248,7 +250,7 @@ export function mergeTinyChapters(chapters: ChapterInfo[], minChars = MIN_CHAPTE
  * 剧情断点切分：超长章节内找不到小标题时，按场景/事件断点切段（替代机械按字数硬切）。
  * 返回的标题形如"父标题·短标题"，起不出名时用"父标题·上/中/下"。
  */
-export async function aiSplitBeats(
+async function aiSplitBeats(
   cfg: ApiConfig,
   text: string,
   parentTitle: string,
@@ -438,11 +440,24 @@ export async function aiSplitChapters(
   }
 
   // 章节内容可能仍超长（如整卷放在一章）：优先递归找内层小标题；
-  // 章内无标题可用（递归只产出机械"第X部分"）时，改用剧情断点切分，不断在对话中途与连续动作中途
+  // 章内无标题可用（递归只产出机械"第X部分"）时，改用剧情断点切分，不断在对话中途与连续动作中途。
+  // 递归必须防死循环：模型对同一段文本稳定输出同一结果（子结果=原文）时会无限递归烧钱。
+  const depth = opts?.depth ?? 0;
+  const MAX_SPLIT_DEPTH = 3;
   const result: ChapterInfo[] = [];
   for (const ch of chapters) {
     if (ch.text.length > maxChapterChars) {
-      const sub = await aiSplitChapters(cfg, ch.text, onUsage, maxChapterChars, feedback, concurrency, stats, opts);
+      const sub = depth < MAX_SPLIT_DEPTH
+        ? await aiSplitChapters(cfg, ch.text, onUsage, maxChapterChars, feedback, concurrency, stats, { ...opts, depth: depth + 1 })
+        : [];
+      // 无进展检测：子结果只有一章且不比原文短（模型没能再切）→ 直接改剧情断点，避免同输入再递归
+      const noProgress = sub.length === 1 && sub[0].text.trim().length >= ch.text.trim().length;
+      if (!sub.length || noProgress) {
+        log.warn("split", `超长章递归无进展（已切 ${depth} 层），改用剧情断点切分：${ch.title}`, { chars: ch.text.length });
+        const beats = await aiSplitBeats(cfg, ch.text, ch.title, maxChapterChars, onUsage, concurrency);
+        result.push(...beats.map((s, i) => ({ ...s, index: result.length + i })));
+        continue;
+      }
       const mechanical = sub.length > 1 && sub.every((s) => /^第\d+部分$/.test(s.title));
       if (mechanical) {
         log.info("split", `超长章无内层标题，改用剧情断点切分：${ch.title}`, { chars: ch.text.length });
@@ -477,16 +492,36 @@ export async function aiSplitChapters(
 /** 回退分章：按近似字数把全文切分成若干章 */
 function hardSplitBySentences(text: string, maxChars: number): ChapterInfo[] {
   const sentences = text.split(/(?<=[。！？!?；;\n])/).filter((s) => s.trim());
+  // 单句超限（整段无句末标点）必须二次硬切：否则整句入章仍超 maxChars，撑爆后续剧本/提取上下文
+  const pieces: string[] = [];
+  for (const sentence of sentences) {
+    if (sentence.length <= maxChars) {
+      pieces.push(sentence);
+      continue;
+    }
+    let rest = sentence;
+    while (rest.length > maxChars) {
+      let cut = -1;
+      for (const sep of ["，", ",", "、", "；", ";", " ", "—"]) {
+        const idx = rest.lastIndexOf(sep, maxChars);
+        if (idx > cut) cut = idx;
+      }
+      const take = cut > Math.floor(maxChars * 0.3) ? cut + 1 : maxChars;
+      pieces.push(rest.slice(0, take));
+      rest = rest.slice(take);
+    }
+    if (rest) pieces.push(rest);
+  }
   const chapters: ChapterInfo[] = [];
   let current = "";
-  for (const sentence of sentences) {
-    if (current && current.length + sentence.length > maxChars) {
+  for (const piece of pieces) {
+    if (current && current.length + piece.length > maxChars) {
       if (current.trim()) {
         chapters.push({ index: chapters.length, title: `第${chapters.length + 1}部分`, text: current.trim(), charCount: current.trim().length });
       }
       current = "";
     }
-    current += sentence;
+    current += piece;
   }
   if (current.trim()) {
     chapters.push({ index: chapters.length, title: `第${chapters.length + 1}部分`, text: current.trim(), charCount: current.trim().length });

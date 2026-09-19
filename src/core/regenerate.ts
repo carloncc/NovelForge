@@ -14,6 +14,7 @@ import { buildVoiceJobs, runVoiceJob } from "./voice";
 import { concurrencyFor } from "../stores/configMigration";
 import { tauri } from "../utils/tauri";
 import { updateAssetMap } from "./assetMap";
+import { cacheHit } from "./cache";
 import { dedupeSceneIdsAcrossChapters } from "./pipeline";
 
 /** 单个素材重生成的共享上下文 */
@@ -57,10 +58,6 @@ export interface RegenImageResult {
 
 function cacheRootFor(outputDir: string): string {
   return `${outputDir}/.novel2vn/cache`;
-}
-
-function metaDirFor(outputDir: string): string {
-  return `${outputDir}/.novel2vn`;
 }
 
 /** 把单个素材重新生成的结果合并进 assets.json，供「组装」阶段读取 */
@@ -133,10 +130,9 @@ export async function regenerateImages(
     if (t.refFromTask && !figureBase[t.refFromTask]) {
       const refTask = allTasks.find((candidate) => candidate.id === t.refFromTask);
       if (refTask) {
-        const cached = await tauri
-          .pathExists(`${cacheRoot}/images/${refTask.fileName}`)
-          .then((ok) => (ok ? `${cacheRoot}/images/${refTask.fileName}` : null))
-          .catch(() => null);
+        // B83：API 常回 jpeg/webp，参考图预填只查精确 .png 会漏掉已有依赖图。
+        // 改用 cacheHit 按 basename 匹配常见图片扩展名。
+        const cached = await cacheHit(`${cacheRoot}/images`, refTask.fileName).catch(() => null);
         if (cached) figureBase[t.refFromTask] = cached;
       }
     }
@@ -149,19 +145,36 @@ export async function regenerateImages(
   // 中断点之后的所有任务不再执行，"补全缺失"每次都剩下一批漏网。
   const failed: { id: string; usage: string }[] = [];
   // 每完成一张立即增量合并进 assets.json：批量重生成过程中素材页也能逐张看到新图。
-  // 用串行链防并发 read-modify-write 丢失（多 worker 同时合并会互相覆盖）。
+  // B68（重生成侧）：逐张 updateAssetMap 是全量读改写，批量重建上百张会写上百次；
+  // 改为 150ms 合并窗口批量写一次，同一窗口内完成的图共写一次。
+  // 语义保持：mergeIncremental 返回的 Promise 仍保证「包含这一张」的合并完成后才 resolve，
+  // onProgress 前先落盘的顺序不变（前端 onProgress 立即读 assets.json 仍能看到该张）。
+  const MERGE_COALESCE_MS = 150;
   let mergeChain: Promise<void> = Promise.resolve();
+  let mergeScheduled: Promise<void> | null = null;
+  const pendingMerges: RegenImageResult[] = [];
   const mergeIncremental = (r: RegenImageResult): Promise<void> => {
-    // .catch 防止单次映射写失败毒化整条链（否则后续所有合并被跳过、整批连带失败）
-    mergeChain = mergeChain.then(() => mergeAssetMap(ctx.outputDir, [r])).catch((e) => {
-      ctx.log({
-        step: "素材",
-        message: `素材映射合并失败（该张新图未入映射，可用「补全缺失图片」修复）：${String(e).slice(0, 120)}`,
-        level: "warn",
-        at: Date.now(),
+    pendingMerges.push(r);
+    if (!mergeScheduled) {
+      mergeScheduled = new Promise<void>((resolve) => {
+        setTimeout(resolve, MERGE_COALESCE_MS);
+      }).then(async () => {
+        mergeScheduled = null;
+        const batch = pendingMerges.splice(0, pendingMerges.length);
+        if (!batch.length) return;
+        // .catch 防止单次映射写失败毒化整条链（否则后续所有合并被跳过、整批连带失败）
+        mergeChain = mergeChain.then(() => mergeAssetMap(ctx.outputDir, batch)).catch((e) => {
+          ctx.log({
+            step: "素材",
+            message: `素材映射合并失败（该批新图未入映射，可用「补全缺失图片」修复）：${String(e).slice(0, 120)}`,
+            level: "warn",
+            at: Date.now(),
+          });
+        });
+        await mergeChain;
       });
-    });
-    return mergeChain;
+    }
+    return mergeScheduled;
   };
   // 图像并发封顶 8：避免配置的 30 并发打爆第三方图片服务触发 429
   const concurrency = Math.min(8, concurrencyFor(ctx.cfg, "image"));

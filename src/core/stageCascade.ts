@@ -65,7 +65,6 @@ export function statusImageTasks(
   options: GenerationOptions,
 ): ImageTask[] {
   return buildImageTasks(chapters, cards, {
-    figurePerCharacter: 1,
     cgPerChapter: options.cgPerChapter ?? 0,
     maxPerChapter: options.imageBudgetPerChapter ?? 0,
     figureEmotions: options.figureEmotions,
@@ -88,7 +87,7 @@ export function imageTaskHasAsset(task: ImageTask, assets: AssetMap | undefined)
 }
 
 /** 还缺多少张图（已命中的不计，用于级联前的费用确认） */
-export function missingImageTaskCount(
+function missingImageTaskCount(
   chapters: ChapterScript[],
   cards: ExtractionResult,
   options: GenerationOptions,
@@ -98,7 +97,7 @@ export function missingImageTaskCount(
 }
 
 /** 还缺多少句配音（无 TTS 配置或未启用配音时为 0） */
-export function missingVoiceJobCount(
+function missingVoiceJobCount(
   tts: ApiConfig | undefined,
   chapters: ChapterScript[],
   cards: ExtractionResult,

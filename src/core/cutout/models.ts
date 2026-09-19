@@ -3,7 +3,7 @@
  * 模型来自 rembg 官方 release，浏览器端用 onnxruntime-web 推理。
  */
 
-export const MODEL_RELEASES_BASE = "https://github.com/danielgatis/rembg/releases/download/v0.0.0";
+const MODEL_RELEASES_BASE = "https://github.com/danielgatis/rembg/releases/download/v0.0.0";
 
 export interface CutoutModel {
   id: string;

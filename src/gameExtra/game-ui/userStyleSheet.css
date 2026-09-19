@@ -10,7 +10,9 @@
   box-sizing: border-box;
 }
 
-/* 首屏落地页（点击进入） */
+/* 首屏落地页（点击进入）：Logo 尺寸 + 「点击开始」提示
+   （引擎硬编码英文文案；这里给中文默认值，project.ts 的 buildThemeCss 会按作品语言
+   追加同选择器的 content 覆盖：zh_CN/zh_TW/en/ja/ko，见 UI104） */
 .title-enter__initial-background {
   background: radial-gradient(
     120% 120% at 25% 0%,
@@ -20,13 +22,61 @@
   );
 }
 
+.title-enter-container__center-text > div {
+  color: transparent !important;
+  font-size: 0 !important;
+}
+
+.title-enter-container__center-text > div::after {
+  content: "点击任意处开始";
+  display: block;
+  font-size: 22px;
+  letter-spacing: 0.6em;
+  padding-left: 0.6em;
+  color: #e9e4ff;
+  text-shadow: 0 0 26px rgba(139, 92, 246, 0.6);
+  animation: nf-enter-pulse 2.6s ease-in-out infinite;
+}
+
+@keyframes nf-enter-pulse {
+  0%,
+  100% {
+    opacity: 0.72;
+  }
+
+  50% {
+    opacity: 1;
+  }
+}
+
+.title-enter-container img {
+  max-width: min(56vw, 680px);
+  max-height: 36vh;
+  object-fit: contain;
+  filter: drop-shadow(0 14px 44px rgba(0, 0, 0, 0.55));
+}
+
+/* 标题/入口页的 Logo 容器：引擎默认把它铺满全屏（背景图被拉伸成巨大字，且挡住全部点击，
+   导致点不进游戏）。固定为居中上方的合理尺寸，并放行点击。类名来自 WebGAL 4.6.3 编译产物。 */
+._Logo_main_1t2wi_1 {
+  width: min(58vw, 700px) !important;
+  height: min(24vh, 250px) !important;
+  top: 15vh !important;
+  left: 50% !important;
+  transform: translateX(-50%) !important;
+  background-size: contain !important;
+  background-repeat: no-repeat !important;
+  background-position: center !important;
+  pointer-events: none !important;
+}
+
 .title-enter__white-background {
   background: linear-gradient(
     165deg,
     rgba(20, 22, 40, 0.4) 0%,
     rgba(16, 18, 32, 1) 50%,
     rgba(20, 22, 40, 0.4) 100%
-  );
+  ) !important;
 }
 
 .title-enter-container__center-text > div {
@@ -58,13 +108,41 @@
   background: rgba(196, 181, 253, 0.6);
 }
 
-/* ---------- 快速操作栏（右下角） ---------- */
+/* ---------- 快速操作栏（右下角）：紧凑化 + 窄屏折行，避免 14 项挤成一行溢出 ---------- */
 ._main_rdjpk_1 {
   background: rgba(12, 14, 24, 0.55);
   -webkit-backdrop-filter: blur(10px);
   backdrop-filter: blur(10px);
   border: 1px solid rgba(255, 255, 255, 0.12);
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+  padding: 4px 8px;
+  border-radius: 14px;
+}
+
+._singleButton_rdjpk_42 {
+  padding: 6px 9px;
+  font-size: 12px;
+  border-radius: 9px;
+}
+
+@media (max-width: 1200px) {
+  ._main_rdjpk_1 {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    max-width: 74%;
+    row-gap: 2px;
+  }
+}
+
+@media (max-width: 780px) {
+  ._main_rdjpk_1 {
+    max-width: 92%;
+  }
+
+  ._singleButton_rdjpk_42 {
+    padding: 5px 7px;
+    font-size: 11px;
+  }
 }
 
 ._singleButton_rdjpk_42:hover,

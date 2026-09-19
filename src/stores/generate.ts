@@ -1,7 +1,7 @@
 import { computed, nextTick, ref, watch } from "vue";
 import { t } from "../i18n";
 import { open } from "@tauri-apps/plugin-dialog";
-import { projectState, pushLog, clearLogs, scheduleSave, restoreProject, flushPendingProjectSave, getStageLastLevels, getLastActiveStage } from "../stores/project";
+import { projectState, pushLog, clearLogs, scheduleSave, restoreProject, flushPendingProjectSave, getStageLastLevels, getLastActiveStage, resetActiveStage } from "../stores/project";
 import { readWorkingCards } from "../utils/persist";
 import { activeConfig, configState, addRecentOutputDir } from "../stores/config";
 import { upsertProject } from "../stores/projects";
@@ -12,6 +12,7 @@ import { tauri, isTauri } from "../utils/tauri";
 import { vfsWriteFileBase64 } from "../utils/vfsWeb";
 import { sanitizeId } from "../core/render";
 import { errMsg } from "../utils/errors";
+import { fileToBase64 } from "../utils/file";
 import { ERROR_CLASS_ICON, ERROR_CLASS_LABEL, classifyError } from "../utils/errorClassifier";
 import { cutoutErrorHint } from "../utils/cutoutErrorHint";
 import { log as logger, dumpLogHistory } from "../utils/logger";
@@ -56,6 +57,7 @@ import {
 import { emptyAssetMap, parseAssetMap, updateAssetMap, listAssetBackups, restoreAssetBackup } from "../core/assetMap";
 import { parseChapterScript } from "../core/dataValidation";
 import { scriptCacheFileName, scriptCacheRest, titleHash } from "../core/cache";
+import { mergeFailedTasks, mutateFailedTasks } from "../core/failedTasks";
 import {
   applySpeakerFix,
   deleteScriptLine,
@@ -183,6 +185,8 @@ const videoStatus = ref<Record<string, boolean>>({});
 const videoInput = ref<HTMLInputElement | null>(null);
 const videoImportTarget = ref<{ id: string; title: string } | null>(null);
 const copiedMsg = ref("");
+/** 提示条级别：保存失败等错误提示不能再用成功色显示 */
+const copiedMsgLevel = ref<"ok" | "err">("ok");
 const logPanelRef = ref<HTMLElement | null>(null);
 const LOG_RENDER_LIMIT = 300;
 const visibleLogs = computed(() => projectState.logs.slice(-LOG_RENDER_LIMIT));
@@ -205,10 +209,20 @@ const activeRunLabels = ref<string[]>([]);
 const activeStepIndexes = computed(() =>
   activeRunLabels.value.map((l) => PIPELINE_STEPS.indexOf(l)).filter((i) => i >= 0),
 );
+/** UI57：清空上一次运行的阶段标记。只在「下一次运行开始时」调用——
+ *  单阶段重跑结束不再在 finally 清空，否则结束后「跳过」标记立刻消失，看不出本次跑了哪些阶段。 */
+function clearRunLabels(): void {
+  activeRunLabels.value = [];
+  currentStep.value = -1;
+  failedSteps.value = [];
+}
 
 watch(
   () => projectState.logs.length,
   async () => {
+    // 追加前先记住用户是否在底部：向上翻阅历史日志时不能被新日志强行拽回底部
+    const panel = logPanelRef.value;
+    const wasAtBottom = !panel || panel.scrollHeight - panel.scrollTop - panel.clientHeight < 40;
     const last = projectState.logs[projectState.logs.length - 1];
     if (last) {
       const idx = PIPELINE_STEPS.indexOf(last.step);
@@ -219,7 +233,7 @@ watch(
       if (last.progress && inRun) liveProgress.value = { step: last.step, ...last.progress };
     }
     await nextTick();
-    if (logPanelRef.value) logPanelRef.value.scrollTop = logPanelRef.value.scrollHeight;
+    if (wasAtBottom && logPanelRef.value) logPanelRef.value.scrollTop = logPanelRef.value.scrollHeight;
   },
 );
 
@@ -576,7 +590,22 @@ let queueToken = 0;
  * 这期间用户再点一次会二次进入、两个循环互相把对方停掉。
  */
 function claimQueue(): number | null {
-  if (busy.value || queueRunning.value || assetBusy.value) return null;
+  // B37：抢占失败必须明确反馈——调用方此前只静默 return，用户点完确认后毫无反应。
+  if (busy.value) {
+    error.value = "队列未启动：已有生成任务正在运行，请等它完成或先点「停止」再试";
+    pushLog({ step: "单章", message: error.value, level: "warn", at: Date.now() });
+    return null;
+  }
+  if (queueRunning.value) {
+    error.value = "队列未启动：已有一条逐章队列正在运行（如需重开请先点「停止队列」）";
+    pushLog({ step: "单章", message: error.value, level: "warn", at: Date.now() });
+    return null;
+  }
+  if (assetBusy.value) {
+    error.value = `队列未启动：素材任务（${assetBusy.value}）正在运行，请等它完成或先点「停止」再试`;
+    pushLog({ step: "单章", message: error.value, level: "warn", at: Date.now() });
+    return null;
+  }
   queueRunning.value = true;
   return ++queueToken;
 }
@@ -651,7 +680,9 @@ async function runChapterBatchInner(indices: number[]): Promise<void> {
     at: Date.now(),
   });
   for (const ch of targets) {
-    if (!queueRunning.value) {
+    // B27：停止请求（stopping）一并作为退出条件——不再预先置 queueRunning=false，
+    // 队列要等当前在途章节真正结束才退出（侧栏「正在停止…」保持可见）。
+    if (!queueRunning.value || stopping.value) {
       stoppedAt = ch.title;
       break;
     }
@@ -670,9 +701,15 @@ async function runChapterBatchInner(indices: number[]): Promise<void> {
   // 有章节失败/中途停止时不组装——残缺的章节集会覆盖游戏目录、把未完成章节的旧场景删掉；
   // 保留旧预览更安全，补齐后点「组装」刷新即可。
   if (targets.length > 0 && done >= targets.length) {
-    const assembled = await execute({ stages: ["assemble"], fromQueue: true, clearLogsFirst: false });
-    if (!assembled) {
-      pushLog({ step: "单章", message: "队列完成，但重新组装未完成（预览可能未包含最新章节），可稍后手动点「组装」刷新", level: "warn", at: Date.now() });
+    // B26：用户已停止时不得再派发收尾组装（停止的语义就是不再派发新任务）；
+    // 停止发生在最后一章刚跑完的竞态下 done 可能已等于总数，必须再查一次停止状态。
+    if (stopping.value || !queueRunning.value) {
+      pushLog({ step: "单章", message: "队列已停止：跳过收尾组装（已完成的章节内容保留），可稍后手动点「组装」刷新预览", level: "warn", at: Date.now() });
+    } else {
+      const assembled = await execute({ stages: ["assemble"], fromQueue: true, clearLogsFirst: false });
+      if (!assembled) {
+        pushLog({ step: "单章", message: "队列完成，但重新组装未完成（预览可能未包含最新章节），可稍后手动点「组装」刷新", level: "warn", at: Date.now() });
+      }
     }
   } else if (done > 0) {
     pushLog({
@@ -748,11 +785,14 @@ async function runChapterQueue(): Promise<void> {
 }
 
 function stopChapterQueue(): void {
-  queueRunning.value = false;
   pipelineRef.value?.abort();
   // 与顶部「停止」同口径：素材重生成信号一起掐掉，并让按钮进入「正在停止…」态
   regenAbort.value = true;
   stopping.value = true;
+  // B27：不再预先置 queueRunning=false。queueRunning 由队列循环退出时的 releaseQueue 置位，
+  // 「正在停止…」才会保持到真正的在途任务结束（否则 watch 立刻复位，UI 误以为已停完）。
+  // 循环退出条件同时检查 stopping（见 runChapterBatchInner）。
+  pendingStop = true;
   pushLog({ step: "单章", message: "用户停止队列：当前章节完成后即停，已完成的章节下次自动跳过", level: "warn", at: Date.now() });
   pushLog({
     step: "单章",
@@ -782,7 +822,7 @@ watch(
   () => void stageStatus.refresh(),
   { deep: true },
 );
-// 图像/配音相关选项与 API Key 变化会改变「完成」口径（任务数、是否可生成），
+// 图像/配音相关选项、语言与画风/文风配置变化会改变「完成」口径（任务数、缓存指纹、是否可生成），
 // 必须刷新看板与章节灯，否则切换开关后仍显示旧的完成状态/假的缺失数字
 watch(
   () => [
@@ -794,6 +834,10 @@ watch(
     projectState.options.styleAnchor,
     projectState.options.imageBudgetPerChapter,
     projectState.options.cgPerChapter,
+    // B29：语言影响翻译感知的剧本/章节指纹；scriptStyle 决定剧本缓存指纹；imageStyle 影响图像任务口径
+    projectState.options.language,
+    projectState.options.scriptStyle,
+    projectState.options.imageStyle,
     activeConfig("image")?.apiKey,
     activeConfig("tts")?.apiKey,
     activeConfig("llm")?.apiKey,
@@ -809,18 +853,6 @@ void stageStatus.refresh();
 const styleRefSrc = ref("");
 const styleRecognizing = ref(false);
 const styleRefInput = ref<HTMLInputElement | null>(null);
-
-function fileToBase64(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = String(reader.result ?? "");
-      resolve(result.includes(",") ? result.split(",")[1] : result);
-    };
-    reader.onerror = () => reject(new Error("文件读取失败"));
-    reader.readAsDataURL(file);
-  });
-}
 
 async function pickStyleRef(): Promise<void> {
   if (!isTauri()) {
@@ -937,8 +969,18 @@ const preview = ref<{ path: string; label: string } | null>(null);
 const regenAbort = ref(false);
 /** 已点「停止」但仍有在途请求：按钮转「正在停止…」并禁用，任务全部结束后自动复位 */
 const stopping = ref(false);
+/** 已发出停止请求（B27）：stopping 只能由「实际在途任务归零」复位，不能因某个标志抢先置 false 而瞬时消失 */
+let pendingStop = false;
 watch([busy, assetBusy, queueRunning, stopping], () => {
-  if (!busy.value && !assetBusy.value && !queueRunning.value) stopping.value = false;
+  // B27：只有 busy/assetBusy/queueRunning 全部归零（真正的在途任务结束）才复位 stopping。
+  // stopChapterQueue 不再预先置 queueRunning=false，所以这里不会在章节还在跑时误复位。
+  if (!busy.value && !assetBusy.value && !queueRunning.value) {
+    if (pendingStop) {
+      pendingStop = false;
+      pushLog({ step: "中止", message: "已停止：在途任务已结束，已生成的内容保留", level: "info", at: Date.now() });
+    }
+    stopping.value = false;
+  }
   runStatusSync(busy.value, assetBusy.value, queueRunning.value, stopping.value);
 });
 const regenProgress = ref<{ done: number; total: number; label: string } | null>(null);
@@ -1598,11 +1640,10 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
   if (opts.clearLogsFirst) {
     clearLogs();
   }
-  // 本次运行的阶段门控＋指示器无条件重置：单阶段重跑不再点亮无关阶段，
-  // 缓存复用日志也不再叠加到上次的进度上
+  // 本次运行的阶段门控＋指示器无条件重置（UI57：上次运行结束不清空，从这里开始才清）：
+  // 单阶段重跑不再点亮无关阶段，缓存复用日志也不再叠加到上次的进度上
+  clearRunLabels();
   activeRunLabels.value = opts.stages.map((s) => STAGE_LABELS[s]);
-  currentStep.value = -1;
-  failedSteps.value = [];
   liveProgress.value = null;
   if (projectState.options.skipCache && opts.stages.some((s) => s !== "assemble")) {
     pushLog({
@@ -1612,6 +1653,8 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
       at: Date.now(),
     });
   }
+  // B36：运行开始时重置「最近活跃阶段」——否则置 busy 的瞬间看板会把上一轮的阶段显示成「进行中」
+  resetActiveStage();
   busy.value = true;
   projectState.running = true;
   // 本次运行的失败任务从这里重新累计（旧值只用于展示上一轮，不能污染本轮的成功/失败判定）
@@ -1685,6 +1728,17 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
     startAssetLiveRefresh();
     const prevResult = projectState.lastResult;
     const result = await pipeline.run();
+    // B13：pipeline 返回的 splitChapters 是含每章正文的完整 ChapterInfo（整本正文的又一份引用）。
+    // 先留完整引用用于更新 novel.chapters；result 上只保留轻量元数据再常驻 lastResult
+    //（正文已完整保存在 novel.chapters 与 split.json），避免整本正文在 lastResult 中再驻留一份。
+    const fullSplitChapters = result.splitChapters;
+    if (fullSplitChapters?.length) {
+      result.splitChapters = fullSplitChapters.map((c) => ({
+        index: c.index,
+        title: c.title,
+        charCount: c.charCount ?? c.text?.length ?? 0,
+      })) as typeof result.splitChapters;
+    }
     stopAssetLiveRefresh();
     await loadAssetMapNow(true);
     // 不含剧本阶段的运行产不出新剧本：若管线返回空剧本，保留旧剧本用于展示
@@ -1711,8 +1765,8 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
         count: result.splitChapters?.length ?? projectState.novel?.chapters.length ?? 0,
       };
     }
-    if (result.splitChapters?.length && projectState.novel) {
-      const split = result.splitChapters;
+    if (fullSplitChapters?.length && projectState.novel) {
+      const split = fullSplitChapters;
       const wasMerged = projectState.novel.chapters.length <= 1 && projectState.novel.chapters[0]?.title === "全文";
       if (wasMerged || split.length > 1) {
         const beforeSig = projectState.novel.chapters.map((c) => c.title).join("|");
@@ -1739,7 +1793,7 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
       await checkVideos();
       await loadAssetMapNow(true);
     }
-    if (opts.clearLogsFirst) tab.value = "cards";
+    // 完成后不再自动切换结果标签（进度与日志已在主页面常驻，产物抽屉保持收起不打扰）
     log({ step: "完成", message: `全部完成！项目输出到 ${result.meta.outputDir}，可前往「预览」页试玩`, level: "success", at: Date.now() });
     return true;
   } catch (e) {
@@ -1763,7 +1817,8 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
     busy.value = false;
     projectState.running = false;
     pipelineRef.value = null;
-    activeRunLabels.value = [];
+    // UI57：此处不清空 activeRunLabels——本次运行的阶段标记（含「跳过」）保留到下一次运行开始，
+    // 由 execute 开头的 clearRunLabels() 统一清掉。
     void stageStatus.refresh();
     void chapterStatus.refresh();
     // 运行日志自动落盘（含失败/中止）：下次出事先看 .novel2vn/logs/run-*.log
@@ -2052,7 +2107,7 @@ function runStageRegen(stage: StageKey): void {
         forceStages: ["split"],
         rerunChapters: null,
       }).then((ok) => {
-        if (ok) {           if (ok) { clearFb(); stageForce.value[stage] = false; } stageForce.value[stage] = false; }
+        if (ok) { clearFb(); stageForce.value[stage] = false; }
         void afterStage(ok, "split", () => hintDownstreamStale("分章", "翻译 / 提取 / 剧本 / 图像 / 配音"));
       });
       break;
@@ -2067,7 +2122,7 @@ function runStageRegen(stage: StageKey): void {
         forceStages: force,
         rerunChapters: null,
       }).then((ok) => {
-        if (ok) {           if (ok) { clearFb(); stageForce.value[stage] = false; } stageForce.value[stage] = false; }
+        if (ok) { clearFb(); stageForce.value[stage] = false; }
         void afterStage(ok, "translate", () => {
           if (full) hintDownstreamStale("翻译", "提取 / 剧本 / 图像 / 配音");
         });
@@ -2083,7 +2138,7 @@ function runStageRegen(stage: StageKey): void {
         forceStages: full ? (["extract"] as StageKey[]) : undefined,
         rerunChapters: null,
       }).then((ok) => {
-        if (ok) {           if (ok) { clearFb(); stageForce.value[stage] = false; } stageForce.value[stage] = false; }
+        if (ok) { clearFb(); stageForce.value[stage] = false; }
         void afterStage(ok, "extract", () => {
           if (full) hintDownstreamStale("提取", "剧本 / 图像 / 配音");
         });
@@ -2099,21 +2154,21 @@ function runStageRegen(stage: StageKey): void {
         const fbMap: Record<number, string> = {};
         if (fb) for (const c of projectState.novel?.chapters ?? []) fbMap[c.index] = fb;
         void execute({ stages, feedback: fb ? { script: fbMap } : undefined, forceStages: ["script"], rerunChapters: null }).then((ok) => {
-          if (ok) {           if (ok) { clearFb(); stageForce.value[stage] = false; } stageForce.value[stage] = false; }
+          if (ok) { clearFb(); stageForce.value[stage] = false; }
           void loadScripts();
           void afterStage(ok, "script", () => hintDownstreamStale("剧本", "图像 / 配音"));
         });
       } else if (failedChapters.length) {
         // 只重生成失败章节，其余复用缓存
         void execute({ stages, rerunChapters: failedChapters }).then((ok) => {
-          if (ok) {           if (ok) { clearFb(); stageForce.value[stage] = false; } stageForce.value[stage] = false; }
+          if (ok) { clearFb(); stageForce.value[stage] = false; }
           void loadScripts();
           void afterStage(ok, "script", () => hintDownstreamStale("剧本", "图像 / 配音"));
         });
       } else {
         // 「继续」：全部章节复用缓存，缺缓存的补生成，不整批重写（避免白烧 LLM 费用）
         void execute({ stages, rerunChapters: null }).then((ok) => {
-          if (ok) {           if (ok) { clearFb(); stageForce.value[stage] = false; } stageForce.value[stage] = false; }
+          if (ok) { clearFb(); stageForce.value[stage] = false; }
           void loadScripts();
           void afterStage(ok, "script", () => hintDownstreamStale("剧本", "图像 / 配音"));
         });
@@ -2130,7 +2185,7 @@ function runStageRegen(stage: StageKey): void {
         feedback: feedback as StageFeedback | undefined,
         forceStages: force,
       }).then((ok) => {
-        if (ok) {           if (ok) { clearFb(); stageForce.value[stage] = false; } stageForce.value[stage] = false; }
+        if (ok) { clearFb(); stageForce.value[stage] = false; }
         void afterStage(ok, "image", () => {
           pushLog({
             step: "图像",
@@ -2147,7 +2202,7 @@ function runStageRegen(stage: StageKey): void {
       // 跑完自动补齐下游（并重新组装刷新预览，组装免费）
       const force = full ? (["voice"] as StageKey[]) : undefined;
       void execute({ stages: ["voice"], feedback: feedback as StageFeedback | undefined, forceStages: force }).then((ok) => {
-        if (ok) {           if (ok) { clearFb(); stageForce.value[stage] = false; } stageForce.value[stage] = false; }
+        if (ok) { clearFb(); stageForce.value[stage] = false; }
         void afterStage(ok, "voice", () => {
           pushLog({
             step: "配音",
@@ -2230,7 +2285,8 @@ async function runChapterFullRegen(novelIdx: number, opts?: { fromQueueBatch?: b
     rerunChapters: [novelIdx],
     rerunChaptersForce: forceAll ? [novelIdx] : undefined,
     requireFullScriptCoverage: true,
-    fromQueue: true,
+    // 仅队列批次入口允许在 queueRunning 期间执行；章节盘/剧本页直接调用必须走互斥守卫
+    fromQueue: opts?.fromQueueBatch === true,
   });
   // 本次运行的失败项（成功返回也可能带部分失败：本章剧本失败 / 若干张图失败）
   const runFailures = lastRunFailedTasks.value;
@@ -2354,7 +2410,6 @@ async function runChapterPartRegen(novelIdx: number, part: "script" | "image" | 
     stages: [],
     rerunChapters: [novelIdx],
     requireFullScriptCoverage: true,
-    fromQueue: true,
   };
   if (part === "script") {
     // 只重写本章剧本：不传 rerunChaptersForce（那是「整章全量」），改传 forceScriptChapters，
@@ -2572,11 +2627,10 @@ async function runAppend(tailRaw: string, label: string): Promise<void> {
     requireFullScriptCoverage: true,
   });
   if (ok) {
-    // 更新内存小说：全文拼接 + 分章以管线返回为准；追加文件路径记入 sourcePaths 以便重启后恢复
+    // 更新内存小说：全文拼接；章节由 execute 按本次分章的完整数据（含正文）写入 novel.chapters，
+    // 这里不再从 lastResult.splitChapters 覆盖——B13 后它只剩轻量元数据（无 text），覆盖会丢正文。
     const newFull = joinAppendText(novel.fullText, tail);
-    const splitChapters = projectState.lastResult?.splitChapters;
     novel.fullText = newFull;
-    if (splitChapters?.length) novel.chapters = splitChapters;
     if (/^[a-zA-Z]:[\\/]/.test(label) || label.startsWith("/")) {
       const paths = novel.sourcePaths?.length ? [...novel.sourcePaths] : (novel.sourcePath ? [novel.sourcePath] : []);
       if (!paths.includes(label)) paths.push(label);
@@ -2695,10 +2749,21 @@ async function afterAssetRegen(label: string, resultsLength: number, stats?: Reg
   const failedList = stats?.failedTasks ?? [];
   if (failedList.length) {
     const at = Date.now();
-    lastRunFailedTasks.value = [
-      ...lastRunFailedTasks.value,
-      ...failedList.map((ft) => ({ id: ft.id, kind: "image" as const, step: "图像", message: `${ft.usage}：重生成失败`, at })),
-    ];
+    const incoming: FailedTask[] = failedList.map((ft) => ({
+      id: ft.id,
+      kind: "image" as const,
+      step: "图像",
+      message: `${ft.usage}：重生成失败`,
+      at,
+    }));
+    // 去重（同身份保留最新）并落盘：只写内存的话刷新/重启就丢，失败项列表与徽标也会重复膨胀
+    lastRunFailedTasks.value = mergeFailedTasks(lastRunFailedTasks.value, incoming);
+    const persisted = projectState.lastResult?.failedTasks;
+    if (persisted) projectState.lastResult!.failedTasks = mergeFailedTasks(persisted, incoming);
+    if (projectState.outputDir) {
+      void mutateFailedTasks(projectState.outputDir, (prev) => mergeFailedTasks(prev, incoming)).catch(() => undefined);
+    }
+    scheduleSave();
   }
   const detail = aborted
     ? `已中断：成功 ${resultsLength} 项${failedCount ? `、失败 ${failedCount} 项` : ""}`
@@ -3290,6 +3355,17 @@ async function loadProjectState(): Promise<void> {
 }
 
 /**
+ * B28：结构同步的增量清单。轮询节拍每 2s 一次，旧实现每次都把全部剧本缓存读盘 + JSON.parse，
+ * 100 章规模下会持续占用主线程。现改为：文件名+大小清单未变直接跳过；只有新增/大小变化的文件
+ * 才读盘解析，解析结果按文件名缓存复用（同一对象进 lastResult，不再整本反复解析驻留）。
+ * 注：FsEntry 没有 mtime，用 size 近似「修改」检测（同一文件大小不变的重写无法感知，脚本缓存极少出现）。
+ */
+let liveShapeDir = "";
+let liveShapeManifestKey = "";
+const liveShapeFileSizes = new Map<string, number>();
+const liveShapeScriptCache = new Map<string, ChapterScript>();
+
+/**
  * 生成期间让素材页有可用的结构（lastResult 缺 chapters/cards 时从磁盘补上）。
  * 只读磁盘，不覆盖 projectState.options/novel 等运行态，避免影响本次生成参数。
  * 目的：图片每生成一张（assets.json 增量写入）就能在素材页即时显示，无需等整批生成完。
@@ -3307,11 +3383,18 @@ async function ensureLiveResultShape(outputDir: string): Promise<void> {
       tauri.pathExists(`${outputDir}/.novel2vn/cards_demo.json`).catch(() => false),
       tauri.pathExists(`${outputDir}/.novel2vn/meta.json`).catch(() => false),
     ]);
-    const entries = await tauri.listDir(`${outputDir}/.novel2vn/cache`).catch(() => [] as { name: string; path: string; isDir: boolean }[]);
+    const entries = await tauri.listDir(`${outputDir}/.novel2vn/cache`).catch(() => [] as { name: string; path: string; isDir: boolean; size: number }[]);
     const files = entries
       .filter((e) => !e.isDir && /^script(_demo)?_ch\d+_/.test(e.name))
       .sort((a, b) => a.name.localeCompare(b.name));
     if (!hasCardsFile && !hasDemoCardsFile && !hasMeta && !files.length) return;
+    // 换项目：增量清单与解析缓存都属于旧目录，直接清空
+    if (liveShapeDir !== outputDir) {
+      liveShapeDir = outputDir;
+      liveShapeManifestKey = "";
+      liveShapeFileSizes.clear();
+      liveShapeScriptCache.clear();
+    }
     if (!projectState.lastResult) {
       projectState.lastResult = {
         meta: {
@@ -3337,18 +3420,39 @@ async function ensureLiveResultShape(outputDir: string): Promise<void> {
       const cards = await readWorkingCards(outputDir);
       if (cards) projectState.lastResult.cards = cards;
     }
-    if (files.length) {
-      const chapters: import("../core/types").ChapterScript[] = [];
-      for (const f of files) {
-        try {
-          const { text } = await tauri.readTextFile(f.path);
-          const sc = parseChapterScript(JSON.parse(text));
-          chapters[sc.chapter] = sc;
-        } catch {
-          /* 跳过损坏缓存 */
-        }
+    if (!files.length) return;
+    // 文件名+大小清单未变 → 无新增/修改，直接跳过：不读盘、不解析、不替换数组。
+    // Tauri/web 的 listDir 都带真实 size；Node 兜底（测试/脚本）恒为 0，此时无法感知修改，
+    // 退回旧的全量读盘行为，保证正确性（生产环境仍是增量）。
+    const sizesKnown = files.some((f) => f.size > 0);
+    const manifestKey = sizesKnown ? files.map((f) => `${f.name}:${f.size}`).join("|") : "";
+    if (sizesKnown && manifestKey === liveShapeManifestKey) return;
+    liveShapeManifestKey = manifestKey;
+    // 只读新增/大小变化的文件；已处理过的按大小跳过（解析失败的也记录大小，避免每 2s 反复重读）
+    for (const f of files) {
+      if (sizesKnown && liveShapeFileSizes.get(f.name) === f.size) continue;
+      liveShapeFileSizes.set(f.name, f.size);
+      try {
+        const { text } = await tauri.readTextFile(f.path);
+        liveShapeScriptCache.set(f.name, parseChapterScript(JSON.parse(text)));
+      } catch {
+        liveShapeScriptCache.delete(f.name);
       }
-      projectState.lastResult.chapters = chapters.filter(Boolean);
+    }
+    // 已消失文件的缓存与大小记录一起清掉
+    const namesNow = new Set(files.map((f) => f.name));
+    for (const name of [...liveShapeScriptCache.keys()]) if (!namesNow.has(name)) liveShapeScriptCache.delete(name);
+    for (const name of [...liveShapeFileSizes.keys()]) if (!namesNow.has(name)) liveShapeFileSizes.delete(name);
+    // 重建章节数组：按文件名升序覆盖（同章多缓存时字典序靠后者胜，与旧实现 chapters[sc.chapter]=sc 一致）
+    const byChapter = new Map<number, ChapterScript>();
+    for (const f of files) {
+      const sc = liveShapeScriptCache.get(f.name);
+      if (sc) byChapter.set(sc.chapter, sc);
+    }
+    const chapters = [...byChapter.values()].sort((a, b) => a.chapter - b.chapter);
+    // 全部缓存都解析失败时不清空已有章节（保留旧结构比清空安全）
+    if (chapters.length || projectState.lastResult.chapters.length === 0) {
+      projectState.lastResult.chapters = chapters;
     }
   } catch {
     /* 恢复失败不阻断生成 */
@@ -3706,7 +3810,8 @@ async function copyText(text: string, label: string): Promise<void> {
 
 /** 统一提示条计时：多个写入点各起一个 setTimeout 会互相提前清掉彼此的消息 */
 let copiedMsgTimer: number | undefined;
-function flashCopied(msg: string, ms = 2000): void {
+function flashCopied(msg: string, ms = 2000, level: "ok" | "err" = "ok"): void {
+  copiedMsgLevel.value = level;
   copiedMsg.value = msg;
   if (copiedMsgTimer !== undefined) window.clearTimeout(copiedMsgTimer);
   copiedMsgTimer = window.setTimeout(() => {
@@ -3744,7 +3849,7 @@ async function saveLogs(): Promise<void> {
     logger.info("page", "日志已保存", { path });
     flashCopied(`日志已保存：${path}`, 3000);
   } catch (e) {
-    flashCopied(`保存失败：${errMsg(e)}`, 3000);
+    flashCopied(`保存失败：${errMsg(e)}`, 3000, "err");
   }
 }
 
@@ -3799,6 +3904,15 @@ async function retryFailedTask(f: FailedTask): Promise<void> {
       const p = await regenerateVoiceLine(ctx, key, () => regenAbort.value);
       pushLog({ step: "素材", message: p ? `配音重试成功：${key}` : `配音重试失败：${key}（可稍后再试）`, level: p ? "success" : "warn", at: Date.now() });
       if (p) {
+        // 重试成功必须销账：内存列表 + 项目状态 + failed.json 三处同步，否则徽标不清零、重启后失败项复活
+        const sameTask = (x: FailedTask): boolean => x.id === f.id && x.kind === f.kind && x.step === f.step && x.message === f.message;
+        lastRunFailedTasks.value = lastRunFailedTasks.value.filter((x) => !sameTask(x));
+        const persisted = projectState.lastResult?.failedTasks;
+        if (persisted) projectState.lastResult!.failedTasks = persisted.filter((x) => !sameTask(x));
+        if (projectState.outputDir) {
+          void mutateFailedTasks(projectState.outputDir, (prev) => prev.filter((x) => !sameTask(x))).catch(() => undefined);
+        }
+        scheduleSave();
         assetBusy.value = "";
         await execute({ stages: ["assemble"] });
       }
@@ -3832,10 +3946,15 @@ async function retryFailedTask(f: FailedTask): Promise<void> {
       );
       await afterAssetRegen("失败项重试", results.length, stats);
       if (results.length && stats.failed === 0) {
-        // 重试成功：从失败项（内存 + 持久化列表）移除该条，徽标/列表即时收敛
-        lastRunFailedTasks.value = lastRunFailedTasks.value.filter((x) => x.id !== f.id);
+        // 重试成功：按「id+kind+step+message（含用途前缀）」精确销账——
+        // 只按 id 会连带删掉同 scene.id 的另一条用途失败（bg/cg 同名）；同时同步 failed.json
+        const sameTask = (x: FailedTask): boolean => x.id === f.id && x.kind === f.kind && x.step === f.step && x.message === f.message;
+        lastRunFailedTasks.value = lastRunFailedTasks.value.filter((x) => !sameTask(x));
         const persisted = projectState.lastResult?.failedTasks;
-        if (persisted) projectState.lastResult!.failedTasks = persisted.filter((x) => x.id !== f.id);
+        if (persisted) projectState.lastResult!.failedTasks = persisted.filter((x) => !sameTask(x));
+        if (projectState.outputDir) {
+          void mutateFailedTasks(projectState.outputDir, (prev) => prev.filter((x) => !sameTask(x))).catch(() => undefined);
+        }
         scheduleSave();
       }
     } catch (e) {
@@ -3864,6 +3983,12 @@ watch(
     scriptChapterFeedback.value = {};
     chapterForce.value = {};
     rerunChapters.value = null;
+    // 阶段意见/全量开关/待批准续跑计划/分章意见同样与旧项目绑定：
+    // 不清会把 A 项目的续跑计划与全量重跑范围带到 B 项目上（静默按错误范围付费重跑）
+    stageFeedback.value = {};
+    stageForce.value = {};
+    splitOpinion.value = "";
+    clearPendingResume();
   },
 );
 
@@ -3913,6 +4038,8 @@ function stop(): void {
   regenAbort.value = true;
   queueRunning.value = false;
   stopping.value = true;
+  // B27：记录停止请求，由「在途任务归零」的 watch 统一复位 stopping 并输出「已停止」日志
+  pendingStop = true;
   pushLog({ step: "中止", message: t("用户请求中止，当前任务完成后将停止"), level: "warn", at: Date.now() });
   // 说清「停止」的确切语义：协作式中止，不是把已发出的 HTTP 请求掐断
   pushLog({
@@ -3930,6 +4057,10 @@ function onCardsSaved(cards: unknown): void {
     projectState.lastResult.cards = cards as never;
   }
   scheduleSave();
+  // B29：卡片（角色/物品数量与 id）直接决定图像/配音任务口径与章节灯，保存后必须刷新，
+  // 否则卡片页改了角色，看板与章节盘仍按旧卡片显示完成/缺失。
+  void stageStatus.refresh();
+  void chapterStatus.refresh();
 }
 
 function fileExistsLabel(file: string | undefined): string {
@@ -3958,6 +4089,7 @@ export const generateStore = {
   videoInput,
   videoImportTarget,
   copiedMsg,
+  copiedMsgLevel,
   logPanelRef,
   LOG_RENDER_LIMIT,
   visibleLogs,
@@ -3967,6 +4099,7 @@ export const generateStore = {
   failedSteps,
   liveProgress,
   activeRunLabels,
+  clearRunLabels,
   activeStepIndexes,
   livePct,
   costText,

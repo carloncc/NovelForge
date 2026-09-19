@@ -1,7 +1,10 @@
+/* 说明（UI109）：本文件尺寸沿用 2560×1440 设计像素。引擎 index.html 会把 #root
+   整体 transform: scale(...) 缩放到任意窗口，px 在设计坐标系里已是分辨率无关；
+   若改用 vw/vh（基于真实视口）反而会与缩放坐标系叠加导致错位，故不做单位替换。 */
 .TextBox_main {
   z-index: 3;
   position: absolute;
-  min-height: 430px;
+  min-height: 320px;
   max-height: 430px;
   background-blend-mode: darken;
   border-radius: 20px;
@@ -88,7 +91,8 @@
 }
 
 .TextBox_showName {
-  font-size: 105% !important;
+  /* 引擎内联名字字号为 200%（正文约 205%），旧实现用 105% 硬压导致名字比台词小一半 */
+  font-size: 185% !important;
   font-weight: 700;
   letter-spacing: 0.1em;
   padding: 0 1.6em;
@@ -167,11 +171,14 @@
 }
 
 .text {
-  /* 允许长台词在文本框内换行显示完整，而不是被裁剪在画面外 */
-  overflow: visible !important;
+  /* UI99：引擎内联样式本就设 overflow:hidden，旧实现用 visible !important 打开溢出，
+     导致长台词盖出对话框。改回 hidden，配合渲染层长台词按 `|` 分段（render.ts paginateForTextBox）
+     与 config 的 Max_line 行数上限，从根上避免超长文本溢出。 */
+  overflow: hidden !important;
   white-space: pre-wrap;
   word-break: break-word;
-  line-height: 1.75 !important;
+  /* 行高与 config 的 Line_height:1.6 对齐（旧值 1.75 偏松，长台词更容易顶出文本框） */
+  line-height: 1.6 !important;
   width: 100%;
   flex: 1;
   align-self: stretch;

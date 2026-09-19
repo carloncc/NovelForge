@@ -6,6 +6,10 @@
 
 /* ===== Design Tokens v3 ===== */
 :root {
+  /* UI33：应用只维护浅色配色，显式声明色板可锁住原生控件/滚动条为浅色，
+     避免系统深色模式下 UA 控件与浅色页面混搭（完整深色主题不在本次低风险范围内） */
+  color-scheme: light;
+
   /* 间距系统 4/8/12/16/24/32/48/64 */
   --space-1: 4px;
   --space-2: 8px;
@@ -25,26 +29,36 @@
   --border-strong: #d6ceeb;
   --text: #111827;
   --text-dim: #4b5563;
-  --text-faint: #9ca3af;
+  /* 旧值 #9ca3af 在浅底上仅 2.3–2.5:1：placeholder、日志时间、缩略图标签等继承处全部不达标，统一提深 */
+  --text-faint: #6b7280;
   --primary: #6d28d9;
   --primary-2: #6366f1;
   --primary-soft: #f3eefe;
-  --accent: #ec4899;
-  --ok: #059669;
+  /* 语义色在各自 soft 底上的对比度此前只有 2.9–3.8:1：按 AA 只加深文字色，soft 底不变以维持风格 */
+  --accent: #be185d;
+  --ok: #047857;
   --ok-soft: rgba(5, 150, 105, 0.1);
-  --warn: #d97706;
+  --warn: #b45309;
   --warn-soft: rgba(217, 119, 6, 0.1);
-  --err: #dc2626;
+  --err: #b91c1c;
   --err-soft: rgba(220, 38, 38, 0.1);
   --info-soft: rgba(109, 40, 217, 0.08);
+  /* UI38：日志底与语义色描边收敛为令牌（此前 .log-panel/.cutout-status/.vb-banner 等
+     直接硬编码 #fbf9ff、rgba(46,125,50)、rgba(88,101,242) 等，与令牌色系不一致） */
+  --bg-log: #fbf9ff;
+  --primary-border: rgba(109, 40, 217, 0.35);
+  /* UI43：完成态边框需要可见描边，原先复用 10% 透明度的 --ok-soft 当边框几乎看不见 */
+  --ok-border: rgba(5, 150, 105, 0.45);
+  --warn-border: rgba(217, 119, 6, 0.28);
+  --err-border: rgba(220, 38, 38, 0.35);
 
   /* 阴影三层 */
   --shadow-rest: 0 1px 2px rgba(17, 24, 39, 0.05), 0 1px 3px rgba(17, 24, 39, 0.04);
   --shadow-hover: 0 4px 16px rgba(109, 40, 217, 0.1), 0 8px 28px rgba(109, 40, 217, 0.08);
   --shadow-active: 0 2px 8px rgba(109, 40, 217, 0.16);
 
-  /* 渐变（全站仅 3 处：logo/主按钮/激活态） */
-  --gradient: linear-gradient(135deg, #7c3aed, #6366f1);
+  /* 渐变（全站仅 3 处：logo/主按钮/激活态）；右端由 #6366f1 加深，白字对比度 4.47→6.2:1 */
+  --gradient: linear-gradient(135deg, #7c3aed, #4f46e5);
   --gradient-hot: linear-gradient(135deg, #7c3aed, #ec4899);
 
   /* 圆角 */
@@ -78,8 +92,14 @@ body,
 body {
   background: var(--bg);
   color: var(--text);
-  font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei",
-    "Noto Sans CJK SC", "Noto Sans SC", "Source Han Sans SC",
+  /* UI17：日/韩字体插在 "Microsoft YaHei" 之前、"PingFang SC" 之后：
+     macOS 中文仍先命中 PingFang SC（日/韩字形不重合，不破坏中文优先级）；
+     Windows 无 PingFang，日文界面由 Yu Gothic UI/Meiryo 命中、韩文由 Malgun Gothic 命中，
+     避免被中文的 Microsoft YaHei 抢先；Apple SD Gothic Neo 兜底 macOS 韩文 */
+  font-family: -apple-system, "Segoe UI", "PingFang SC",
+    "Yu Gothic UI", "Meiryo", "Noto Sans JP",
+    "Malgun Gothic", "Noto Sans KR", "Apple SD Gothic Neo",
+    "Microsoft YaHei", "Noto Sans CJK SC", "Noto Sans SC", "Source Han Sans SC",
     "WenQuanYi Micro Hei", "WenQuanYi Zen Hei", sans-serif;
   font-size: 14px;
   line-height: 1.6;
@@ -100,6 +120,8 @@ body {
   display: flex;
   flex-direction: column;
   padding: var(--space-4) var(--space-3);
+  /* body overflow:hidden，矮窗口时侧栏内容此前直接被裁掉，无法滚到页脚 */
+  overflow-y: auto;
 }
 
 .sidebar .logo {
@@ -133,12 +155,13 @@ body {
 }
 
 .sidebar .logo .tagline {
-  font-size: 10.5px;
+  /* UI27：全站正文字号下限提到 12px，10.5px 在浅底上可读性不足 */
+  font-size: 12px;
   color: var(--text-faint);
 }
 
 .sidebar .nav-group-label {
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
   color: var(--text-faint);
   padding: var(--space-2) var(--space-3) var(--space-1);
@@ -208,7 +231,7 @@ body {
 }
 
 .sidebar .sidebar-footer .lang-select {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-dim);
   background: var(--bg-soft);
   border: 1px solid var(--border);
@@ -219,12 +242,12 @@ body {
 }
 
 .sidebar .sidebar-footer .version {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-faint);
 }
 
 .sidebar .sidebar-footer .about-btn {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-dim);
   background: none;
   border: none;
@@ -250,6 +273,17 @@ body {
   animation: pageIn 180ms var(--ease);
 }
 
+/* 窄窗口响应：侧栏收窄、主区减小留白（此前没有任何断点，小窗口布局全靠溢出裁切） */
+@media (max-width: 900px) {
+  .sidebar {
+    width: 180px;
+  }
+
+  .main {
+    padding: var(--space-4);
+  }
+}
+
 @keyframes pageIn {
   from {
     opacity: 0;
@@ -272,6 +306,8 @@ body {
   justify-content: space-between;
   gap: var(--space-4);
   margin-bottom: var(--space-5);
+  /* 窄屏时标题与操作按钮换行，避免互相挤压 */
+  flex-wrap: wrap;
 }
 
 .page-head .page-title {
@@ -317,6 +353,8 @@ body {
   justify-content: space-between;
   gap: var(--space-3);
   margin-bottom: var(--space-4);
+  /* 长标题 + 多个操作按钮在窄卡片里换行，不再互相压盖 */
+  flex-wrap: wrap;
 }
 
 .card-head h3 {
@@ -345,6 +383,8 @@ body {
   font-size: 13.5px;
   font-weight: 500;
   cursor: pointer;
+  /* 按钮文字不换行：长英文/提示文本此前会把按钮撑成两行高 */
+  white-space: nowrap;
   box-shadow: var(--shadow-active);
   transition: filter var(--dur) var(--ease), transform var(--dur) var(--ease), box-shadow var(--dur) var(--ease), background var(--dur) var(--ease);
 }
@@ -392,10 +432,61 @@ body {
   background: var(--primary-soft);
 }
 
+/* 小按钮统一降级为「软底次级样式」：全站只有全尺寸 .btn 才是高强调主按钮
+   （此前 .btn.small 也带渐变底色，一屏十几个主按钮，页面像操作台） */
 .btn.small {
   padding: 4px 12px;
   font-size: 12px;
   border-radius: 6px;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  color: var(--text);
+  box-shadow: none;
+}
+
+.btn.small:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-strong);
+  filter: none;
+  box-shadow: none;
+}
+
+.btn.secondary.small {
+  background: var(--bg-soft);
+}
+
+.btn.danger.small {
+  background: var(--err-soft);
+  border-color: var(--err-border);
+  color: var(--err);
+}
+
+.btn.danger.small:hover {
+  background: var(--err-soft);
+  border-color: var(--err);
+}
+
+.btn.ghost.small {
+  background: none;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+.btn.small.is-loading .spinner {
+  border-color: rgba(109, 40, 217, 0.25);
+  border-top-color: var(--primary);
+}
+
+/* 基础 spinner：此前只有 .btn.is-loading 复合规则，未挂 is-loading 的按钮与侧栏运行指示里
+   的 spinner 只有空 span，转圈完全不可见；这里给默认尺寸与动画，复合规则再按底色覆盖颜色 */
+.spinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
 }
 
 /* loading spinner */
@@ -423,6 +514,28 @@ body {
   to {
     transform: rotate(360deg);
   }
+}
+
+/* ===== 文本链接按钮（降级操作专用：无按钮外观，只有下划线） ===== */
+.link-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--primary);
+  font-size: inherit;
+  font-family: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.link-btn:hover {
+  filter: brightness(1.15);
+}
+
+.link-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 /* ===== 表单 ===== */
@@ -456,7 +569,7 @@ textarea:focus {
 
 select {
   appearance: none;
-  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%239ca3af' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%236b7280' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
   background-position: right 10px center;
   padding-right: 30px;
@@ -591,7 +704,7 @@ input[type="checkbox"]:focus-visible {
 
 /* ===== 日志 ===== */
 .log-panel {
-  background: #fbf9ff;
+  background: var(--bg-log);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   padding: var(--space-3);
@@ -624,7 +737,7 @@ input[type="checkbox"]:focus-visible {
 
 .log-line .step-badge {
   flex-shrink: 0;
-  font-size: 10.5px;
+  font-size: 12px;
   padding: 0 6px;
   border-radius: 4px;
   background: var(--info-soft);
@@ -652,7 +765,7 @@ input[type="checkbox"]:focus-visible {
   display: inline-block;
   padding: 2px 9px;
   border-radius: 6px;
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 500;
   background: var(--bg-soft);
   border: 1px solid var(--border);
@@ -696,6 +809,8 @@ input[type="checkbox"]:focus-visible {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   background: var(--bg-card);
+  /* sticky 表头需要容器自身滚动才生效：给高表格一个上限，滚动时表头吸顶 */
+  max-height: 60vh;
 }
 
 table.tbl {
@@ -735,13 +850,41 @@ table.tbl tbody tr:last-child td {
 }
 
 /* ===== 预览 ===== */
+/* 16:9 舞台：宽度按缩放比例，高度由 aspect-ratio 决定（窄屏自动限制到 100%） */
+.preview-stage {
+  width: var(--preview-zoom, 100%);
+  max-width: 100%;
+  aspect-ratio: 16 / 9;
+  margin: 0 auto;
+}
+/* >100% 时解除 max-width 钳制（此前 125%/150% 被压回 100%），由 .main 横向滚动查看 */
+.preview-stage.zoomed {
+  max-width: none;
+}
 .preview-frame {
   width: 100%;
-  height: calc(100vh - 200px);
+  height: 100%;
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   background: #000;
   box-shadow: var(--shadow-hover);
+}
+.preview-stage:fullscreen {
+  width: 100vw;
+  height: 100vh;
+  max-width: none;
+  aspect-ratio: auto;
+  display: flex;
+  align-items: center;
+  background: #000;
+}
+.preview-stage:fullscreen .preview-frame {
+  border: none;
+  border-radius: 0;
+  width: auto;
+  height: 100%;
+  aspect-ratio: 16 / 9;
+  max-width: 100vw;
 }
 
 /* ===== Tabs ===== */
@@ -750,6 +893,8 @@ table.tbl tbody tr:last-child td {
   gap: var(--space-1);
   margin-bottom: var(--space-4);
   border-bottom: 1px solid var(--border);
+  /* tab 多时换行而不是溢出到不可点击 */
+  flex-wrap: wrap;
 }
 
 .tabs .tab {
@@ -823,14 +968,15 @@ code {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #d5ccef;
+  /* UI33/UI38：滚动条颜色收敛到令牌，不再硬编码紫灰色 */
+  background: var(--border-strong);
   border-radius: 8px;
   border: 2px solid transparent;
   background-clip: content-box;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #c0b3e6;
+  background: var(--text-faint);
   background-clip: content-box;
 }
 
@@ -840,6 +986,8 @@ code {
   align-items: center;
   gap: var(--space-2);
   margin-bottom: var(--space-5);
+  /* UI63：英文标签较宽时允许整步换行，而不是把所有步骤挤在一行里被压折行 */
+  flex-wrap: wrap;
 }
 
 .step-item {
@@ -848,6 +996,8 @@ code {
   gap: 6px;
   font-size: 12.5px;
   color: var(--text-faint);
+  /* UI63：标签不折行，避免换行后圆点垂直居中到多行文字、与相邻步骤圆点错位 */
+  white-space: nowrap;
   transition: color var(--dur) var(--ease);
 }
 
@@ -859,7 +1009,7 @@ code {
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 11px;
+  font-size: 12px;
   background: var(--bg-card);
   transition: all var(--dur) var(--ease);
 }
@@ -891,9 +1041,9 @@ code {
   color: var(--err);
 }
 
-/* 本次运行未包含的阶段：灰显 + 破折号，不再显示成已完成 */
+/* 本次运行未包含的阶段：斜体 + 虚线圆点区分；不再叠加低透明度（与 faint 色叠加后几乎不可读） */
 .step-item.skipped {
-  opacity: 0.45;
+  font-style: italic;
 }
 
 .step-item.skipped .step-dot {
@@ -921,6 +1071,8 @@ code {
   align-items: center;
   justify-content: center;
   z-index: 100;
+  /* 给矮窗口留出边距，配合 .modal 的 max-height 保证内容不贴边 */
+  padding: var(--space-5);
   animation: fadeIn var(--dur) var(--ease);
 }
 
@@ -940,6 +1092,9 @@ code {
   padding: var(--space-6);
   max-width: 420px;
   width: calc(100% - 48px);
+  /* 矮窗口内容过长时内部滚动，而不是被视口裁掉 */
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
   animation: modalIn 200ms var(--ease);
 }
 
@@ -1024,7 +1179,7 @@ code {
   border-radius: 50%;
   background: var(--gradient);
   color: #fff;
-  font-size: 10.5px;
+  font-size: 12px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1091,7 +1246,7 @@ code {
 .asset-row-head .asset-name {
   font-weight: 600;
   font-size: 14px;
-  color: var(--accent-2);
+  color: var(--accent);
 }
 
 .asset-row-head .asset-file {
@@ -1152,7 +1307,7 @@ code {
 }
 
 .asset-thumb .thumb-label {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-dim);
 }
 
@@ -1328,7 +1483,8 @@ code {
 
 .cfg-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+  /* min(380px,100%)：窄容器下轨道可收缩到 100%，不再固定 380px 撑出横向滚动 */
+  grid-template-columns: repeat(auto-fit, minmax(min(380px, 100%), 1fr));
   gap: var(--space-4);
   align-items: start;
 }
@@ -1361,7 +1517,7 @@ code {
 }
 
 .cfg-channel-desc {
-  font-size: 11.5px;
+  font-size: 12px;
   color: var(--text-dim);
 }
 
@@ -1440,6 +1596,9 @@ code {
   font-size: 12px;
   padding: 3px 10px;
   border-radius: 6px;
+  /* 长错误/长模型名可任意断行，避免撑破配置卡片 */
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .cfg-test-result.ok {
@@ -1477,12 +1636,13 @@ code {
   margin-top: 4px;
   font-size: 12px;
   color: var(--err);
+  overflow-wrap: anywhere;
 }
 
 .cfg-model-loading {
   font-weight: normal;
   color: var(--text-dim);
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .cfg-context-resolved {
@@ -1496,7 +1656,7 @@ code {
   font-size: 12.5px;
 }
 .cfg-context-resolved code {
-  font-family: var(--font-mono, monospace);
+  font-family: var(--mono, monospace);
   font-size: 13px;
   color: var(--primary);
   font-weight: 600;
@@ -1530,19 +1690,19 @@ label.field > span.cutout-desc {
   border: 1px solid var(--border);
 }
 .cutout-status.ok {
-  color: var(--success, #2e7d32);
-  border-color: rgba(46, 125, 50, 0.35);
-  background: rgba(46, 125, 50, 0.08);
+  color: var(--ok);
+  border-color: var(--ok-border);
+  background: var(--ok-soft);
 }
 .cutout-status.err {
   color: var(--err);
-  border-color: rgba(220, 60, 60, 0.35);
-  background: rgba(220, 60, 60, 0.07);
+  border-color: var(--err-border);
+  background: var(--err-soft);
 }
 .cutout-status.working {
   color: var(--primary);
-  border-color: rgba(88, 101, 242, 0.35);
-  background: rgba(88, 101, 242, 0.07);
+  border-color: var(--primary-border);
+  background: var(--primary-soft);
 }
 .cutout-dir {
   display: block;
@@ -1556,8 +1716,8 @@ label.field > span.cutout-desc {
   color: var(--text-dim);
 }
 .cutout-dir code {
-  font-family: var(--font-mono, monospace);
-  font-size: 11.5px;
+  font-family: var(--mono, monospace);
+  font-size: 12px;
   color: var(--text);
 }
 .cfg-context-budget {
@@ -1590,10 +1750,19 @@ label.field > span.cutout-desc {
   gap: var(--space-4);
   flex-wrap: wrap;
   background: var(--warn-soft);
-  border: 1px solid rgba(217, 119, 6, 0.24);
+  border: 1px solid var(--warn-border);
   border-radius: var(--radius-md);
   padding: 12px 16px;
   margin-bottom: var(--space-4);
+}
+
+/* 失败任务横幅：与视觉守门提示区分（红系警示，实时显示失败数量 + 一键重试） */
+.fail-banner {
+  background: var(--err-soft, rgba(220, 38, 38, 0.08));
+  border-color: var(--err-border);
+}
+.fail-banner strong {
+  color: var(--err, #dc2626);
 }
 
 .vb-banner strong {
@@ -1613,7 +1782,7 @@ label.field > span.cutout-desc {
   border-radius: 999px;
   background: var(--warn-soft);
   color: var(--warn);
-  font-size: 10.5px;
+  font-size: 12px;
   font-weight: 600;
   vertical-align: 1px;
 }
@@ -1792,7 +1961,7 @@ details.card[open] > summary.card-head h3::before {
 
 .vb-preview-label {
   color: var(--text-dim);
-  font-size: 11.5px;
+  font-size: 12px;
   font-weight: 500;
   margin-bottom: var(--space-1);
 }
@@ -1842,7 +2011,7 @@ details.card[open] > summary.card-head h3::before {
 }
 
 .vb-thumb .thumb-label {
-  font-size: 10.5px;
+  font-size: 12px;
   color: var(--text-faint);
 }
 
@@ -1943,7 +2112,7 @@ details.card[open] > summary.card-head h3::before {
 .vb-fold-summary::before {
   content: "▸";
   color: var(--text-faint);
-  font-size: 11px;
+  font-size: 12px;
   transition: transform var(--dur) var(--ease);
 }
 
@@ -2328,7 +2497,7 @@ details.adv[open] > summary::before {
 }
 
 .dist-desc {
-  font-size: 11.5px;
+  font-size: 12px;
   color: var(--text-dim);
 }
 
@@ -2358,6 +2527,24 @@ details.adv[open] > summary::before {
 }
 
 .err-text {
+  color: var(--err);
+}
+
+/* 提示块：此前 ConfigPage 的危险提示（如配置文件读取失败）没有样式、退化成普通文字；
+   danger 变体用红色强调，普通变体保持信息性软底 */
+.notice {
+  padding: 8px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-soft);
+  color: var(--text-dim);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+
+.notice.danger {
+  background: var(--err-soft);
+  border-color: var(--err);
   color: var(--err);
 }
 
@@ -2405,8 +2592,16 @@ details.adv[open] > summary::before {
 
 .mat-row select,
 .mat-row input[type="text"] {
-  padding: 4px 8px;
   font-size: 12px;
+}
+
+/* 箭头是 background-image 定位在右侧 10px：select 必须保留右内边距，否则文字压在箭头上 */
+.mat-row select {
+  padding: 4px 26px 4px 8px;
+}
+
+.mat-row input[type="text"] {
+  padding: 4px 8px;
 }
 
 /* 最近项目列表 */
@@ -2445,6 +2640,19 @@ details.adv[open] > summary::before {
   cursor: pointer;
   padding: 10px 14px;
   transition: background var(--dur) var(--ease);
+  /* UI35：头部由 div 改为原生 button（可聚焦、回车/空格触发），此处重置按钮默认样式保持原观感 */
+  width: 100%;
+  border: none;
+  background: none;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+}
+
+.disclosure-head:focus-visible {
+  /* UI35：键盘焦点可见 */
+  outline: 2px solid var(--primary);
+  outline-offset: -2px;
 }
 
 .disclosure-head:hover {

@@ -1,7 +1,9 @@
-import type { CharacterCard, ExtractionResult, ItemCard, SceneCard } from "./types";
+import type { CharacterAction, CharacterCard, CharacterCostume, ExtractionResult, ItemCard, SceneCard } from "./types";
 import { chatJson } from "../api/openaiCompatible";
 import { inputCharBudget, resolveContextLength } from "../api/providers";
 import { voiceLibraryFor } from "../stores/config";
+import { pickVoiceForGender, voiceGenderOf } from "./minimaxVoices";
+import { normalizeEntityId } from "./ids";
 import type { ApiConfig } from "./types";
 
 const SYSTEM_PROMPT = `你是视觉小说制作人。从小说文本中提取制作视觉小说所需的结构化信息。
@@ -15,7 +17,7 @@ const SYSTEM_PROMPT = `你是视觉小说制作人。从小说文本中提取制
    - voiceDesc: 适合的音色描述（如"清冷的女声"）
    - gender: 角色性别，填 "male"（男）或 "female"（女）
    - voiceName: TTS 音色标识，必须从下面"可用音色列表"中选择最接近的一个，**且性别必须与角色的 gender 一致**（男性角色只能选男声音色，女性角色只能选女声音色；如果列表里没有匹配性别的，选该性别下最接近的；不要编造列表外的值）
-    - imagePrompt: 用于 AI 绘画生成立绘的完整英文 prompt，只描述人物本身（全身像、服装、发型、表情），姿态必须为自然放松站姿、双臂自然下垂，不要设计任何手势动作；禁止写任何背景/底色/场地/环境描述（系统会自动附加纯绿幕背景），风格统一为"动漫风格，精美立绘"
+    - imagePrompt: 用于 AI 绘画生成立绘的完整英文 prompt，只描述人物本身（全身像、服装、发型、表情）。构图必须是全身：prompt 里明确写 "full body, head to toe, entire figure in frame, shoes visible"，绝对不要写 "half body / portrait / close-up / waist-up / bust shot" 这类裁切构图词；姿态必须为自然放松站姿、双臂自然下垂，不要设计任何手势动作；禁止写任何背景/底色/场地/环境描述（系统会自动附加纯绿幕背景），风格统一为"动漫风格，精美立绘"
     - threeViewPrompt: 用于生成该角色"三视图参考图"（正面/侧面/背面）的完整英文 prompt：同一角色设定、站姿自然、表情平静、全身可见，同样禁止写任何背景/底色描述（系统会自动附加纯绿幕背景）。此图会作为该角色所有立绘/表情/动作的图生图参考，务必与人物的 imagePrompt 描述完全一致
     - actions: 该角色可能做出的经典自然动作（日常站姿/行走/坐姿/持物等真实姿态，用于动作立绘，基于三视图图生图，数量不限，按角色特点给出；不要设计夸张手势或凭空加手部动作）：
       - id: 简短英文标识（如 point/wave/cross/crouch/hold）
@@ -25,6 +27,7 @@ const SYSTEM_PROMPT = `你是视觉小说制作人。从小说文本中提取制
      - id: 简短英文标识（如 casual/formal/battle/pajama）
      - name: 服装中文名（如 日常服、礼服、战斗服）
      - prompt: 该服装的完整英文 prompt，在保持人物外貌（发型/体型/五官）完全一致的前提下描述该服装的款式/颜色/材质，全身可见，纯色背景，动漫风格
+   - emotions: 该角色剧情中实际需要的表情差分（英文小写 id，如 happy/sad/angry/surprised/shy/embarrassed/cry 等，控制在 6-10 个；不需要包含 normal）
    - color: 角色的主题色（十六进制，用于 UI）
    - isNpc: 布尔值。主要角色（有台词或推动剧情）填 false；次要角色/NPC（有台词但戏份少）填 true
 2. scenes：故事中出现的地点场景（数量按剧情决定、不设上限）。
@@ -46,41 +49,173 @@ function truncate(text: string, maxChars: number): string {
   return text.length > maxChars ? text.slice(0, maxChars) + "\n……(截断)" : text;
 }
 
-/** 归一化提取结果：兜底空数组、缺 title 补标题、音色回退到列表首个、动作列表规范化。经典单次提取与 Agent 流程共用。 */
+/** 名称归一化（与 extractAgent.normalizeName 同口径；本文件内联避免循环依赖） */
+function normName(name: string): string {
+  return (name || "").trim().toLowerCase().replace(/\s+/g, "");
+}
+
+/** id 查重：冲突按出现顺序加稳定后缀 _2/_3…（同一输入重复运行结果一致） */
+function uniqueId(want: string, used: Set<string>): string {
+  let id = want;
+  let n = 2;
+  while (used.has(id)) id = `${want}_${n++}`;
+  used.add(id);
+  return id;
+}
+
+/** 重复角色卡合并（本文件内实现，避免与 extractAgent 循环依赖）：
+ * 先出现的卡为底，缺字段由后出现者补齐，动作/服装按 id 并集、表情按值并集 */
+function mergeDupCharacter(target: CharacterCard, source: CharacterCard): void {
+  for (const k of [
+    "appearance", "clothing", "personality", "voiceDesc", "voiceName", "imagePrompt",
+    "threeViewPrompt", "color", "gender", "voiceProfileId", "referenceImage", "referenceImagePath",
+  ] as const) {
+    if (!target[k] && source[k]) (target as unknown as Record<string, unknown>)[k] = source[k];
+  }
+  if (target.isNpc == null && source.isNpc != null) target.isNpc = source.isNpc;
+  // 数组字段做 Array.isArray 防护：模型可能把数组写成字符串/对象，直接展开会抛错或清空已有数据
+  const actionMap = new Map<string, CharacterAction>();
+  for (const a of [
+    ...(Array.isArray(target.actions) ? target.actions : []),
+    ...(Array.isArray(source.actions) ? source.actions : []),
+  ]) {
+    if (a?.id && !actionMap.has(a.id)) actionMap.set(a.id, a);
+  }
+  if (actionMap.size || target.actions || source.actions) target.actions = [...actionMap.values()];
+  const costumeMap = new Map<string, CharacterCostume>();
+  for (const c of [
+    ...(Array.isArray(target.costumes) ? target.costumes : []),
+    ...(Array.isArray(source.costumes) ? source.costumes : []),
+  ]) {
+    if (c?.id && !costumeMap.has(c.id)) costumeMap.set(c.id, c);
+  }
+  if (costumeMap.size || target.costumes || source.costumes) target.costumes = [...costumeMap.values()];
+  const emoSeen = new Set<string>();
+  const emotions = [
+    ...(Array.isArray(target.emotions) ? target.emotions : []),
+    ...(Array.isArray(source.emotions) ? source.emotions : []),
+  ].filter((e) => {
+    if (typeof e !== "string" || !e || emoSeen.has(e)) return false;
+    emoSeen.add(e);
+    return true;
+  });
+  if (emotions.length || target.emotions || source.emotions) target.emotions = emotions;
+}
+
+/** 归一化提取结果：兜底空数组、缺 title 补标题、音色回退到列表首个、动作列表规范化。
+ * 同时做基础去重：丢弃空 id/name 的残卡、id 查重（冲突加稳定后缀）、同名卡合并，
+ * 防止同一角色/场景/物品出两张卡导致重复出图与配音计费。经典单次提取与 Agent 流程共用。 */
 export function normalizeExtractionResult(result: ExtractionResult, lib: string[], title: string): ExtractionResult {
   if (!Array.isArray(result.characters)) throw new Error("提取结果缺少 characters 字段");
-  result.scenes = result.scenes ?? [];
-  result.items = result.items ?? [];
+  result.scenes = Array.isArray(result.scenes) ? result.scenes : [];
+  result.items = Array.isArray(result.items) ? result.items : [];
   result.title = result.title || title;
+
+  {
+    const usedIds = new Set<string>();
+    const byName = new Map<string, CharacterCard>();
+    const characters: CharacterCard[] = [];
+    for (const raw of result.characters) {
+      if (!raw || typeof raw !== "object") continue;
+      const name = typeof raw.name === "string" ? raw.name.trim() : "";
+      const id = typeof raw.id === "string" ? raw.id.trim() : "";
+      if (!name || !id) continue; // 空 id/name 无法关联渲染与素材键，直接丢弃
+      const key = normName(name);
+      const hit = byName.get(key);
+      if (hit) {
+        mergeDupCharacter(hit, raw);
+        continue;
+      }
+      const card: CharacterCard = { ...raw, id: uniqueId(id, usedIds), name };
+      characters.push(card);
+      byName.set(key, card);
+    }
+    result.characters = characters;
+  }
+  {
+    const usedIds = new Set<string>();
+    const byName = new Map<string, SceneCard>();
+    const scenes: SceneCard[] = [];
+    for (const raw of result.scenes) {
+      if (!raw || typeof raw !== "object") continue;
+      const location = typeof raw.location === "string" ? raw.location.trim() : "";
+      const id = typeof raw.id === "string" ? raw.id.trim() : "";
+      if (!location || !id) continue;
+      const key = normName(location);
+      const hit = byName.get(key);
+      if (hit) {
+        for (const k of ["atmosphere", "time", "imagePrompt"] as const) {
+          if (!hit[k] && raw[k]) hit[k] = raw[k];
+        }
+        continue;
+      }
+      const card: SceneCard = { ...raw, id: uniqueId(id, usedIds), location };
+      scenes.push(card);
+      byName.set(key, card);
+    }
+    result.scenes = scenes;
+  }
+  {
+    const usedIds = new Set<string>();
+    const byName = new Map<string, ItemCard>();
+    const items: ItemCard[] = [];
+    for (const raw of result.items) {
+      if (!raw || typeof raw !== "object") continue;
+      const name = typeof raw.name === "string" ? raw.name.trim() : "";
+      const id = typeof raw.id === "string" ? raw.id.trim() : "";
+      if (!name || !id) continue;
+      const key = normName(name);
+      const hit = byName.get(key);
+      if (hit) {
+        for (const k of ["appearance", "note", "imagePrompt"] as const) {
+          if (!hit[k] && raw[k]) hit[k] = raw[k];
+        }
+        continue;
+      }
+      const card: ItemCard = { ...raw, id: uniqueId(id, usedIds), name };
+      items.push(card);
+      byName.set(key, card);
+    }
+    result.items = items;
+  }
+
   for (const c of result.characters) {
     if (c.gender !== "male" && c.gender !== "female") {
       c.gender = /女|她|小姐|少女|母亲|奶奶|姐姐|妈妈|公主/i.test(c.appearance + c.name + c.personality) ? "female" : "male";
     }
-    if (!c.voiceName || !lib.includes(c.voiceName)) {
-      c.voiceName = lib[0] || c.voiceName || "default";
-    }
-    // 性别兜底：AI 选的音色性别与角色不符时，从同性别音色里重选（无同性别则保持原值）
-    if (c.gender && c.voiceName) {
-      const wantFemale = c.gender === "female";
-      const voiceIsFemale = /^female|女/.test(c.voiceName);
-      const voiceIsMale = /^male|男/.test(c.voiceName);
-      const mismatch = (wantFemale && voiceIsMale) || (!wantFemale && voiceIsFemale);
-      if (mismatch) {
-        const sameGender = lib.find((id) => (wantFemale ? /^female|女/.test(id) : /^male|男/.test(id)));
-        if (sameGender) c.voiceName = sameGender;
-      }
+    // 音色归一化：无效音色或性别不符（AI 选错/旧数据）→ 按角色性别从音色库稳定挑选；
+    // 音色库无同性别候选时才退回列表首个（此前一律 lib[0]，默认列表首个是男声，女角色会拿到男声）
+    const validVoice = c.voiceName && lib.includes(c.voiceName) ? c.voiceName : undefined;
+    const voiceGender = validVoice ? voiceGenderOf(validVoice) : undefined;
+    const mismatch = !!voiceGender && voiceGender !== "other" && !!c.gender && voiceGender !== c.gender;
+    if (!validVoice || mismatch) {
+      c.voiceName = pickVoiceForGender(lib, c.gender, c.id) || validVoice || lib[0] || c.voiceName || "default";
     }
     // 动作列表归一化：只保留 id/name/prompt 都合法的项（数量不限，按剧情提取）
     if (Array.isArray(c.actions)) {
       c.actions = c.actions
         .filter((a) => a && a.id && a.prompt)
-        .map((a) => ({ id: String(a.id).toLowerCase().replace(/[^a-z0-9_-]/g, "_"), name: a.name || a.id, prompt: a.prompt }));
+        .map((a) => ({ id: normalizeEntityId(a.id, "a"), name: a.name || a.id, prompt: a.prompt }));
     }
     // 服装差分归一化：数量不限，按剧情提取
     if (Array.isArray(c.costumes)) {
       c.costumes = c.costumes
         .filter((ct) => ct && ct.id && ct.prompt)
-        .map((ct) => ({ id: String(ct.id).toLowerCase().replace(/[^a-z0-9_-]/g, "_"), name: ct.name || ct.id, prompt: ct.prompt }));
+        .map((ct) => ({ id: normalizeEntityId(ct.id, "ct"), name: ct.name || ct.id, prompt: ct.prompt }));
+    }
+    // 表情集归一化：只保留非空字符串、去重、上限 10（prompt 要求 6-10 个）；
+    // 上限同时兜底模型超量返回导致立绘张数/费用暴涨
+    if (Array.isArray(c.emotions)) {
+      const seen = new Set<string>();
+      const cleaned: string[] = [];
+      for (const e of c.emotions) {
+        if (typeof e !== "string") continue;
+        const v = e.trim();
+        if (!v || seen.has(v)) continue;
+        seen.add(v);
+        cleaned.push(v);
+      }
+      c.emotions = cleaned.slice(0, 10);
     }
   }
   return result;
@@ -95,11 +230,12 @@ export async function extractFromNovel(
 ): Promise<ExtractionResult> {
   const lib = voiceLibraryFor(cfg);
   const fb = feedback ? `\n\n用户对上一版提取结果的修改意见（请严格参考并落实）：${feedback}` : "";
-  // 按性别标注音色，帮助 AI 给角色分配符合性别的音色（MiniMax 音色 ID 前缀含 male/female）
+  // 按性别标注音色，帮助 AI 给角色分配符合性别的音色（覆盖 MiniMax 官方表与常见音色名，不靠 ID 前缀猜）
   const genderedLib = lib
     .map((id) => {
-      const g = /^male|^[a-z-]*男/.test(id) ? "（男）" : /^female|^[a-z-]*女/.test(id) ? "（女）" : "";
-      return `${id}${g}`;
+      const g = voiceGenderOf(id);
+      const label = g === "male" ? "（男）" : g === "female" ? "（女）" : "";
+      return `${id}${label}`;
     })
     .join(", ");
   const user = `小说标题：${title}\n\n可用音色列表（已标注性别）：${genderedLib}\n\n请为每个角色挑选与其 gender 匹配性别的音色。${fb}\n\n以下是小说全文（按模型上下文动态截断，剩余部分将不被 LLM 看到）：\n${truncate(novelText, inputCharBudget(cfg))}`;

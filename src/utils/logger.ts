@@ -16,6 +16,9 @@ export interface LogEntry {
 const HISTORY_LIMIT = 5000;
 const history: LogEntry[] = [];
 const SENSITIVE_KEY = /api[_-]?key|authorization|token|secret|password/i;
+/** B106：计费/用量字段（promptTokens / completionTokens / maxTokens / *_tokens 等）以 tokens 结尾，
+ * 但不是凭据。旧实现见 key 含 token 就整键脱敏，把计费数字写成 [REDACTED]，成本与用量日志失真。 */
+const USAGE_TOKEN_KEY = /tokens$/i;
 const REDACTED = "[REDACTED]";
 
 export function redactSensitive(value: unknown, seen = new WeakSet<object>()): unknown {
@@ -40,7 +43,8 @@ export function redactSensitive(value: unknown, seen = new WeakSet<object>()): u
     seen.add(value);
     const out: Record<string, unknown> = {};
     for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-      out[key] = SENSITIVE_KEY.test(key) ? REDACTED : redactSensitive(item, seen);
+      // 凭据键脱敏；*Tokens 计费字段例外（B106）
+      out[key] = SENSITIVE_KEY.test(key) && !USAGE_TOKEN_KEY.test(key) ? REDACTED : redactSensitive(item, seen);
     }
     return out;
   }

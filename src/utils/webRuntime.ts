@@ -8,12 +8,10 @@
 import { zipSync } from "fflate";
 import type { CutoutModelDownloadRequest, CutoutModelStatus, FsEntry, HttpResult } from "./tauri";
 import * as vfs from "./vfsWeb";
-import { log, truncate } from "./logger";
+import { log } from "./logger";
 import { errMsg } from "./errors";
-
-export function isWeb(): boolean {
-  return typeof window !== "undefined" && typeof indexedDB !== "undefined";
-}
+import { b64encode } from "./base64";
+import { t } from "../i18n";
 
 const PROXY_URL = "/__novelforge/proxy";
 const TEMPLATE_URL = "/__novelforge/template";
@@ -24,25 +22,34 @@ const TEMPLATE_ROOT = "/app/template";
 const WEB_RESPONSE_LIMIT = 64 * 1024 * 1024;
 let sessionTokenPromise: Promise<string> | undefined;
 
-function webSessionToken(): Promise<string> {
+function webSessionToken(forceRenew = false): Promise<string> {
+  // B96：403 表示 token 过期/被 dev server 重启丢弃，必须强制重取而不是继续复用旧 Promise
+  if (forceRenew) sessionTokenPromise = undefined;
   sessionTokenPromise ??= fetch(SESSION_URL, { method: "GET", credentials: "same-origin" })
     .then(async (response) => {
       if (!response.ok) throw new Error(`Web session unavailable ${response.status}`);
       const data = await response.json() as { token?: string };
       if (!data.token) throw new Error("Web session token missing");
       return data.token;
+    })
+    .catch((error) => {
+      // B96：失败的 Promise 绝不能留在缓存里：旧实现一次取 token 失败（网络抖动/服务未就绪）
+      // 会让之后所有请求都复用同一个 rejected Promise，永久失效直到刷新页面。
+      sessionTokenPromise = undefined;
+      throw error;
     });
   return sessionTokenPromise;
 }
 
-function b64encode(data: Uint8Array): string {
-  if (typeof Buffer !== "undefined") return Buffer.from(data).toString("base64");
-  let binary = "";
-  const chunk = 0x8000;
-  for (let i = 0; i < data.length; i += chunk) {
-    binary += String.fromCharCode(...data.subarray(i, i + chunk));
+/**
+ * 代理已返回 HTTP 响应时的错误标记（B97）。
+ * 这类失败说明请求已经真实发给厂商（可能已完成/已计费），绝不能回退直连重发。
+ */
+class ProxyHttpError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "ProxyHttpError";
   }
-  return btoa(binary);
 }
 
 function b64decode(b64: string): Uint8Array {
@@ -64,11 +71,10 @@ export async function webHttp(args: {
   timeoutSecs?: number;
 }): Promise<HttpResult> {
   if (!/^https?:\/\//i.test(args.url)) {
-    throw new Error("仅支持 HTTP/HTTPS API 地址");
+    throw new Error(t("仅支持 HTTP/HTTPS API 地址"));
   }
   try {
-    const token = await webSessionToken();
-    const resp = await fetch(PROXY_URL, {
+    const send = async (token: string) => fetch(PROXY_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-NovelForge-Token": token },
       body: JSON.stringify({
@@ -80,15 +86,32 @@ export async function webHttp(args: {
         timeoutSecs: args.timeoutSecs ?? 120,
       }),
     });
+    let resp = await send(await webSessionToken());
+    if (resp.status === 403) {
+      // B96：token 过期/失效时强制重取一次并重放（仅一次，避免死循环）
+      log.warn("webRuntime", "代理返回 403，刷新会话 token 后重放一次", { url: args.url });
+      resp = await send(await webSessionToken(true));
+    }
     if (!resp.ok) {
-      if ([400, 403, 413, 415].includes(resp.status)) throw new Error(`代理拒绝请求 ${resp.status}`);
-      throw new Error(`代理不可用 ${resp.status}`);
+      let detail = "";
+      try {
+        detail = (await resp.text()).slice(0, 300);
+      } catch {
+        /* 响应体读取失败时只报状态码 */
+      }
+      // HTTP 状态码保留数字：仅包裹文案模板，{status} 由 t() 插值
+      const message = [400, 403, 413, 415].includes(resp.status)
+        ? t("代理拒绝请求 {status}{detail}", { status: resp.status, detail: detail ? `：${detail}` : "" })
+        : t("代理不可用 {status}{detail}", { status: resp.status, detail: detail ? `：${detail}` : "" });
+      // B97：代理已返回 HTTP 响应 = 请求已真实发往厂商，不能回退直连重发（付费 POST 会被执行两次）
+      throw new ProxyHttpError(message, resp.status);
     }
     const json = (await resp.json()) as { status: number; contentType: string; bodyBase64: string };
     return { status: json.status, contentType: json.contentType, bodyBase64: json.bodyBase64 };
   } catch (e) {
-    if (/代理拒绝请求/.test(errMsg(e))) throw e;
-    log.warn("webRuntime", "同源代理失败，尝试直连", { url: args.url, error: errMsg(e) });
+    // B97：只有网络层异常（fetch reject，请求根本没送到代理）才允许直连兜底
+    if (e instanceof ProxyHttpError) throw e;
+    log.warn("webRuntime", "同源代理网络层失败，尝试直连", { url: args.url, error: errMsg(e) });
     return directFetch(args);
   }
 }
@@ -161,14 +184,14 @@ async function ensureTemplateTree(): Promise<void> {
 export async function webReadTextFile(path: string): Promise<{ text: string; encoding: string }> {
   if (path.startsWith(TEMPLATE_ROOT + "/")) await ensureTemplateLocal(path);
   const text = await vfs.vfsReadTextFile(path);
-  if (text === undefined) throw new Error(`文件不存在：${path}`);
+  if (text === undefined) throw new Error(t("文件不存在：{path}", { path }));
   return { text, encoding: "UTF-8" };
 }
 
 export async function webReadFileBase64(path: string): Promise<string> {
   if (path.startsWith(TEMPLATE_ROOT + "/")) await ensureTemplateLocal(path);
   const b64 = await vfs.vfsReadFileBase64(path);
-  if (b64 === undefined) throw new Error(`文件不存在：${path}`);
+  if (b64 === undefined) throw new Error(t("文件不存在：{path}", { path }));
   return b64;
 }
 
@@ -196,7 +219,11 @@ export async function webPathExists(path: string): Promise<boolean> {
   if (path.startsWith(TEMPLATE_ROOT + "/")) {
     if (await vfs.vfsExists(path)) return true;
     if (!path.endsWith("/index.html") && (await vfs.vfsExists(`${path}/index.html`))) return true;
-    const node = await fetchTemplateNode(path.slice(TEMPLATE_ROOT.length + 1));
+    const rel = path.slice(TEMPLATE_ROOT.length + 1);
+    // 只为模板根的直接子项做远端探测（模板解析校验所需）；深层路径同步前一律视为不存在，
+    // 否则候选路径探测会给浏览器控制台刷一串 404。深层路径由读取/复制时的 ensureTemplateLocal 懒同步。
+    if (!rel || rel.includes("/")) return false;
+    const node = await fetchTemplateNode(rel);
     return node !== undefined;
   }
   return vfs.vfsExists(path);
@@ -295,7 +322,7 @@ export async function webStartPreviewServer(root: string): Promise<{ url: string
   log.info("webRuntime", "web 预览启动", { root });
   await ensureTemplateTree();
   const files = await vfs.vfsCollectFiles(root, [`${root}/.novel2vn`]);
-  if (!files.length) throw new Error(`预览失败：目录为空（${root}）`);
+  if (!files.length) throw new Error(t("预览失败：目录为空（{path}）", { path: root }));
   const entries: Record<string, Uint8Array> = {};
   for (const f of files) entries[f.path] = new Uint8Array(f.data);
   const zipData = zipSync(entries);
@@ -306,7 +333,7 @@ export async function webStartPreviewServer(root: string): Promise<{ url: string
     headers: { "Content-Type": "application/json", "X-NovelForge-Token": token },
     body: JSON.stringify({ name, zip: b64encode(zipData) }),
   });
-  if (!resp.ok) throw new Error(`预览上传失败 ${resp.status}`);
+  if (!resp.ok) throw new Error(t("预览上传失败 {status}", { status: resp.status }));
   const json = (await resp.json()) as { url: string };
   log.info("webRuntime", "web 预览就绪", { url: json.url, files: files.length });
   return { url: json.url, port: 0 };
@@ -314,19 +341,58 @@ export async function webStartPreviewServer(root: string): Promise<{ url: string
 
 /* ============ 打包 zip（导出页面） ============ */
 
+/** 已压缩的媒体/字体文件：直接 store，不再浪费 CPU 二次压缩（大项目能快一个数量级） */
+const ZIP_MEDIA_RE = /\.(png|jpe?g|webp|gif|mp4|webm|mp3|ogg|opus|wav|flac|m4a|ttf|otf|woff2?)$/i;
+
+/** 在专用 Worker 中压缩（浏览器）；Node（单测）无 Worker 时回退同步压缩 */
+function zipEntries(entries: Record<string, [Uint8Array, { level: 0 | 6 }]>): Promise<Uint8Array> {
+  if (typeof Worker === "undefined") {
+    return Promise.resolve(zipSync(entries));
+  }
+  return new Promise<Uint8Array>((resolve, reject) => {
+    let worker: Worker;
+    try {
+      worker = new Worker(new URL("./zipWorker.ts", import.meta.url), { type: "module" });
+    } catch {
+      resolve(zipSync(entries));
+      return;
+    }
+    worker.onmessage = (ev: MessageEvent<{ data?: ArrayBuffer; error?: string }>) => {
+      worker.terminate();
+      if (ev.data?.error) reject(new Error(ev.data.error));
+      else resolve(new Uint8Array(ev.data.data!));
+    };
+    worker.onerror = (e) => {
+      worker.terminate();
+      reject(new Error(e.message || t("zip worker 执行失败")));
+    };
+    worker.postMessage({ entries });
+  });
+}
+
 export async function webBuildZip(
   sourceDir: string,
-  zipPath: string,
+  _zipPath: string,
   exclude: string[],
-): Promise<{ fileCount: number; sizeBytes: number }> {
+): Promise<{ fileCount: number; sizeBytes: number; data: Uint8Array }> {
   const files = await vfs.vfsCollectFiles(sourceDir, exclude);
-  const entries: Record<string, Uint8Array> = {};
+  const entries: Record<string, [Uint8Array, { level: 0 | 6 }]> = {};
   for (const f of files) {
-    entries[f.path] = new Uint8Array(f.data);
+    entries[f.path] = [new Uint8Array(f.data), { level: ZIP_MEDIA_RE.test(f.path) ? 0 : 6 }];
   }
-  const zipData = zipSync(entries);
-  await vfs.vfsWriteFile(zipPath, zipData as unknown as ArrayBuffer);
-  return { fileCount: files.length, sizeBytes: zipData.byteLength };
+  const zipData = await zipEntries(entries);
+  return { fileCount: files.length, sizeBytes: zipData.byteLength, data: zipData };
+}
+
+/** 网页版导出：压缩后直接触发浏览器下载（应用层调用，字节不经日志包装） */
+export async function webDownloadZip(
+  sourceDir: string,
+  exclude: string[],
+  downloadName: string,
+): Promise<{ fileCount: number; sizeBytes: number }> {
+  const { fileCount, sizeBytes, data } = await webBuildZip(sourceDir, "", exclude);
+  vfs.vfsDownloadBytes(data, downloadName, "application/zip");
+  return { fileCount, sizeBytes };
 }
 
 /* ============ 抠图（canvas 四角 flood-fill 去背景） ============ */
@@ -351,7 +417,7 @@ export async function webCutoutModelDownload(req: CutoutModelDownloadRequest): P
     headers: { "Content-Type": "application/json", "X-NovelForge-Token": token },
     body: JSON.stringify(req),
   });
-  if (!resp.ok) throw new Error(`模型下载启动失败 ${resp.status}`);
+  if (!resp.ok) throw new Error(t("模型下载启动失败 {status}", { status: resp.status }));
   return (await resp.json()) as CutoutModelStatus;
 }
 
@@ -362,7 +428,7 @@ export async function webCutoutModelRemove(modelId: string, filename: string): P
     headers: { "Content-Type": "application/json", "X-NovelForge-Token": token },
     body: JSON.stringify({}),
   });
-  if (!resp.ok) throw new Error(`模型删除失败 ${resp.status}`);
+  if (!resp.ok) throw new Error(t("模型删除失败 {status}", { status: resp.status }));
 }
 
 /* ============ 抠图（canvas 四角 flood-fill 去背景） ============ */
@@ -371,7 +437,7 @@ async function loadImage(dataB64: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.onload = () => resolve(img);
-    img.onerror = () => reject(new Error("图片解码失败"));
+    img.onerror = () => reject(new Error(t("图片解码失败")));
     img.src = `data:image/png;base64,${dataB64}`;
   });
 }
@@ -386,10 +452,13 @@ export async function webHasTransparency(dataB64: string): Promise<boolean> {
     if (!ctx) return true;
     ctx.drawImage(img, 0, 0);
     const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+    // 与桌面版（Rust has_transparency）对齐：alpha<16 的像素占比 >5% 才算「已透明」。
+    // 旧实现「任一 alpha<250 即已透明」会让 AI 常返回的边缘半透明 PNG 直接跳过抠图、绿幕整片残留。
+    let low = 0;
     for (let i = 3; i < data.length; i += 4) {
-      if (data[i] < 250) return true;
+      if (data[i] < 16) low++;
     }
-    return false;
+    return low / Math.max(1, data.length / 4) > 0.05;
   } catch {
     return true;
   }
@@ -399,14 +468,14 @@ export async function webHasTransparency(dataB64: string): Promise<boolean> {
  *  只移除与边缘相连的背景区域，主体内部与背景相近的孤立像素（如脸部高光）不会被误删。
  *  绿幕下启用色度加权距离（降 G 权重）+ 暗色前景保护（max(rgb)<60 当前景边界），
  *  对齐 Rust cutout.rs 行为，避免「绿底把黑色抠成灰色半透明」。 */
-export async function webCutoutImage(dataB64: string, threshold = 40): Promise<string> {
+export async function webCutoutImage(dataB64: string, threshold = 40): Promise<{ dataB64: string; method: string }> {
   try {
     const img = await loadImage(dataB64);
     const canvas = document.createElement("canvas");
     canvas.width = img.width;
     canvas.height = img.height;
     const ctx = canvas.getContext("2d");
-    if (!ctx) return dataB64;
+    if (!ctx) return { dataB64, method: "chroma" };
     ctx.drawImage(img, 0, 0);
     const w = canvas.width;
     const h = canvas.height;
@@ -439,7 +508,7 @@ export async function webCutoutImage(dataB64: string, threshold = 40): Promise<s
         pushPx(w - 1 - x, y);
       }
     }
-    if (rs.length < 8) return dataB64;
+    if (rs.length < 8) return { dataB64, method: "chroma" };
     const median = (v: number[]) => v.slice().sort((a, b) => a - b)[(v.length / 2) | 0];
     const bgR = median(rs);
     const bgG = median(gs);
@@ -451,9 +520,13 @@ export async function webCutoutImage(dataB64: string, threshold = 40): Promise<s
       (bgG - Math.max(bgR, bgB) > 30 ||
         (bgB > bgR + 15 && bgG >= bgB - 15) ||
         (bgG > bgR + 10 && bgG > bgB + 10 && bgG >= (bgR + bgB) * 0.55));
+    // 深色背景（黑/墨蓝）：色度键无法区分黑发/黑衣与深色背景，硬抠会把主体抠成半透明灰 → 保留原图（对齐 Rust）
+    if (!green && Math.max(bgR, bgG, bgB) < 90) {
+      return { dataB64, method: "skip-dark" };
+    }
 
     // 绿幕下用更大容差与色度加权距离（降 G 权重）
-    const thr = green ? Math.max(threshold, 80) : threshold;
+    const thr = green ? Math.max(threshold, 80) : Math.max(threshold, 4);
     const thrEdge = green ? thr + 90 : thr + 40;
 
     const dist = (i: number) => {
@@ -497,9 +570,11 @@ export async function webCutoutImage(dataB64: string, threshold = 40): Promise<s
       if (d <= thr) {
         px[i + 3] = 0;
       } else {
-        // 羽化：边缘半透明渐变（抗锯齿）
-        const t = 1 - (d - thr) / (thrEdge - thr);
-        px[i + 3] = Math.round(px[i + 3] * (0.15 + 0.85 * t));
+        // 羽化：对齐 Rust cutout.rs 的 smoothstep（t*t*(3-2t)）——越靠近背景越透明、越靠近前景越不透明；
+        // 旧实现是 1-t 的线性反相（越靠近背景反而越不透明），过渡带会出现怪异半透明边
+        const t = (d - thr) / (thrEdge - thr);
+        const s = t * t * (3 - 2 * t);
+        px[i + 3] = Math.round(px[i + 3] * s);
       }
       const x = idx % w;
       const y = (idx / w) | 0;
@@ -508,25 +583,78 @@ export async function webCutoutImage(dataB64: string, threshold = 40): Promise<s
       if (y > 0) stack.push(idx - w);
       if (y < h - 1) stack.push(idx + w);
     }
-    // 去绿边/绿晕：对边缘与半透明像素，绿色明显高于红/蓝时压制绿色（与 Rust 版一致）
-    for (let i = 0; i < px.length; i += 4) {
-      const r = px[i];
-      const g = px[i + 1];
-      const b = px[i + 2];
-      const a = px[i + 3];
-      const maxRB = Math.max(r, b);
-      const spill = g - maxRB;
-      if (spill > 6 && a < 250) {
-        const strength = a < 200 ? 1 : 0.85;
-        px[i + 1] = Math.round(Math.max(0, g - spill * strength));
+    // 去绿边/绿晕：对齐 Rust cutout.rs 的 despill/apply_despill/dilate——
+    // 初始 fringe＝半透明像素＋4 邻域含高透明像素的不透明边界像素，随后按绿幕强度做 2~3 轮
+    // 8 邻域膨胀＋去绿，把「不透明但与高透明相邻的绿晕发丝」也处理掉；旧实现只处理 a<250 且只跑一轮，
+    // 不透明边缘的绿边/绿晕会残留。
+    const pixelCount = w * h;
+    const spillTh = green ? 2 : 6;
+    const fringeStrength = green ? 0.95 : 0.85;
+    const maxPasses = green ? 3 : 2;
+    let fringe = new Uint8Array(pixelCount);
+    for (let y = 1; y < h - 1; y++) {
+      for (let x = 1; x < w - 1; x++) {
+        const idx = y * w + x;
+        if (px[idx * 4 + 3] < 250) {
+          fringe[idx] = 1;
+        } else if (
+          px[(idx - 1) * 4 + 3] < 128 ||
+          px[(idx + 1) * 4 + 3] < 128 ||
+          px[(idx - w) * 4 + 3] < 128 ||
+          px[(idx + w) * 4 + 3] < 128
+        ) {
+          fringe[idx] = 1;
+        }
       }
     }
+    const applyDespill = (): void => {
+      for (let idx = 0; idx < pixelCount; idx++) {
+        if (!fringe[idx]) continue;
+        const i = idx * 4;
+        const r = px[i];
+        const g = px[i + 1];
+        const b = px[i + 2];
+        const spill = g - Math.max(r, b);
+        if (spill <= spillTh) continue;
+        // 强度按透明度分档（对齐 Rust apply_despill）：不透明用 fringe_strength，
+        // 半透明羽化带用 0.85 保留发丝色调，高度半透明用 1.0 几乎彻底去绿
+        const a = px[i + 3];
+        const strength = a >= 250 ? fringeStrength : a >= 128 ? 0.85 : 1;
+        px[i + 1] = Math.round(Math.max(0, g - spill * strength));
+      }
+    };
+    for (let pass = 0; pass < maxPasses; pass++) {
+      applyDespill();
+      // 8 邻域膨胀 fringe：下一轮把更靠内的不透明绿晕也纳入去绿范围
+      const grown = fringe.slice();
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          const idx = y * w + x;
+          if (!fringe[idx]) continue;
+          for (let dy = -1; dy <= 1; dy++) {
+            for (let dx = -1; dx <= 1; dx++) {
+              if (dx === 0 && dy === 0) continue;
+              const xx = x + dx;
+              const yy = y + dy;
+              if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+              grown[yy * w + xx] = 1;
+            }
+          }
+        }
+      }
+      fringe = grown;
+    }
+    applyDespill();
     let removed = 0;
     for (let i = 3; i < px.length; i += 4) if (px[i] < 250) removed++;
-    if (removed === 0) return dataB64;
+    if (removed === 0) return { dataB64, method: "chroma" };
+    // 非绿底且透明占比过高 → 疑似把主体误抠掉：保留原图（对齐 Rust skip-overcut），交回前端提示
+    if (!green && removed / (w * h) >= 0.6) {
+      return { dataB64, method: "skip-overcut" };
+    }
     ctx.putImageData(imageData, 0, 0);
-    return canvas.toDataURL("image/png").split(",")[1] ?? dataB64;
+    return { dataB64: canvas.toDataURL("image/png").split(",")[1] ?? dataB64, method: "chroma" };
   } catch {
-    return dataB64;
+    return { dataB64, method: "chroma" };
   }
 }

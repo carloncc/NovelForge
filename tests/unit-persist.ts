@@ -111,6 +111,14 @@ async function main(): Promise<void> {
   assert(restored.visualBible?.styleDescription === visualBible.styleDescription, "visual bible should restore from its canonical manifest");
   const projectJson = (await tauri.readTextFile(`${DIR}/.novel2vn/project_state.json`)).text;
   assert(!projectJson.includes(PNG_B64) && !projectJson.includes("visualBible"), "project JSON should not duplicate the visual-bible manifest or image data");
+
+  // B33：没有 visualBible 的项目同样不能把参考图 base64 内嵌进 project_state.json
+  const noBibleDir = `${DIR}-no-bible`;
+  await tauri.mkdirAll(noBibleDir);
+  await saveProjectState({ novel: null, materials: [], outputDir: noBibleDir, options, lastResult });
+  const noBibleJson = (await tauri.readTextFile(`${noBibleDir}/.novel2vn/project_state.json`)).text;
+  assert(!noBibleJson.includes(PNG_B64), "project JSON should strip inline reference images even without a visual bible");
+  await tauri.removePath(noBibleDir);
   assert(
     /^character-reference_alice\.rev-[A-Za-z0-9-]+\.png$/.test(restored.lastResult?.cards.characters[0].referenceImagePath ?? ""),
     "legacy character references should restore as revisioned project-local paths",

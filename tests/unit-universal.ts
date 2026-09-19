@@ -1,4 +1,5 @@
 import { unifiedImage, unifiedTts, buildRequestBody, getByPath, joinUrl, setByPath, buildMultipartBody } from "../src/api/universal";
+import { normalizeBaseUrl, normalizeProviderBaseUrl } from "../src/api/baseUrl";
 import { getTemplate, resolveTemplate } from "../src/api/templates";
 import type { ApiConfig } from "../src/core/types";
 
@@ -58,7 +59,7 @@ async function main(): Promise<void> {
     respond: () => ({
       status: 200,
       contentType: "application/json",
-      body: { data: [{ b64_json: "QUJDRA==" }] }, // ABCD
+      body: { data: [{ b64_json: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==" }] },
     }),
   });
   const img1 = await unifiedImage(makeCfg(), getTemplate("openai-image")!, {
@@ -66,7 +67,7 @@ async function main(): Promise<void> {
     width: 1024,
     height: 1024,
   });
-  assert(img1.dataB64 === "QUJDRA==", "openai-image b64 解析失败");
+  assert(img1.dataB64 === "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "openai-image b64 解析失败");
   assert(img1.mime === "image/png", "openai-image mime 错误");
 
   // base_url 带 /v1 时 URL 拼接正确（不产生 /v1/v1）
@@ -74,6 +75,26 @@ async function main(): Promise<void> {
   assert(url1 === "https://api.test.com/v1/images/generations", `joinUrl 失败: ${url1}`);
   const url2 = joinUrl("https://api.test.com", "/v1/images/generations");
   assert(url2 === "https://api.test.com/v1/images/generations", `joinUrl 失败: ${url2}`);
+
+  // B101：版本段不在末尾（/v1beta/openai）也不能再追加 /v1
+  assert(
+    normalizeBaseUrl("https://generativelanguage.googleapis.com/v1beta/openai") === "https://generativelanguage.googleapis.com/v1beta/openai",
+    "base 含 /v1beta/openai 时不应追加 /v1",
+  );
+  assert(normalizeBaseUrl("https://api.test.com") === "https://api.test.com/v1", "普通 base 仍应补 /v1");
+  // B109：base 带 query 时接口路径必须拼进 pathname，query 保留在最后
+  assert(
+    normalizeBaseUrl("https://api.test.com/api?key=1") === "https://api.test.com/api/v1?key=1",
+    `带 query 的 base 归一化错误: ${normalizeBaseUrl("https://api.test.com/api?key=1")}`,
+  );
+  assert(
+    joinUrl("https://api.test.com/api?key=1", "/v1/images/generations") === "https://api.test.com/api/v1/images/generations?key=1",
+    `带 query 的 joinUrl 错误: ${joinUrl("https://api.test.com/api?key=1", "/v1/images/generations")}`,
+  );
+  assert(
+    normalizeProviderBaseUrl("https://api.test.com/v1beta?key=1") === "https://api.test.com/v1beta?key=1",
+    "通用适配器 base 的 query 应保留",
+  );
 
   // ---------- 2. minimax-image URL 响应（自动下载） ----------
   routes.length = 0;
@@ -224,7 +245,7 @@ async function main(): Promise<void> {
         candidates: [
           {
             content: {
-              parts: [{ inlineData: { mimeType: "image/png", data: "R0lOR0FOAA==" } }],
+              parts: [{ inlineData: { mimeType: "image/png", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==" } }],
             },
           },
         ],
@@ -236,7 +257,7 @@ async function main(): Promise<void> {
     model: "gemini-2.0-flash-exp",
   });
   const img4 = await unifiedImage(geminiCfg, getTemplate("gemini-image")!, { prompt: "星空", width: 1024, height: 1024 });
-  assert(img4.dataB64 === "R0lOR0FOAA==", "gemini inlineData 提取失败");
+  assert(img4.dataB64 === "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "gemini inlineData 提取失败");
   assert(img4.mime === "image/png", "gemini mime 错误");
   assert(geminiUrl === "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent", `gemini URL 错误: ${geminiUrl}`);
   assert(geminiBody.contents[0].parts[0].text === "星空", "gemini 数组路径构造失败");

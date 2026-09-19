@@ -27,7 +27,6 @@ export function chapterScopeImageTasks(
     items: (cards.items ?? []).filter((i) => itemIds.has(i.id)),
   };
   return buildImageTasks([chapter], scoped, {
-    figurePerCharacter: 1,
     cgPerChapter: options.cgPerChapter ?? 0,
     maxPerChapter: options.imageBudgetPerChapter ?? 0,
     figureEmotions: options.figureEmotions,

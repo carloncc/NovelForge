@@ -93,3 +93,43 @@ export function minimaxVoiceById(id: string): MiniMaxVoice | undefined {
 export function minimaxVoiceLabel(id: string): string {
   return minimaxVoiceById(id)?.name ?? id;
 }
+
+/** 常见 OpenAI 兼容音色的性别（默认音色库用；MiniMax 走官方表） */
+const KNOWN_VOICE_GENDERS: Record<string, "male" | "female"> = {
+  anna: "female",
+  bella: "female",
+  lily: "female",
+  meimei: "female",
+  sarah: "female",
+  xuanxuan: "female",
+  harry: "male",
+  jack: "male",
+  jim: "male",
+  marvin: "male",
+  roger: "male",
+};
+
+/** 判定音色性别：MiniMax 官方表 → 常见音色名 → ID 前缀启发；未知返回 undefined */
+export function voiceGenderOf(id: string): "male" | "female" | "other" | undefined {
+  const official = minimaxVoiceById(id);
+  if (official) return official.gender;
+  const known = KNOWN_VOICE_GENDERS[id.toLowerCase()];
+  if (known) return known;
+  if (/^female|女/i.test(id)) return "female";
+  if (/^male|男/i.test(id)) return "male";
+  return undefined;
+}
+
+/** 从音色库按性别挑选：同一角色稳定轮换（避免所有角色共用同一个声音）；无匹配返回 undefined */
+export function pickVoiceForGender(
+  lib: string[],
+  gender: "male" | "female" | undefined,
+  seed: string,
+): string | undefined {
+  if (!gender) return undefined;
+  const pool = lib.filter((id) => voiceGenderOf(id) === gender);
+  if (!pool.length) return undefined;
+  let h = 5381;
+  for (const ch of seed) h = ((h * 33) ^ ch.codePointAt(0)!) >>> 0;
+  return pool[h % pool.length];
+}

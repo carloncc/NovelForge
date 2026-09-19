@@ -3,7 +3,7 @@ use chardetng::EncodingDetector;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -13,6 +13,8 @@ use crate::{preview, server};
 
 const API_SECRET_SERVICE: &str = "com.novelforge.app.api";
 const HTTP_BODY_LIMIT: usize = 64 * 1024 * 1024;
+/// read_file_header 允许读取的最大头部字节数：无论调用方传多大都不读取整文件
+const READ_FILE_HEADER_LIMIT: usize = 64 * 1024;
 static ATOMIC_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Deserialize)]
@@ -73,6 +75,9 @@ pub async fn http_request(args: HttpRequestArgs) -> Result<Value, String> {
     let target = http_target(&args)?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(args.timeout_secs.clamp(1, 600)))
+        // 禁止跟随重定向：否则 302/307 可跳到内网/元数据地址完成 SSRF 绕过，
+        // 且与 Web 代理（redirect:"manual"）策略不一致
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| format!("HTTP 客户端初始化失败: {e}"))?;
 
@@ -81,7 +86,10 @@ pub async fn http_request(args: HttpRequestArgs) -> Result<Value, String> {
 
     let mut req = client.request(method, target);
     for (k, v) in &args.headers {
-        if k.to_lowercase() != "host" {
+        // host/cookie/content-length 由客户端管理：与 Web 代理的禁止头列表保持一致，
+        // 防止渲染层借 Tauri 侧携带 Cookie 请求任意站点
+        let lower = k.to_lowercase();
+        if lower != "host" && lower != "cookie" && lower != "content-length" {
             req = req.header(k, v);
         }
     }
@@ -115,24 +123,29 @@ pub async fn http_request(args: HttpRequestArgs) -> Result<Value, String> {
 }
 
 #[tauri::command]
-pub fn read_text_file(path: String) -> Result<Value, String> {
-    let p = PathBuf::from(&path);
-    let data = std::fs::read(&p).map_err(|e| format!("读取失败: {e}"))?;
+pub async fn read_text_file(path: String) -> Result<Value, String> {
+    // 文件读 + 编码探测是阻塞 IO/CPU，放阻塞线程池执行，避免卡住主线程（IPC 命令默认在主线程执行）
+    tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
+        let p = PathBuf::from(&path);
+        let data = std::fs::read(&p).map_err(|e| format!("读取失败: {e}"))?;
 
-    if let Ok(text) = String::from_utf8(data.clone()) {
-        return Ok(serde_json::json!({ "text": text, "encoding": "UTF-8" }));
-    }
+        if let Ok(text) = String::from_utf8(data.clone()) {
+            return Ok(serde_json::json!({ "text": text, "encoding": "UTF-8" }));
+        }
 
-    let mut detector = EncodingDetector::new();
-    detector.feed(&data, true);
-    let enc = detector.guess(None, true);
-    if enc.name() != "UTF-8" {
-        let (text, _, _) = encoding_rs::Encoding::decode(enc, &data);
-        return Ok(serde_json::json!({ "text": text, "encoding": enc.name() }));
-    }
+        let mut detector = EncodingDetector::new();
+        detector.feed(&data, true);
+        let enc = detector.guess(None, true);
+        if enc.name() != "UTF-8" {
+            let (text, _, _) = encoding_rs::Encoding::decode(enc, &data);
+            return Ok(serde_json::json!({ "text": text, "encoding": enc.name() }));
+        }
 
-    let lossy = String::from_utf8_lossy(&data).to_string();
-    Ok(serde_json::json!({ "text": lossy, "encoding": "unknown" }))
+        let lossy = String::from_utf8_lossy(&data).to_string();
+        Ok(serde_json::json!({ "text": lossy, "encoding": "unknown" }))
+    })
+    .await
+    .map_err(|e| format!("读取任务执行失败: {e}"))?
 }
 
 #[tauri::command]
@@ -157,15 +170,58 @@ pub fn write_text_file(path: String, content: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn read_file_base64(path: String) -> Result<String, String> {
-    let data = std::fs::read(&path).map_err(|e| format!("读取失败: {e}"))?;
-    Ok(B64.encode(&data))
+pub async fn read_file_base64(path: String) -> Result<String, String> {
+    // 图片/音频等文件读取 + base64 编码是阻塞操作，放阻塞线程池（大素材读几十 MB）
+    tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
+        let data = std::fs::read(&path).map_err(|e| format!("读取失败: {e}"))?;
+        Ok(B64.encode(&data))
+    })
+    .await
+    .map_err(|e| format!("读取任务执行失败: {e}"))?
+}
+
+/// 读取文件头部最多 max_bytes 字节（不超过 64KB 常量上限）。
+fn read_file_header_bytes(path: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
+    let limit = max_bytes.min(READ_FILE_HEADER_LIMIT);
+    let mut file = std::fs::File::open(path).map_err(|e| format!("读取失败: {e}"))?;
+    let mut buffer = vec![0u8; limit];
+    let mut read = 0usize;
+    // read 允许短读：循环直到填满 limit 或到达文件末尾
+    while read < limit {
+        match file.read(&mut buffer[read..]) {
+            Ok(0) => break,
+            Ok(n) => read += n,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(format!("读取失败: {error}")),
+        }
+    }
+    buffer.truncate(read);
+    Ok(buffer)
+}
+
+/// 只读取文件头部最多 max_bytes 字节（B85）：前端识别图片尺寸只需文件头，
+/// 旧实现调用 read_file_base64 会把几十 MB 的整张图读入内存再 base64 编码，纯为解析 4 字节宽高。
+/// max_bytes 由调用方给出并被强制封顶 64KB。
+#[tauri::command]
+pub async fn read_file_header(path: String, max_bytes: usize) -> Result<Value, String> {
+    // 头部读取同样是阻塞 IO，放阻塞线程池执行，避免卡住主线程（与 read_file_base64 一致）
+    tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
+        let bytes = read_file_header_bytes(&path, max_bytes)?;
+        Ok(serde_json::json!({ "base64": B64.encode(&bytes) }))
+    })
+    .await
+    .map_err(|e| format!("读取任务执行失败: {e}"))?
 }
 
 #[tauri::command]
-pub fn write_file_base64(path: String, data_b64: String) -> Result<(), String> {
-    let bytes = B64.decode(&data_b64).map_err(|e| format!("base64 解码失败: {e}"))?;
-    atomic_write(&PathBuf::from(&path), &bytes)
+pub async fn write_file_base64(path: String, data_b64: String) -> Result<(), String> {
+    // base64 解码 + 落盘是阻塞操作（大图可能几十 MB），放阻塞线程池
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let bytes = B64.decode(&data_b64).map_err(|e| format!("base64 解码失败: {e}"))?;
+        atomic_write(&PathBuf::from(&path), &bytes)
+    })
+    .await
+    .map_err(|e| format!("写入任务执行失败: {e}"))?
 }
 
 #[tauri::command]
@@ -264,12 +320,24 @@ pub fn replace_path(src: String, dst: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn copy_dir_all(src: String, dst: String) -> Result<(), String> {
-    copy_dir_recursive(Path::new(&src), Path::new(&dst))
+pub async fn copy_dir_all(src: String, dst: String) -> Result<(), String> {
+    // 递归复制目录是磁盘密集阻塞操作，放阻塞线程池
+    tauri::async_runtime::spawn_blocking(move || {
+        copy_dir_recursive(Path::new(&src), Path::new(&dst))
+    })
+    .await
+    .map_err(|e| format!("复制任务执行失败: {e}"))?
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
-    if src.is_dir() {
+    // 用 symlink_metadata 绝不跟随链接：链接可能指回父目录造成无限递归/磁盘写满,
+    // 也可能把导出目录外的文件（用户私密目录）复制进发布包，直接跳过
+    let meta = std::fs::symlink_metadata(src).map_err(|e| format!("读取文件属性失败: {e}"))?;
+    if meta.file_type().is_symlink() {
+        eprintln!("[novelforge] 跳过符号链接: {}", src.display());
+        return Ok(());
+    }
+    if meta.file_type().is_dir() {
         std::fs::create_dir_all(dst).map_err(|e| format!("创建目录失败: {e}"))?;
         for entry in std::fs::read_dir(src).map_err(|e| format!("读取目录失败: {e}"))? {
             let entry = entry.map_err(|e| format!("读取条目失败: {e}"))?;
@@ -277,7 +345,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
             let d = dst.join(entry.file_name());
             copy_dir_recursive(&s, &d)?;
         }
-    } else if src.is_file() {
+    } else if meta.file_type().is_file() {
         std::fs::copy(src, dst).map_err(|e| format!("复制失败: {e}"))?;
     }
     Ok(())
@@ -468,20 +536,30 @@ pub fn get_default_output_dir() -> String {
 
 #[tauri::command]
 pub fn open_url(url: String) -> Result<(), String> {
+    // 只允许 http/https：旧实现把任意字符串交给 explorer/open，可借系统关联启动本地程序、
+    // 访问 file:// 或 UNC（\\host\share）触发 NTLM 外泄
+    let trimmed = url.trim();
+    let lower = trimmed.to_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return Err("仅支持打开 http/https 链接".to_string());
+    }
+    if trimmed.contains('\\') || trimmed.contains('\n') || trimmed.contains('\r') {
+        return Err("链接包含非法字符".to_string());
+    }
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("explorer").arg(&url).spawn().map_err(|e| format!("打开失败: {e}"))?;
+        std::process::Command::new("explorer").arg(trimmed).spawn().map_err(|e| format!("打开失败: {e}"))?;
         return Ok(());
     }
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("open").arg(&url).spawn().map_err(|e| format!("打开失败: {e}"))?;
+        std::process::Command::new("open").arg(trimmed).spawn().map_err(|e| format!("打开失败: {e}"))?;
         return Ok(());
     }
     #[cfg(target_os = "linux")]
     {
         for cmd in ["xdg-open", "gio"] {
-            if std::process::Command::new(cmd).arg(&url).spawn().is_ok() {
+            if std::process::Command::new(cmd).arg(trimmed).spawn().is_ok() {
                 return Ok(());
             }
         }
@@ -514,8 +592,15 @@ pub async fn cutout_image(
     data_b64: String,
     threshold: f32,
 ) -> Result<CutoutResult, String> {
-    // 纯代码色度键：立绘/物品背景多为纯色（提示词强制 solid background），色度键即可干净抠出
-    let chroma = crate::cutout::cutout_with_stats(&data_b64, threshold);
+    // 纯代码色度键：立绘/物品背景多为纯色（提示词强制 solid background），色度键即可干净抠出。
+    // 抠图是 CPU 密集 + 大内存操作（解码/洪水填充/PNG 编码），必须放阻塞线程池：
+    // 直接内联在 async 里会占满 async 运行时线程，拖慢其他命令（如下载状态轮询）。
+    let input = data_b64.clone();
+    let chroma = tauri::async_runtime::spawn_blocking(move || {
+        crate::cutout::cutout_with_stats(&input, threshold)
+    })
+    .await
+    .map_err(|e| format!("抠图任务执行失败: {e}"))?;
     match &chroma {
         Ok((_, removed, bg_is_green, dark_bg, _sweep_count)) => {
             // 绿幕背景：removed 高是成功（背景被干净抠掉）
@@ -560,30 +645,68 @@ pub fn has_transparency(data_b64: String) -> Result<bool, String> {
 }
 
 #[tauri::command]
-pub fn build_zip(
+pub async fn build_zip(
     source_dir: String,
     zip_path: String,
     exclude: Vec<String>,
 ) -> Result<serde_json::Value, String> {
-    let src = std::path::PathBuf::from(&source_dir);
+    // ZIP 压缩是 CPU + 磁盘密集阻塞操作，放阻塞线程池执行
+    tauri::async_runtime::spawn_blocking(move || {
+        build_zip_sync(&source_dir, &zip_path, &exclude)
+    })
+    .await
+    .map_err(|e| format!("压缩任务执行失败: {e}"))?
+}
+
+fn build_zip_sync(
+    source_dir: &str,
+    zip_path: &str,
+    exclude: &[String],
+) -> Result<serde_json::Value, String> {
+    let src = std::path::PathBuf::from(source_dir);
     if !src.is_dir() {
         return Err("源目录不存在".to_string());
     }
-    if let Some(parent) = std::path::Path::new(&zip_path).parent() {
+    if let Some(parent) = std::path::Path::new(zip_path).parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
     }
-    let file = std::fs::File::create(&zip_path).map_err(|e| format!("创建 zip 失败: {e}"))?;
+    let result = write_zip_contents(&src, zip_path, exclude);
+    if result.is_err() {
+        // 失败时删除目标 zip：半成品（缺文件/未收尾）会被用户当成完整发布包上传
+        let _ = std::fs::remove_file(zip_path);
+    }
+    result
+}
+
+fn write_zip_contents(
+    src: &Path,
+    zip_path: &str,
+    exclude: &[String],
+) -> Result<serde_json::Value, String> {
+    let file = std::fs::File::create(zip_path).map_err(|e| format!("创建 zip 失败: {e}"))?;
     let mut writer = zip::ZipWriter::new(std::io::BufWriter::new(file));
     let options: zip::write::SimpleFileOptions =
         zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
-    fn is_excluded(path: &std::path::Path, exclude: &[String]) -> bool {
-        path.components().any(|c| {
-            if let std::path::Component::Normal(n) = c {
-                let s = n.to_string_lossy();
-                exclude.iter().any(|e| s == e.as_str() || s.ends_with(e.as_str()))
+    // 排除项按「路径组件」精确匹配：把 "game/vocal" 这类写法归一化为组件序列，
+    // 旧实现 s.ends_with(e) 会把 "not.novel2vn"、"xnode_modules" 等相似名误伤
+    let patterns: Vec<Vec<String>> = exclude
+        .iter()
+        .map(|e| {
+            e.split(['/', '\\'])
+                .filter(|s| !s.is_empty() && *s != ".")
+                .map(str::to_string)
+                .collect()
+        })
+        .filter(|p: &Vec<String>| !p.is_empty())
+        .collect();
+
+    fn is_excluded(rel: &[String], patterns: &[Vec<String>]) -> bool {
+        patterns.iter().any(|pat| {
+            if pat.len() == 1 {
+                rel.iter().any(|c| c == &pat[0])
             } else {
-                false
+                rel.windows(pat.len()).any(|w| w == pat.as_slice())
             }
         })
     }
@@ -593,46 +716,53 @@ pub fn build_zip(
 
     fn walk(
         dir: &std::path::Path,
-        prefix: &str,
+        rel: &mut Vec<String>,
         writer: &mut zip::ZipWriter<std::io::BufWriter<std::fs::File>>,
         options: zip::write::SimpleFileOptions,
-        exclude: &[String],
+        patterns: &[Vec<String>],
         file_count: &mut u64,
         total_size: &mut u64,
     ) -> Result<(), String> {
         for entry in std::fs::read_dir(dir).map_err(|e| format!("读取目录失败: {e}"))? {
             let entry = entry.map_err(|e| format!("读取条目失败: {e}"))?;
             let path = entry.path();
-            if is_excluded(&path, exclude) {
+            // 不跟随符号链接（file_type 取自目录项本身）：链接可能指回父目录导致无限递归，
+            // 或把导出目录外的文件打包进发布物
+            let file_type = entry.file_type().map_err(|e| format!("读取条目类型失败: {e}"))?;
+            if file_type.is_symlink() {
+                eprintln!("[novelforge] 跳过符号链接: {}", path.display());
                 continue;
             }
-            let name = entry.file_name().to_string_lossy().to_string();
-            let zip_name = if prefix.is_empty() {
-                name.clone()
-            } else {
-                format!("{prefix}/{name}")
-            };
-            if path.is_dir() {
+            rel.push(entry.file_name().to_string_lossy().to_string());
+            if is_excluded(rel, patterns) {
+                rel.pop();
+                continue;
+            }
+            if file_type.is_dir() {
+                let zip_name = rel.join("/");
                 writer
-                    .add_directory(zip_name.clone(), options)
+                    .add_directory(zip_name, options)
                     .map_err(|e| format!("写入目录失败: {e}"))?;
-                walk(&path, &zip_name, writer, options, exclude, file_count, total_size)?;
+                walk(&path, rel, writer, options, patterns, file_count, total_size)?;
             } else {
-                let data = std::fs::read(&path).map_err(|e| format!("读取文件失败: {e}"))?;
+                let zip_name = rel.join("/");
+                // 流式写入：io::copy 分块拷贝，大视频/配音不再整块读进内存
+                let mut reader = std::fs::File::open(&path).map_err(|e| format!("读取文件失败: {e}"))?;
+                let size = reader.metadata().map(|m| m.len()).unwrap_or(0);
                 writer
                     .start_file(zip_name, options)
                     .map_err(|e| format!("写入文件失败: {e}"))?;
-                writer
-                    .write_all(&data)
-                    .map_err(|e| format!("写入数据失败: {e}"))?;
+                std::io::copy(&mut reader, writer).map_err(|e| format!("写入数据失败: {e}"))?;
                 *file_count += 1;
-                *total_size += data.len() as u64;
+                *total_size += size;
             }
+            rel.pop();
         }
         Ok(())
     }
 
-    walk(&src, "", &mut writer, options, &exclude, &mut file_count, &mut total_size)?;
+    let mut rel = Vec::new();
+    walk(src, &mut rel, &mut writer, options, &patterns, &mut file_count, &mut total_size)?;
     writer.finish().map_err(|e| format!("zip 收尾失败: {e}"))?;
 
     Ok(serde_json::json!({ "fileCount": file_count, "sizeBytes": total_size }))
@@ -697,7 +827,15 @@ mod atomic_write_tests {
 
 #[cfg(test)]
 mod zip_tests {
-    use super::build_zip;
+    use super::build_zip_sync;
+
+    fn read_zip_names(zip_path: &std::path::Path) -> Vec<String> {
+        let f = std::fs::File::open(zip_path).unwrap();
+        let mut reader = zip::ZipArchive::new(f).unwrap();
+        (0..reader.len())
+            .map(|i| reader.by_index(i).unwrap().name().to_string())
+            .collect()
+    }
 
     #[test]
     fn zip_excludes_and_keeps_utf8_names() {
@@ -710,21 +848,49 @@ mod zip_tests {
         std::fs::write(dir.join("index.html"), "<html/>").unwrap();
 
         let zip_path = dir.join("out.zip");
-        let res = build_zip(
-            dir.to_string_lossy().to_string(),
-            zip_path.to_string_lossy().to_string(),
-            vec![".novel2vn".to_string()],
+        let res = build_zip_sync(
+            &dir.to_string_lossy(),
+            &zip_path.to_string_lossy(),
+            &[".novel2vn".to_string()],
         );
         assert!(res.is_ok(), "build_zip 失败: {:?}", res.err());
 
-        let f = std::fs::File::open(&zip_path).unwrap();
-        let mut reader = zip::ZipArchive::new(f).unwrap();
-        let names: Vec<String> = (0..reader.len())
-            .map(|i| reader.by_index(i).unwrap().name().to_string())
-            .collect();
+        let names = read_zip_names(&zip_path);
         assert!(names.iter().any(|n| n.contains("中文名")), "中文文件名丢失: {names:?}");
         assert!(names.iter().any(|n| n == "index.html"), "根文件丢失: {names:?}");
         assert!(!names.iter().any(|n| n.contains(".novel2vn")), "排除目录被打包: {names:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zip_exclude_matches_path_components_exactly() {
+        // B126 回归：排除 ".novel2vn" 不能误伤 "not.novel2vn" / "xnode_modules" 这类相似名
+        let dir = std::env::temp_dir().join("novelforge_zip_exclude_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".novel2vn")).unwrap();
+        std::fs::create_dir_all(dir.join("not.novel2vn")).unwrap();
+        std::fs::create_dir_all(dir.join("node_modules")).unwrap();
+        std::fs::write(dir.join(".novel2vn/cache.json"), "secret").unwrap();
+        std::fs::write(dir.join("not.novel2vn/keep.txt"), "keep").unwrap();
+        std::fs::write(dir.join("node_modules/keep.txt"), "keep").unwrap();
+        std::fs::write(dir.join("index.html"), "<html/>").unwrap();
+
+        let zip_path = dir.join("out.zip");
+        let res = build_zip_sync(
+            &dir.to_string_lossy(),
+            &zip_path.to_string_lossy(),
+            &[".novel2vn".to_string(), "node_modules".to_string()],
+        );
+        assert!(res.is_ok(), "build_zip 失败: {:?}", res.err());
+
+        let names = read_zip_names(&zip_path);
+        assert!(!names.iter().any(|n| n.starts_with(".novel2vn/")), "应排除 .novel2vn: {names:?}");
+        assert!(!names.iter().any(|n| n.starts_with("node_modules/")), "应排除 node_modules: {names:?}");
+        assert!(
+            names.iter().any(|n| n.starts_with("not.novel2vn/")),
+            "相似名目录被误伤: {names:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -3,7 +3,7 @@ import { rawReferenceBase64, ReferenceImageError, referenceDataUrl, referenceRou
 import { tauri } from "../utils/tauri";
 import { log } from "../utils/logger";
 import { classifyError } from "../utils/errorClassifier";
-import { normalizeProviderBaseUrl, customHeadersFor } from "./baseUrl";
+import { normalizeProviderBaseUrl, customHeadersFor, joinApiPath } from "./baseUrl";
 
 /* ============ 统一能力模型 ============ */
 
@@ -270,7 +270,7 @@ function smartPick(raw: unknown, depth = 0): { value: unknown; mime?: string } |
 }
 
 /** 从任意响应中提取可读错误信息（各厂商错误字段不一） */
-export function smartErrorText(json: unknown): string | undefined {
+function smartErrorText(json: unknown): string | undefined {
   if (!json || typeof json !== "object") return undefined;
   const obj = json as Record<string, unknown>;
   for (const key of ["status_message", "message", "msg", "error_message", "errorMsg"]) {
@@ -304,8 +304,10 @@ async function decodeResult(
   template: AdapterTemplate,
   cfg: ApiConfig,
 ): Promise<UnifiedResult> {
-  const encoding = template.response.encoding ?? "base64";
-  const mime = template.response.mime;
+  // B105（防御性）：自定义模板可能缺少 response 配置，这里按默认值处理，避免解构出的 undefined 直接抛 TypeError
+  const response = template.response ?? {};
+  const encoding = response.encoding ?? "base64";
+  const mime = response.mime;
 
   // 数组：取第一项递归
   if (Array.isArray(raw)) {
@@ -317,7 +319,7 @@ async function decodeResult(
     const hit = smartPick(raw);
     if (hit !== undefined && hit.value !== undefined) {
       const itemMime = hit.mime ?? mime;
-      const sub = { ...template, response: { ...template.response, mime: itemMime } };
+      const sub = { ...template, response: { ...response, mime: itemMime } };
       return decodeResult(hit.value, sub, cfg);
     }
     const errMsg = smartErrorText(raw);
@@ -345,7 +347,31 @@ async function decodeResult(
     }
     return { dataB64: value, mime: mime ?? "application/octet-stream" };
   }
+  assertEncodedPayload(value, mime);
   return { dataB64: value, mime: mime ?? "image/png" };
+}
+
+/** 结果数据合法性校验：模型拒答/说明文字（Gemini 的 content.parts[0].text 等）常被 smartPick 当数据返回，
+ * 直接在写盘后表现为损坏 .png。这里至少拦掉「非 base64 文本」与「图片缺少已知文件头」。 */
+function assertEncodedPayload(value: string, mime: string | undefined): void {
+  const compact = value.replace(/\s+/g, "");
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(compact)) {
+    throw new Error(`结果数据不是合法 base64（疑似模型返回了文本而非图片/音频）：${value.slice(0, 80)}`);
+  }
+  const m = (mime ?? "").toLowerCase();
+  if (m.startsWith("image/")) {
+    // 注意用「3 字节对齐」的前缀：base64 只有完整 3 字节组才稳定（8 字节 PNG 头 + 后续字节时
+    // 第 9-12 位会变成下一组的编码，不能用 ^iVBORw0KGgo 这种跨越半组的写法）
+    const magicOk =
+      /^iVBORw0K/.test(compact) || // PNG（前 6 字节稳定前缀）
+      /^\/9j\//.test(compact) || // JPEG
+      /^R0lG/.test(compact) || // GIF
+      /^UklG/.test(compact) || // WebP (RIFF)
+      /^Qk/.test(compact); // BMP
+    if (!magicOk) {
+      throw new Error(`图片数据缺少已知文件头（疑似返回文本被当成图片）：${value.slice(0, 80)}`);
+    }
+  }
 }
 
 /* ============ HTTP 请求（带重试） ============ */
@@ -363,7 +389,35 @@ function referenceErrorFromResponse(raw: string): ReferenceImageError | undefine
   return new ReferenceImageError(message, code);
 }
 
-const RETRY_DELAYS = [1000, 10000, 20000, 30000, 40000, 50000, 60000];
+/**
+ * 适配器请求重试间隔（4 档，最多 5 次请求）。
+ * 旧实现 7 档（最多 8 次）与外层 images 的 3 次重试叠加，最坏一张图打出 24 个付费请求；
+ * 收敛为 4 档并限制单请求退避上限 30s，配合外层任务级重试已足够覆盖服务端抖动。
+ */
+const RETRY_DELAYS = [1000, 5000, 15000, 30000];
+
+/** GET 轮询失败的额外重试次数（B104）：网络抖动/429/5xx 才重试，最多 3 次 */
+const GET_RETRY_COUNT = 3;
+
+/** 退避抖动：0.7~1.3 倍，避免多个并发任务在同一时刻集体重试（thundering herd）再次打爆服务端 */
+function jitterDelay(ms: number): number {
+  return Math.round(ms * (0.7 + Math.random() * 0.6));
+}
+
+/**
+ * 可中止的退避等待：把长等待切成 250ms 分片，isAborted 回调返回 true 时最多再等一个分片即退出，
+ * 不像旧实现那样把 1~30s 的退避睡满（期间还占着限流槽位，停止任务也要等退避结束）。
+ */
+async function retrySleep(ms: number, isAborted?: () => boolean): Promise<void> {
+  let remaining = ms;
+  while (remaining > 0) {
+    if (isAborted?.()) throw new Error("已中止");
+    const step = Math.min(250, remaining);
+    await new Promise((r) => setTimeout(r, step));
+    remaining -= step;
+  }
+  if (isAborted?.()) throw new Error("已中止");
+}
 
 /** 请求体里是否真的带了图片（data-url 或 png/jpeg/gif/webp 的 base64 magic）——只有带了图才把 413 归到「线路拒图」 */
 const IMAGE_PAYLOAD_MAGIC = /data:image\/[a-z0-9.+-]+;base64,|iVBORw0KGgo|\/9j\/|R0lGOD|UklGR/;
@@ -398,12 +452,27 @@ function authHeaders(cfg: ApiConfig, template: AdapterTemplate): Record<string, 
   return { Authorization: `Bearer ${cfg.apiKey}` };
 }
 
-async function postJson(
+interface HttpRawResult {
+  status: number;
+  raw: string;
+  bodyBase64: string;
+  contentType: string;
+  json?: unknown;
+}
+
+/**
+ * 带重试的底层 POST 请求（B90）。
+ * 原 postJson 的重试/classifyError 逻辑抽到这里，rawResponse 同步模板也复用同一套：
+ * 旧实现对二进制响应裸调 tauri.http，5xx/网络错误既不重试也不分类，与 JSON 模板行为不一致。
+ * options.parseJson=true 时在重试循环内解析 JSON（解析失败仍可退避重试，保持旧行为）。
+ */
+async function requestWithRetry(
   cfg: ApiConfig,
   url: string,
   body: Record<string, unknown>,
   template: AdapterTemplate,
-): Promise<{ status: number; json: unknown; raw: string }> {
+  options?: { isAborted?: () => boolean; parseJson?: boolean },
+): Promise<HttpRawResult> {
   let lastErr: unknown;
   const isForm = template.contentType === "form";
   for (let attempt = 0; attempt <= RETRY_DELAYS.length; attempt++) {
@@ -429,7 +498,10 @@ async function postJson(
         body: payload,
         timeoutSecs: 300,
       });
-      const raw = utf8FromB64(res.bodyBase64);
+      // 只在需要时解码响应体：rawResponse 的成功路径可能是几 MB 的音频/图片字节，
+      // 每次都转成字符串（旧 postJson 为解析 JSON 才需要）会白白构造大字符串
+      const needRaw = res.status >= 400 || options?.parseJson === true;
+      const raw = needRaw ? utf8FromB64(res.bodyBase64) : "";
       if (res.status >= 400) {
         log.error("api", "适配器请求失败", {
           url,
@@ -463,12 +535,15 @@ async function postJson(
         throw apiError;
       }
       let json: unknown;
-      try {
-        json = JSON.parse(raw);
-      } catch {
-        throw new Error(`API 响应不是合法 JSON: ${raw.slice(0, 300)}`);
+      if (options?.parseJson) {
+        try {
+          json = JSON.parse(raw);
+        } catch {
+          // 解析失败留在重试循环内：网关偶发返回截断/半截 JSON 时仍可退避重试（保持旧 postJson 行为）
+          throw new Error(`API 响应不是合法 JSON: ${raw.slice(0, 300)}`);
+        }
       }
-      return { status: res.status, json, raw };
+      return { status: res.status, raw, bodyBase64: res.bodyBase64, contentType: res.contentType, json };
     } catch (e) {
       lastErr = e;
       const err = e as { status?: number; message?: string };
@@ -479,10 +554,20 @@ async function postJson(
       if (attempt >= RETRY_DELAYS.length) {
         throw e;
       }
-      await new Promise((r) => setTimeout(r, RETRY_DELAYS[attempt]));
+      await retrySleep(jitterDelay(RETRY_DELAYS[attempt]), options?.isAborted);
     }
   }
   throw lastErr;
+}
+
+async function postJson(
+  cfg: ApiConfig,
+  url: string,
+  body: Record<string, unknown>,
+  template: AdapterTemplate,
+): Promise<{ status: number; json: unknown; raw: string }> {
+  const res = await requestWithRetry(cfg, url, body, template, { parseJson: true });
+  return { status: res.status, json: res.json, raw: res.raw };
 }
 
 export function utf8FromB64(b64: string): string {
@@ -496,24 +581,59 @@ export function utf8FromB64(b64: string): string {
   }
 }
 
-async function getJson(cfg: ApiConfig, url: string, template: AdapterTemplate): Promise<unknown> {
-  const res = await tauri.http({
-    method: "GET",
-    url,
-    headers: { ...authHeaders(cfg, template), ...customHeadersFor(cfg) },
-    timeoutSecs: 60,
-  });
-  if (res.status >= 400) {
-    let errText = utf8FromB64(res.bodyBase64).slice(0, 200);
+/**
+ * GET（异步任务轮询）请求（B104）。
+ * 旧实现单次裸调，一次网络抖动就让整个异步任务轮询中断、任务白提交；
+ * 这里仅对网络层错误/429/5xx 做有限退避重试（最多 GET_RETRY_COUNT 次），
+ * 4xx（除 429）与响应解析失败属于永久错误，立即抛出不做无谓重试。
+ */
+async function getJson(cfg: ApiConfig, url: string, template: AdapterTemplate, isAborted?: () => boolean): Promise<unknown> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= GET_RETRY_COUNT; attempt++) {
     try {
-      const smart = smartErrorText(JSON.parse(utf8FromB64(res.bodyBase64)));
-      if (smart) errText = smart;
-    } catch {
-      /* 非 JSON */
+      const res = await tauri.http({
+        method: "GET",
+        url,
+        headers: { ...authHeaders(cfg, template), ...customHeadersFor(cfg) },
+        timeoutSecs: 60,
+      });
+      const raw = utf8FromB64(res.bodyBase64);
+      if (res.status >= 500 || res.status === 429) {
+        throw { status: res.status, message: `HTTP ${res.status}` };
+      }
+      if (res.status >= 400) {
+        let errText = raw.slice(0, 200);
+        try {
+          const smart = smartErrorText(JSON.parse(raw));
+          if (smart) errText = smart;
+        } catch {
+          /* 非 JSON */
+        }
+        const apiError = new Error(`轮询请求失败 ${res.status}: ${errText}`);
+        (apiError as { status?: number }).status = res.status;
+        throw apiError;
+      }
+      try {
+        return JSON.parse(raw);
+      } catch {
+        throw new Error(`轮询响应不是合法 JSON: ${raw.slice(0, 200)}`);
+      }
+    } catch (e) {
+      lastErr = e;
+      const err = e as { status?: number; message?: string };
+      const cls = classifyError(e, err.status);
+      if (cls !== "network" && cls !== "rate_limit") throw e;
+      if (attempt >= GET_RETRY_COUNT) throw e;
+      const delay = jitterDelay(RETRY_DELAYS[Math.min(attempt, RETRY_DELAYS.length - 1)]);
+      log.warn("api", `轮询请求失败，${(delay / 1000).toFixed(1)}s 后重试`, {
+        url,
+        status: err.status ?? 0,
+        message: err.message?.slice(0, 200),
+      });
+      await retrySleep(delay, isAborted);
     }
-    throw new Error(`轮询请求失败 ${res.status}: ${errText}`);
   }
-  return JSON.parse(utf8FromB64(res.bodyBase64));
+  throw lastErr;
 }
 
 /* ============ 通用调用入口 ============ */
@@ -533,63 +653,47 @@ export function joinUrl(base: string, endpoint: string): string {
   if (/\/v\d+(?:alpha|beta|p\d+)?$/i.test(b) && /^\/v\d+(?:alpha|beta|p\d+)?\//i.test(e)) {
     e = e.replace(/^\/v\d+(?:alpha|beta|p\d+)?/i, "");
   }
-  return `${b}${e}`;
+  // joinApiPath：base 带 query（?key=...）时接口路径必须拼进 pathname，不能落进 query（B109）
+  return joinApiPath(b, e);
 }
 
-export async function callUnified(ctx: CallContext): Promise<UnifiedResult> {
+/**
+ * B102：是否为官方 OpenAI 图像通道：base_url 命中 api.openai.com，或模型名为 GPT-image/DALL·E 系列。
+ * 官方 /v1/images/generations 不接受 response_format（会 400 unknown_parameter），
+ * 也不支持在 generations 里携带参考图（参考图必须走 /v1/images/edits，本版本未实现）。
+ */
+export function isOfficialOpenAIImage(cfg: ApiConfig): boolean {
+  const base = (cfg.baseUrl || "").trim().toLowerCase().replace(/^https?:\/\//, "");
+  // 只认官方域名：中转站常代理 gpt-image 模型但仍支持 b64_json/参考图字段（实测 relay 413 场景），
+  // 仅凭模型名判断会把中转线路误判成官方通道、错误地剔除 response_format 或提前拒绝参考图
+  return /(^|\.)api\.openai\.com([:/]|$)/.test(base);
+}
+
+async function callUnified(ctx: CallContext): Promise<UnifiedResult> {
   const { cfg, template, vars } = ctx;
   // 与文本/视觉同口径地补协议/应用 pathPrefix；但通用适配器端点自带版本段，不自动补 /v1
   const base = normalizeProviderBaseUrl(cfg.baseUrl, (cfg.extra?.pathPrefix as string) || undefined);
   const url = joinUrl(base, template.endpoint.replace("{model}", String(vars.model ?? "")));
   const body = buildRequestBody(template, vars);
+  // B102：官方 OpenAI 图像通道不支持 response_format 字段，带上会 400 unknown_parameter，组装后剔除；
+  // 中转站/其它线路仍需 b64_json 指定返回格式，保持原样。
+  if (template.capability === "image" && isOfficialOpenAIImage(cfg) && "response_format" in body) {
+    delete body.response_format;
+  }
 
   if (template.mode === "sync") {
     if (template.rawResponse) {
-      const isForm = template.contentType === "form";
-      const headers: Record<string, string> = {
-        ...(isForm ? {} : { "Content-Type": "application/json" }),
-        ...authHeaders(cfg, template),
-        ...customHeadersFor(cfg),
-        ...(template.headers ?? {}),
-      };
-      let payload: string;
-      if (isForm) {
-        const mp = buildMultipartBody(body);
-        headers["Content-Type"] = mp.contentType;
-        payload = mp.body;
-      } else {
-        payload = JSON.stringify(body);
-      }
-      const res = await tauri.http({
-        method: "POST",
-        url,
-        headers,
-        body: payload,
-        timeoutSecs: 300,
-      });
-      if (res.status >= 400) {
-        const raw = utf8FromB64(res.bodyBase64);
-        const referenceError = referenceErrorFromResponse(raw);
-        if (referenceError) throw referenceError;
-        let errText = raw.slice(0, 300);
-        try {
-          const smart = smartErrorText(JSON.parse(raw));
-          if (smart) errText = smart;
-        } catch {
-          /* 非 JSON */
-        }
-        const apiError = new Error(`API 错误 ${res.status}: ${errText}`);
-        (apiError as { status?: number }).status = res.status;
-        throw apiError;
-      }
+      // B90：二进制响应同样走 requestWithRetry（5xx/429/网络错误退避重试 + 类型化错误分类），
+      // 不再裸调 tauri.http 导致探测/测试连接一遇抖动就失败
+      const res = await requestWithRetry(cfg, url, body, template);
       return {
         dataB64: res.bodyBase64,
         // 优先真实响应的 Content-Type：模板写死的 mime（如 audio/mpeg）会把 ogg/opus/wav 结果存成 .mp3
-        mime: (res.contentType?.split(";")[0] || template.response.mime) || "application/octet-stream",
+        mime: (res.contentType?.split(";")[0] || template.response?.mime) || "application/octet-stream",
       };
     }
     const { json } = await postJson(cfg, url, body, template);
-    const raw = getByPath(json, template.response.path ?? "");
+    const raw = getByPath(json, template.response?.path ?? "");
     if (raw !== undefined && raw !== null && raw !== "") {
       return decodeResult(raw, template, cfg);
     }
@@ -599,7 +703,7 @@ export async function callUnified(ctx: CallContext): Promise<UnifiedResult> {
     } catch (e) {
       const errMsg = smartErrorText(json);
       throw new Error(
-        errMsg ? `API 错误：${errMsg}` : `响应中未找到结果字段「${template.response.path}」：${JSON.stringify(json).slice(0, 300)}`,
+        errMsg ? `API 错误：${errMsg}` : `响应中未找到结果字段「${template.response?.path ?? ""}」：${JSON.stringify(json).slice(0, 300)}`,
       );
     }
   }
@@ -674,6 +778,14 @@ export async function unifiedImage(
   input: UnifiedImageInput,
 ): Promise<UnifiedResult> {
   const references = input.references ?? [];
+  // B102：官方 GPT-image/DALL·E 通道无法在 /v1/images/generations 携带参考图（需 /v1/images/edits）。
+  // 提前抛类型化错误给出可行动提示，避免用户只看到官方 400 unknown_parameter/请求体超限后不知所措。
+  if (references.length > 0 && isOfficialOpenAIImage(cfg)) {
+    throw new ReferenceImageError(
+      "官方 GPT-image/DALL·E 的参考图需走 /v1/images/edits（本版本暂不支持），请改用支持 reference 的中转线路，或换用支持图生图的图像模型",
+      "REFERENCE_UNSUPPORTED",
+    );
+  }
   const rawReferences = references.map(rawReferenceBase64);
   const dataUrlReferences = references.map(referenceDataUrl);
   const encodedReferences = input.referenceEncoding === "data-url" ? dataUrlReferences : rawReferences;

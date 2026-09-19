@@ -1,8 +1,13 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import { t } from "../../../i18n";
+import { currentLang, t } from "../../../i18n";
 import { ERROR_CLASS_ICON, ERROR_CLASS_LABEL, classifyError } from "../../../utils/errorClassifier";
 import { useGenerateController } from "../../../stores/generate";
+
+/** UI15：失败时间按界面语言本地化；渲染时读取 currentLang，切语言后自动重渲染 */
+function formatTime(ms: number): string {
+  return new Date(ms).toLocaleTimeString(currentLang.value === "zh-CN" ? "zh-CN" : currentLang.value);
+}
 
 // 结果区子面板：状态全部来自 generate store。
 const {
@@ -22,7 +27,8 @@ const canRetryOne = (kind: string): boolean => kind === "image" || kind === "tts
 </script>
 
 <template>
-<div v-if="tab === 'failed'">
+<!-- tab 联合类型里没有 'failed'（失败项并入了运行页），原来的 tab === 'failed' 是永不成立死条件 -->
+<div v-if="tab === 'run'">
   <div class="card" v-if="failedTasks.length">
     <div class="card-head">
       <h3>{{ t("失败任务（") }}{{ failedTasks.length }}{{ t(" 个）") }}</h3>
@@ -36,8 +42,9 @@ const canRetryOne = (kind: string): boolean => kind === "image" || kind === "tts
         <div style="display: flex; align-items: center; gap: 8px">
           <span class="tag err">{{ f.kind === "image" ? t("图像") : f.kind === "script" ? t("剧本") : f.kind === "llm" ? "LLM" : t("配音") }}</span>
           <span>{{ ERROR_CLASS_ICON[classifyError({ message: f.message })] }} {{ ERROR_CLASS_LABEL[classifyError({ message: f.message })] }}</span>
-          <span style="font-weight: 600; font-size: 13px">{{ f.id }}</span>
-          <span style="color: var(--text-faint); font-size: 11px; margin-left: auto">{{ new Date(f.at).toLocaleTimeString() }}</span>
+          <!-- min-width:0 让长 id 在 flex 行内可收缩；text-ellipsis + title 既截断又能悬浮看全 -->
+          <span class="text-ellipsis" style="font-weight: 600; font-size: 13px; min-width: 0" :title="f.id">{{ f.id }}</span>
+          <span style="color: var(--text-faint); font-size: 11px; margin-left: auto">{{ formatTime(f.at) }}</span>
           <button
             v-if="canRetryOne(f.kind)"
             class="btn small"

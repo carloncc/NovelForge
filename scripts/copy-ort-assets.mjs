@@ -37,5 +37,10 @@ for (const filename of runtimeFiles) {
 }
 console.log(`[copy-ort] 已复制 ${copied.length}/${runtimeFiles.length} 个文件到 public/onnx`);
 if (copied.length < runtimeFiles.length) {
-  console.warn(`[copy-ort] 缺失：${runtimeFiles.filter((name) => !copied.includes(name)).join(", ")}`);
+  const missing = runtimeFiles.filter((name) => !copied.includes(name));
+  console.error(`[copy-ort] 缺失：${missing.join(", ")}`);
+  // 这些文件分别被 WASM 回退（simd-threaded）与 WebGPU（jsep/asyncify）推理路径直接加载，
+  // 缺失会让抠图在运行时才失败；构建期必须显式失败，不能静默 exit 0 产出坏包
+  console.error("[copy-ort] 关键运行时文件缺失，构建失败。请检查 onnxruntime-web 版本是否变化。");
+  process.exit(1);
 }

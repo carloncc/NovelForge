@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { ensureAssetLoaded } from "../composables/useAssetThumbs";
+import { clearThumbCache, ensureAssetLoaded } from "../composables/useAssetThumbs";
 import { t } from "../i18n";
 
 const props = defineProps<{
@@ -11,6 +11,8 @@ const props = defineProps<{
 const emit = defineEmits<{ (e: "close"): void }>();
 
 const src = ref("");
+/** 三态：加载中 / 成功 / 失败。旧实现只有「加载中/有值」两态，文件缺失时永久显示「加载中…」 */
+const status = ref<"loading" | "ready" | "failed">("loading");
 const scale = ref(1);
 const tx = ref(0);
 const ty = ref(0);
@@ -19,14 +21,34 @@ let startX = 0;
 let startY = 0;
 let ox = 0;
 let oy = 0;
+let loadAbort: AbortController | null = null;
 
-watch(
-  () => props.path,
-  (p) => {
-    if (p) void ensureAssetLoaded(p).then((s) => (src.value = s));
-  },
-  { immediate: true },
-);
+function load(): void {
+  loadAbort?.abort();
+  loadAbort = null;
+  const p = props.path;
+  src.value = "";
+  if (!p) {
+    status.value = "failed";
+    return;
+  }
+  status.value = "loading";
+  const controller = new AbortController();
+  loadAbort = controller;
+  void ensureAssetLoaded(p, controller.signal).then((s) => {
+    if (controller.signal.aborted) return;
+    src.value = s;
+    status.value = s ? "ready" : "failed";
+  });
+}
+
+/** 失败重试：先清掉该路径的失败退避状态，否则点击后会被 5s 退避直接拒绝、看起来没反应 */
+function retry(): void {
+  if (props.path) clearThumbCache([props.path]);
+  load();
+}
+
+watch(() => props.path, load, { immediate: true });
 
 function onWheel(e: WheelEvent): void {
   const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
@@ -63,7 +85,10 @@ function onKey(e: KeyboardEvent): void {
 }
 
 onMounted(() => window.addEventListener("keydown", onKey));
-onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
+onBeforeUnmount(() => {
+  loadAbort?.abort();
+  window.removeEventListener("keydown", onKey);
+});
 </script>
 
 <template>
@@ -79,7 +104,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
     </div>
     <div class="asset-preview-stage" @wheel.prevent="onWheel">
       <img
-        v-if="src"
+        v-if="status === 'ready'"
         :src="src"
         :alt="label"
         class="asset-preview-img"
@@ -88,6 +113,9 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
         @pointerdown="onPointerDown"
         @pointermove="onPointerMove"
       />
+      <button v-else-if="status === 'failed'" class="btn secondary small" @click="retry">
+        {{ t("加载失败，点击重试") }}
+      </button>
       <div v-else class="asset-preview-loading">{{ t("加载中…") }}</div>
     </div>
   </div>

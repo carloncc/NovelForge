@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { computed } from "vue";
 import { t } from "../../i18n";
 import { LANGUAGES } from "../../core/types";
 import { projectState } from "../../stores/project";
@@ -7,10 +8,17 @@ import { useGenerateController } from "../../stores/generate";
 const { styleRecognizing, pickStyleRef, styleRefSrc, onStyleRefFile, styleRefInput, cancelStyleRecognize } =
   useGenerateController();
 
+/** 折叠状态下也能看到关键开关，避免「看不见的配置在生效」 */
+const optionsSummary = computed(() => {
+  const o = projectState.options;
+  const m = (label: string, on: boolean) => `${label}${on ? "✓" : "×"}`;
+  return [m(t("图像"), o.useImage), m(t("配音"), o.useTts), m(t("视频推荐位"), o.useVideoPoints), m(t("BGM 匹配"), o.useBgm), m(t("环境音效（SE）"), !!o.useSe)].join(" · ");
+});
+
 /** 全量重跑开关：开启前二次确认，避免误勾后每一次生成都全价计费 */
 function onSkipCacheChange(e: Event): void {
   const input = e.target as HTMLInputElement;
-  if (input.checked && !window.confirm("开启「跳过缓存（全量重跑）」后，之后每一次生成/重跑都会忽略缓存全量重生成（全价计费）。确定开启吗？")) {
+  if (input.checked && !window.confirm(t("开启「跳过缓存（全量重跑）」后，之后每一次生成/重跑都会忽略缓存全量重生成（全价计费）。确定开启吗？"))) {
     input.checked = false;
     return;
   }
@@ -19,8 +27,11 @@ function onSkipCacheChange(e: Event): void {
 </script>
 
 <template>
-  <details class="card" :open="!projectState.lastResult">
-    <summary class="card-head"><h3>{{ t("生成内容") }}</h3></summary>
+  <details class="card" open>
+    <summary class="card-head">
+      <h3>{{ t("生成内容") }}</h3>
+      <span class="hint" style="margin-left: 10px">{{ optionsSummary }}</span>
+    </summary>
 
     <div class="opt-grid">
       <label class="opt-item">
@@ -48,10 +59,10 @@ function onSkipCacheChange(e: Event): void {
       <label class="opt-item">
         <input type="checkbox" v-model="projectState.options.useVideoPoints" /> {{ t("视频推荐位") }}
       </label>
-      <label class="opt-item">
+      <label class="opt-item" :title="t('扫描项目 bgm 文件夹匹配场景 BGM；默认关闭时成品将没有背景音乐，需要时请勾选')">
         <input type="checkbox" v-model="projectState.options.useBgm" /> {{ t("BGM 匹配") }}
       </label>
-      <label class="opt-item" :title="t('按场景氛围播放雨/雷/风等内置音效；不需要氛围音时保持关闭')">
+      <label class="opt-item" :title="t('按场景氛围播放雨/雷/风等内置音效；默认关闭时成品将没有任何环境音效，需要时请勾选')">
         <input type="checkbox" v-model="projectState.options.useSe" /> {{ t("环境音效（SE）") }}
       </label>
       <label class="opt-item">

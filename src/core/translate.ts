@@ -40,8 +40,16 @@ export async function translateChapter(
   }
   if (!raw) throw new Error("翻译返回为空");
   const lines = raw.split("\n");
-  const title = (lines[0] || "").replace(/^标题[:：]\s*/, "").trim() || chapter.title;
-  const body = lines.slice(1).join("\n").trim();
-  const text = body || raw;
-  return { title, text };
+  const firstLine = (lines[0] || "").trim();
+  const blankSecond = (lines[1] ?? "").trim() === "";
+  // 首行必须是「像标题」的短行：过长或以句末标点结尾的更像正文，不能当标题吞掉
+  const titleLooksValid = firstLine.length > 0 && firstLine.length <= 60 && !/[。！？!?]$/.test(firstLine);
+  if (blankSecond && titleLooksValid && lines.length >= 3) {
+    const title = firstLine.replace(/^标题[:：]\s*/, "").trim() || chapter.title;
+    const body = lines.slice(1).join("\n").trim();
+    if (body) return { title, text: body };
+  }
+  // 格式不符（模型直接输出正文/缺空行/首行像正文）时整体作为正文：
+  // 旧实现把首行一律当标题，格式错误时正文第一段被吞掉，且错误译文还会被缓存复用
+  return { title: chapter.title, text: raw };
 }

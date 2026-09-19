@@ -27,9 +27,9 @@ const line = (text: string, characterId = "c1") => ({ type: "dialogue" as const,
   assert(c !== a, "文字变化指纹必须变");
 }
 
-// ---------- 2. 追加拼接格式 ----------
+// ---------- 2. 追加拼接格式（B12：分隔统一为 \n\n，与导入链共用归一化） ----------
 {
-  assert(joinAppendText("旧文  ", "  新文\n") === "旧文\n\n\n新文", "追加拼接格式异常");
+  assert(joinAppendText("旧文  ", "  新文\n") === "旧文\n\n新文", "追加拼接格式异常");
 }
 
 // ---------- 3. 映射剪枝：过期删、新键留、旧 CG 键迁移 ----------

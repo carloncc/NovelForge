@@ -5,6 +5,14 @@ function record(input: unknown, label: string): Record<string, unknown> {
   return input as Record<string, unknown>;
 }
 
+/** 剧本行校验：空 text 会导致渲染 esc(undefined) 崩溃，非法 type 会被渲染端静默跳过。
+ * 主流程 lines 与分支 choices.lines 共用同一口径（分支台词同样会被渲染）。 */
+function assertScriptLine(lineInput: unknown, label: string): void {
+  const line = record(lineInput, label);
+  if (typeof line.text !== "string" || !line.text.trim()) throw new Error(`${label} has an invalid text`);
+  if (line.type !== "dialogue" && line.type !== "narration") throw new Error(`${label} has an invalid type`);
+}
+
 export function parseChapterScript(input: unknown): ChapterScript {
   const chapter = record(input, "chapter cache");
   if (!Number.isInteger(chapter.chapter) || (chapter.chapter as number) < 0) throw new Error("chapter cache has an invalid chapter number");
@@ -18,11 +26,8 @@ export function parseChapterScript(input: unknown): ChapterScript {
     for (const field of ["itemEvents", "lines", "figures"] as const) {
       if (!Array.isArray(scene[field])) throw new Error(`chapter scene has an invalid ${field}`);
     }
-    // 行内容校验：空 text 会导致渲染 esc(undefined) 崩溃，提前拦截
     for (const lineInput of scene.lines as unknown[]) {
-      const line = record(lineInput, "chapter line");
-      if (typeof line.text !== "string" || !line.text.trim()) throw new Error("chapter line has an invalid text");
-      if (line.type !== "dialogue" && line.type !== "narration") throw new Error("chapter line has an invalid type");
+      assertScriptLine(lineInput, "chapter line");
     }
     // 可选块结构校验：坏结构会导致 CG/分支/视频位静默丢失
     if (scene.cgEvent !== undefined && scene.cgEvent !== null) {
@@ -34,10 +39,25 @@ export function parseChapterScript(input: unknown): ChapterScript {
       for (const c of scene.choices as unknown[]) {
         const choice = record(c, "chapter choice");
         if (!Array.isArray(choice.lines)) throw new Error("chapter choice has an invalid lines");
+        // 分支台词与主台词同口径：坏行/空 text 在渲染分支 label 时同样会崩溃
+        for (const lineInput of choice.lines as unknown[]) {
+          assertScriptLine(lineInput, "chapter choice line");
+        }
       }
     }
-    if (scene.videoPoints !== undefined && !Array.isArray(scene.videoPoints)) {
-      throw new Error("chapter scene has an invalid videoPoints");
+    if (scene.videoPoints !== undefined) {
+      if (!Array.isArray(scene.videoPoints)) throw new Error("chapter scene has an invalid videoPoints");
+      // 视频推荐点必填字段校验：id 是任务键、title/videoPrompt 是展示与生成入口，
+      // 缺了会渲染出空条目或无法生成视频
+      for (const vpInput of scene.videoPoints as unknown[]) {
+        const vp = record(vpInput, "chapter videoPoint");
+        if (typeof vp.id !== "string" || !vp.id.trim()) throw new Error("chapter videoPoint has an invalid id");
+        if (typeof vp.title !== "string" || !vp.title.trim()) throw new Error("chapter videoPoint has an invalid title");
+        if (typeof vp.videoPrompt !== "string" || !vp.videoPrompt.trim()) throw new Error("chapter videoPoint has an invalid videoPrompt");
+        if (vp.durationSecs !== undefined && typeof vp.durationSecs !== "number") {
+          throw new Error("chapter videoPoint has an invalid durationSecs");
+        }
+      }
     }
   }
   return chapter as unknown as ChapterScript;

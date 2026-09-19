@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { log, truncate } from "./logger";
+import { b64encode } from "./base64";
 
 let webRuntimePromise: Promise<typeof import("./webRuntime")> | undefined;
 
@@ -23,15 +24,6 @@ export interface HttpResult {
   status: number;
   contentType: string;
   bodyBase64: string;
-}
-
-export interface HttpRequest {
-  method: string;
-  url: string;
-  headers?: Record<string, string>;
-  body?: string;
-  bodyBase64?: string;
-  timeoutSecs?: number;
 }
 
 export function isTauri(): boolean {
@@ -109,18 +101,6 @@ function detectImageSize(buf: Uint8Array): { width: number; height: number } | n
     return { width: buf[6] | (buf[7] << 8), height: buf[8] | (buf[9] << 8) };
   }
   return null;
-}
-
-function b64encode(data: Uint8Array): string {
-  if (typeof Buffer !== "undefined") {
-    return Buffer.from(data).toString("base64");
-  }
-  let binary = "";
-  const chunk = 0x8000;
-  for (let i = 0; i < data.length; i += chunk) {
-    binary += String.fromCharCode(...data.subarray(i, i + chunk));
-  }
-  return btoa(binary);
 }
 
 async function httpFallback(args: {
@@ -252,6 +232,10 @@ function safeCallArgs(name: string, args: unknown): unknown {
 
 function safeCallResult(name: string, result: unknown): unknown {
   if (name === "readConfig" || name === "readApiSecrets") return "[REDACTED]";
+  if (result instanceof ArrayBuffer || ArrayBuffer.isView(result)) {
+    // 二进制大对象（如 zip 字节）绝不能进日志序列化：截断字符串化会把主线程拖死
+    return `[binary ${(result as ArrayBufferView | ArrayBuffer).byteLength ?? 0} bytes]`;
+  }
   if (name === "http" && result && typeof result === "object") {
     const response = result as Record<string, unknown>;
     return {
@@ -434,9 +418,9 @@ export const tauri = {
     if (isTauri())
       return invoke("cutout_image", { dataB64, threshold: threshold ?? 40 }).then((r) => r as { dataB64: string; method: string });
     if (isWebRuntime()) {
-      return webRuntime()
-        .then((web) => web.webCutoutImage(dataB64, threshold))
-        .then((dataB64) => ({ dataB64, method: "chroma" }));
+      // Web 版返回真实 method（chroma/skip-dark/skip-overcut）：旧实现恒报 chroma，
+      // 导致深色/过激保护在前端成死代码、绿幕图被当成功写盘
+      return webRuntime().then((web) => web.webCutoutImage(dataB64, threshold));
     }
     return Promise.resolve({ dataB64, method: "chroma" });
   }),
@@ -456,19 +440,29 @@ export const tauri = {
   }),
   buildZip: wrap("buildZip", (sourceDir: string, zipPath: string, exclude: string[]): Promise<{ fileCount: number; sizeBytes: number }> => {
     if (isTauri()) return invoke("build_zip", { sourceDir, zipPath, exclude });
-    if (isWebRuntime()) return webRuntime().then((web) => web.webBuildZip(sourceDir, zipPath, exclude));
-    return Promise.reject(new Error("Web 环境不支持打包"));
+    return Promise.reject(new Error("网页版请使用 downloadZipWeb"));
   }),
-  /** 判断图片文件尺寸是否匹配目标宽高（读 PNG/JPEG 文件头，纯前端实现） */
+  /** 判断图片文件尺寸是否匹配目标宽高（读 PNG/JPEG/WebP/GIF 文件头）
+   *  B85：Tauri 环境改用 read_file_header 只读文件头（旧实现 readFileBase64 会把整张图
+   *  读入内存并 base64 编码，只为解析 4 字节宽高）；Web/Node 无对应命令，回退 readFileBase64。 */
   imageSizeMatches: wrap("imageSizeMatches", async (path: string, targetWidth: number, targetHeight: number): Promise<boolean> => {
     try {
-      const b64 = await tauri.readFileBase64(path);
-      const buf = base64ToBuffer(b64);
+      let buf: Uint8Array;
+      if (isTauri()) {
+        // 4KB 足以覆盖典型文件头；JPEG 的 SOF 段可能排在 EXIF(APP1) 之后，512B 有漏判风险。
+        // Rust 侧对 maxBytes 封顶 64KB，绝不会把整文件读进来。
+        const header = (await invoke("read_file_header", { path, maxBytes: 4096 })) as { base64?: string };
+        buf = header.base64 ? base64ToBuffer(header.base64) : new Uint8Array();
+      } else {
+        buf = base64ToBuffer(await tauri.readFileBase64(path));
+      }
       const size = detectImageSize(buf);
-      if (!size) return true; // 无法识别 → 不阻断（保守放行）
-      return size.width === targetWidth && size.height === targetHeight;
+      // 无法识别/解析失败 → 不合格（触发重生成）。旧实现一律放行，会让尺寸错误但文件名
+      // 命中的缓存图被当成合格复用。
+      return size !== null && size.width === targetWidth && size.height === targetHeight;
     } catch {
-      return true; // 读取失败 → 放行（后续生成/缓存逻辑兜底）
+      // 读取失败同样视为不合格（文件缺失/损坏本就该重新生成）
+      return false;
     }
   }),
   cutoutModelStatus: wrap("cutoutModelStatus", (modelId: string, filename: string): Promise<CutoutModelStatus> => {
@@ -494,3 +488,17 @@ export const tauri = {
     return Promise.resolve();
   }),
 };
+
+/**
+ * 网页版专用：打包 zip 并在浏览器中直接下载。
+ * 大字节不进 tauri 日志包装层（成功日志会 truncate 序列化返回值，47MB 会被拖成分钟级）。
+ */
+export async function downloadZipWeb(
+  sourceDir: string,
+  exclude: string[],
+  downloadName: string,
+): Promise<{ fileCount: number; sizeBytes: number }> {
+  if (!isWebRuntime()) throw new Error("当前环境不是网页版");
+  const web = await webRuntime();
+  return web.webDownloadZip(sourceDir, exclude, downloadName);
+}

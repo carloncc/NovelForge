@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, ref, watch, onBeforeUnmount } from "vue";
-import type { CharacterCard, ExtractionResult, ItemCard, SceneCard } from "../core/types";
+import { computed, ref, watch, onBeforeUnmount, type ComponentPublicInstance } from "vue";
+import type { CharacterCard, ExtractionResult } from "../core/types";
 import { activeConfig, configState, voiceLibraryFor } from "../stores/config";
 import { tauri, isTauri } from "../utils/tauri";
 import { vfsWriteFileBase64 } from "../utils/vfsWeb";
@@ -8,11 +8,13 @@ import { projectState } from "../stores/project";
 import { saveEditedCards } from "../core/cards";
 import { open } from "@tauri-apps/plugin-dialog";
 import { errMsg } from "../utils/errors";
+import { fileToBase64 } from "../utils/file";
 import { recognizeCharacter } from "../core/recognize";
 import { configIsUsable } from "../api/providers";
 import { t } from "../i18n";
 import { createMiniMaxVoiceProfile, importVoiceProfile } from "../core/voiceProfiles";
-import { minimaxVoiceLabel } from "../core/minimaxVoices";
+import { aiAssignVoices } from "../core/voiceCast";
+import { minimaxVoiceLabel, voiceGenderOf } from "../core/minimaxVoices";
 import { useGenerateController } from "../stores/generate";
 import Disclosure from "./Disclosure.vue";
 
@@ -24,7 +26,18 @@ const { busy: pipelineBusy, assetBusy, queueRunning } = useGenerateController();
 
 const local = ref<ExtractionResult>(JSON.parse(JSON.stringify(props.cards)));
 const savedMsg = ref("");
+/** 提示级别：失败类消息（保存失败/识别失败/创建声音失败等）必须用错误色，不能一律绿色 */
+const savedMsgLevel = ref<"ok" | "err">("ok");
+function setSavedMsg(msg: string, level: "ok" | "err" = "ok"): void {
+  savedMsg.value = msg;
+  savedMsgLevel.value = level;
+}
 const refImgInput = ref<HTMLInputElement | null>(null);
+// v-for 内用字符串 ref 会得到元素数组，ref.value.click() 必然失效；函数 ref 只记录最后挂载的输入框即可
+// （点击哪个输入框都会读 refImgTarget，因此不需要区分具体是哪一个）
+function bindRefImgInput(el: Element | ComponentPublicInstance | null): void {
+  if (el instanceof HTMLInputElement) refImgInput.value = el;
+}
 const refImgTarget = ref<CharacterCard | null>(null);
 const busy = ref(false);
 const openChar = ref<string | null>(null);
@@ -44,17 +57,17 @@ let recordTimer: number | undefined;
 
 async function recognizeChar(c: CharacterCard): Promise<void> {
   if (!c.referenceImage) {
-    savedMsg.value = t("请先为该角色设置参考图（从素材库选择或上传）");
+    setSavedMsg(t("请先为该角色设置参考图（从素材库选择或上传）"), "err");
     return;
   }
   const cfg = activeConfig("vision");
   if (!configIsUsable(cfg, "vision")) {
-    savedMsg.value = t("图片识别 API 未配置或不可用，请先在「API 配置」页配置");
+    setSavedMsg(t("图片识别 API 未配置或不可用，请先在「API 配置」页配置"), "err");
     return;
   }
-  if (!window.confirm(`将调用图片识别 API 生成「${c.name}」的设定与提示词（计费）。继续吗？`)) return;
+  if (!window.confirm(t("将调用图片识别 API 生成「{name}」的设定与提示词（计费）。继续吗？", { name: c.name }))) return;
   charRecognizing.value = c.id;
-  savedMsg.value = "";
+  setSavedMsg("");
   try {
     const r = await recognizeCharacter(cfg, c.referenceImage);
     if (r.name) c.name = r.name;
@@ -64,9 +77,9 @@ async function recognizeChar(c: CharacterCard): Promise<void> {
     if (r.voiceDesc) c.voiceDesc = r.voiceDesc;
     if (r.imagePrompt) c.imagePrompt = r.imagePrompt;
     if (r.threeViewPrompt) c.threeViewPrompt = r.threeViewPrompt;
-    savedMsg.value = `已根据参考图识别「${c.name}」的设定与提示词，确认后点「保存卡片」`;
+    setSavedMsg(t("已根据参考图识别「{name}」的设定与提示词，确认后点「保存卡片」", { name: c.name }));
   } catch (e) {
-    savedMsg.value = `识别失败：${errMsg(e)}`;
+    setSavedMsg(t("识别失败：{error}", { error: errMsg(e) }), "err");
   } finally {
     charRecognizing.value = null;
   }
@@ -77,7 +90,7 @@ watch(
   () => props.cards,
   () => {
     local.value = JSON.parse(JSON.stringify(props.cards));
-    savedMsg.value = "";
+    setSavedMsg("");
   },
 );
 
@@ -97,30 +110,25 @@ const voiceOptions = computed(() => {
 /** 按性别过滤音色：female 角色只显示女声音色，male 只显示男声；无法判别的显示全部 */
 function voiceOptionsForGender(card: CharacterCard): typeof voiceOptions.value {
   if (card.gender !== "female" && card.gender !== "male") return voiceOptions.value;
-  const female = card.gender === "female";
-  return voiceOptions.value.filter((v) => {
-    const m = /^female|女/.test(v.id);
-    const ml = /^male|男/.test(v.id);
-    return female ? m : ml;
-  });
+  return voiceOptions.value.filter((v) => voiceGenderOf(v.id) === card.gender);
 }
 
 async function importCharacterVoice(card: CharacterCard): Promise<void> {
   const config = activeConfig("tts");
-  if (!config) { savedMsg.value = t("请先配置 TTS"); return; }
+  if (!config) { setSavedMsg(t("请先配置 TTS"), "err"); return; }
   const voiceId = window.prompt("MiniMax voice_id");
   if (!voiceId?.trim()) return;
   try {
     const profile = await importVoiceProfile({ name: `${card.name} 声音`, configId: config.id, voiceId });
     card.voiceProfileId = profile.id;
     card.voiceName = undefined;
-    savedMsg.value = `已绑定克隆声音：${profile.name}`;
-  } catch (error) { savedMsg.value = `导入声音失败：${errMsg(error)}`; }
+    setSavedMsg(t("已绑定克隆声音：{name}", { name: profile.name }));
+  } catch (error) { setSavedMsg(t("导入声音失败：{error}", { error: errMsg(error) }), "err"); }
 }
 
 async function chooseVoiceReference(card: CharacterCard): Promise<void> {
   if (!isTauri()) { voiceFileTarget.value = card; voiceFileInput.value?.click(); return; }
-  const picked = await open({ multiple: false, filters: [{ name: "参考声音", extensions: ["wav", "mp3", "m4a", "ogg", "flac"] }] });
+  const picked = await open({ multiple: false, filters: [{ name: t("参考声音"), extensions: ["wav", "mp3", "m4a", "ogg", "flac"] }] });
   if (typeof picked === "string") await createVoiceFromPath(card, picked);
 }
 
@@ -131,16 +139,16 @@ function audioMime(fileName: string): string {
 
 async function createVoiceFromPath(card: CharacterCard, path: string): Promise<void> {
   const config = activeConfig("tts");
-  if (!config) { savedMsg.value = t("请先配置 TTS"); return; }
-  if (!window.confirm("我确认拥有该参考声音的使用授权，且允许将其上传到所选供应商。")) return;
+  if (!config) { setSavedMsg(t("请先配置 TTS"), "err"); return; }
+  if (!window.confirm(t("我确认拥有该参考声音的使用授权，且允许将其上传到所选供应商。"))) return;
   voiceBusy.value = card.id;
   try {
     const audioB64 = await tauri.readFileBase64(path);
     const fileName = path.split(/[\\/]/).pop() || "voice.wav";
     const profile = await createMiniMaxVoiceProfile({ name: `${card.name} 声音`, configId: config.id, fileName, mime: audioMime(fileName), audioB64, consent: true });
     card.voiceProfileId = profile.id; card.voiceName = undefined;
-    savedMsg.value = `已创建并绑定克隆声音：${profile.name}`;
-  } catch (error) { savedMsg.value = `创建声音失败：${errMsg(error)}`; }
+    setSavedMsg(t("已创建并绑定克隆声音：{name}", { name: profile.name }));
+  } catch (error) { setSavedMsg(t("创建声音失败：{error}", { error: errMsg(error) }), "err"); }
   finally { voiceBusy.value = null; }
 }
 
@@ -149,15 +157,15 @@ async function onVoiceFile(e: Event): Promise<void> {
   const file = input.files?.[0]; input.value = "";
   const card = voiceFileTarget.value; voiceFileTarget.value = null;
   if (!file || !card) return;
-  if (file.size > 12 * 1024 * 1024) { savedMsg.value = "参考音频不能超过 12MB"; return; }
-  const audioB64 = await fileToBase64(file);
+  if (file.size > 12 * 1024 * 1024) { setSavedMsg(t("参考音频不能超过 12MB"), "err"); return; }
+  const audioB64 = await fileToBase64(file, t("文件读取失败"));
   const config = activeConfig("tts");
-  if (!config || !window.confirm("我确认拥有该参考声音的使用授权，且允许将其上传到所选供应商。")) return;
+  if (!config || !window.confirm(t("我确认拥有该参考声音的使用授权，且允许将其上传到所选供应商。"))) return;
   voiceBusy.value = card.id;
   try {
     const profile = await createMiniMaxVoiceProfile({ name: `${card.name} 声音`, configId: config.id, fileName: file.name, mime: file.type || "audio/mpeg", audioB64, consent: true });
-    card.voiceProfileId = profile.id; card.voiceName = undefined; savedMsg.value = `已创建并绑定克隆声音：${profile.name}`;
-  } catch (error) { savedMsg.value = `创建声音失败：${errMsg(error)}`; }
+    card.voiceProfileId = profile.id; card.voiceName = undefined; setSavedMsg(t("已创建并绑定克隆声音：{name}", { name: profile.name }));
+  } catch (error) { setSavedMsg(t("创建声音失败：{error}", { error: errMsg(error) }), "err"); }
   finally { voiceBusy.value = null; }
 }
 
@@ -189,8 +197,8 @@ function stopRecordingAndWait(recorder: MediaRecorder): Promise<void> {
 /** 播放视频时点击录音：捕获系统正在播放的声音（共享屏幕/窗口音频），用于生成克隆音色 */
 async function startSystemAudioRecording(card: CharacterCard): Promise<void> {
   const config = activeConfig("tts");
-  if (!config) { savedMsg.value = t("请先配置 TTS"); return; }
-  if (!window.confirm("我将捕获系统正在播放的声音（会弹出选择共享屏幕/窗口的提示，请勾选「分享音频」）。我确认拥有该声音的使用授权。")) return;
+  if (!config) { setSavedMsg(t("请先配置 TTS"), "err"); return; }
+  if (!window.confirm(t("我将捕获系统正在播放的声音（会弹出选择共享屏幕/窗口的提示，请勾选「分享音频」）。我确认拥有该声音的使用授权。"))) return;
   try {
     // 捕获系统音频：getDisplayMedia 的 audio 轨道（Chrome/Edge/WebView2 支持）
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -202,7 +210,7 @@ async function startSystemAudioRecording(card: CharacterCard): Promise<void> {
     const audioTrack = stream.getAudioTracks()[0];
     if (!audioTrack) {
       stream.getTracks().forEach((track: MediaStreamTrack) => track.stop());
-      throw new Error("未捕获到系统音频（请在选择共享内容时勾选「分享音频」）");
+      throw new Error(t("未捕获到系统音频（请在选择共享内容时勾选「分享音频」）"));
     }
     // 只要音频轨；视频轨仅供满足捕获要求，立即停止
     const audioOnly = new MediaStream([audioTrack]);
@@ -215,16 +223,16 @@ async function startSystemAudioRecording(card: CharacterCard): Promise<void> {
     recorder.ondataavailable = (ev) => { if (ev.data.size) recordChunksRef.value.push(ev.data); };
     recorder.start();
     recordTimer = window.setInterval(() => { recordingSec.value++; }, 1000);
-    savedMsg.value = `正在录音（${card.name}）：请播放参考视频，完成后点「停止并克隆」`;
+    setSavedMsg(t("正在录音（{name}）：请播放参考视频，完成后点「停止并克隆」", { name: card.name }));
   } catch (e) {
-    savedMsg.value = `录音启动失败：${errMsg(e)}`;
+    setSavedMsg(t("录音启动失败：{error}", { error: errMsg(e) }), "err");
   }
 }
 
 /** 停止录音并作为参考音频克隆（10s~5min，符合 MiniMax 要求） */
 async function stopRecordingAndClone(card: CharacterCard): Promise<void> {
   const config = activeConfig("tts");
-  if (!config) { savedMsg.value = t("请先配置 TTS"); return; }
+  if (!config) { setSavedMsg(t("请先配置 TTS"), "err"); return; }
   const recorder = recorderRef.value;
   if (!recorder) return;
   const cardId = recordingChar.value;
@@ -235,9 +243,9 @@ async function stopRecordingAndClone(card: CharacterCard): Promise<void> {
   await stopRecordingAndWait(recorder);
   stopRecordingNow();
   const chunks = recordChunksRef.value;
-  if (secs < 10) { savedMsg.value = `录音时长不足（${secs}s），MiniMax 要求至少 10 秒`; return; }
-  if (secs > 300) { savedMsg.value = `录音过长（${secs}s），请控制在 5 分钟内`; return; }
-  if (!chunks.length) { savedMsg.value = "未录制到音频"; return; }
+  if (secs < 10) { setSavedMsg(t("录音时长不足（{sec}s），MiniMax 要求至少 10 秒", { sec: secs }), "err"); return; }
+  if (secs > 300) { setSavedMsg(t("录音过长（{sec}s），请控制在 5 分钟内", { sec: secs }), "err"); return; }
+  if (!chunks.length) { setSavedMsg(t("未录制到音频"), "err"); return; }
   const blob = new Blob(chunks, { type: recorder.mimeType || "audio/webm" });
   const audioB64 = await blobToBase64(blob);
   const isWav = recorder.mimeType.includes("wav");
@@ -246,8 +254,8 @@ async function stopRecordingAndClone(card: CharacterCard): Promise<void> {
   voiceBusy.value = cardId ?? card.id;
   try {
     const profile = await createMiniMaxVoiceProfile({ name: `${card.name} 录音`, configId: config.id, fileName, mime, audioB64, consent: true });
-    card.voiceProfileId = profile.id; card.voiceName = undefined; savedMsg.value = `已用录音创建并绑定克隆声音：${profile.name}`;
-  } catch (error) { savedMsg.value = `创建声音失败：${errMsg(error)}`; }
+    card.voiceProfileId = profile.id; card.voiceName = undefined; setSavedMsg(t("已用录音创建并绑定克隆声音：{name}", { name: profile.name }));
+  } catch (error) { setSavedMsg(t("创建声音失败：{error}", { error: errMsg(error) }), "err"); }
   finally { voiceBusy.value = null; }
 }
 
@@ -268,15 +276,15 @@ async function pickReferenceImage(card: CharacterCard): Promise<void> {
   }
   const picked = await open({
     multiple: false,
-    filters: [{ name: "参考图", extensions: ["png", "jpg", "jpeg", "webp"] }],
+    filters: [{ name: t("参考图"), extensions: ["png", "jpg", "jpeg", "webp"] }],
   });
   if (!picked || typeof picked !== "string") return;
   try {
     const b64 = await tauri.readFileBase64(picked);
     card.referenceImage = b64;
-    savedMsg.value = `已为「${card.name}」设置参考图：${picked.split(/[\\/]/).pop()}（记得点「保存卡片」）`;
+    setSavedMsg(t("已为「{name}」设置参考图：{file}（记得点「保存卡片」）", { name: card.name, file: picked.split(/[\\/]/).pop() ?? "" }));
   } catch (e) {
-    savedMsg.value = `读取参考图失败：${errMsg(e)}`;
+    setSavedMsg(t("读取参考图失败：{error}", { error: errMsg(e) }), "err");
   }
 }
 
@@ -287,57 +295,82 @@ async function onRefImgFile(e: Event): Promise<void> {
   const card = refImgTarget.value;
   if (!file || !card) return;
   try {
-    const b64 = await fileToBase64(file);
+    const b64 = await fileToBase64(file, t("文件读取失败"));
     const vPath = `/app/materials/ref_${Date.now()}_${file.name}`;
     await vfsWriteFileBase64(vPath, b64);
     card.referenceImage = b64;
-    savedMsg.value = `已为「${card.name}」设置参考图（记得点「保存卡片」）`;
+    setSavedMsg(t("已为「{name}」设置参考图（记得点「保存卡片」）", { name: card.name }));
   } catch (err) {
-    savedMsg.value = `读取参考图失败：${(err as Error).message}`;
+    setSavedMsg(t("读取参考图失败：{error}", { error: (err as Error).message }), "err");
   } finally {
     refImgTarget.value = null;
   }
 }
 
-function fileToBase64(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = String(reader.result ?? "");
-      resolve(result.includes(",") ? result.split(",")[1] : result);
-    };
-    reader.onerror = () => reject(new Error(t("文件读取失败")));
-    reader.readAsDataURL(file);
-  });
+
+const castBusy = ref(false);
+
+/** 一键 AI 选音色：按角色性格/音色描述从音色库重新分配（已绑定克隆音色的角色跳过） */
+async function aiCastVoices(): Promise<void> {
+  const cfg = activeConfig("llm");
+  if (!cfg?.apiKey) {
+    setSavedMsg(t("请先在「API 配置」里配置文本 LLM（音色库取 TTS 配置）"), "err");
+    return;
+  }
+  const targets = local.value.characters.filter((c) => !c.voiceProfileId);
+  if (!targets.length) {
+    setSavedMsg(t("没有可分配的角色（已绑定克隆音色的角色会跳过）"), "err");
+    return;
+  }
+  if (targets.some((c) => c.voiceName) && !window.confirm(t("将为 {n} 个角色重新分配音色（已绑定克隆音色的角色跳过）。继续吗？", { n: targets.length }))) return;
+  castBusy.value = true;
+  setSavedMsg(t("AI 正在挑选音色…"));
+  try {
+    const assignments = await aiAssignVoices(cfg, targets);
+    const byId = new Map(local.value.characters.map((c) => [c.id, c]));
+    let n = 0;
+    for (const a of assignments) {
+      const ch = byId.get(a.characterId);
+      if (ch && !ch.voiceProfileId) {
+        ch.voiceName = a.voiceName;
+        n++;
+      }
+    }
+    setSavedMsg(t("AI 已为 {n} 个角色分配音色（记得点「保存卡片」）", { n }));
+  } catch (e) {
+    setSavedMsg(t("AI 选音色失败：{error}", { error: errMsg(e) }), "err");
+  } finally {
+    castBusy.value = false;
+  }
 }
 
 async function save(): Promise<void> {
   // 运行中禁止保存：保存会写 cards.json 并可能删除图像缓存文件，与管线并发会互相覆盖
   if (pipelineBusy.value || assetBusy.value || queueRunning.value) {
-    savedMsg.value = t("已有生成任务在运行：请等它完成（或先点「停止」）后再保存卡片，避免与管线互相覆盖");
+    setSavedMsg(t("已有生成任务在运行：请等它完成（或先点「停止」）后再保存卡片，避免与管线互相覆盖"), "err");
     return;
   }
   // 「同时重写剧本」= 清空全部章节剧本缓存（下次生成重写，消耗 token）：执行前确认
-  if (invalidateScript.value && !window.confirm("已勾选「同时重写剧本」：保存会清空全部章节的剧本缓存（下次生成需重写剧本，消耗 token）。继续吗？")) return;
+  if (invalidateScript.value && !window.confirm(t("已勾选「同时重写剧本」：保存会清空全部章节的剧本缓存（下次生成需重写剧本，消耗 token）。继续吗？"))) return;
   busy.value = true;
-  savedMsg.value = "";
+  setSavedMsg("");
   try {
     await saveEditedCards(projectState.outputDir, local.value, (m, level = "info") => {
-      savedMsg.value = m;
-      void level;
+      // 保存回调的 warn 也是失败信号（错误路径抛异常，走下面的 catch）
+      setSavedMsg(m, level === "warn" ? "err" : "ok");
     }, invalidateScript.value, !activeConfig("llm")?.apiKey);
     emit("saved", local.value);
   } catch (e) {
-    savedMsg.value = `保存失败：${errMsg(e)}`;
+    setSavedMsg(t("保存失败：{error}", { error: errMsg(e) }), "err");
   } finally {
     busy.value = false;
   }
 }
 
 function reset(): void {
-  if (!window.confirm("放弃所有未保存的修改，恢复为上次生成时的卡片？")) return;
+  if (!window.confirm(t("放弃所有未保存的修改，恢复为上次生成时的卡片？"))) return;
   local.value = JSON.parse(JSON.stringify(props.cards));
-  savedMsg.value = t("已恢复为上次生成时的卡片");
+  setSavedMsg(t("已恢复为上次生成时的卡片"));
 }
 
 function addCostume(c: CharacterCard): void {
@@ -355,13 +388,13 @@ function addCostume(c: CharacterCard): void {
 }
 
 function confirmClearRefImage(card: CharacterCard): void {
-  if (!window.confirm(`清除「${card.name}」的参考图？（保存后生效）`)) return;
+  if (!window.confirm(t("清除「{name}」的参考图？（保存后生效）", { name: card.name }))) return;
   card.referenceImage = undefined;
 }
 
 function removeCostume(c: CharacterCard, idx: number): void {
   const target = c.costumes?.[idx];
-  if (!window.confirm(`删除服装「${target?.name ?? target?.id ?? ""}」？未保存前可点「放弃修改」找回。`)) return;
+  if (!window.confirm(t("删除服装「{name}」？未保存前可点「放弃修改」找回。", { name: target?.name ?? target?.id ?? "" }))) return;
   c.costumes?.splice(idx, 1);
   if (!c.costumes?.length) c.costumes = undefined;
 }
@@ -375,17 +408,20 @@ onBeforeUnmount(() => {
   <div class="card">
     <input ref="voiceFileInput" type="file" accept="audio/*" style="display: none" @change="onVoiceFile" />
     <div class="flex items-center justify-between mb-3">
-      <h3 class="mb-0">{{ t("角色卡编辑（") }}{{ local.characters.length }}{{ t("）") }}</h3>
+      <h3 class="mb-0">{{ t("角色卡编辑（{n}）", { n: local.characters.length }) }}</h3>
       <div class="flex gap-2 flex-none">
         <label class="opt-item" style="margin: 0" :title="t('勾选后保存会清空剧本缓存，下次生成全部章节重新写剧本（白烧较多 token）；仅改了台词相关内容时才需要')">
           <input type="checkbox" v-model="invalidateScript" />
           {{ t("同时重写剧本") }}
         </label>
+        <button class="btn secondary small" :disabled="busy || castBusy" @click="aiCastVoices">
+          {{ castBusy ? t("AI 挑选中…") : t("AI 选音色") }}
+        </button>
         <button class="btn small" :disabled="busy" @click="save">{{ t("保存卡片") }}</button>
         <button class="btn secondary small" @click="reset">{{ t("放弃修改") }}</button>
       </div>
     </div>
-    <p v-if="savedMsg" class="small mb-2" style="color: var(--ok)">{{ savedMsg }}</p>
+    <p v-if="savedMsg" class="small mb-2" :style="{ color: savedMsgLevel === 'err' ? 'var(--err)' : 'var(--ok)' }">{{ savedMsg }}</p>
       <p class="hint mb-2">
         {{ t("保存后：只有绘画相关改动（立绘/三视图/动作/服装/表情提示词）会作废对应图片缓存；改音色/文字不重画图。剧本缓存默认保留。背景/CG 保留。") }}
       </p>
@@ -422,19 +458,25 @@ onBeforeUnmount(() => {
           <span>{{ t("TTS 音色") }}</span>
           <select v-model="c.voiceName" @change="c.voiceProfileId = undefined">
             <option v-if="!c.voiceName" :value="undefined" disabled>{{ t("选择音色…") }}</option>
+            <!-- 性别过滤会把不匹配的原音色从列表里剔除：保留一个「当前音色」选项，
+                 否则先选音色再改性别后下拉会显示空白，看起来像音色丢了 -->
+            <option
+              v-if="c.voiceName && !voiceOptionsForGender(c).some((v) => v.id === c.voiceName)"
+              :value="c.voiceName"
+            >{{ t("当前音色：") }}{{ c.voiceName }}</option>
             <option v-for="v in voiceOptionsForGender(c)" :key="v.id" :value="v.id">{{ v.label }}</option>
           </select>
         </label>
       </div>
       <div class="field">
-        <span>克隆声音（可跨项目复用）</span>
+        <span>{{ t("克隆声音（可跨项目复用）") }}</span>
         <select v-model="c.voiceProfileId" @change="c.voiceName = undefined">
-          <option :value="undefined">使用上方预设音色</option>
+          <option :value="undefined">{{ t("使用上方预设音色") }}</option>
           <option v-for="profile in voiceProfiles" :key="profile.id" :value="profile.id">{{ profile.name }}（{{ profile.voiceId }}）</option>
         </select>
         <div class="row mt-2">
-          <button class="btn secondary small" :disabled="voiceBusy === c.id" @click="chooseVoiceReference(c)">{{ voiceBusy === c.id ? "创建中..." : "上传参考音频创建" }}</button>
-          <button class="btn ghost small" :disabled="voiceBusy === c.id" @click="importCharacterVoice(c)">导入已有 voice_id</button>
+          <button class="btn secondary small" :disabled="voiceBusy === c.id" @click="chooseVoiceReference(c)">{{ voiceBusy === c.id ? t("创建中...") : t("上传参考音频创建") }}</button>
+          <button class="btn ghost small" :disabled="voiceBusy === c.id" @click="importCharacterVoice(c)">{{ t("导入已有 voice_id") }}</button>
         </div>
         <div class="row mt-2">
           <button
@@ -445,13 +487,13 @@ onBeforeUnmount(() => {
           >🎙 {{ t("录音（捕获正在播放的声音）") }}</button>
           <template v-else>
             <button class="btn danger small" @click="stopRecordingAndClone(c)" :disabled="voiceBusy === c.id">
-              {{ voiceBusy === c.id ? "创建中..." : `停止并克隆（${recordingSec}s）` }}
+              {{ voiceBusy === c.id ? t("创建中...") : t("停止并克隆（{sec}s）", { sec: recordingSec }) }}
             </button>
-            <button class="btn ghost small" @click="stopRecordingNow(); recordingChar = null; savedMsg = '已取消录音'">取消</button>
+            <button class="btn ghost small" @click="stopRecordingNow(); recordingChar = null; savedMsg = t('已取消录音'); savedMsgLevel = 'ok'">{{ t("取消") }}</button>
           </template>
         </div>
-        <span v-if="recordingChar === c.id" class="hint small">正在录音：请播放参考视频，系统会捕获其声音；至少 10 秒、最长 5 分钟。</span>
-        <span class="faint small">创建时使用当前 TTS 配置；失败不会自动换成其他人物声音。AI 提取时默认从上方音色列表挑选。</span>
+        <span v-if="recordingChar === c.id" class="hint small">{{ t("正在录音：请播放参考视频，系统会捕获其声音；至少 10 秒、最长 5 分钟。") }}</span>
+        <span class="faint small">{{ t("创建时使用当前 TTS 配置；失败不会自动换成其他人物声音。AI 提取时默认从上方音色列表挑选。") }}</span>
       </div>
       <label class="field">
         <span>{{ t("立绘提示词（imagePrompt）") }}</span>
@@ -482,7 +524,7 @@ onBeforeUnmount(() => {
         <span v-else class="tag">{{ t("未设置") }}</span>
         <button class="btn secondary small" @click="pickReferenceImage(c)" :title="t('选择后仅暂存，记得点右上「保存卡片」才落盘')">{{ t("上传参考图…") }}</button>
         <button v-if="c.referenceImage" class="btn danger small" @click="confirmClearRefImage(c)">{{ t("清除") }}</button>
-        <input v-if="!isTauri()" ref="refImgInput" type="file" accept="image/*" style="display: none" @change="onRefImgFile" />
+        <input v-if="!isTauri()" :ref="bindRefImgInput" type="file" accept="image/*" style="display: none" @change="onRefImgFile" />
       </div>
       <div class="row mt-2">
         <button class="btn small" :disabled="charRecognizing === c.id || !c.referenceImage" @click="recognizeChar(c)">
@@ -495,7 +537,7 @@ onBeforeUnmount(() => {
   </div>
 
   <div class="card">
-    <h3 class="mb-3">{{ t("物品卡编辑（") }}{{ local.items.length }}{{ t("）") }}</h3>
+    <h3 class="mb-3">{{ t("物品卡编辑（{n}）", { n: local.items.length }) }}</h3>
     <Disclosure
       v-for="it in local.items"
       :key="it.id"
@@ -515,7 +557,7 @@ onBeforeUnmount(() => {
   </div>
 
   <div class="card">
-    <h3 class="mb-3">{{ t("场景卡编辑（") }}{{ local.scenes.length }}{{ t("）") }}</h3>
+    <h3 class="mb-3">{{ t("场景卡编辑（{n}）", { n: local.scenes.length }) }}</h3>
     <Disclosure
       v-for="s in local.scenes"
       :key="s.id"

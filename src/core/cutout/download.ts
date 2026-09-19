@@ -8,7 +8,7 @@ import { cutoutModelRemoteUrl, type CutoutModel } from "./models";
 
 export type { CutoutModelStatus } from "../../utils/tauri";
 
-export const CUTOUT_MODEL_NOT_INSTALLED: CutoutModelStatus = {
+const CUTOUT_MODEL_NOT_INSTALLED: CutoutModelStatus = {
   modelId: "",
   state: "idle",
   bytes: 0,
@@ -33,7 +33,7 @@ export async function cutoutModelStatus(model: CutoutModel): Promise<CutoutModel
 }
 
 /** 手动下载模型（不自动确认；下载中请轮询 cutoutModelStatus 展示进度） */
-export async function downloadCutoutModel(model: CutoutModel): Promise<void> {
+async function downloadCutoutModel(model: CutoutModel): Promise<void> {
   await tauri.cutoutModelDownload({
     modelId: model.id,
     filename: model.filename,

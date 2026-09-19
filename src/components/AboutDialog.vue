@@ -1,11 +1,11 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { onBeforeUnmount, onMounted, ref } from "vue";
 import { t } from "../i18n";
 import { tauri } from "../utils/tauri";
 import { brandDomain, brandName, brandUrl } from "../utils/branding";
 import { version } from "../../package.json";
 
-defineProps<{ open: boolean }>();
+const props = defineProps<{ open: boolean }>();
 const emit = defineEmits<{ close: [] }>();
 
 const linkError = ref("");
@@ -18,6 +18,13 @@ async function openExternal(url: string): Promise<void> {
     linkError.value = `打开链接失败：${e instanceof Error ? e.message : String(e)}（可手动复制：${url}）`;
   }
 }
+
+/** Esc 关闭：组件常驻挂载，必须判断 open，避免关闭状态下也响应 */
+function onKey(e: KeyboardEvent): void {
+  if (props.open && e.key === "Escape") emit("close");
+}
+onMounted(() => window.addEventListener("keydown", onKey));
+onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
 </script>
 
 <template>
@@ -46,6 +53,7 @@ async function openExternal(url: string): Promise<void> {
             <a href="https://github.com/carloncc/NovelForge" @click.prevent="openExternal('https://github.com/carloncc/NovelForge')">GitHub</a>
           </p>
           <p class="faint small">{{ t("更多作品、更新与 PC/手机版下载请访问官网。") }}</p>
+          <p v-if="linkError" class="link-error">{{ linkError }}</p>
         </div>
 
         <div class="about-section">
@@ -85,5 +93,11 @@ async function openExternal(url: string): Promise<void> {
 .about-links a {
   color: var(--primary, #087f73);
   text-decoration: none;
+}
+/* 外链失败提示：红色强调，让「点了没反应」变成可见反馈 */
+.link-error {
+  color: var(--err, #b91c1c);
+  font-size: 12px;
+  overflow-wrap: anywhere;
 }
 </style>

@@ -12,6 +12,26 @@ const url = ref("");
 const starting = ref(false);
 const error = ref("");
 const reloadKey = ref(0);
+const zoom = ref(100);
+const stageRef = ref<HTMLElement | null>(null);
+const isFullscreen = ref(false);
+const stageStyle = computed(() => ({ "--preview-zoom": `${zoom.value}%` }));
+
+function onFullscreenChange(): void {
+  isFullscreen.value = !!document.fullscreenElement;
+}
+
+async function toggleFullscreen(): Promise<void> {
+  try {
+    if (document.fullscreenElement) {
+      await document.exitFullscreen();
+    } else if (stageRef.value) {
+      await stageRef.value.requestFullscreen();
+    }
+  } catch (e) {
+    error.value = t("全屏失败：{error}", { error: errMsg(e) });
+  }
+}
 
 const previewDir = computed(() => {
   if (!projectState.lastResult) return "";
@@ -48,7 +68,7 @@ async function stopPreview(): Promise<void> {
     log.info("page", "预览服务器已停止");
   } catch (e) {
     log.error("page", "停止预览失败", { error: errMsg(e) });
-    error.value = `停止预览失败：${errMsg(e)}（可重试；若服务已退出可忽略）`;
+    error.value = t("停止预览失败：{error}（可重试；若服务已退出可忽略）", { error: errMsg(e) });
   }
 }
 
@@ -57,7 +77,7 @@ async function openInBrowser(): Promise<void> {
   try {
     await tauri.openUrl(url.value);
   } catch (e) {
-    error.value = `打开失败：${errMsg(e)}`;
+    error.value = t("打开失败：{error}", { error: errMsg(e) });
   }
 }
 
@@ -71,17 +91,19 @@ async function openAppreciation(): Promise<void> {
   try {
     await tauri.openUrl(ap);
   } catch (e) {
-    error.value = `打开鉴赏室失败：${errMsg(e)}`;
+    error.value = t("打开鉴赏室失败：{error}", { error: errMsg(e) });
   }
 }
 
 onMounted(() => {
+  document.addEventListener("fullscreenchange", onFullscreenChange);
   if (projectState.lastResult) {
     void startPreview();
   }
 });
 
 onBeforeUnmount(() => {
+  document.removeEventListener("fullscreenchange", onFullscreenChange);
   void tauri.stopPreviewServer();
 });
 </script>
@@ -101,16 +123,32 @@ onBeforeUnmount(() => {
     <div class="card" style="padding: var(--space-3)">
       <div class="flex items-center gap-3" style="font-size: 12.5px">
         <span class="muted shrink-0">{{ t("项目：") }}</span>
-        <code class="grow text-ellipsis">{{ previewDir || t("（未生成）") }}</code>
+        <code class="grow text-ellipsis" :title="previewDir || t('（未生成）')">{{ previewDir || t("（未生成）") }}</code>
       </div>
       <p v-if="error" class="err-text mt-2">{{ error }}</p>
     </div>
 
     <div v-if="url" class="mt-4">
-      <iframe :key="reloadKey" class="preview-frame" :src="url" />
+      <div class="flex items-center gap-3 mb-2" style="font-size: 12.5px">
+        <span class="muted shrink-0">{{ t("显示比例") }}</span>
+        <select v-model.number="zoom" class="shrink-0" style="width: 96px">
+          <option :value="50">50%</option>
+          <option :value="75">75%</option>
+          <option :value="100">100%</option>
+          <option :value="125">125%</option>
+          <option :value="150">150%</option>
+        </select>
+        <button class="btn ghost small" @click="toggleFullscreen">
+          {{ isFullscreen ? t("退出全屏") : t("全屏（16:9）") }}
+        </button>
+        <span class="hint">{{ t("全屏后可用 Esc 退出；游戏内坐标系按 16:9 适配") }}</span>
+      </div>
+      <div ref="stageRef" class="preview-stage" :class="{ zoomed: zoom > 100 }" :style="stageStyle">
+        <iframe :key="reloadKey" class="preview-frame" :src="url" allow="fullscreen" />
+      </div>
     </div>
     <div v-else class="card empty">
-      <img src="/src/assets/empty-preview.png" alt="" style="width: 280px; opacity: 0.9; margin-bottom: 12px" />
+      <img src="/src/assets/empty-preview.png" alt="" style="width: 280px; max-width: 100%; height: auto; opacity: 0.9; margin-bottom: 12px" />
       <template v-if="projectState.lastResult">
         <p>{{ t("启动预览后在此显示游戏画面") }}</p>
         <button class="btn mt-3" :disabled="starting" @click="startPreview">{{ t("启动预览") }}</button>

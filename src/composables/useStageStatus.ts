@@ -3,6 +3,7 @@ import type { ApiConfig, AssetMap, FailedTask, GenerationOptions, NovelDoc, Pipe
 import { STAGE_ORDER, STEP_TO_STAGE } from "../core/types";
 import { buildImageTasks } from "../core/images";
 import { buildVoiceJobs } from "../core/voice";
+import { scriptCacheRest, titleHash } from "../core/cache";
 import { tauri } from "../utils/tauri";
 import { parseAssetMap } from "../core/assetMap";
 
@@ -44,19 +45,50 @@ export function useStageStatus(input: StageStatusInput) {
     }
   }
 
-  async function listUniqueChapters(dir: string, chapterFromName: (name: string) => string | null): Promise<number> {
+  /** 与管线一致的翻译还原：语言开启且有译文缓存时，用译文标题/正文算剧本指纹 */
+  async function effectiveChapter(
+    metaDir: string,
+    lang: string,
+    ch: { title: string; text?: string },
+  ): Promise<{ title: string; text: string }> {
+    const title = ch.title;
+    const text = ch.text || "";
+    if (!lang) return { title, text };
     try {
-      const entries = await tauri.listDir(dir);
-      const chapters = new Set<string>();
-      for (const entry of entries) {
-        if (entry.isDir) continue;
-        const chapter = chapterFromName(entry.name);
-        if (chapter) chapters.add(chapter);
+      const f = `${metaDir}/translate/translate_${lang}_${titleHash(title)}_${titleHash(text)}.json`;
+      if (!(await pathExists(f))) return { title, text };
+      const { text: rawText } = await tauri.readTextFile(f);
+      const parsed = JSON.parse(rawText) as { title?: string; text?: string };
+      if (typeof parsed?.title === "string" && typeof parsed?.text === "string") {
+        return { title: parsed.title, text: parsed.text };
       }
-      return chapters.size;
+    } catch {
+      /* 无译文缓存则回退原文 */
+    }
+    return { title, text };
+  }
+
+  /** 统计「与当前章节输入指纹匹配」的剧本缓存数（正式/演示前缀都认） */
+  async function countFreshScripts(
+    metaDir: string,
+    lang: string,
+    chapters: { index: number; title: string; text?: string }[],
+    styleFrag: string,
+  ): Promise<number> {
+    let names: Set<string>;
+    try {
+      const entries = await tauri.listDir(`${metaDir}/cache`);
+      names = new Set(entries.filter((e) => !e.isDir).map((e) => e.name));
     } catch {
       return 0;
     }
+    let matched = 0;
+    for (const ch of chapters) {
+      const eff = await effectiveChapter(metaDir, lang, ch);
+      const rest = scriptCacheRest(eff.title, eff.text, styleFrag);
+      if (names.has(`script_ch${ch.index + 1}_${rest}.json`) || names.has(`script_demo_ch${ch.index + 1}_${rest}.json`)) matched++;
+    }
+    return matched;
   }
 
   async function assetMap(dir: string): Promise<AssetMap | undefined> {
@@ -69,8 +101,9 @@ export function useStageStatus(input: StageStatusInput) {
   }
 
   function allExpectedImagesExist(map: AssetMap, result: PipelineResult, options: GenerationOptions): boolean {
+    // 还没读到任何剧本（restore 后 chapters 为空）时不能判「完成」：Array.every 对空数组恒为 true
+    if (!result.chapters.length) return false;
     const tasks = buildImageTasks(result.chapters, result.cards, {
-      figurePerCharacter: 1,
       cgPerChapter: options.cgPerChapter ?? 0,
       maxPerChapter: options.imageBudgetPerChapter ?? 0,
       figureEmotions: options.figureEmotions,
@@ -90,15 +123,23 @@ export function useStageStatus(input: StageStatusInput) {
   }
 
   function allExpectedVoicesExist(map: AssetMap, result: PipelineResult, config: ApiConfig): boolean {
+    // 同上：无剧本时不判完成，避免「0 条配音也全绿」
+    if (!result.chapters.length) return false;
     return buildVoiceJobs(config, result.chapters, result.cards.characters)
       .every((job) => Boolean(map.vocal[job.key]));
   }
 
+  /** B30：刷新并发令牌。多次 refresh 重叠时（配置/卡片变化与运行结束几乎同时触发），
+   *  旧的一次可能晚于新的一次完成，用过期结果覆盖新状态；令牌变化即丢弃本次写入。 */
+  let refreshToken = 0;
+
   /** 依据产物/缓存文件刷新「完成」状态 */
   async function refresh(): Promise<void> {
+    const token = ++refreshToken;
     const dir = input.getOutputDir();
     const novel = input.getNovel();
     if (!dir) {
+      if (token !== refreshToken) return;
       for (const k of STAGE_ORDER) base[k] = false;
       return;
     }
@@ -109,36 +150,43 @@ export function useStageStatus(input: StageStatusInput) {
       pathExists(`${metaDir}/cards_demo.json`),
       pathExists(`${metaDir}/meta.json`),
     ]);
+    if (token !== refreshToken) return;
     base.split = split || (novel?.chapters.length ?? 0) > 1;
     base.extract = cards || demoCards;
     base.assemble = meta;
 
     const activeCount = novel?.chapters.filter((c) => c.enabled !== false).length ?? 0;
+    const enabledChapters = (novel?.chapters ?? []).filter((c) => c.enabled !== false);
 
-    // 翻译：语言为空 = 无需执行；否则按当前语言统计译文缓存 ≥ 启用章节数
-    // 键格式与管线 translateCacheFile 同源（去序号，只认标题＋正文哈希）
+    // 翻译：语言为空 = 无需执行；否则逐章校验「标题＋正文哈希」命中的译文缓存
+    // （不按文件数量统计：旧正文/旧版本残留文件会凑数，看板误判完成）
     const lang = input.getLanguage();
     if (!lang) {
+      if (token !== refreshToken) return;
       base.translate = true;
     } else {
-      const translated = await listUniqueChapters(`${metaDir}/translate`, (name) => {
-        if (!name.startsWith(`translate_${lang}_`)) return null;
-        if (/^translate_.+_ch\d+_/.test(name)) return null; // 旧序号键已废除，不计
-        return name;
-      });
+      let translated = 0;
+      for (const ch of enabledChapters) {
+        if (await pathExists(`${metaDir}/translate/translate_${lang}_${titleHash(ch.title)}_${titleHash(ch.text || "")}.json`)) translated++;
+      }
+      if (token !== refreshToken) return;
       base.translate = activeCount > 0 && translated >= activeCount;
     }
 
-    // 剧本：script 缓存数量 ≥ 启用章节数
-    const scriptFiles = await listUniqueChapters(
-      `${metaDir}/cache`,
-      (name) => name.match(/^script(?:_demo)?_ch(\d+)_/)?.[1] ?? null,
-    );
-    base.script = activeCount > 0 && scriptFiles >= activeCount;
+    // 剧本：逐章校验与「当前标题＋正文＋文风（翻译感知）」指纹匹配的缓存（正式/演示前缀都认），
+    // 只有数量达标才判完成（旧实现只数文件个数，改写正文/换文风后旧残留仍会点绿）
+    const styleFrag = (() => {
+      const style = (input.getOptions().scriptStyle ?? "").trim();
+      return style ? `_st${titleHash(style)}` : "";
+    })();
+    const freshScripts = await countFreshScripts(metaDir, lang, enabledChapters, styleFrag);
+    if (token !== refreshToken) return;
+    base.script = activeCount > 0 && freshScripts >= activeCount;
 
     const options = input.getOptions();
     const result = input.getResult();
     const assets = await assetMap(dir);
+    if (token !== refreshToken) return;
     base.image = !options.useImage || Boolean(assets && result && allExpectedImagesExist(assets, result, options));
     const ttsConfig = input.getTtsConfig();
     base.voice = !options.useTts || Boolean(assets && result && ttsConfig && allExpectedVoicesExist(assets, result, ttsConfig));

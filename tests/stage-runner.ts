@@ -155,8 +155,6 @@ async function stage4Script(llm: ApiConfig): Promise<void> {
   assert(new Set(ids).size === ids.length, "场景 id 无重复");
   // render 语法校验
   const txt = renderChapter(script, {
-    title: cards.title,
-    gameKey: "test",
     characters: cards.characters,
     items: cards.items,
     assets: { bg: {}, cg: {}, figure: {}, item: {}, vocal: {} },

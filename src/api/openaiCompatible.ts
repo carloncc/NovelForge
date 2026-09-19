@@ -2,8 +2,7 @@ import { tauri } from "../utils/tauri";
 import { version as APP_VERSION } from "../../package.json";
 import type { ApiConfig, ChannelKey, ImageModelCapabilities, ImageReference } from "../core/types";
 import { unifiedImage, unifiedTts, utf8FromB64 } from "./universal";
-import { normalizeBaseUrl, customHeadersFor } from "./baseUrl";
-export { normalizeBaseUrl } from "./baseUrl";
+import { normalizeBaseUrl, joinApiPath, customHeadersFor } from "./baseUrl";
 import { resolveTemplate, getTemplate } from "./templates";
 import { ConcurrencyLimiter } from "../utils/performance";
 import { classifyError } from "../utils/errorClassifier";
@@ -13,7 +12,6 @@ import {
   parseModelList,
   protocolForConfig,
   providerIdForConfig,
-  ReferenceImageError,
   referenceDataUrl,
   resolveImageModelCapabilities,
   routeImageReferences,
@@ -62,10 +60,16 @@ export function setImageConcurrency(cfg: ApiConfig, n: number): void {
 /**
  * 文本/视觉 LLM 请求并发上限（按 API 隔离，各配置互不影响）。
  * 文本请求体可达 2 万+ 字符，并发过大会同时向文本 API 发大请求，触发网关限流 / error sending request。
- * 因此每个文本/视觉 API 各自持有独立限流器，上限跟随该 API 配置的「并发数」（setLlmConcurrency）；
- * 默认 3 是兜底。图片有独立 IMAGE_LIMITERS（可调）。
+ * 因此每个文本/视觉 API 各自持有独立限流器，上限跟随该 API 配置的「并发数」（setLlmConcurrency），
+ * 默认 3 是兜底，封顶 8（防止把「并发数」填成 50 后真的并发 50 个大请求打爆网关）。图片有独立 IMAGE_LIMITERS（可调）。
  */
 const LLM_LIMITERS = new Map<string, ConcurrencyLimiter>();
+
+/**
+ * 文本/视觉并发硬上限（B108）：配置里填再大也不会超过此值。
+ * 与图片侧的 IMAGE_MAX_CONCURRENT 同一思路：并发到底层 API 之前先被信号量压住。
+ */
+const LLM_MAX_CONCURRENT = 8;
 
 function llmLimiterKey(cfg: ApiConfig): string {
   return cfg.id || `${cfg.baseUrl ?? ""}|${cfg.model ?? ""}`;
@@ -81,9 +85,34 @@ function llmLimiterFor(cfg: ApiConfig): ConcurrencyLimiter {
   return limiter;
 }
 
-/** 设置某个 API 的文本/视觉请求并发上限（由文本生成/视觉守门入口按该 API 的并发配置调用） */
+/** 设置某个 API 的文本/视觉请求并发上限（由文本生成/视觉守门入口按该 API 的并发配置调用），封顶到 LLM_MAX_CONCURRENT */
 export function setLlmConcurrency(cfg: ApiConfig, n: number): void {
-  llmLimiterFor(cfg).setMaxConcurrent(n);
+  llmLimiterFor(cfg).setMaxConcurrent(Math.max(1, Math.min(LLM_MAX_CONCURRENT, Math.floor(n) || 1)));
+}
+
+/** 计算某个配置在限流器表里的 key（与内部 imageLimiterKey / llmLimiterKey 口径一致） */
+export function limiterKeyForConfig(cfg: ApiConfig): string {
+  return cfg.id || `${cfg.baseUrl ?? ""}|${cfg.model ?? ""}`;
+}
+
+/**
+ * B34：限流器是按配置 key 常驻的 Map（IMAGE_LIMITERS / LLM_LIMITERS），删除/更换 API 配置后
+ * 旧条目不会自动释放，长期改配置会让 Map 无界增长。提供两个清理入口：
+ * - pruneLimiters(activeKeys)：只保留仍存在配置的 key（推荐接线）；
+ * - disposeLimiters()：清空全部（等价于重置所有限流状态）。
+ * 接线点：stores/config.ts 删除 API 配置处（该文件不在本次改动白名单，需另行接线）：
+ *   pruneLimiters(configState.channels.map(limiterKeyForConfig))
+ */
+export function pruneLimiters(activeKeys: Iterable<string>): void {
+  const keep = new Set(activeKeys);
+  for (const key of [...IMAGE_LIMITERS.keys()]) if (!keep.has(key)) IMAGE_LIMITERS.delete(key);
+  for (const key of [...LLM_LIMITERS.keys()]) if (!keep.has(key)) LLM_LIMITERS.delete(key);
+}
+
+/** 清空全部限流器（B34）：见 pruneLimiters 注释 */
+export function disposeLimiters(): void {
+  IMAGE_LIMITERS.clear();
+  LLM_LIMITERS.clear();
 }
 
 /**
@@ -92,7 +121,8 @@ export function setLlmConcurrency(cfg: ApiConfig, n: number): void {
  */export async function fetchModelsForChannel(cfg: ApiConfig, kind: ChannelKey): Promise<DiscoveredModel[]> {
   if (!cfg.baseUrl?.trim()) throw new Error("请先填写 Base URL 再刷新模型");
   const base = normalizeBaseUrl(cfg.baseUrl, cfg.extra?.pathPrefix as string | undefined);
-  const url = `${base}/models`;
+  // joinApiPath：base 带 query 时把 /models 拼进 pathname 而不是 query（B109）
+  const url = joinApiPath(base, "/models");
   log.info("api", "拉取模型列表", { url, kind, model: cfg.model, apiKey: maskKey(cfg.apiKey) });
   const response = await tauri.http({
     method: "GET",
@@ -108,7 +138,16 @@ export function setLlmConcurrency(cfg: ApiConfig, n: number): void {
     log.error("api", "拉取模型列表失败", { url, status: response.status, raw });
     throw new Error(`模型列表接口返回 ${response.status}${raw ? `：${raw}` : ""}`);
   }
-  const payload = JSON.parse(utf8FromB64(response.bodyBase64));
+  // JSON 解析失败必须给出可读错误（B107）：中转站/网关会返回 HTML 错误页，
+  // 之前的裸 JSON.parse 会把 "Unexpected token '<'..." 抛给用户，看不出是哪一步失败。
+  let payload: unknown;
+  try {
+    payload = JSON.parse(utf8FromB64(response.bodyBase64));
+  } catch {
+    const head = utf8FromB64(response.bodyBase64).slice(0, 120);
+    log.error("api", "模型列表响应不是合法 JSON", { url, head });
+    throw new Error(`模型列表响应不是合法 JSON：${head}`);
+  }
   const provider = providerIdForConfig(cfg);
   const models = parseModelList(payload, provider).filter(
     (model) => model.capabilities.length === 0 || model.capabilities.includes(kind),
@@ -222,6 +261,19 @@ export interface ChatOptions {
   tools?: ChatTool[];
   /** 工具选择策略：默认 "auto"；可指定 "none"、"required" 或具体函数名（如 { type: "function", function: { name } }） */
   toolChoice?: string | Record<string, unknown>;
+  /**
+   * 模型调用预算（B91）：chatJson 用它把「截断续写 × 预算升级 × JSON 修复」的总请求数封顶，
+   * 避免一次调用打出几十个付费请求。由 chatJson 内部创建，调用方通常不需要传。
+   */
+  requestBudget?: { used: number; max: number };
+  /**
+   * B93：可选中止信号。传入后：
+   * - 每次发起请求/重试前检查 aborted，已中止立即抛「已中止」；
+   * - withRetry 的退避 sleep（最长 60s）改成分段可中断等待，用户点停止后不再空等。
+   * 默认不传，行为与旧版完全一致；接线点：管线/素材重生成的 aborted 回调可桥接为
+   * AbortController.signal 后透传给 chatCompletion / chatJson / chatVision。
+   */
+  signal?: AbortSignal;
 }
 
 /** OpenAI 兼容 tool 定义（function calling） */
@@ -309,22 +361,61 @@ function extractProviderBaseError(data: unknown): string | null {
 }
 
 /**
+ * chatJson 模型调用预算耗尽（B91）。
+ * 归为硬失败：预算已满时再重试也只会立刻再次超限，不能让 withRetry 把它当 unknown 再退避重试 4 次。
+ */
+class ChatRequestBudgetError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ChatRequestBudgetError";
+  }
+}
+
+/**
+ * B93：可中止等待。重试退避最长 60s，用户点停止后不该继续空等；
+ * 有 signal 时监听 abort 立即以「已中止」拒绝，无 signal 时保持旧行为。
+ */
+function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) return new Promise((resolve) => setTimeout(resolve, ms));
+  if (signal.aborted) return Promise.reject(new Error("已中止"));
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(new Error("已中止"));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/**
  * 统一重试：错误分类驱动 + 递增间隔（首次 1s、二次 10s、之后 +10s，封顶 60s）。
  * 硬失败（鉴权/参数/中止/内容审查）立即抛出；网络/限流/未知退避重试。
  * 对不稳定中转代理（如 opencode.ai/zen）提供更充分的恢复机会：最多 4 次重试。
+ * B93：可选 signal——进入重试与退避等待都会检查中止。
  */
 export async function withRetry<T>(
   fn: () => Promise<T>,
-  opts?: { retries?: number; delayFor?: (attempt: number) => number },
+  opts?: { retries?: number; delayFor?: (attempt: number) => number; signal?: AbortSignal },
 ): Promise<T> {
   let lastErr: unknown;
   const retries = opts?.retries ?? 4;
   const delayFor = opts?.delayFor ?? retryDelayFor;
   for (let attempt = 0; ; attempt++) {
+    if (opts?.signal?.aborted) throw new Error("已中止");
     try {
       return await fn();
     } catch (e) {
       lastErr = e;
+      // 视觉能力不支持/响应结构非法：模型就是不看图或返回空，重试 4 次只会白烧付费请求（B92）
+      if (e instanceof VisionApiError && (e.code === "VISION_CAPABILITY_UNSUPPORTED" || e.code === "VISION_RESPONSE_INVALID")) {
+        throw e;
+      }
+      // chatJson 请求预算耗尽：重试也不会恢复，直接抛出（B91）
+      if (e instanceof ChatRequestBudgetError) throw e;
       const status = typeof (e as { status?: number }).status === "number" ? (e as { status?: number }).status : undefined;
       const cls = classifyError(e, status);
       if (cls === "auth" || cls === "invalid_param" || cls === "aborted" || cls === "content_moderation") {
@@ -336,7 +427,7 @@ export async function withRetry<T>(
         status: status ?? 0,
         message: String(e instanceof Error ? e.message : e).slice(0, 300),
       });
-      await new Promise((r) => setTimeout(r, delay));
+      await sleepAbortable(delay, opts?.signal);
     }
   }
   throw lastErr;
@@ -352,7 +443,8 @@ export async function chatCompletion(
   opts: ChatOptions = {},
 ): Promise<{ content: string; promptTokens: number; completionTokens: number; finishReason?: string; toolCalls?: ToolCall[] }> {
   const base = normalizeBaseUrl(cfg.baseUrl, (cfg.extra?.pathPrefix as string) || undefined);
-  const url = `${base}/chat/completions`;
+  // joinApiPath：base 带 query 时接口路径不能落进 query（B109）
+  const url = joinApiPath(base, "/chat/completions");
   const done = log.time("api", `chatCompletion ${cfg.model}`);
   const body: Record<string, unknown> = {
     model: cfg.model,
@@ -387,6 +479,19 @@ export async function chatCompletion(
   // 当 content 为空且 finish_reason=length 时，说明预算被思考耗尽、答案未输出，需放大预算重试。
   // 这里把 HTTP 调用做成可带独立 tokenBudget 的闭包，逐级放大。
   const perform = async (tokenBudget: number) => {
+    // B93：中止检查放在预算计数之前——已中止不消耗调用预算，也不再发出付费请求
+    if (opts.signal?.aborted) throw new Error("已中止");
+    // 全局请求预算（B91）：跨 chatCompletion 多次调用累加，防止 chatJson 的
+    //「预算升级 × 截断续写 × JSON 修复」相乘后打出几十个付费请求。
+    const budget = opts.requestBudget;
+    if (budget) {
+      if (budget.used >= budget.max) {
+        throw new ChatRequestBudgetError(
+          `chatJson 模型调用次数已达上限（${budget.max} 次，含截断续写/JSON 修复/预算升级）。已停止以免重复付费；可调低 maxTokens、减少 maxContinue/maxRepair 后重试`,
+        );
+      }
+      budget.used += 1;
+    }
     const requestBody = { ...body };
     if (tokenBudget > 0) requestBody.max_tokens = tokenBudget;
     const res = await tauri.http({
@@ -473,7 +578,9 @@ export async function chatCompletion(
         ? [opts.maxTokens, opts.maxTokens]
         : Array.from(new Set([opts.maxTokens, opts.maxTokens + 8000, Math.max(opts.maxTokens * 2, 24000)])).sort((a, b) => a - b))
     : [baseBudget, baseBudget * 2];
-  const seenBudgets = new Set<number>();
+  // 预置首轮预算（B91）：opts.maxTokens 是 generous 时 escalation=[X, X]，
+  // 旧实现升级循环还会用同一个 X 再发一次请求（无意义重复付费）；预置后直接跳过。
+  const seenBudgets = new Set<number>([escalation[0]]);
 
   // 文本请求全局限流：并发 1（串行），避免多章节剧本同时发大请求打爆网关
   return llmLimiterFor(cfg).run(() => withRetry(async () => {
@@ -532,7 +639,7 @@ export async function chatCompletion(
       contentHead: content.slice(0, 120),
     });
     return { content, promptTokens, completionTokens, finishReason, toolCalls };
-  }));
+  }, { signal: opts.signal }));  // B93：退避等待可被中止
 }
 
 /**
@@ -622,7 +729,7 @@ function canParseJson(text: string): boolean {
  * 推理型模型（deepseek 系列）的 reasoning_content 通常是：思考文字 + 末尾一个完整 JSON。
  * 策略：从文本末尾向前找闭合符，再向后做括号平衡扫描定位匹配的开括号，尝试 JSON.parse。
  */
-export function extractJsonFromMixed(text: string): string {
+function extractJsonFromMixed(text: string): string {
   const cleaned = text.replace(/```json|```/g, "");
   const endIndexes: number[] = [];
   for (let i = cleaned.length - 1; i >= 0; i--) {
@@ -681,12 +788,15 @@ export async function chatJson<T>(
 
   const maxContinue = opts.maxContinue ?? 3;
   const maxRepair = opts.maxRepair ?? 2;
+  // 全局请求预算（B91）：「截断续写 × 预算升级 × JSON 修复」曾可相乘成几十次付费调用；
+  // 默认 6 次封顶（≈1 次主调用 + 3 次续写 + 2 次修复），预算升级的重试也计入。
+  const requestBudget = { used: 0, max: opts.requestBudget?.max ?? 6 };
   let continueCount = 0;
   let repairCount = 0;
   let accumulated = "";
 
   for (;;) {
-    const { content, finishReason } = await chatCompletion(cfg, messages, { ...opts, json: true });
+    const { content, finishReason } = await chatCompletion(cfg, messages, { ...opts, json: true, requestBudget });
     accumulated += content;
 
     // 输出因长度上限被截断 → 请求模型从中断处续写
@@ -738,6 +848,8 @@ export async function chatVision(
   if (!configIsUsable(cfg, "vision")) {
     throw new VisionApiError("图片识别 API 未配置或不可用", "VISION_CONFIGURATION_INVALID");
   }
+  // B93：中止信号优先——已中止不再构造请求（视觉请求同样按次计费）
+  if (opts.signal?.aborted) throw new Error("已中止");
   const base = normalizeBaseUrl(cfg.baseUrl, (cfg.extra?.pathPrefix as string) || undefined);
   const done = log.time("api", `chatVision ${cfg.model}`);
   log.debug("api", "chatVision 请求", {
@@ -775,22 +887,23 @@ export async function chatVision(
   if (opts.maxTokens) body.max_tokens = opts.maxTokens;
 
   // 视觉请求与文本请求共享全局串行限流，避免并发打爆网关
+  const chatUrl = joinApiPath(base, "/chat/completions");
   const content = await llmLimiterFor(cfg).run(() => withRetry(async () => {
     const res = await tauri.http({
       method: "POST",
-      url: `${base}/chat/completions`,
+      url: chatUrl,
       headers: headersFor(cfg),
       body: JSON.stringify(body),
       timeoutSecs: opts.timeoutSecs ?? 120,
     });
     if (res.status >= 500 || res.status === 429) {
-      log.error("api", `chatVision 服务端错误 ${res.status}`, { url: `${base}/chat/completions`, model: cfg.model });
+      log.error("api", `chatVision 服务端错误 ${res.status}`, { url: chatUrl, model: cfg.model });
       throw { status: res.status, message: `HTTP ${res.status}` };
     }
     if (res.status >= 400) {
       const raw = b64ToUtf8(res.bodyBase64);
       log.error("api", `chatVision 失败 ${res.status}`, {
-        url: `${base}/chat/completions`,
+        url: chatUrl,
         model: cfg.model,
         apiKey: maskKey(cfg.apiKey),
         raw: raw.slice(0, 600),
@@ -834,7 +947,7 @@ export async function chatVision(
       completionTokens: usage.completion_tokens ?? 0,
     });
     return reply;
-  }));
+  }, { signal: opts.signal }));  // B93：视觉请求的重试退避同样可被中止
   done(`len=${content.length}`);
   return content;
 }
@@ -1045,6 +1158,13 @@ export async function testTts(cfg: ApiConfig): Promise<void> {
   }
 }
 
+/**
+ * 「测试连接」出图尺寸（B103）：旧实现硬编码 512x512，但官方与多数中转图像模型只接受 1024 档
+ * （如 gpt-image 系列、DALL·E 3 最小 1024x1024），会把可用的线路误报成测试失败。
+ * 已知模型能力表只描述参考图/seed，不含尺寸约束，这里统一取支持面最广的 1024x1024 作为探测尺寸。
+ */
+const CONNECTION_TEST_IMAGE_SIZE = "1024x1024";
+
 /** 带参考图的能力探测：用一张纯色小图作为参考图请求图生图，成功说明该模型支持参考图/图生图 */
 async function probeImageEditSupport(cfg: ApiConfig): Promise<{ ok: boolean; detail: string }> {
   // 探针必须真正把参考图发出去才能判断能力。未知模型此前没有能力值，
@@ -1058,7 +1178,7 @@ async function probeImageEditSupport(cfg: ApiConfig): Promise<{ ok: boolean; det
     const probe = await generateImage(
       cfg,
       "a simple red square next to the reference image, same style",
-      { references: [{ role: "structure", required: true, dataB64: VISION_TEST_PNG_B64, mime: "image/png" }], size: "512x512" },
+      { references: [{ role: "structure", required: true, dataB64: VISION_TEST_PNG_B64, mime: "image/png" }], size: CONNECTION_TEST_IMAGE_SIZE },
     );
     if (!probe.dataB64 || probe.dataB64.length < 500) {
       return { ok: false, detail: "返回数据异常" };
@@ -1073,7 +1193,7 @@ async function probeImageEditSupport(cfg: ApiConfig): Promise<{ ok: boolean; det
 }
 
 export async function testImage(cfg: ApiConfig): Promise<{ imageOk: boolean; editOk: boolean; detail: string }> {
-  const r = await generateImage(cfg, "a simple red square on white background", { size: "512x512" });
+  const r = await generateImage(cfg, "a simple red square on white background", { size: CONNECTION_TEST_IMAGE_SIZE });
   if (!r.dataB64 || r.dataB64.length < 500) {
     throw new Error("图像 API 返回数据异常");
   }

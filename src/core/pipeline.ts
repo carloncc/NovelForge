@@ -19,7 +19,7 @@ import type {
 } from "./types";
 import { STAGE_ORDER, languageName } from "./types";
 import type { RenderAssets, WebgalLanguage } from "./render";
-import { sanitizeId } from "./render";
+import { sanitizeId, inferWebgalLanguage } from "./render";
 import { demoExtract } from "./extract";
 import { extractFromNovelAgent, extractFromNovelChunked, mergeCharacter, normalizeName } from "./extractAgent";
 import { scriptChapter, demoScriptAll, verifyScriptAgainstSource, scriptVerifyFileName, readScriptVerify, writeScriptVerify, SCRIPT_MIN_KEPT_RATIO } from "./script";
@@ -32,6 +32,7 @@ import { generateVoice, vocalKeysForChapters } from "./voice";
 import { assembleProject, gameKeyFor } from "./project";
 import { cacheDirFor, titleHash, scriptCacheRest, scriptCacheFileName } from "./cache";
 export { titleHash, scriptCacheRest, scriptCacheFileName };
+import { normalizeNovelText } from "./chapters";
 import { tauri } from "../utils/tauri";
 import { errMsg } from "../utils/errors";
 import { classifyError } from "../utils/errorClassifier";
@@ -42,6 +43,7 @@ import { setLlmConcurrency } from "../api/openaiCompatible";
 import { assertVisualBibleApprovalStatus, assertVisualBibleReadyForImages } from "./visualBible";
 import { readAssetMap, updateAssetMap, backupAssetMap } from "./assetMap";
 import { parseChapterScript } from "./dataValidation";
+import { failedTaskIdentity, mutateFailedTasks } from "./failedTasks";
 
 export interface PipelineInput {
   novel: NovelDoc;
@@ -76,7 +78,7 @@ export interface PipelineInput {
   append?: { baseFullText: string; tailText: string };
 }
 
-export const DEFAULT_PRICES = {
+const DEFAULT_PRICES = {
   llmInYuanPer1m: 2,
   llmOutYuanPer1m: 8,
   imageYuanEach: 0.3,
@@ -112,9 +114,11 @@ async function withTextRetry<T>(
   }
 }
 
-/** 追加拼接原文：已生成部分（去尾空白）+ 分隔空行 + 新增部分（去首尾空白） */
+/** 追加拼接原文：与导入链共用 normalizeNovelText 归一化（B12）。
+ * 旧实现只 trim 尾部、不折叠多空行，导致「追加后的 fullText」与「重启后按源文件重新导入的 fullText」
+ * 多空行不一致 → 指纹失配被误判成小说内容变化、静默重分章并作废下游缓存。 */
 export function joinAppendText(baseFullText: string, tailText: string): string {
-  return `${baseFullText.replace(/\s+$/, "")}\n\n\n${tailText.replace(/^\s+/, "").replace(/\s+$/, "")}`;
+  return `${normalizeNovelText(baseFullText)}\n\n${normalizeNovelText(tailText)}`;
 }
 
 /** 小说全文指纹：源路径 + 正文内容哈希，用于分章/卡片缓存作废判断 */
@@ -140,6 +144,11 @@ export function novelBodyFingerprint(texts: (string | undefined | null)[]): stri
   return h.toString(36);
 }
 
+/** 标题归一化（legacy 剧本缓存对齐用）：忽略空白/大小写差异 */
+function normalizeTitle(title: string): string {
+  return (title || "").trim().replace(/\s+/g, "").toLowerCase();
+}
+
 /** 分章入口：有 LLM 用 AI 分章，无 LLM 用规则回退（调用方据此记录分章来源） */
 export type SplitMethod = "ai" | "fallback";
 async function splitNovelForPipeline(
@@ -163,7 +172,7 @@ async function splitNovelForPipeline(
 }
 
 /** 图片固定种子：用户指定则用之；否则按标题稳定派生，保证同一项目多次生成风格一致 */
-export function imageSeedFor(title: string, opts: GenerationOptions): number | undefined {
+function imageSeedFor(title: string, opts: GenerationOptions): number | undefined {
   if (opts.imageSeed && opts.imageSeed > 0) return Math.floor(opts.imageSeed);
   let h = 5381;
   for (const ch of title) {
@@ -175,15 +184,22 @@ export function imageSeedFor(title: string, opts: GenerationOptions): number | u
 // 章节内场景 id 去重：LLM 可能输出重复 id，会导致背景图/配音/BGM 互相覆盖。
 // 幂等：重复 id 追加 _2/_3 后缀；已带后缀的不重复处理。
 export function ensureUniqueSceneIds(script: ChapterScript): void {
-  const seen = new Map<string, number>();
+  // 两遍处理：先把最终分配结果（含加后缀后的 id）全部登记进 seen 再写回。
+  // 旧实现只登记“基准 id”，输入形如 [s1, s1, s1_2] 时第 3 个原样保留 s1_2，
+  // 与第 2 个重新生成的 s1_2 相撞——去重不幂等。
+  const seen = new Set<string>();
+  const planned: (string | null)[] = [];
   for (const scene of script.scenes) {
     const base = scene.id || "s";
-    const count = seen.get(base) ?? 0;
-    if (count > 0) {
-      scene.id = `${base}_${count + 1}`;
-    }
-    seen.set(base, count + 1);
+    let id = base;
+    let n = 2;
+    while (seen.has(id)) id = `${base}_${n++}`;
+    seen.add(id);
+    planned.push(id === base ? null : id);
   }
+  script.scenes.forEach((scene, i) => {
+    if (planned[i]) scene.id = planned[i]!;
+  });
 }
 
 /** 跨章场景 id 唯一化：LLM 不同章都可能输出 s1/s2…，同名会导致背景图/配音/BGM 互相覆盖
@@ -255,35 +271,85 @@ export function pruneAssetRefs(
 
 /** 重提 id 对齐（纯函数）：新卡片按归一化姓名认领老 id，避免视觉守门/人物图/配音因 id  churn 全废。
  * 同名只认领一次（多 Claim  protection：第二个同名新人保留自己的 id，不硬并）；
+ * 场景按 location、物品按 name 同样认领老 id（背景/物品图按 id 存，id 漂移会导致重复出图与死映射）。
  * 身份类粘性字段（音色映射/参考图/已选音色）沿用老的，描述类取新的。
  * 老卡片没有时原样返回。 */
 export function alignExtractedIds(
   oldCards: ExtractionResult | undefined,
   fresh: ExtractionResult,
-): { aligned: ExtractionResult; adopted: number } {
-  if (!oldCards?.characters.length) return { aligned: fresh, adopted: 0 };
+): { aligned: ExtractionResult; adopted: number; adoptedScenes: number; adoptedItems: number } {
+  if (!oldCards) return { aligned: fresh, adopted: 0, adoptedScenes: 0, adoptedItems: 0 };
   const oldByName = new Map<string, CharacterCard>();
-  for (const c of oldCards.characters) {
+  for (const c of oldCards.characters ?? []) {
     const k = normalizeName(c.name);
     if (k && !oldByName.has(k)) oldByName.set(k, c);
   }
   const claimedOldIds = new Set<string>();
+  const usedCharIds = new Set<string>();
   let adopted = 0;
   const characters = fresh.characters.map((fc) => {
-    const hit = normalizeName(fc.name) ? oldByName.get(normalizeName(fc.name)) : undefined;
-    if (!hit || hit.id === fc.id || claimedOldIds.has(hit.id)) return fc;
+    const key = normalizeName(fc.name);
+    const hit = key ? oldByName.get(key) : undefined;
+    // usedCharIds 兜底：老 id 已被本批其它新卡占用时不认领，避免对齐后出现重复 id
+    if (!hit || hit.id === fc.id || claimedOldIds.has(hit.id) || usedCharIds.has(hit.id)) {
+      usedCharIds.add(fc.id);
+      return fc;
+    }
     claimedOldIds.add(hit.id);
+    usedCharIds.add(hit.id);
     adopted++;
     return {
       ...fc,
       id: hit.id,
-      voiceProfileId: fc.voiceProfileId ?? hit.voiceProfileId,
-      voiceName: fc.voiceName || hit.voiceName,
+      // B56：老卡上的音色选择（含用户手工选过的 voiceName）优先，仅老卡缺失时才用新值，
+      // 否则每次重提都会把人工选好的音色冲回 AI 随机分配
+      voiceProfileId: hit.voiceProfileId ?? fc.voiceProfileId,
+      voiceName: hit.voiceName || fc.voiceName,
       referenceImage: fc.referenceImage ?? hit.referenceImage,
       referenceImagePath: fc.referenceImagePath ?? hit.referenceImagePath,
     };
   });
-  return { aligned: { ...fresh, characters }, adopted };
+  const oldSceneByLoc = new Map<string, (typeof fresh.scenes)[number]>();
+  for (const os of oldCards.scenes ?? []) {
+    const k = normalizeName(os.location);
+    if (k && !oldSceneByLoc.has(k)) oldSceneByLoc.set(k, os);
+  }
+  const claimedSceneIds = new Set<string>();
+  const usedSceneIds = new Set<string>();
+  let adoptedScenes = 0;
+  const scenes = fresh.scenes.map((fs) => {
+    const key = normalizeName(fs.location);
+    const hit = key ? oldSceneByLoc.get(key) : undefined;
+    if (!hit || hit.id === fs.id || claimedSceneIds.has(hit.id) || usedSceneIds.has(hit.id)) {
+      usedSceneIds.add(fs.id);
+      return fs;
+    }
+    claimedSceneIds.add(hit.id);
+    usedSceneIds.add(hit.id);
+    adoptedScenes++;
+    return { ...fs, id: hit.id, imagePrompt: fs.imagePrompt || hit.imagePrompt };
+  });
+  const oldItemByName = new Map<string, (typeof fresh.items)[number]>();
+  for (const oi of oldCards.items ?? []) {
+    const k = normalizeName(oi.name);
+    if (k && !oldItemByName.has(k)) oldItemByName.set(k, oi);
+  }
+  const claimedItemIds = new Set<string>();
+  const usedItemIds = new Set<string>();
+  let adoptedItems = 0;
+  const items = fresh.items.map((fi) => {
+    const key = normalizeName(fi.name);
+    const hit = key ? oldItemByName.get(key) : undefined;
+    if (!hit || hit.id === fi.id || claimedItemIds.has(hit.id) || usedItemIds.has(hit.id)) {
+      usedItemIds.add(fi.id);
+      return fi;
+    }
+    claimedItemIds.add(hit.id);
+    usedItemIds.add(hit.id);
+    adoptedItems++;
+    return { ...fi, id: hit.id, imagePrompt: fi.imagePrompt || hit.imagePrompt };
+  });
+  return { aligned: { ...fresh, characters, scenes, items }, adopted, adoptedScenes, adoptedItems };
 }
 
 /** 提取退化熔断：老卡片 ≥3 人且新卡片不足半数 → 视为提取失败，不覆盖（纯函数供单测） */
@@ -293,6 +359,8 @@ export function isExtractDegraded(oldCount: number, newCount: number): boolean {
 
 /** 增量卡片合并（纯追加）：老卡片为底，新增部分提取结果按归一化姓名并入。
  * 同名角色视为同一人（老 id/字段保留、缺字段补齐、动作并集）；
+ * 场景按 location、物品按 name 同名合并（缺字段补齐、保留既有 id），避免同批追加里
+ * 同一地点/道具被登记成多张卡（重复出图/死条目）；
  * 新角色/场景/物品 id 若与老 id 冲突则加后缀避让。返回合并结果与新增统计。 */
 export function mergeAppendedCards(
   oldCards: ExtractionResult,
@@ -317,29 +385,63 @@ export function mergeAppendedCards(
     usedIds.add(id);
     return id;
   };
-  const oldByName = new Map<string, (typeof merged.characters)[number]>();
+  const charByName = new Map<string, (typeof merged.characters)[number]>();
+  const sceneByName = new Map<string, (typeof merged.scenes)[number]>();
+  const itemByName = new Map<string, (typeof merged.items)[number]>();
   for (const c of merged.characters) {
     const key = normalizeName(c.name);
-    if (key && !oldByName.has(key)) oldByName.set(key, c);
+    if (key && !charByName.has(key)) charByName.set(key, c);
+  }
+  for (const s of merged.scenes) {
+    const key = normalizeName(s.location);
+    if (key && !sceneByName.has(key)) sceneByName.set(key, s);
+  }
+  for (const i of merged.items) {
+    const key = normalizeName(i.name);
+    if (key && !itemByName.has(key)) itemByName.set(key, i);
   }
   for (const fc of freshCards.characters) {
-    const hit = normalizeName(fc.name) ? oldByName.get(normalizeName(fc.name)) : undefined;
+    const key = normalizeName(fc.name);
+    const hit = key ? charByName.get(key) : undefined;
     if (hit) {
       mergeCharacter(hit, { ...fc, id: hit.id });
     } else {
-      merged.characters.push({ ...fc, id: uniqueId(fc.id) });
+      const card = { ...fc, id: uniqueId(fc.id) };
+      merged.characters.push(card);
+      // 回填索引：同一批追加里出现两次的同名角色，第二次会并入这张新卡而不是再建一张
+      if (key) charByName.set(key, card);
       addedCharacters.push(fc.name || fc.id);
     }
   }
   let addedScenes = 0;
   for (const fs of freshCards.scenes) {
-    merged.scenes.push({ ...fs, id: uniqueId(fs.id) });
-    addedScenes++;
+    const key = normalizeName(fs.location);
+    const hit = key ? sceneByName.get(key) : undefined;
+    if (hit) {
+      for (const k of ["location", "atmosphere", "time", "imagePrompt"] as const) {
+        if (!hit[k] && fs[k]) hit[k] = fs[k];
+      }
+    } else {
+      const card = { ...fs, id: uniqueId(fs.id) };
+      merged.scenes.push(card);
+      if (key) sceneByName.set(key, card);
+      addedScenes++;
+    }
   }
   let addedItems = 0;
   for (const fi of freshCards.items) {
-    merged.items.push({ ...fi, id: uniqueId(fi.id) });
-    addedItems++;
+    const key = normalizeName(fi.name);
+    const hit = key ? itemByName.get(key) : undefined;
+    if (hit) {
+      for (const k of ["name", "appearance", "note", "imagePrompt"] as const) {
+        if (!hit[k] && fi[k]) hit[k] = fi[k];
+      }
+    } else {
+      const card = { ...fi, id: uniqueId(fi.id) };
+      merged.items.push(card);
+      if (key) itemByName.set(key, card);
+      addedItems++;
+    }
   }
   return { merged, addedCharacters, addedScenes, addedItems };
 }
@@ -370,6 +472,8 @@ export class Pipeline {
   private skippedScriptChapters: string[] = [];
   /** 纯追加模式新增章节的 novel index（分章后赋值；供剧本/图像/配音自动限定只跑新章） */
   private appendedIndexes: number[] = [];
+  /** 纯追加模式新增章节的原始章节（分章时记录；B07 提取前按目标语言取译文用，保证新旧卡同源） */
+  private appendedRawChapters: ChapterInfo[] = [];
 
   constructor(private input: PipelineInput) {}
 
@@ -396,20 +500,19 @@ export class Pipeline {
     return this.failedTasks.slice();
   }
 
-  private failedFile(): string {
-    return `${this.input.outputDir}/.novel2vn/failed.json`;
+  private wasSucceeded(f: FailedTask): boolean {
+    if (f.kind === "image") return this.succeededTaskIds.has(failedTaskIdentity(f));
+    return this.succeededTaskIds.has(f.id);
   }
 
   private async persistFailedTasks(): Promise<void> {
     try {
       // 合并而非覆盖：保留历史失败项（未在本次成功的），避免"任何一次无关的成功运行"把失败列表清空；
       // 本次成功的任务从列表移除（失败项只在真正修复成功后才消失）
-      const prev = (await this.readCachedJson<FailedTask[]>(this.failedFile())) ?? [];
-      const merged = [
-        ...prev.filter((f) => !this.succeededTaskIds.has(f.id) && !this.failedTasks.some((n) => n.id === f.id)),
+      await mutateFailedTasks(this.input.outputDir, (prev) => [
+        ...prev.filter((f) => !this.wasSucceeded(f) && !this.failedTasks.some((n) => failedTaskIdentity(n) === failedTaskIdentity(f))),
         ...this.failedTasks,
-      ];
-      await tauri.writeTextFile(this.failedFile(), JSON.stringify(merged, null, 2));
+      ]);
     } catch {
       /* 失败列表落盘失败不阻断 */
     }
@@ -428,15 +531,22 @@ export class Pipeline {
   }
 
   private async readCachedJson<T>(file: string): Promise<T | null> {
+    let exists = false;
     try {
-      if (await tauri.pathExists(file)) {
-        const { text } = await tauri.readTextFile(file);
-        return JSON.parse(text) as T;
-      }
+      exists = await tauri.pathExists(file);
     } catch {
-      /* ignore */
+      return null;
     }
-    return null;
+    if (!exists) return null;
+    try {
+      const { text } = await tauri.readTextFile(file);
+      return JSON.parse(text) as T;
+    } catch (e) {
+      // 文件存在但读/解析失败：不能静默当成“没有缓存”——否则会整段重跑（白花钱）
+      // 或误判状态；打 warn 带路径方便定位，返回值语义仍是 null（缓存缺失）
+      logger.warn("pipeline", `缓存文件损坏，已按缺失处理：${file}`, { error: errMsg(e).slice(0, 200) });
+      return null;
+    }
   }
 
   /* ---------- 从磁盘恢复中间产物（供分阶段运行） ---------- */
@@ -494,6 +604,7 @@ export class Pipeline {
     demo?: boolean,
   ): Promise<{ chapters: ChapterScript[]; rawCount: number; staleCount: number; legacyCount: number }> {
     const expectedByIndex = new Map(working.map((c) => [c.index, this.expectedScriptRest(c, styleFrag)] as [number, string]));
+    const workingByIndex = new Map(working.map((c) => [c.index, c] as const));
     const chapters: ChapterScript[] = [];
     let rawCount = 0;
     let staleCount = 0;
@@ -512,7 +623,15 @@ export class Pipeline {
           if (kind === "stale") staleCount++;
           continue;
         }
-        if (kind === "legacy") legacyCount++;
+        if (kind === "legacy") {
+          // legacy 无正文指纹，只能靠序号+标题人工对齐：序号越界说明是旧小说残留
+          //（如旧版 15 章、现在 10 章），若接受会在 chapters[旧序号] 处复活出不存在的章节
+          if (!workingByIndex.has(chapterPos)) {
+            staleCount++;
+            continue;
+          }
+          legacyCount++;
+        }
         const prev = picked.get(chapterPos);
         if (!prev) {
           picked.set(chapterPos, { path: f.path, legacy: kind === "legacy" });
@@ -526,10 +645,19 @@ export class Pipeline {
         // 已有 valid 时后来的 legacy 直接丢弃
       }
       const ordered = [...picked.entries()].sort((a, b) => a[0] - b[0]);
-      for (const [, { path }] of ordered) {
+      for (const [, { path, legacy }] of ordered) {
         try {
           const { text } = await tauri.readTextFile(path);
           const sc = parseChapterScript(JSON.parse(text));
+          if (legacy) {
+            // 序号之外再校标题：重分章后旧文件可能落在同序号但内容已不是那一章；
+            // 对不上就按过期忽略，宁可重生成也不混入错章内容
+            const wc = workingByIndex.get(sc.chapter);
+            if (!wc || normalizeTitle(sc.title) !== normalizeTitle(wc.title)) {
+              staleCount++;
+              continue;
+            }
+          }
           chapters[sc.chapter] = sc;
         } catch (e) {
           // 单个缓存损坏不再静默：打日志方便定位是哪一章坏了
@@ -573,6 +701,20 @@ export class Pipeline {
 
   private async loadMeta(): Promise<ProjectMeta | null> {
     return this.readCachedJson<ProjectMeta>(`${this.input.outputDir}/.novel2vn/meta.json`);
+  }
+
+  /** 是否已存在游戏成品：meta.json / build.json / game/scene/*.txt 任一存在即视为“有成品”。
+   * 旧实现只看 meta.json：部分旧项目或中断项目有场景文件却缺 meta，会被误判为全新项目，
+   * 组装保护失效，缺失章节的旧场景被静默删除。 */
+  private async gameArtifactsExist(): Promise<boolean> {
+    if (await this.loadMeta()) return true;
+    try {
+      if (await tauri.pathExists(`${this.input.outputDir}/build.json`)) return true;
+      const entries = await tauri.listDir(`${this.input.outputDir}/game/scene`);
+      return entries.some((e) => !e.isDir && /\.txt$/i.test(e.name));
+    } catch {
+      return false;
+    }
   }
 
   private async persistAssets(assets: RenderAssets): Promise<void> {
@@ -686,6 +828,28 @@ export class Pipeline {
           /* images 目录不存在 */
         }
         images = await this.trashPaths(victims);
+        // 文件移入回收站后同步删掉 assets.json 里对应的映射键：否则映射继续指向已删文件，
+        // 渲染引用缺失、看板仍判「图已齐」，形成永远修不掉的死条目。
+        // 存活 id 的键一律保留（figure_ 前缀会互相命中，如 id "a" 与 "a_b"）。
+        let removedKeys = 0;
+        await updateAssetMap(this.input.outputDir, (m) => {
+          for (const k of Object.keys(m.figure)) {
+            if (liveIds.some((id) => k === id || k.startsWith(`${id}_`))) continue;
+            if ([...deadCharIds].some((id) => k === id || k.startsWith(`${id}_`))) {
+              delete m.figure[k];
+              removedKeys++;
+            }
+          }
+          for (const k of Object.keys(m.item)) {
+            // item 映射键就是物品 id：死刑 id 的键直接删（liveItemIds 已剔除死刑 id）
+            if (!deadItemIds.has(k)) continue;
+            delete m.item[k];
+            removedKeys++;
+          }
+        });
+        if (removedKeys > 0) {
+          this.log(`已同步清理 ${removedKeys} 个失效素材映射键（对应文件已移入回收站，避免死条目继续引用缺失图片）`, "info", "提取");
+        }
       }
       if (images > 0) {
         this.log(`卡片变化：${images} 个人物/物品图文件已移入回收站（.novel2vn/trash，保留最近 2 轮），对应图将在图像阶段重生成`, "warn", "提取");
@@ -885,13 +1049,29 @@ export class Pipeline {
       level: "success",
       at: Date.now(),
     });
-    return this.applyNovelEnabled(chapters);
+    // 重新分章：章节序号与旧分章不再一一对应，按序号继承停用标记会停错章 → 全启用并提示复核
+    return this.applyNovelEnabled(chapters, false);
   }
 
   /** split.json 不存 enabled（追加分支的注释也承认这点）：复用分章缓存/新分章结果时，
-   *  按当前小说同序号章节的标记恢复停用状态，否则默认全量流程会把停用章复活并写回成品游戏。 */
-  private applyNovelEnabled(chapters: ChapterInfo[]): ChapterInfo[] {
-    const enabledByIndex = new Map((this.input.novel.chapters || []).map((c) => [c.index, c.enabled]));
+   *  按当前小说同序号章节的标记恢复停用状态，否则默认全量流程会把停用章复活并写回成品游戏。
+   *  inheritByIndex=false（刚重切完）时不继承：重切后序号含义已变，旧停用标记会套到别的章上，
+   *  一律恢复全启用由用户复核，避免“想停第 3 章结果停了第 7 章”这种静默错误。 */
+  private applyNovelEnabled(chapters: ChapterInfo[], inheritByIndex = true): ChapterInfo[] {
+    const novelChapters = this.input.novel.chapters || [];
+    if (!inheritByIndex) {
+      if (novelChapters.some((c) => c.enabled === false)) {
+        this.input.log({
+          step: "分章",
+          message: "重新分章后章节序号已变化：原「停用」标记不再按序号继承，本次已全部启用；请在章节列表复核并按需重新停用",
+          level: "warn",
+          at: Date.now(),
+        });
+      }
+      for (const c of chapters) c.enabled = true;
+      return chapters;
+    }
+    const enabledByIndex = new Map(novelChapters.map((c) => [c.index, c.enabled]));
     for (const c of chapters) {
       const enabled = enabledByIndex.get(c.index);
       if (enabled === false) c.enabled = false;
@@ -960,6 +1140,8 @@ export class Pipeline {
     this.lastSplitMethod = method;
     this.lastSplitDiscarded = discarded;
     this.appendedIndexes = tailChapters.map((c) => c.index);
+    // B07：留存新增章节原文——提取阶段要按目标语言逐章取译文（与旧卡同源），而不是直接用原文提取
+    this.appendedRawChapters = tailChapters.map((c) => ({ ...c }));
     const working = [...oldChapters, ...tailChapters];
     await tauri.mkdirAll(this.cacheRoot);
     await tauri.writeTextFile(this.splitCacheFile(), JSON.stringify({ fp: newFp, chapters: working, method, at: new Date().toISOString(), discarded }, null, 2));
@@ -970,6 +1152,60 @@ export class Pipeline {
       at: Date.now(),
     });
     return working;
+  }
+
+  /** B07：追加提取的文本来源——与旧卡片保持同源。
+   * 已设置目标语言时，旧卡来自译文，新卡若从原文提取会出现新旧卡片语言不一致。
+   * 这里按分章时记录的新章原文，逐章用 runTranslation 的同一缓存键
+   * （translate_{lang}_{titleHash(title)}_{titleHash(text)}.json）取译文：命中即 0 计费；
+   * 缺失则补翻并落盘；单章翻译失败回退该章原文并 warn（新卡可能与旧卡语言不一致）。 */
+  private async appendTailForExtract(rawTail: string, lang: string): Promise<string> {
+    const cfg = this.input.llm;
+    const raw = this.appendedRawChapters;
+    if (!cfg?.apiKey || !raw.length) return rawTail;
+    const parts: string[] = [];
+    let failed = 0;
+    for (const ch of raw) {
+      this.checkAbort();
+      const cacheFile = this.translateCacheFile(lang, ch);
+      const cached = await this.readCachedJson<{ title: string; text: string }>(cacheFile);
+      if (cached) {
+        parts.push(cached.text);
+        continue;
+      }
+      try {
+        const tr = await withTextRetry(() => translateChapter(cfg, ch, lang, this.onUsageCb, this.feedback.translate), {
+          isAborted: () => this.aborted,
+          onRetry: (attempt, delay, e) =>
+            this.input.log({
+              step: "提取",
+              message: `新增章节翻译失败，${delay / 1000}s 后重试（第 ${attempt} 次）：${errMsg(e).slice(0, 100)}`,
+              level: "warn",
+              at: Date.now(),
+            }),
+        });
+        await tauri.writeTextFile(cacheFile, JSON.stringify(tr, null, 2));
+        parts.push(tr.text);
+      } catch (e) {
+        failed++;
+        this.input.log({
+          step: "提取",
+          message: `新增章节「${ch.title}」翻译失败，已回退原文参与提取：新卡可能与旧卡语言不一致（${errMsg(e).slice(0, 100)}）；建议补跑翻译阶段后重新追加`,
+          level: "warn",
+          at: Date.now(),
+        });
+        parts.push(ch.text);
+      }
+    }
+    if (failed) {
+      this.input.log({
+        step: "提取",
+        message: `增量提取：${failed} 个新增章节没有译文（已回退原文），新卡可能与旧卡语言不一致`,
+        level: "warn",
+        at: Date.now(),
+      });
+    }
+    return parts.join("\n\n");
   }
 
   /* ---------- 翻译：把小说章节翻译为目标语言（缓存于 .novel2vn/translate/，不被提取指纹清理） ---------- */
@@ -1104,19 +1340,23 @@ export class Pipeline {
     return out;
   }
 
-  private async loadTranslation(chapters: ChapterInfo[], lang: string): Promise<ChapterInfo[] | null> {
+  /** 从磁盘恢复译文缓存：返回命中/缺失章节数，供调用方对「部分命中=原文混用」给出明确警告 */
+  private async loadTranslation(
+    chapters: ChapterInfo[],
+    lang: string,
+  ): Promise<{ chapters: ChapterInfo[]; hits: number; missing: number } | null> {
     const out: ChapterInfo[] = [];
-    let any = false;
+    let hits = 0;
     for (const ch of chapters) {
       const cached = await this.readCachedJson<{ title: string; text: string }>(this.translateCacheFile(lang, ch));
       if (cached) {
         out.push({ ...ch, title: cached.title, text: cached.text });
-        any = true;
+        hits++;
       } else {
         out.push(ch);
       }
     }
-    return any ? out : null;
+    return hits ? { chapters: out, hits, missing: chapters.length - hits } : null;
   }
 
   /** novel index → 当前 chapters 数组位置（重编号后 chapter.chapter 即位置，与图片/配音 scope 同口径）。
@@ -1244,8 +1484,22 @@ export class Pipeline {
     } else if (canTranslate) {
       const restored = await this.loadTranslation(workingChapters, lang);
       if (restored) {
-        workingChapters = restored;
-        log({ step: "翻译", message: `[缓存] 复用已翻译章节（${languageName(lang)}）`, level: "info", at: Date.now() });
+        workingChapters = restored.chapters;
+        log({
+          step: "翻译",
+          message: `[缓存] 复用已翻译章节（${languageName(lang)}）：${restored.hits}/${restored.chapters.length} 章命中`,
+          level: "info",
+          at: Date.now(),
+        });
+        if (restored.missing > 0) {
+          // 部分命中会静默把未命中章节的原文混进译文流程（下游提取/剧本中英混杂），必须显式提示
+          log({
+            step: "翻译",
+            message: `注意：另有 ${restored.missing} 章没有译文缓存，将直接把原文混入生成（${languageName(lang)} 项目会中英混杂）；建议补跑翻译阶段后再继续`,
+            level: "warn",
+            at: Date.now(),
+          });
+        }
       } else {
         log({ step: "翻译", message: "未勾选翻译阶段且无已翻译缓存，将使用原文", level: "warn", at: Date.now() });
       }
@@ -1274,7 +1528,13 @@ export class Pipeline {
         const oldCards = (await this.readCachedJson<ExtractionResult>(cardsCache)) ?? undefined;
         if (!oldCards) throw new Error("项目还没有卡片缓存，无法追加：请先全量生成一次，再追加新章节");
         log({ step: "提取", message: `增量追加：保留旧卡片（${oldCards.characters.length} 角色），只对新增约 ${appendTail.trim().length} 字提取…`, level: "info", at: Date.now() });
-        const tailText = appendTail.replace(/\r/g, "").trim();
+        let tailText = appendTail.replace(/\r/g, "").trim();
+        // B07：追加+翻译时旧卡来自译文，新卡若从原文提取会新旧语言混杂。与全量流程同源：
+        // 按分章时记录的新章原文逐章取译文（翻译阶段已写好的缓存直接命中，0 计费）。
+        const appendLang = (this.options.language ?? "").trim();
+        if (canTranslate && appendLang) {
+          tailText = await this.appendTailForExtract(tailText, appendLang);
+        }
         const title = workingNovel.fileName.replace(/\.txt$/i, "");
         try {
           const useAgent = !!this.options.extractAgent;
@@ -1306,7 +1566,9 @@ export class Pipeline {
               });
           const { merged, addedCharacters, addedScenes, addedItems } = mergeAppendedCards(oldCards, fresh);
           cards = merged;
-          await tauri.writeTextFile(cardsCache, JSON.stringify({ ...cards, _novelFp: novelFp }, null, 2));
+        await tauri.writeTextFile(cardsCache, JSON.stringify({ ...cards, _novelFp: novelFp }, null, 2));
+        // 提取成功也登记销账：否则历史 extract 失败项会永久留在 failed.json（成功不销账→徽标只增不减）
+        this.succeededTaskIds.add("extract");
           log({
             step: "提取",
             message: `增量提取完成：新增角色 ${addedCharacters.length}${addedCharacters.length ? `（${addedCharacters.slice(0, 5).join("、")}${addedCharacters.length > 5 ? "…" : ""}）` : ""}、场景 ${addedScenes}、物品 ${addedItems}；旧卡片与全部旧素材保留`,
@@ -1379,11 +1641,16 @@ export class Pipeline {
         }
         const prevCards = (await this.readCachedJson<ExtractionResult>(cardsCache)) ?? undefined;
         if (!demo && prevCards) {
-          // id 对齐：同名角色沿用老 id（视觉守门/人物图/配音不因重提换 id 全废），粘性字段保留
-          const { aligned, adopted } = alignExtractedIds(prevCards, cards);
-          if (adopted > 0) {
+          // id 对齐：同名角色/同地点场景/同名物品沿用老 id（视觉守门/人物图/背景图不因重提换 id 全废），粘性字段保留
+          const { aligned, adopted, adoptedScenes, adoptedItems } = alignExtractedIds(prevCards, cards);
+          if (adopted + adoptedScenes + adoptedItems > 0) {
             cards = aligned;
-            log({ step: "提取", message: `角色 id 已对齐：${adopted} 个同名角色沿用原 id 与音色/参考图（视觉守门与人物图不受影响）`, level: "info", at: Date.now() });
+            log({
+              step: "提取",
+              message: `卡片 id 已对齐：角色 ${adopted} / 场景 ${adoptedScenes} / 物品 ${adoptedItems} 沿用原 id 与音色/参考图（视觉守门、人物图与背景图不受影响）`,
+              level: "info",
+              at: Date.now(),
+            });
           }
           // 退化熔断：新卡片不足老卡片半数视为提取失败，不覆盖（多因 Agent 早退/截断）
           if (isExtractDegraded(prevCards.characters.length, cards.characters.length)) {
@@ -1620,6 +1887,8 @@ export class Pipeline {
                 continue;
               }
               await tauri.writeTextFile(cacheFile, JSON.stringify(script, null, 2));
+              // 剧本成功写盘即登记销账：失败→重跑成功的章节从 failed.json 收敛
+              this.succeededTaskIds.add(`chapter_${chapter.index + 1}`);
               // 保真自检：核对刚生成的剧本并落盘核对报告（剧本页「保真核对」可逐条接受/删除/忽略）；
               // 覆盖率过低（<85%）且无用户意见时自动重写一次补足遗漏（最多 1 次）
               const reportVerify = (vr: ScriptVerifyResult): void => {
@@ -1829,7 +2098,8 @@ export class Pipeline {
         }
         log({ step: "图像", message: "开始处理图像素材…", level: "info", at: Date.now() });
         const imageFeedback = this.feedback.image;
-        const imageForce = !!imageFeedback || input.forceStages?.includes("image");
+        // 「跳过缓存（全量重跑）」必须对图像同样生效，否则用户勾选了全量却全部命中旧图（与 UI/日志承诺不符）
+        const imageForce = !!imageFeedback || input.forceStages?.includes("image") || this.options.skipCache === true;
         const baseSeed = imageSeedFor(cards!.title || workingNovel.fileName, this.options);
         // 单章节模式：rerunChapters（novel 原始 index）→ chapters 数组位置集合（与配音 scope 同口径）
         // 纯追加模式：只处理新章位置（无视 rerunChapters）
@@ -1896,11 +2166,11 @@ export class Pipeline {
         );
         this.failedTasks.push(...failed);
         this.imageHadFailures = this.imageHadFailures || failed.length > 0;
-        // 成功产出的图像 id 记入本次成功集（failed.json 收敛用）；失败时立即增量落盘
-        for (const id of Object.keys(images.bg)) this.succeededTaskIds.add(id);
-        for (const id of Object.keys(images.cg)) this.succeededTaskIds.add(id);
-        for (const id of Object.keys(images.figure)) this.succeededTaskIds.add(id);
-        for (const id of Object.keys(images.item)) this.succeededTaskIds.add(id);
+        // 成功产出的图像 id 记入本次成功集（failed.json 收敛用，带用途类别避免 bg/cg 同名互相抵消）；失败时立即增量落盘
+        for (const id of Object.keys(images.bg)) this.succeededTaskIds.add(`image:${id}:bg`);
+        for (const id of Object.keys(images.cg)) this.succeededTaskIds.add(`image:${id}:cg`);
+        for (const id of Object.keys(images.figure)) this.succeededTaskIds.add(`image:${id}:figure`);
+        for (const id of Object.keys(images.item)) this.succeededTaskIds.add(`image:${id}:item`);
         if (failed.length) void this.persistFailedTasks();
         // 费用按实际 API 生成数计（缓存复用/用户素材拷贝不计费），不再按映射总数估算
         this.cost.imageCount = generated;
@@ -1938,7 +2208,8 @@ export class Pipeline {
       if (input.tts?.apiKey) {
         // forceVoiceChapters：只重配点名章节（与 rerunChapters 取并集）；作用域内强制跳过缓存
         const voiceForceSet = new Set(this.options.forceVoiceChapters ?? []);
-        const voiceForce = !!this.feedback.voice || input.forceStages?.includes("voice") || voiceForceSet.size > 0;
+        // 「跳过缓存（全量重跑）」同样作用于配音：与图像口径一致
+        const voiceForce = !!this.feedback.voice || input.forceStages?.includes("voice") || voiceForceSet.size > 0 || this.options.skipCache === true;
         // 分章节生成：rerunChapters（novel 原始 index 集合）→ chapters 数组位置集合。
         // activeChapterIndexes[i] 对应重编号前的 chapters[i]，两侧同一口径。
         let chapterScope: Set<number> | undefined;
@@ -1989,7 +2260,7 @@ export class Pipeline {
             .filter((c) => c.enabled !== false && !this.activeChapterIndexes.includes(c.index))
             .map((c) => `第 ${c.index + 1} 章 ${c.title}`);
       if (missingTitles.length > 0) {
-        const hadGame = await this.loadMeta();
+        const hadGame = await this.gameArtifactsExist();
         if (hadGame) {
           if (input.requireFullScriptCoverage) {
             throw new Error(
@@ -2041,10 +2312,15 @@ export class Pipeline {
       }
     } else if (stages.has("assemble")) {
       log({ step: "组装", message: `组装项目到 ${input.outputDir}…`, level: "info", at: Date.now() });
+      // 导出页设置优先（重新组装不再覆盖自定义标题/Game_key）；未设置时按卡片标题自动派生
+      const exportTitle = this.options.exportTitle?.trim() || cards!.title || workingNovel.fileName.replace(/\.txt$/i, "");
+      const exportGameKey = /^[a-zA-Z0-9]{6,10}$/.test(this.options.exportGameKey?.trim() ?? "")
+        ? this.options.exportGameKey!.trim()
+        : gameKeyFor(exportTitle);
       const r = await assembleProject({
         outputDir: input.outputDir,
-        title: cards!.title || workingNovel.fileName.replace(/\.txt$/i, ""),
-        gameKey: gameKeyFor(cards!.title || workingNovel.fileName),
+        title: exportTitle,
+        gameKey: exportGameKey,
         templateDir: input.templateDir,
         chapters,
         cards: cards!,
@@ -2054,7 +2330,20 @@ export class Pipeline {
         figureActions: this.options.figureActions,
         useBgm: this.options.useBgm,
         useSe: this.options.useSe,
-        language: (this.options.language as WebgalLanguage) || "zh_CN",
+        // UI98：「不翻译（使用原文）」时不要写死 zh_CN，按原文语种推断 Default_Language
+        // （假名→ja、谚文→ko、CJK→zh_CN、拉丁→en），保证游戏界面语言与正文一致
+        language: (this.options.language as WebgalLanguage) || inferWebgalLanguage(workingNovel.fullText),
+        titleCoverMode: this.options.titleCoverMode,
+        titleCoverPath: this.options.titleCoverPath,
+        titleLogoMode: this.options.titleLogoMode,
+        titleLogoPath: this.options.titleLogoPath,
+        titleBgmFile: this.options.titleBgmFile,
+        titleEnableContinue: this.options.titleEnableContinue,
+        titleEnableFlowchart: this.options.titleEnableFlowchart,
+        titleEnableAppreciation: this.options.titleEnableAppreciation,
+        themeFromArtwork: this.options.themeFromArtwork,
+        // 主题取色优先用风格锚点（视觉守门/风格锚点图）；缺失时 assembleProject 内部回退首张背景/CG
+        styleReferencePath: `${input.outputDir.replace(/[\\/]+$/, "")}/.novel2vn/cache/images/anchor_style.png`,
         log: (m) => this.log(m, "info", "组装"),
       });
       meta = r.meta;

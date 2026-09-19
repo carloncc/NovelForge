@@ -41,7 +41,7 @@ function assertMiniMaxConfig(config: ApiConfig): void {
   }
 }
 
-function authHeaders(config: ApiConfig): Record<string, string> {
+function minimaxAuthHeaders(config: ApiConfig): Record<string, string> {
   if (!config.apiKey.trim()) throw new Error("所选 TTS 配置没有 API Key");
   return { Authorization: `Bearer ${config.apiKey}` };
 }
@@ -105,7 +105,7 @@ export async function createMiniMaxVoiceProfile(input: {
   if (!config) throw new Error("找不到所选 TTS 配置");
   assertMiniMaxConfig(config);
   if (input.audioB64.length > 16 * 1024 * 1024) throw new Error("参考音频过大，请选择不超过 12MB 的文件");
-  const headers = authHeaders(config);
+  const headers = minimaxAuthHeaders(config);
   const multipart = multipartBody(input.fileName, input.mime, input.audioB64);
   const upload = jsonResponse(await tauri.http({ method: "POST", url: apiUrl(config, "/v1/files/upload"), headers: { ...headers, "Content-Type": multipart.contentType }, bodyBase64: multipart.bodyBase64 }));
   const fileId = extractFileId(upload);
@@ -140,7 +140,7 @@ export interface MiniMaxRemoteVoice {
 
 export async function fetchMiniMaxVoices(config: ApiConfig, voiceType: "system" | "all" = "all"): Promise<MiniMaxRemoteVoice[]> {
   assertMiniMaxConfig(config);
-  const headers = authHeaders(config);
+  const headers = minimaxAuthHeaders(config);
   const resp = await tauri.http({
     method: "POST",
     url: apiUrl(config, "/v1/get_voice"),

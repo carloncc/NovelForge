@@ -96,6 +96,7 @@ pub fn run() {
             commands::read_text_file,
             commands::write_text_file,
             commands::read_file_base64,
+            commands::read_file_header,
             commands::write_file_base64,
             commands::list_dir,
             commands::mkdir_all,

@@ -6,7 +6,10 @@ const files = ["zh-TW", "en", "ja", "ko"];
 let failed = false;
 for (const f of files) {
   const src = readFileSync(`src/i18n/${f}.ts`, "utf-8");
-  const dictKeys = [...src.matchAll(/^\s*"((?:[^"\\]|\\.)*)":/gm)].map((m) => m[1]);
+  // 同时支持双引号与单引号 key（旧正则只认双引号，单引号条目会被漏掉而误报"缺翻"）
+  const dictKeys = [...src.matchAll(/^\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)')\s*:/gm)].map(
+    (m) => m[1] ?? m[2],
+  );
   const missing = uniq.filter((k) => !dictKeys.includes(k));
   const extra = dictKeys.filter((k) => !uniq.includes(k));
   if (missing.length || extra.length) {

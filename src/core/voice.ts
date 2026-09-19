@@ -3,8 +3,9 @@ import { ttsSpeech } from "../api/openaiCompatible";
 import { tauri } from "../utils/tauri";
 import { errMsg } from "../utils/errors";
 import { cacheDirFor } from "./cache";
-import { sceneVocalKey } from "./render";
+import { sceneVocalKey, sceneVocalKeyPart, splitLineForSpeech } from "./render";
 import { ttsConfigById, voiceLibraryFor, voiceProfileById } from "../stores/config";
+import { pickVoiceForGender, voiceGenderOf } from "./minimaxVoices";
 import { log as logger } from "../utils/logger";
 import { readAssetMap, updateAssetMap } from "./assetMap";
 
@@ -136,15 +137,24 @@ function voiceFileName(
   return `v_${key}_${voiceFingerprint(voice, ttsConfigId)}_${fnv1a([text, speed, ttsEmotion])}.mp3`;
 }
 
-/** 按当前剧本算出全部配音 key（与 buildVoiceJobs 的 key 公式同源，供映射剪枝用） */
+/** 按当前剧本算出全部配音 key（与 buildVoiceJobs 的 key 公式同源，供映射剪枝用）。
+ * 长台词按 splitLineForSpeech 展开 _pN 段 key：否则剪枝会把分段映射全删，组装后长台词静默无声。 */
 export function vocalKeysForChapters(chapters: ChapterScript[]): string[] {
   const keys: string[] = [];
+  const pushLine = (baseKey: string, text: string): void => {
+    const parts = splitLineForSpeech(text || "");
+    if (parts.length <= 1) {
+      keys.push(baseKey);
+      return;
+    }
+    parts.forEach((_, si) => keys.push(sceneVocalKeyPart(baseKey, si, parts.length)));
+  };
   for (const chapter of chapters) {
     for (const scene of chapter.scenes) {
-      scene.lines.forEach((_, i) => keys.push(sceneVocalKey(chapter.chapter, scene.id, i)));
+      scene.lines.forEach((line, i) => pushLine(sceneVocalKey(chapter.chapter, scene.id, i), line.text));
       (scene.choices || []).forEach((choice, b) => {
-        choice.lines.forEach((_, j) =>
-          keys.push(sceneVocalKey(chapter.chapter, scene.id, scene.lines.length + 1000 * (b + 1) + j)));
+        choice.lines.forEach((line, j) =>
+          pushLine(sceneVocalKey(chapter.chapter, scene.id, scene.lines.length + 1000 * (b + 1) + j), line.text));
       });
     }
   }
@@ -163,7 +173,18 @@ export function buildVoiceJobs(  cfg: ApiConfig,
     const char = charById.get(charId);
     const profile = voiceProfileById(char?.voiceProfileId);
     if (profile) return { voice: profile.voiceId, ttsConfigId: profile.ttsConfigId, cloned: true };
-    const v = char?.voiceName || char?.id || "default";
+    const gender = char?.gender;
+    const explicit = char?.voiceName;
+    if (explicit && library.includes(explicit)) {
+      const voiceGender = voiceGenderOf(explicit);
+      // 性别明确且与角色不符（旧项目里 AI 选错/默认回退成男声）→ 重新按性别挑选，修复「女角色男声」
+      if (!gender || voiceGender === undefined || voiceGender === "other" || voiceGender === gender) {
+        return { voice: explicit, cloned: false };
+      }
+    }
+    const picked = pickVoiceForGender(library, gender, char?.id || charId);
+    if (picked) return { voice: picked, cloned: false };
+    const v = explicit || charId;
     return { voice: library.includes(v) ? v : fallbackVoice, cloned: false };
   };
   const jobs: VoiceJob[] = [];
@@ -173,47 +194,15 @@ export function buildVoiceJobs(  cfg: ApiConfig,
     for (const scene of chapter.scenes) {
       // 主流程台词：对话按角色音色，旁白/独白按默认音色（fallbackVoice）配音，避免整段静默导致 auto/快进体感断层
       scene.lines.forEach((line, i) => {
-        const key = sceneVocalKey(chapter.chapter, scene.id, i);
-        const text = line.text.slice(0, 500);
-        if (line.type === "dialogue") {
-          const selected = voiceName(line.characterId);
-          const speed = typeof line.speed === "number" ? line.speed : undefined;
-          const ttsEmotion = typeof line.ttsEmotion === "string" && line.ttsEmotion ? line.ttsEmotion : undefined;
-          jobs.push({
-            key,
-            file: voiceFileName(key, selected.voice, selected.ttsConfigId, text, speed, ttsEmotion),
-            text,
-            voice: selected.voice,
-            charId: line.characterId,
-            ttsConfigId: selected.ttsConfigId,
-            cloned: selected.cloned,
-            speed,
-            ttsEmotion,
-          });
-        } else {
-          // 旁白/独白：超长先截断 500 字（与对话一致），过长句由 lint 告警建议拆句
-          // NarrationLine 无 speed/ttsEmotion 标注，用全局 TTS 默认值
-          if (line.text.length > 200) {
-            logger.info("voice", "旁白超长（快进易截断，建议拆句）", { key, len: line.text.length });
-          }
-          jobs.push({
-            key,
-            file: voiceFileName(key, fallbackVoice, undefined, text),
-            text,
-            voice: fallbackVoice,
-            charId: "narrator",
-            ttsConfigId: undefined,
-            cloned: false,
-            speed: undefined,
-            ttsEmotion: undefined,
-          });
+        // 超长台词按句拆段：key 与渲染层 sceneVocalKeyPart 同公式（多段统一 _pN 后缀），
+        // 修复「玩家读到全文、听到的却只有前 500 字」的声画不一致（此前静默 slice(0,500)）
+        const baseKey = sceneVocalKey(chapter.chapter, scene.id, i);
+        const parts = splitLineForSpeech(line.text);
+        if (parts.length > 1) {
+          logger.info("voice", "超长台词已按句拆分配音", { key: baseKey, len: line.text.length, parts: parts.length });
         }
-      });
-      // 分支选择台词（与渲染层的序号公式一致）：对话与旁白同样处理
-      (scene.choices || []).forEach((choice, b) => {
-        choice.lines.forEach((line, j) => {
-          const key = sceneVocalKey(chapter.chapter, scene.id, scene.lines.length + 1000 * (b + 1) + j);
-          const text = line.text.slice(0, 500);
+        parts.forEach((text, si) => {
+          const key = sceneVocalKeyPart(baseKey, si, parts.length);
           if (line.type === "dialogue") {
             const selected = voiceName(line.characterId);
             const speed = typeof line.speed === "number" ? line.speed : undefined;
@@ -230,6 +219,10 @@ export function buildVoiceJobs(  cfg: ApiConfig,
               ttsEmotion,
             });
           } else {
+            // 旁白/独白：NarrationLine 无 speed/ttsEmotion 标注，用全局 TTS 默认值
+            if (text.length > 200) {
+              logger.info("voice", "旁白超长（快进易截断，建议拆句）", { key, len: text.length });
+            }
             jobs.push({
               key,
               file: voiceFileName(key, fallbackVoice, undefined, text),
@@ -242,6 +235,44 @@ export function buildVoiceJobs(  cfg: ApiConfig,
               ttsEmotion: undefined,
             });
           }
+        });
+      });
+      // 分支选择台词（与渲染层的序号公式一致）：对话与旁白同样处理
+      (scene.choices || []).forEach((choice, b) => {
+        choice.lines.forEach((line, j) => {
+          const baseKey = sceneVocalKey(chapter.chapter, scene.id, scene.lines.length + 1000 * (b + 1) + j);
+          const parts = splitLineForSpeech(line.text);
+          parts.forEach((text, si) => {
+            const key = sceneVocalKeyPart(baseKey, si, parts.length);
+            if (line.type === "dialogue") {
+              const selected = voiceName(line.characterId);
+              const speed = typeof line.speed === "number" ? line.speed : undefined;
+              const ttsEmotion = typeof line.ttsEmotion === "string" && line.ttsEmotion ? line.ttsEmotion : undefined;
+              jobs.push({
+                key,
+                file: voiceFileName(key, selected.voice, selected.ttsConfigId, text, speed, ttsEmotion),
+                text,
+                voice: selected.voice,
+                charId: line.characterId,
+                ttsConfigId: selected.ttsConfigId,
+                cloned: selected.cloned,
+                speed,
+                ttsEmotion,
+              });
+            } else {
+              jobs.push({
+                key,
+                file: voiceFileName(key, fallbackVoice, undefined, text),
+                text,
+                voice: fallbackVoice,
+                charId: "narrator",
+                ttsConfigId: undefined,
+                cloned: false,
+                speed: undefined,
+                ttsEmotion: undefined,
+              });
+            }
+          });
         });
       });
     }
@@ -258,6 +289,8 @@ export async function runVoiceJob(
   log: (ev: PipelineEvent) => void,
   force = false,
   isAborted?: () => boolean,
+  /** B16：每次真正发起 TTS 合成请求时回调文本长度（按实际下发计费；中止/null 返回的任务不计入） */
+  onSynthesis?: (chars: number) => void,
 ): Promise<string | null> {
   const cacheDir = cacheDirFor(cacheRoot, "vocal");
   await tauri.mkdirAll(cacheDir);
@@ -277,6 +310,8 @@ export async function runVoiceJob(
   log({ step: "配音", message: `配音中：${job.voice} 「${job.text.slice(0, 20)}…」`, level: "info", at: Date.now() });
   const isMiniMax = jobConfig.adapter === "minimax-tts" || /minimaxi?\.com/i.test(jobConfig.baseUrl);
   const speak = async (voice: string): Promise<string> => {
+    // B16：真正发起合成前才登记计费字符——缓存命中/中止跳过/配置缺失都不会走到这里
+    onSynthesis?.(job.text.length);
     // MiniMax 单次合成受 RPM 限制（免费 10 / 充值 20）：全局串行 + 最小间隔，避免并发打爆限流。
     // 其他 TTS 服务（OpenAI / 硅基流动等）不限速，保持并发。
     const res = isMiniMax
@@ -414,11 +449,15 @@ export async function generateVoice(
   };
 
   let idx = 0;
+  // B16：费用按「实际发起合成」的文本长度累计（旧实现按全部 pending 上限预估，中止后未派发的句子也被计费）
+  let synthChars = 0;
   const runner = async () => {
     while (idx < pending.length) {
       if (isAborted?.()) return;
       const job = pending[idx++];
-      const path = await runVoiceJob(cfg, job, cacheRoot, log, force, isAborted);
+      const path = await runVoiceJob(cfg, job, cacheRoot, log, force, isAborted, (n) => {
+        synthChars += n;
+      });
       emitProgress(job);
       if (path) {
         vocal[job.key] = path;
@@ -437,8 +476,8 @@ export async function generateVoice(
   };
 
   await Promise.all(Array.from({ length: concurrency }, () => runner()));
-  // 实字计费：只统计实际下发 TTS 的文本（缓存命中不计费），而非按句数估算
-  const chars = pending.reduce((n, j) => n + (j.text?.length ?? 0), 0);
+  // 实字计费：只统计实际下发 TTS 的文本（缓存命中不发请求不计费；中止后未派发的任务也不计）
+  const chars = synthChars;
   logger.info("voice", "配音生成完成", { total: jobs.length, success: Object.keys(vocal).length, failed: failed.length, chars });
   return { vocal, failed, chars };
 }
@@ -510,6 +549,8 @@ export async function repairVoiceAssets(
   let failed = 0;
   let idx = 0;
   let mergeChain: Promise<void> = Promise.resolve();
+  // 本轮新写入的文件：映射合并失败时也不能在随后的孤儿清理里被删掉（付费产物，可被下次内容索引认领）
+  const freshFiles = new Set<string>();
   const worker = async (): Promise<void> => {
     while (idx < need.length) {
       if (isAborted?.()) return;
@@ -517,6 +558,7 @@ export async function repairVoiceAssets(
       const path = await runVoiceJob(cfg, job, cacheRoot, log, true, isAborted);
       if (path) {
         fixed++;
+        freshFiles.add((path.split(/[\\/]/).pop() || "").toLowerCase());
         // 串行合并防并发写丢（与 regenerate 流程一致）；catch 防止单次写失败毒化整条链
         mergeChain = mergeChain
           .then(() => updateAssetMap(outputDir, (map) => { map.vocal[job.key] = path; }))
@@ -539,19 +581,31 @@ export async function repairVoiceAssets(
   };
   await Promise.all(Array.from({ length: Math.max(1, Math.min(concurrency, need.length)) }, () => worker()));
   const aborted = isAborted?.() === true;
-  // 结构归位：删除缓存中不再被 assets.json 引用的孤儿语音文件（已中断则不清理，避免半套状态）
+  // 结构归位：把缓存中不再被 assets.json 引用的孤儿语音移入回收目录（已中断则不清理，避免半套状态）。
+  // B86：旧实现直接删除——旧命名/无法解析的 v_* 文件会被当孤儿误删（付费产物永久丢失）；
+  // 改为移入 .novel2vn/trash/，可从磁盘找回或用内容索引重新认领，不再直接销毁。
   let purged = 0;
   if (!aborted) {
     const finalAssets = await readAssetMap(outputDir);
     const referenced = new Set<string>();
     for (const p of Object.values(finalAssets.vocal)) referenced.add((p.split(/[\\/]/).pop() || "").toLowerCase());
+    const trashDir = `${outputDir.replace(/[\\/]+$/, "")}/.novel2vn/trash`;
     try {
       const entries = await tauri.listDir(cacheDir);
       for (const e of entries) {
         if (e.isDir || !/^v_/i.test(e.name)) continue;
-        if (!referenced.has(e.name.toLowerCase())) {
-          await tauri.removePath(e.path).catch(() => {});
+        // 不回收本轮刚生成的文件：映射写失败只记 warn，但文件是付费产物，删掉会进入「生成→写失败→删除→再生成」循环
+        if (referenced.has(e.name.toLowerCase()) || freshFiles.has(e.name.toLowerCase())) continue;
+        try {
+          await tauri.mkdirAll(trashDir);
+          await tauri.replacePath(e.path, `${trashDir}/${e.name}`);
           purged++;
+        } catch (moveError) {
+          // 回收失败（权限/跨盘）绝不退回删除：付费产物宁可留着，仅告警
+          logger.warn("voice", "孤儿语音移入回收目录失败，已保留原文件", {
+            file: e.name,
+            error: errMsg(moveError),
+          });
         }
       }
     } catch {
@@ -563,7 +617,7 @@ export async function repairVoiceAssets(
     message: aborted
       ? `配音结构修复已中断：孤儿认领 ${relinked} 句，重配 ${fixed} 句，失败 ${failed}（孤儿文件未清理）`
       : purged
-        ? `配音结构修复完成：孤儿认领 ${relinked} 句，重配 ${fixed} 句，失败 ${failed}，清理孤儿文件 ${purged} 个`
+        ? `配音结构修复完成：孤儿认领 ${relinked} 句，重配 ${fixed} 句，失败 ${failed}，孤儿文件 ${purged} 个已移入回收目录`
         : `配音结构修复完成：孤儿认领 ${relinked} 句，重配 ${fixed} 句，失败 ${failed}（无需清理孤儿文件）`,
     level: aborted ? "warn" : fixed ? "success" : "info",
     at: Date.now(),

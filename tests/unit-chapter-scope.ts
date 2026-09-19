@@ -19,14 +19,13 @@ function bgCount(tasks: { kind: string }[]): number {
 }
 
 // 不过滤：背景数＝各章场景数之和
-const all = buildImageTasks(scripts, cards, { figurePerCharacter: 1, cgPerChapter: 0, maxPerChapter: 0 });
+const all = buildImageTasks(scripts, cards, { cgPerChapter: 0, maxPerChapter: 0 });
 const expectAll = scripts.reduce((n, s) => n + s.scenes.length, 0);
 assert(bgCount(all) === expectAll, `全量背景数应为 ${expectAll}，实际 ${bgCount(all)}`);
 
 // 单章过滤：只保留目标章背景，全局任务（锚点/三视图/立绘/物品）不受影响
 const target = scripts[1];
 const scoped = buildImageTasks(scripts, cards, {
-  figurePerCharacter: 1,
   cgPerChapter: 0,
   maxPerChapter: 0,
   chapterIndexes: new Set([target.chapter]),
@@ -43,8 +42,8 @@ for (const k of ["anchor", "threeview", "figure", "item"]) {
   assert((kScoped[k] || 0) === (kAll[k] || 0), `全局任务 ${k} 不应被章节过滤影响`);
 }
 // CG 同样按章过滤；CG 键只用 scene.id（不含章节号，重编号不再作废）
-const cgAll = buildImageTasks(scripts, cards, { figurePerCharacter: 1, cgPerChapter: 3, maxPerChapter: 0 });
-const cgScoped = buildImageTasks(scripts, cards, { figurePerCharacter: 1, cgPerChapter: 3, maxPerChapter: 0, chapterIndexes: new Set([target.chapter]) });
+const cgAll = buildImageTasks(scripts, cards, { cgPerChapter: 3, maxPerChapter: 0 });
+const cgScoped = buildImageTasks(scripts, cards, { cgPerChapter: 3, maxPerChapter: 0, chapterIndexes: new Set([target.chapter]) });
 const targetCgScenes = new Set(target.scenes.filter((s) => s.cgEvent).map((s) => s.id));
 for (const t of cgScoped.filter((t) => t.kind === "cg")) {
   assert(!/^\d+_/.test(t.id), `CG 键不应含章节号前缀：${t.id}`);

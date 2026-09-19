@@ -63,7 +63,7 @@ export function updateAssetMap(outputDir: string, mutate: (assets: AssetMap) => 
 
 const ASSET_BACKUP_RE = /^assets\.backup-.*\.json$/;
 
-export function assetBackupFileName(date = new Date()): string {
+function assetBackupFileName(date = new Date()): string {
   const stamp = date.toISOString().replace(/[:.]/g, "-").slice(0, 19);
   return `assets.backup-${stamp}.json`;
 }

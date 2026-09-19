@@ -80,7 +80,8 @@ const stageOrder = computed(() => STAGE_ORDER);
   background: var(--err-soft);
 }
 .stage-row.is-done {
-  border-color: var(--ok-soft, rgba(47, 158, 68, 0.25));
+  /* UI43：完成态需要可见的描边；原先用 10% 透明度的 --ok-soft 当边框，几乎看不出 */
+  border-color: var(--ok-border, rgba(5, 150, 105, 0.45));
 }
 .stage-state-dot {
   width: 20px;
@@ -89,7 +90,7 @@ const stageOrder = computed(() => STAGE_ORDER);
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 11px;
+  font-size: 12px;
   color: #fff;
   background: var(--text-dim);
   flex: none;
@@ -101,7 +102,7 @@ const stageOrder = computed(() => STAGE_ORDER);
   background: var(--err);
 }
 .stage-state-dot.running {
-  background: var(--accent-2);
+  background: var(--accent);
 }
 .stage-state-text {
   font-size: 12px;
@@ -116,6 +117,6 @@ const stageOrder = computed(() => STAGE_ORDER);
   font-weight: 600;
 }
 .stage-state-text.running {
-  color: var(--accent-2);
+  color: var(--accent);
 }
 </style>

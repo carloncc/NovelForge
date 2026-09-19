@@ -21,6 +21,13 @@ function main(): void {
   assert(classifyError(new Error("rate limit exceeded")) === "rate_limit", "rate limit");
   assert(classifyError(new Error("insufficient balance, please recharge")) === "rate_limit", "余额不足");
   assert(classifyError(new Error("额度不足")) === "rate_limit", "中文额度");
+  // B94：部分服务把限流回成 400，文本带 rate limit 时必须当限流（否则不会退避重试）
+  assert(classifyError(new Error("HTTP 400: rate limit reached, slow down"), 400) === "rate_limit", "400 + rate limit 文本");
+  assert(classifyError(new Error("You exceeded your current quota"), 400) === "rate_limit", "400 + quota 超限");
+  assert(classifyError(new Error("请求过于频繁，请稍后再试")) === "rate_limit", "请求过于频繁");
+  // B95：泛化的 /exceed/ 不再一律当限流——超长/超限属于永久参数错误，重试无用
+  assert(classifyError(new Error("prompt exceeds maximum context length 8192 tokens"), 400) === "invalid_param", "超长不应重试");
+  assert(classifyError(new Error("maximum context length exceeded"), 400) === "invalid_param", "context 超限不应重试");
 
   // 鉴权
   assert(classifyError(new Error("invalid api key")) === "auth", "invalid api key");

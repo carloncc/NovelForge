@@ -2,7 +2,7 @@
  * 统一的错误处理和用户友好的错误提示
  */
 
-export class NovelForgeError extends Error {
+class NovelForgeError extends Error {
   constructor(
     message: string,
     public readonly code: string,

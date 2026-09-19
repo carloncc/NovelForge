@@ -112,7 +112,12 @@ export function useChapterStatus(input: ChapterStatusInput) {
     return cached ? { characters: cached.characters, items: cached.items ?? [] } : null;
   }
 
+  /** B30：刷新并发令牌。多次 refresh 重叠时（配置/卡片变化与生成结束几乎同时触发），
+   *  旧的一次可能晚于新的一次完成，用过期结果覆盖新状态；令牌变化即丢弃本次写入。 */
+  let refreshToken = 0;
+
   async function refresh(): Promise<void> {
+    const token = ++refreshToken;
     const dir = input.getOutputDir();
     const novel = input.getNovel();
     if (!dir || !novel) return;
@@ -162,6 +167,7 @@ export function useChapterStatus(input: ChapterStatusInput) {
       // 失配的新格式文件＝过期残留，直接忽略（下次跑剧本阶段自动清理）
     }
     legacyCount = [...picked.values()].filter((x) => x.legacy).length;
+    if (token !== refreshToken) return;
     legacy.count = legacyCount;
 
     // 素材映射与卡片只读一次
@@ -236,9 +242,11 @@ export function useChapterStatus(input: ChapterStatusInput) {
           }
         }
       }
+      if (token !== refreshToken) return;
       lights[ch.index] = light;
     }
     // 下线章节清灯
+    if (token !== refreshToken) return;
     for (const k of Object.keys(lights).map(Number)) {
       if (!enabled.some((c) => c.index === k)) delete lights[k];
     }

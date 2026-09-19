@@ -8,14 +8,20 @@
 use once_cell::sync::OnceCell;
 use serde::Serialize;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tauri::Manager;
 
 const CONNECT_TIMEOUT_MS: u64 = 30_000;
 const MAX_CONNECT_ATTEMPTS: u32 = 12;
 const RETRYABLE_STATUS: &[u16] = &[408, 429, 500, 502, 503, 504];
+/// 外层「断流后续传」的最大轮数：无上限重试会无限占用网络并让 stop/删除永远等不到结果
+const MAX_RESUME_ATTEMPTS: u32 = 20;
+/// 单个文件下载的总时长上限（含所有续传轮次）
+const MAX_DOWNLOAD_DURATION: Duration = Duration::from_secs(30 * 60);
 
 static MODELS_DIR: OnceCell<PathBuf> = OnceCell::new();
 
@@ -27,6 +33,9 @@ struct InstallState {
     bytes: u64,
     total: u64,
     error: Option<String>,
+    /// 当前下载任务的取消标志：model_remove / 开始另一个模型下载时置位，
+    /// 下载循环检查到后立即返回，避免删除后仍继续写盘
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 static INSTALL: Mutex<InstallState> = Mutex::new(InstallState {
@@ -36,6 +45,7 @@ static INSTALL: Mutex<InstallState> = Mutex::new(InstallState {
     bytes: 0,
     total: 0,
     error: None,
+    cancel: None,
 });
 
 #[derive(Serialize, Clone)]
@@ -187,24 +197,48 @@ async fn connect_with_retry(url: &str, headers: Vec<(String, String)>) -> Result
     Err(last_error.unwrap_or_else(|| "无法连接下载源".to_string()))
 }
 
-/// 下载一个文件到 part（断点续传；连接中断自动续传）
-async fn download_to_part(dir: &Path, filename: &str, url: &str) -> Result<(), String> {
+/// 下载一个文件到 part（断点续传；连接中断自动续传，但轮数与总时长有上限且可取消）
+async fn download_to_part(
+    dir: &Path,
+    filename: &str,
+    url: &str,
+    model_id: &str,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
     let part = model_part_file(dir, filename);
+    let started = Instant::now();
     let mut attempt: u32 = 0;
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("下载已取消".to_string());
+        }
         attempt += 1;
-        let offset = if part.exists() { fs::metadata(&part).map(|m| m.len()).unwrap_or(0) } else { 0 };
+        if attempt > MAX_RESUME_ATTEMPTS {
+            return Err(format!(
+                "下载多次中断（{MAX_RESUME_ATTEMPTS} 次）仍未完成，请检查网络后重试"
+            ));
+        }
+        if started.elapsed() > MAX_DOWNLOAD_DURATION {
+            return Err("下载超时（超过 30 分钟），请检查网络后重试".to_string());
+        }
+        let mut offset = if part.exists() { fs::metadata(&part).map(|m| m.len()).unwrap_or(0) } else { 0 };
         if offset > 0 && attempt == 1 {
             println!("[model-download] 检测到未完成下载 {} MB，将断点续传…", offset / 1048576);
         }
         let headers = if offset > 0 { vec![("Range".to_string(), format!("bytes={offset}-"))] } else { Vec::new() };
         let response = connect_with_retry(url, headers).await?;
+        if cancel.load(Ordering::Relaxed) {
+            return Err("下载已取消".to_string());
+        }
         let status = response.status().as_u16();
         if status == 200 {
             if offset > 0 {
                 println!("[model-download] 下载源不支持断点续传，将从头重新下载…");
                 let _ = fs::remove_file(&part);
             }
+            // B121：200 表示返回完整文件，offset 必须清零，否则 total/downloaded 会把旧偏移
+            // 算进去（进度虚高），且 append 写入会在旧数据后叠加造成文件损坏
+            offset = 0;
         } else if status != 206 {
             return Err(format!("下载失败：HTTP {status}"));
         }
@@ -216,13 +250,20 @@ async fn download_to_part(dir: &Path, filename: &str, url: &str) -> Result<(), S
         let mut downloaded = offset;
         let mut failed = false;
         while let Some(chunk) = stream.next().await {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("下载已取消".to_string());
+            }
             match chunk {
                 Ok(bytes) => {
                     file.write_all(&bytes).map_err(|e| format!("写入下载文件失败: {e}"))?;
                     downloaded += bytes.len() as u64;
+                    // 仅当全局状态槽仍属于本模型时才回写进度：并发的另一个模型下载接管状态后，
+                    // 旧任务的进度会污染新模型的 UI（B116 跨模型污染）
                     let mut guard = INSTALL.lock().unwrap_or_else(|e| e.into_inner());
-                    guard.bytes = downloaded;
-                    guard.total = total;
+                    if guard.model_id.as_deref() == Some(model_id) {
+                        guard.bytes = downloaded;
+                        guard.total = total;
+                    }
                 }
                 Err(error) => {
                     failed = true;
@@ -241,32 +282,62 @@ async fn download_to_part(dir: &Path, filename: &str, url: &str) -> Result<(), S
     }
 }
 
-/// RFC 1321 MD5（内联实现，避免额外依赖；下载完整性校验用）
-fn md5_hex(data: &[u8]) -> String {
-    const SHIFTS: [u32; 64] = [
-        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
-        5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
-        4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
-        6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
-    ];
-    let mut k = [0u32; 64];
-    for (i, item) in k.iter_mut().enumerate() {
-        *item = ((1u64 << 32) as f64 * ((i as f64) + 1.0).sin().abs()) as u32;
-    }
-    let mut msg = data.to_vec();
-    let bit_len = (data.len() as u64).wrapping_mul(8);
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
-    }
-    msg.extend_from_slice(&bit_len.to_le_bytes());
+/// RFC 1321 MD5 增量实现（内联，避免额外依赖；下载完整性校验用）。
+/// B123：模型文件可达数百 MB，不能再一次性读入内存，必须以 update 分块喂入。
+struct Md5 {
+    state: [u32; 4],
+    k: [u32; 64],
+    buffer: [u8; 64],
+    buffered: usize,
+    length: u64,
+}
 
-    let mut a0: u32 = 0x6745_2301;
-    let mut b0: u32 = 0xefcd_ab89;
-    let mut c0: u32 = 0x98ba_dcfe;
-    let mut d0: u32 = 0x1032_5476;
+impl Md5 {
+    fn new() -> Self {
+        let mut k = [0u32; 64];
+        for (i, item) in k.iter_mut().enumerate() {
+            *item = ((1u64 << 32) as f64 * ((i as f64) + 1.0).sin().abs()) as u32;
+        }
+        Md5 {
+            state: [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476],
+            k,
+            buffer: [0u8; 64],
+            buffered: 0,
+            length: 0,
+        }
+    }
 
-    for chunk in msg.chunks_exact(64) {
+    fn update(&mut self, mut data: &[u8]) {
+        self.length = self.length.wrapping_add(data.len() as u64);
+        if self.buffered > 0 {
+            let take = (64 - self.buffered).min(data.len());
+            self.buffer[self.buffered..self.buffered + take].copy_from_slice(&data[..take]);
+            self.buffered += take;
+            data = &data[take..];
+            if self.buffered == 64 {
+                let block = self.buffer;
+                self.process(&block);
+                self.buffered = 0;
+            }
+        }
+        while data.len() >= 64 {
+            let (block, rest) = data.split_at(64);
+            self.process(block);
+            data = rest;
+        }
+        if !data.is_empty() {
+            self.buffer[..data.len()].copy_from_slice(data);
+            self.buffered = data.len();
+        }
+    }
+
+    fn process(&mut self, chunk: &[u8]) {
+        const SHIFTS: [u32; 64] = [
+            7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+            5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+            4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+            6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+        ];
         let mut m = [0u32; 16];
         for (i, word) in m.iter_mut().enumerate() {
             *word = u32::from_le_bytes([
@@ -276,7 +347,7 @@ fn md5_hex(data: &[u8]) -> String {
                 chunk[i * 4 + 3],
             ]);
         }
-        let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
+        let (mut a, mut b, mut c, mut d) = (self.state[0], self.state[1], self.state[2], self.state[3]);
         for i in 0..64 {
             let (f, g) = match i / 16 {
                 0 => ((b & c) | ((!b) & d), i),
@@ -289,41 +360,75 @@ fn md5_hex(data: &[u8]) -> String {
             c = b;
             b = b.wrapping_add(
                 a.wrapping_add(f)
-                    .wrapping_add(k[i])
+                    .wrapping_add(self.k[i])
                     .wrapping_add(m[g])
                     .rotate_left(SHIFTS[i]),
             );
             a = tmp;
         }
-        a0 = a0.wrapping_add(a);
-        b0 = b0.wrapping_add(b);
-        c0 = c0.wrapping_add(c);
-        d0 = d0.wrapping_add(d);
+        self.state[0] = self.state[0].wrapping_add(a);
+        self.state[1] = self.state[1].wrapping_add(b);
+        self.state[2] = self.state[2].wrapping_add(c);
+        self.state[3] = self.state[3].wrapping_add(d);
     }
-    let mut out = String::with_capacity(32);
-    for word in [a0, b0, c0, d0] {
-        // RFC 1321：输出按每个字的低字节在前（little-endian 字节序）
-        out.push_str(&format!(
-            "{:02x}{:02x}{:02x}{:02x}",
-            word & 0xff,
-            (word >> 8) & 0xff,
-            (word >> 16) & 0xff,
-            (word >> 24) & 0xff
-        ));
+
+    fn finalize_hex(mut self) -> String {
+        let bit_len = self.length.wrapping_mul(8);
+        self.update(&[0x80]);
+        while self.buffered != 56 {
+            self.update(&[0]);
+        }
+        self.update(&bit_len.to_le_bytes());
+        let mut out = String::with_capacity(32);
+        for word in self.state {
+            // RFC 1321：输出按每个字的低字节在前（little-endian 字节序）
+            out.push_str(&format!(
+                "{:02x}{:02x}{:02x}{:02x}",
+                word & 0xff,
+                (word >> 8) & 0xff,
+                (word >> 16) & 0xff,
+                (word >> 24) & 0xff
+            ));
+        }
+        out
     }
-    out
 }
 
+/// 一次性便捷封装（仅测试用；生产路径走 file_md5 流式分块）
+#[cfg(test)]
+fn md5_hex(data: &[u8]) -> String {
+    let mut hasher = Md5::new();
+    hasher.update(data);
+    hasher.finalize_hex()
+}
+
+/// B123：流式计算文件 MD5，按 64KB 分块读取，峰值内存与文件大小无关
 fn file_md5(path: &Path) -> Result<String, String> {
-    let bytes = fs::read(path).map_err(|e| format!("读取模型文件失败: {e}"))?;
-    Ok(md5_hex(&bytes))
+    let mut file = fs::File::open(path).map_err(|e| format!("读取模型文件失败: {e}"))?;
+    let mut hasher = Md5::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).map_err(|e| format!("读取模型文件失败: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize_hex())
 }
 
-async fn download_model(dir: &Path, filename: &str, url: &str, md5: &str) -> Result<(), String> {
+async fn download_model(
+    dir: &Path,
+    filename: &str,
+    url: &str,
+    md5: &str,
+    model_id: &str,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
     let destination = model_file(dir, filename);
     let part = model_part_file(dir, filename);
     for round in 1..=3u32 {
-        download_to_part(dir, filename, url).await?;
+        download_to_part(dir, filename, url, model_id, cancel).await?;
         println!("[model-download] 第 {round} 轮下载完成，正在校验完整性…");
         let digest = file_md5(&part)?;
         if md5.is_empty() || digest == md5 {
@@ -351,21 +456,54 @@ pub async fn model_download_start(
         set_install_state(&model_id, &safe, "done", None);
         return Ok(status_for(&model_id, &safe));
     }
-    {
-        let guard = INSTALL.lock().unwrap_or_else(|e| e.into_inner());
+    // 「检查是否已在下载 + 标记下载中」必须放在同一持锁临界区：
+    // 否则两个并发调用都能通过检查，对同一模型启动两次下载（双倍流量/互相覆盖 .part）
+    let cancel = Arc::new(AtomicBool::new(false));
+    let same_download_active = {
+        let mut guard = INSTALL.lock().unwrap_or_else(|e| e.into_inner());
         if guard.state == "downloading" && guard.model_id.as_deref() == Some(model_id.as_str()) {
-            return Ok(status_for(&model_id, &safe));
+            true
+        } else {
+            // 下载槽被新模型接管前，取消仍在进行的旧下载，避免其继续占带宽/写进度
+            if let Some(old) = guard.cancel.take() {
+                old.store(true, Ordering::Relaxed);
+            }
+            guard.model_id = Some(model_id.clone());
+            guard.filename = Some(safe.clone());
+            guard.state = "downloading".to_string();
+            guard.bytes = 0;
+            guard.total = 0;
+            guard.error = None;
+            guard.cancel = Some(cancel.clone());
+            false
         }
+    };
+    if same_download_active {
+        return Ok(status_for(&model_id, &safe));
     }
-    set_install_state(&model_id, &safe, "downloading", None);
     let spawn_dir = dir.clone();
     let spawn_safe = safe.clone();
     let spawn_url = url.clone();
     let spawn_md5 = md5.clone();
     let spawn_model_id = model_id.clone();
+    let spawn_cancel = cancel.clone();
     tauri::async_runtime::spawn(async move {
-        let result = download_model(&spawn_dir, &spawn_safe, &spawn_url, &spawn_md5).await;
+        let result = download_model(
+            &spawn_dir,
+            &spawn_safe,
+            &spawn_url,
+            &spawn_md5,
+            &spawn_model_id,
+            &spawn_cancel,
+        )
+        .await;
         let mut guard = INSTALL.lock().unwrap_or_else(|e| e.into_inner());
+        // 仅当状态槽仍属于本次下载时才回写结果：期间可能已开始另一个模型的下载，
+        // 旧任务的结果会覆盖新模型的 state/error（B116 跨模型污染）
+        if guard.model_id.as_deref() != Some(spawn_model_id.as_str()) {
+            return;
+        }
+        guard.cancel = None;
         match result {
             Ok(()) => {
                 guard.state = "done".to_string();
@@ -391,10 +529,49 @@ pub async fn model_download_status(model_id: String, filename: String) -> Result
 #[tauri::command]
 pub async fn model_remove(model_id: String, filename: String) -> Result<(), String> {
     let safe = safe_model_filename(&filename)?;
-    if let Some(dir) = models_dir() {
-        let _ = fs::remove_file(model_file(dir, &safe));
-        let _ = fs::remove_file(model_part_file(dir, &safe));
-    }
+    let wait_model_id = model_id.clone();
+    // 等待取消 + 删除文件是阻塞操作，放阻塞线程池，不占用 async 运行时
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        if let Some(dir) = models_dir() {
+            // 先尝试取消正在进行的下载：否则删除 .part 后下载线程会继续 append 写回（B124）。
+            // 仅当下载槽属于当前要删除的模型时才取消，避免误杀另一个模型的下载
+            {
+                let guard = INSTALL.lock().unwrap_or_else(|e| e.into_inner());
+                if guard.model_id.as_deref() == Some(wait_model_id.as_str()) {
+                    if let Some(flag) = guard.cancel.as_ref() {
+                        flag.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+            // 给下载线程最多 3 秒退出（每个 chunk 都会检查取消标志）；超时则放弃等待直接删，
+            // 由文件占用错误如实反馈（Windows 删被占用文件会失败）
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let downloading = {
+                    let guard = INSTALL.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.state == "downloading"
+                        && guard.model_id.as_deref() == Some(wait_model_id.as_str())
+                };
+                if !downloading || Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            // B124：删除失败必须返回错误，静默忽略会让用户以为模型已删除但实际仍在
+            let model = model_file(dir, &safe);
+            if model.exists() {
+                fs::remove_file(&model).map_err(|e| format!("删除模型文件失败: {e}"))?;
+            }
+            let part = model_part_file(dir, &safe);
+            if part.exists() {
+                fs::remove_file(&part).map_err(|e| format!("删除未完成下载文件失败: {e}"))?;
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("删除任务执行失败: {e}"))??;
+
     let mut guard = INSTALL.lock().unwrap_or_else(|e| e.into_inner());
     if guard.model_id.as_deref() == Some(model_id.as_str()) {
         guard.model_id = None;
@@ -403,11 +580,14 @@ pub async fn model_remove(model_id: String, filename: String) -> Result<(), Stri
         guard.bytes = 0;
         guard.total = 0;
         guard.error = None;
+        guard.cancel = None;
     }
     Ok(())
 }
 
-/// 供 model:// 自定义协议读取模型文件（返回文件字节；失败返回 None）
+/// 供 model:// 自定义协议读取模型文件（返回文件字节；失败返回 None）。
+/// B123：自定义协议要求一次性返回完整 body，无法流式；模型文件通常几十 MB，
+/// 这里维持全量读入（协议层无 Range 支持）。若将来引入超大模型，需改用分块协议。
 pub fn read_model_file(filename: &str) -> Option<Vec<u8>> {
     let dir = models_dir()?;
     let safe = safe_model_filename(filename).ok()?;
@@ -420,7 +600,19 @@ pub fn read_model_file(filename: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::md5_hex;
+    use super::{md5_hex, Md5};
+
+    #[test]
+    fn md5_streaming_matches_one_shot() {
+        // B123：分块 update（非 64 字节对齐）必须与一次性计算得到相同摘要
+        let data = "The quick brown fox jumps over the lazy dog".repeat(10);
+        let expected = md5_hex(data.as_bytes());
+        let mut hasher = Md5::new();
+        for chunk in data.as_bytes().chunks(7) {
+            hasher.update(chunk);
+        }
+        assert_eq!(hasher.finalize_hex(), expected);
+    }
 
     #[test]
     fn md5_known_vectors() {

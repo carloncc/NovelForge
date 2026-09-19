@@ -6,7 +6,8 @@
 }
 
 .Title_buttonList {
-  font-family: "资源圆体", "WebgalUI", sans-serif;
+  /* UI103：使用模板实际注册的「资源圆体 / WebgalUI」；韩文追加 Malgun/Noto 系统兜底 */
+  font-family: "资源圆体", "WebgalUI", "Malgun Gothic", "Noto Sans KR", sans-serif;
   display: flex;
   position: absolute;
   left: 0;

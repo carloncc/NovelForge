@@ -165,21 +165,30 @@ export function clearThumbCache(paths?: string[]): void {
   }
 }
 
-/** 等待加载完成（用于试听等需要拿到结果的场景）；失败或超时返回空字符串 */
-export function ensureAssetLoaded(p: string): Promise<string> {
-  if (!p) return Promise.resolve("");
+/**
+ * 等待加载完成（用于试听等需要拿到结果的场景）；失败或超时返回空字符串。
+ * 可选 signal：组件卸载或切换路径时中止 120ms 轮询，避免句柄泄漏和向已销毁组件回写。
+ */
+export function ensureAssetLoaded(p: string, signal?: AbortSignal): Promise<string> {
+  if (!p || signal?.aborted) return Promise.resolve("");
   if (cache.value[p]) return Promise.resolve(cache.value[p]);
   loadAssetDataUrl(p);
   return new Promise((resolve) => {
     const t0 = Date.now();
+    const stop = (): void => {
+      clearInterval(iv);
+      resolve("");
+    };
     const iv = setInterval(() => {
-      if (cache.value[p]) {
+      if (signal?.aborted) {
+        stop();
+      } else if (cache.value[p]) {
         clearInterval(iv);
         resolve(cache.value[p]);
       } else if (failed.has(p) || Date.now() - t0 > 30000) {
-        clearInterval(iv);
-        resolve("");
+        stop();
       }
     }, 120);
+    signal?.addEventListener("abort", stop, { once: true });
   });
 }

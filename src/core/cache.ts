@@ -1,5 +1,5 @@
 ﻿import { tauri } from "../utils/tauri";
-import { cleanPath, safeFilename } from "../utils/path";
+import { cleanPath } from "../utils/path";
 
 export function cacheDirFor(cacheRoot: string, section: string): string {
   return cleanPath(`${cacheRoot}/${section}`);
@@ -30,14 +30,6 @@ export async function cacheHit(dir: string, fileName: string): Promise<string | 
     }
   }
   return null;
-}
-
-export function jsonKey(kind: string, key: string): string {
-  return `${kind}_${safeFilename(key, 100)}.json`;
-}
-
-export function slugify(s: string): string {
-  return safeFilename(s, 60);
 }
 
 /** 短标题哈希（缓存文件名用，非加密） */

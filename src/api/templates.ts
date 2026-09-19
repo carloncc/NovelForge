@@ -4,7 +4,7 @@ import type { AdapterTemplate } from "./universal";
  * 预置服务商适配模板（图像 / TTS）。
  * 新增厂商：复制一个模板 JSON 调整即可，无需改代码。
  */
-export const PRESET_TEMPLATES: AdapterTemplate[] = [
+const PRESET_TEMPLATES: AdapterTemplate[] = [
   {
     id: "openai-image",
     name: "OpenAI 兼容图像（智谱 CogView / OpenAI）",

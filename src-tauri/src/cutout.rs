@@ -1,5 +1,11 @@
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use image::{ImageFormat, Rgba, RgbaImage};
+use image::{ImageFormat, RgbaImage};
+
+/// 输入 base64 长度上限 32MB（编码后）：超限直接拒绝，避免解码/像素缓冲阶段内存失控
+const MAX_INPUT_B64_BYTES: usize = 32 * 1024 * 1024;
+/// 解码后像素数上限 4096×4096：RGBA 缓冲 + alpha/visited 等中间数组约为像素数的数十倍，
+/// 超大图会在抠图过程里耗尽内存，解码前必须拦截
+const MAX_INPUT_PIXELS: u64 = 4096 * 4096;
 
 /// 判断采样到的背景色是否绿色幕（含亮绿、墨绿、青绿、teal）：
 /// - 亮绿/饱和绿：G 显著高于 R/B
@@ -354,10 +360,28 @@ pub fn cutout_with_stats(
     data_b64: &str,
     threshold: f32,
 ) -> Result<(String, f32, bool, bool, usize), String> {
+    // 解码前先做输入上限校验：先限 base64 长度，再限解码后的像素数
+    if data_b64.len() > MAX_INPUT_B64_BYTES {
+        return Err(format!(
+            "图片数据过大（{} MB），超过 {} MB 上限，已拒绝",
+            data_b64.len() / 1048576,
+            MAX_INPUT_B64_BYTES / 1048576
+        ));
+    }
     let bytes = B64
         .decode(data_b64)
         .map_err(|e| format!("base64 解码失败: {e}"))?;
     let img = image::load_from_memory(&bytes).map_err(|e| format!("图片解码失败: {e}"))?;
+    // 在 to_rgba8 分配整幅缓冲之前先检查尺寸，避免超大图直接吃满内存
+    let pixels = u64::from(img.width()) * u64::from(img.height());
+    if pixels > MAX_INPUT_PIXELS {
+        return Err(format!(
+            "图片尺寸过大（{}×{}，{} 万像素），超过 4096×4096 上限，已拒绝",
+            img.width(),
+            img.height(),
+            pixels / 10000
+        ));
+    }
     let mut rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
     let bg = sample_bg_color(&rgba).ok_or("无法采样背景色（图像过小或边缘全透明）")?;
@@ -493,22 +517,12 @@ pub fn cutout_with_stats(
         0
     };
 
-    let mut writes: Vec<(u32, u32, [u8; 4])> = Vec::with_capacity((w * h) as usize / 8);
-    for (x, y, base) in rgba.enumerate_pixels() {
-        let a = alpha_out[idx(x, y)] * (base[3] as f32 / 255.0);
-        let mut out = Rgba([base[0], base[1], base[2], 0]);
-        out[3] = (a * 255.0).round().clamp(0.0, 255.0) as u8;
-        if out[3] > 0 {
-            let src_a = base[3] as f32 / 255.0;
-            let blend = a / src_a.max(0.001);
-            out[0] = (base[0] as f32 * blend.min(1.0)) as u8;
-            out[1] = (base[1] as f32 * blend.min(1.0)) as u8;
-            out[2] = (base[2] as f32 * blend.min(1.0)) as u8;
-        }
-        writes.push((x, y, out.0));
-    }
-    for (x, y, px) in writes {
-        *rgba.get_pixel_mut(x, y) = Rgba(px);
+    // 原地写 alpha（不需 writes 中转数组）：PNG 采用直通（straight）alpha，RGB 必须保持原值；
+    // 旧实现 out = base * blend 按透明度预乘会把半透明像素压暗，羽化边缘出现暗边/黑边。
+    // 原地遍历时每个像素只写自己的 alpha，读取的 RGB 仍是原值，安全且省一份全图拷贝。
+    for (x, y, p) in rgba.enumerate_pixels_mut() {
+        let a = alpha_out[idx(x, y)] * (p[3] as f32 / 255.0);
+        p[3] = (a * 255.0).round().clamp(0.0, 255.0) as u8;
     }
 
     let mut out_buf = std::io::Cursor::new(Vec::new());
@@ -1188,5 +1202,56 @@ mod tests {
                 p[0], p[1], p[2]
             );
         }
+    }
+
+    /// B70 回归：输出 PNG 是直通 alpha，半透明像素的 RGB 必须保持原值。
+    /// 旧实现对半透明像素按 alpha 预乘（out = base * blend）会把羽化边缘压暗成黑边。
+    #[test]
+    fn cutout_semitransparent_pixel_keeps_rgb() {
+        let mut img = RgbaImage::new(64, 64);
+        for p in img.pixels_mut() {
+            *p = Rgba([255, 255, 255, 255]);
+        }
+        for y in 20..44 {
+            for x in 20..44 {
+                img.put_pixel(x, y, Rgba([200, 40, 40, 255]));
+            }
+        }
+        // 边缘放一个与白色背景距离 ≈55 的像素：落在羽化带（thr=40..thr_edge=80）内，
+        // alpha_out 约为 0.33 → 输出应为半透明，且 RGB 原样保留 (223,223,223)
+        img.put_pixel(0, 32, Rgba([223, 223, 223, 255]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, ImageFormat::Png).unwrap();
+
+        let out = cutout(&B64.encode(buf.into_inner()), 40.0).expect("抠图应成功");
+        let out_img = image::load_from_memory(&B64.decode(&out).unwrap())
+            .unwrap()
+            .to_rgba8();
+        let p = out_img.get_pixel(0, 32);
+        assert!(
+            p[3] > 0 && p[3] < 255,
+            "羽化带像素应为半透明（构造校验）: a={}",
+            p[3]
+        );
+        assert_eq!(
+            [p[0], p[1], p[2]],
+            [223, 223, 223],
+            "半透明像素 RGB 必须保持原值（预乘 alpha 会把它压暗）: rgba=({},{},{},{})",
+            p[0],
+            p[1],
+            p[2],
+            p[3]
+        );
+    }
+
+    /// B115 回归：超过像素上限的输入直接拒绝（在解码/分配整幅缓冲前拦截）
+    #[test]
+    fn cutout_rejects_oversized_input() {
+        let mut img = RgbaImage::new(4100, 4100);
+        img.put_pixel(0, 0, Rgba([1, 2, 3, 255]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, ImageFormat::Png).unwrap();
+        let err = cutout(&B64.encode(buf.into_inner()), 40.0).unwrap_err();
+        assert!(err.contains("4096"), "超限输入应被拒绝并提示尺寸上限: {err}");
     }
 }

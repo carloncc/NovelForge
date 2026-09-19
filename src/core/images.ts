@@ -1,5 +1,4 @@
 import type {
-  AssetMap,
   ChapterScript,
   CharacterCard,
   ExtractionResult,
@@ -10,7 +9,6 @@ import type {
   ItemCard,
   MaterialAsset,
   PipelineEvent,
-  SceneJSON,
   ProjectVisualBible,
   VisualBibleCacheBinding,
 } from "./types";
@@ -24,6 +22,7 @@ import { errMsg } from "../utils/errors";
 import { classifyError } from "../utils/errorClassifier";
 import { sanitizePrompt, appendSafeStyleSuffix } from "../utils/promptRewriter";
 import { cutoutErrorHint } from "../utils/cutoutErrorHint";
+import { imageMimeForPath } from "../utils/mime";
 import { configState } from "../stores/config";
 import { cacheDirFor, cacheHit } from "./cache";
 import { sanitizeId } from "./render";
@@ -35,6 +34,21 @@ export interface ImageResultMap {
   cg: Record<string, string>;
   figure: Record<string, string>;
   item: Record<string, string>;
+}
+
+/** B77：figure 映射被 threeview/figure/action 三类任务共用键空间，同键任务互相覆盖且只事后告警。
+ *  构建期显式抛错并带上冲突键与来源，便于定位是角色 id / 表情 id / 动作 id 的哪组撞了。 */
+export class ImageTaskKeyConflictError extends Error {
+  readonly code = "IMAGE_TASK_KEY_CONFLICT" as const;
+  readonly key: string;
+  readonly sources: string[];
+
+  constructor(key: string, sources: string[]) {
+    super(`IMAGE_TASK_KEY_CONFLICT: 图像任务键 "${key}" 被多个来源共用（${sources.join(" 与 ")}），后生成的图会覆盖先生成的`);
+    this.name = "ImageTaskKeyConflictError";
+    this.key = key;
+    this.sources = sources;
+  }
 }
 
 function nameContains(name: string, keywords: string[]): boolean {
@@ -95,12 +109,16 @@ const SMILE_FACE_WORDS = /\b(smiling|smile|grinning|grin|chuckle|laughing|laugh|
 // 此前只在 normal 时清理，happy 等情绪会把基础里的挥手/指物/比耶等手势带进来，配上表情就成了怪动作。
 const FIGURE_GESTURE_WORDS = /\b(one hand raised|hand raised in a \w+ wave|waving|waves|waved|waving one hand|pointing|thumbs up|peace sign|hand on hip|hands on hips|winking|giving a wave)\b/gi;
 
-function emotionPrompt(base: string, emo: string): string {
+function emotionPrompt(base: string, emo: string, label?: string): string {
   let p = stripBackground(base);
-  if (emo === "happy") return p.replace(FIGURE_GESTURE_WORDS, " ").replace(/\s{2,}/g, " ").trim() + (EMOTION_PROMPT_SUFFIX[emo] ?? "");
-  p = p.replace(SMILE_FACE_WORDS, " ");
+  if (emo !== "happy") {
+    p = p.replace(SMILE_FACE_WORDS, " ");
+  }
   p = p.replace(FIGURE_GESTURE_WORDS, " ");
-  return p.replace(/\s{2,}/g, " ").trim() + (EMOTION_PROMPT_SUFFIX[emo] ?? "");
+  // 自定义表情（表外键）：旧实现后缀为空，生成的图彼此都与 normal 雷同；这里补显式表情约束
+  const specific = EMOTION_PROMPT_SUFFIX[emo]
+    ?? `, clearly showing the "${label || emo}" facial expression, expressive face with matching eyes, eyebrows and mouth` + NATURAL_POSE_GUARD;
+  return p.replace(/\s{2,}/g, " ").trim() + specific;
 }
 
 // 动作立绘：只做 prompt 里明确写出的姿态要素，其余一律保持自然放松站姿。
@@ -125,9 +143,21 @@ const DEFAULT_NEGATIVE =
 // 让图更立体，但这会导致抠图后这些缝隙残留偏绿暗块。本段前置追加（靠近主提示词，模型权重更高），
 // 显式禁止：发丝间/手指间/衣缝间也必须是同一纯绿，禁止任何体积阴影、自阴影、边缘暗化。
 const FIGURE_BG_SUFFIX =
-  ", solid chroma key green #00FF00 background filling 100% of every exposed area including all gaps between hair strands, between fingers, between clothing folds, and around every body contour edge, the background in these gaps is the EXACT same pure #00FF00 green as the rest of the background, absolutely no volumetric shadow, no self-shadow, no depth darkening, no ambient occlusion, no contact shadow anywhere on the background, the character's silhouette must sit on flat uniform green with no darker green outline ring, on a solid chroma key green background, the background is pure #00FF00 green, completely uniform flat color filling 100% of the background area edge-to-edge, every single pixel of the background area is exactly the same green, absolutely no gradient, no pattern, no texture, no lighting variation, no other colors in the background, no white, no black, no gray, no dark, no light, no scenery, no floor, no objects, no shadow under character, no green elements on the character, character stands centered with green background visible on all four sides, full body visible from head to feet, no legs cut off";
+  ", solid chroma key green #00FF00 background filling 100% of every exposed area including all gaps between hair strands, between fingers, between clothing folds, and around every body contour edge, the background in these gaps is the EXACT same pure #00FF00 green as the rest of the background, absolutely no volumetric shadow, no self-shadow, no depth darkening, no ambient occlusion, no contact shadow anywhere on the background, the character's silhouette must sit on flat uniform green with no darker green outline ring, on a solid chroma key green background, the background is pure #00FF00 green, completely uniform flat color filling 100% of the background area edge-to-edge, every single pixel of the background area is exactly the same green, absolutely no gradient, no pattern, no texture, no lighting variation, no other colors in the background, no white, no black, no gray, no dark, no light, no scenery, no floor, no objects, no shadow under character, no green elements on the character, character stands centered with green background visible on all four sides, full body visible from head to feet including shoes, the whole figure fits inside the frame with the complete head and both feet clearly visible, nothing cropped, no half-body framing, no close-up, no waist-up composition";
 const ITEM_BG_SUFFIX =
   ", object isolated for transparent cutout, on a solid chroma key green background #00FF00 filling 100% of every exposed area including gaps and around the complete object silhouette, the background is exactly uniform pure green with no gradient, pattern, texture, reflection, floor, shadow or text, dark and black parts of the object remain fully opaque with their original colors, no gray transparency on the object, no people, no characters";
+
+/** 人物类任务的构图负面词：明确排除半身/裁切/特写，保证立绘全身（三视图同） */
+const FIGURE_NEGATIVE =
+  "half body, half-body, portrait crop, bust shot, waist-up composition, close-up, cropped head, cropped legs, cropped feet, out of frame, zoomed-in framing";
+const FIGURE_KINDS = new Set<ImageTask["kind"]>(["figure", "action", "threeview"]);
+
+/** 本次任务的有效负面词 = 全局负面词 +（人物类任务）构图负面词 */
+function effectiveNegative(task: ImageTask, negativePrompt: string | undefined): string | undefined {
+  const parts = [negativePrompt?.trim(), FIGURE_KINDS.has(task.kind) ? FIGURE_NEGATIVE : ""].filter(Boolean);
+  return parts.length ? parts.join(", ") : undefined;
+}
+
 /** 三视图绿幕背景后缀：三视图同样强制纯绿幕，与立绘/动作保持一致（作抠图与图生图参考）
  * 【发丝/缝隙反阴影加固】与 FIGURE_BG_SUFFIX 同源：禁止发丝间/手指间/衣缝间体积阴影。 */
 const THREEVIEW_GREEN_SUFFIX =
@@ -137,7 +167,7 @@ const THREEVIEW_GREEN_SUFFIX =
 const ANCHOR_PROMPT =
   "anime background scenery, a serene countryside valley at golden hour with distant mountains and a small village, soft lighting, cinematic wide shot, no people, no text";
 
-/** 图生图一致性提示：要求与参考图保持同一角色/服装/配色/画风/维度 */
+/** 图生图一致性提示：要求与参考图保持同一角色/服装/配色/画风/维度，且全身构图 */
 const REF_HINT =
   ", exactly match the reference image: same character, same hair and eye color, same clothing and colors, same art style, same proportions, front-facing full body";
 
@@ -242,7 +272,6 @@ async function safeRewritePrompt(cfg: ApiConfig, prompt: string): Promise<string
 }
 
 export interface BuildImageTaskOptions {
-  figurePerCharacter?: number;
   cgPerChapter?: number;
   maxPerChapter?: number;
   figureEmotions?: boolean;
@@ -273,7 +302,6 @@ export function buildImageTasks(
   opts: BuildImageTaskOptions = {},
 ): ImageTask[] {
   const tasks: ImageTask[] = [];
-  const figurePerCharacter = opts.figurePerCharacter ?? 1;
   const cgPerChapter = opts.cgPerChapter ?? 0;
   const maxPerChapter = opts.maxPerChapter ?? 0;
   const useEmotions = opts.figureEmotions !== false;
@@ -325,20 +353,30 @@ export function buildImageTasks(
     // ② 立绘（默认姿态）→ 以三视图为参考图
     // core 档：只用标准 5 表情（忽略 AI 自定义大表情集，省图）；
     // full 档：优先角色自定义表情集（AI 按剧情提取），缺省用标准 5 表情
-    const emotions = !useEmotions ? ["normal"] : detail === "core" ? FIGURE_EMOTIONS : (char.emotions?.length ? char.emotions : FIGURE_EMOTIONS);
-    for (const emo of emotions) {
-      const isNormal = emo === "normal";
+    const baseEmotions = !useEmotions ? ["normal"] : detail === "core" ? FIGURE_EMOTIONS : (char.emotions?.length ? char.emotions : FIGURE_EMOTIONS);
+    // 强制包含 normal 并去重/消毒：表情集缺 normal 会导致默认立绘整张缺失、所有差分 refFromTask 断链；
+    // 自定义表情名含中文/符号时旧实现直接拼文件名（可能路径穿越/覆盖），按动作同一口径 sanitize（原值保留给提示词）
+    const emoList: { raw: string; id: string }[] = [];
+    const seenEmo = new Set<string>();
+    for (const raw of ["normal", ...baseEmotions]) {
+      const id = sanitizeId(String(raw)) || "normal";
+      if (seenEmo.has(id)) continue;
+      seenEmo.add(id);
+      emoList.push({ raw: String(raw), id });
+    }
+    for (const { raw: emoRaw, id: emoId } of emoList) {
+      const isNormal = emoId === "normal";
       tasks.push({
         kind: "figure",
-        id: isNormal ? char.id : `${char.id}_${emo}`,
+        id: isNormal ? char.id : `${char.id}_${emoId}`,
         characterId: char.id,
-        emotion: emo,
-        prompt: emotionPrompt(char.imagePrompt, emo) + REF_HINT + figureStyle + FIGURE_BG_SUFFIX,
+        emotion: emoId,
+        prompt: emotionPrompt(char.imagePrompt, emoId, emoRaw) + REF_HINT + figureStyle + FIGURE_BG_SUFFIX,
         refFromTask: isNormal ? (threeView ? `${char.id}_threeview` : undefined) : char.id,
-        fileName: `figure_${sanitizeId(char.id)}_${emo}.png`,
+        fileName: `figure_${sanitizeId(char.id)}_${emoId}.png`,
         width: 1024,
         height: 1024,
-        usage: `立绘-${char.name}${isNormal ? "" : `（${emo}）`}`,
+        usage: `立绘-${char.name}${isNormal ? "" : `（${emoRaw}）`}`,
       });
     }
     // ②b 服装差分立绘（基于三视图图生图；full 档才生成，core 档跳过以省图；
@@ -431,6 +469,18 @@ export function buildImageTasks(
     }
   }
 
+  // B77：figure 键唯一性断言。threeview/figure/action 都会写 result.figure，同 id 会互相覆盖——
+  // 例如角色 "alice_threeview" 的立绘 id 与角色 "alice" 的三视图 id 相同，实际只留下一张图。
+  // 这里在构建期显式失败（含冲突键与来源），由既有调用方失败隔离处理，不再等覆盖后才告警。
+  const figureKeySources = new Map<string, string>();
+  for (const t of tasks) {
+    if (t.kind !== "figure" && t.kind !== "threeview" && t.kind !== "action") continue;
+    const source = `${t.kind}:${t.id}（${t.usage ?? t.fileName}）`;
+    const existing = figureKeySources.get(t.id);
+    if (existing && existing !== source) throw new ImageTaskKeyConflictError(t.id, [existing, source]);
+    figureKeySources.set(t.id, source);
+  }
+
   // 确定性种子：按任务 id 哈希派生（baseSeed + fnv1a(id)），与任务顺序无关——
   // 增删角色/章节不再导致后续所有任务种子漂移，旧实现 baseSeed+i 顺序分配一动全变。
   // 同 id 出现多次（如裸调 buildImageTasks 未做跨章去重时）按出现次序加盐，保证同输入下唯一且稳定；
@@ -492,7 +542,8 @@ export async function ensureCutout(
     // 抠图方式=色度键：跳过 AI 模型直走色度键；=AI 优先：先试 AI，失败降级色度键
     const aiResult = mode === "ai" ? await tryAiCutout(b64, task, log) : null;
     if (aiResult) {
-      const pngPath = path.replace(/\.(jpg|jpeg)$/i, ".png");
+      // B71：抠图结果按字节签名落 `.png`（GIF 等未识别时保持原扩展名）
+      const pngPath = withDetectedExt(path, aiResult);
       await tauri.writeFileBase64(pngPath, aiResult);
       if (pngPath !== path) {
         await tauri.removePath(path).catch(() => {});
@@ -512,8 +563,19 @@ export async function ensureCutout(
       });
       return path;
     }
+    // 过激保护（Rust/Web 均可能返回）：透明占比过高说明主体被误抠，保留原图而不是把残缺图当「已抠图」写盘
+    if (res.method === "skip-overcut") {
+      log({
+        step: "图像",
+        message: `色度键抠图疑似过激（主体可能被误删），已保留原图：${task.usage}（可改用 AI 抠图或重新生成绿幕立绘）`,
+        level: "warn",
+        at: Date.now(),
+      });
+      return path;
+    }
     const out = res.dataB64;
-    const pngPath = path.replace(/\.(jpg|jpeg)$/i, ".png");
+    // B71：色度键结果按字节签名落 `.png`（GIF 等未识别时保持原扩展名）
+    const pngPath = withDetectedExt(path, out);
     await tauri.writeFileBase64(pngPath, out);
     if (pngPath !== path) {
       await tauri.removePath(path).catch(() => {});
@@ -612,8 +674,6 @@ export interface ImageRunOptions {
    * 其结果是已付费产物，仍会保留落盘。缺省（undefined）表示不中止。
    */
   isAborted?: () => boolean;
-  /** 重试间隔毫秒（默认 3000，每次翻倍） */
-  retryDelayMs?: number;
 }
 
 export interface ImageReferenceResolutionContext {
@@ -621,13 +681,6 @@ export interface ImageReferenceResolutionContext {
   visualBible?: ProjectVisualBible;
   figureBase?: Record<string, string>;
   styleAnchorPath?: string;
-}
-
-function imageMimeForPath(path: string): string {
-  const lower = path.toLowerCase();
-  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
-  if (lower.endsWith(".webp")) return "image/webp";
-  return "image/png";
 }
 
 async function fileReference(
@@ -649,7 +702,7 @@ async function fileReference(
   }
 }
 
-function visualBibleArtifactPath(outputDir: string, storedPath: string): string {
+function visualBibleArtifactCachePath(outputDir: string, storedPath: string): string {
   return `${outputDir.replace(/[\\/]$/, "").replace(/\\/g, "/")}/.novel2vn/visual-bible/${storedPath}`;
 }
 
@@ -679,54 +732,76 @@ export async function resolveImageTaskReferences(
       }
     }
     if (!identity && bibleCharacter) {
-      try {
-        // 换装任务优先引用该服装的独立三视图锚点（保证换装后身份/服装一致）
-        const costumeSheet = task.costume ? bibleCharacter.costumeSheets?.[task.costume] : undefined;
-        const fallbackPath = costumeSheet?.threeViewPath ?? bibleCharacter.threeViewPath;
-        identity = await fileReference(
-          visualBibleArtifactPath(context.outputDir, fallbackPath),
-          "identity",
-          `Approved identity for ${task.characterId}${costumeSheet ? ` (costume ${task.costume})` : ""}`,
-        );
-      } catch (e) {
-        logger.warn("images", "视觉守门参考图也缺失，改用纯文本生图", {
-          task: task.id,
-          characterId: task.characterId,
-          error: e instanceof Error ? e.message : String(e),
-        });
+      // 换装任务优先引用该服装的独立三视图锚点（保证换装后身份/服装一致）；
+      // B72：锚点文件读取失败（被删/损坏）时回退默认装三视图再试，而不是直接让任务失败。
+      const costumeSheet = task.costume ? bibleCharacter.costumeSheets?.[task.costume] : undefined;
+      const candidates: { path: string; label: string }[] = [];
+      if (costumeSheet?.threeViewPath) candidates.push({ path: costumeSheet.threeViewPath, label: `costume ${task.costume}` });
+      candidates.push({ path: bibleCharacter.threeViewPath, label: "default three-view" });
+      for (const candidate of candidates) {
+        try {
+          identity = await fileReference(
+            visualBibleArtifactCachePath(context.outputDir, candidate.path),
+            "identity",
+            `Approved identity for ${task.characterId} (${candidate.label})`,
+          );
+          break;
+        } catch (e) {
+          logger.warn("images", "视觉守门参考图缺失", {
+            task: task.id,
+            characterId: task.characterId,
+            fallback: candidate.label,
+            error: e instanceof Error ? e.message : String(e),
+          });
+        }
       }
     }
     if (identity) references.unshift(identity);
-    // 无任何可用身份参考图：降级为纯文本生图（角色一致性交给提示词），不再抛 REFERENCE_MISSING
+    // 身份参考缺失必须显式失败（进入「失败项」可逐条重试/补图），不再静默降级为纯文本生图：
+    // 旧实现静默降级会让角色形象与已批准三视图漂移，违背 README「参考文件缺失会明确报错」承诺
+    if (!identity) {
+      throw new ReferenceImageError(
+        `Identity reference missing for task ${task.id} (refFromTask=${task.refFromTask})`,
+        "REFERENCE_MISSING",
+      );
+    }
   } else if (characterDerivative && bibleCharacter) {
     try {
       references.unshift(await fileReference(
-        visualBibleArtifactPath(context.outputDir, bibleCharacter.threeViewPath),
+        visualBibleArtifactCachePath(context.outputDir, bibleCharacter.threeViewPath),
         "identity",
         `Approved identity for ${task.characterId}`,
       ));
     } catch (e) {
-      // 视觉守门图缺失：降级纯文本生图，不阻断整批
-      logger.warn("images", "视觉守门参考图缺失，该任务降级为纯文本生图", {
+      // 视觉守门图缺失：显式失败而不是静默纯文生图（保持角色一致性承诺）
+      logger.warn("images", "视觉守门参考图缺失，任务失败等待补图", {
         task: task.id,
         characterId: task.characterId,
         error: e instanceof Error ? e.message : String(e),
       });
+      throw new ReferenceImageError(
+        `Approved identity missing for task ${task.id} (character=${task.characterId})`,
+        "REFERENCE_MISSING",
+      );
     }
   } else if (task.kind === "threeview" && bibleCharacter && !references.some((reference) => reference.role === "identity")) {
     const storedPath = bibleCharacter.sourceReferencePath ?? bibleCharacter.threeViewPath;
     try {
       references.unshift(await fileReference(
-        visualBibleArtifactPath(context.outputDir, storedPath),
+        visualBibleArtifactCachePath(context.outputDir, storedPath),
         "identity",
         `Character source for ${task.characterId}`,
       ));
     } catch (e) {
-      logger.warn("images", "三视图源参考图缺失，该任务降级为纯文本生图", {
+      logger.warn("images", "三视图源参考图缺失，任务失败等待补图", {
         task: task.id,
         characterId: task.characterId,
         error: e instanceof Error ? e.message : String(e),
       });
+      throw new ReferenceImageError(
+        `Three-view source reference missing for task ${task.id} (character=${task.characterId})`,
+        "REFERENCE_MISSING",
+      );
     }
   }
 
@@ -737,7 +812,7 @@ export async function resolveImageTaskReferences(
     if (!isCharacterImage) {
       try {
         references.push(await fileReference(
-          visualBibleArtifactPath(context.outputDir, bible.styleReferencePath),
+          visualBibleArtifactCachePath(context.outputDir, bible.styleReferencePath),
           "style",
           "Approved global style reference",
           false,
@@ -806,6 +881,97 @@ export function fitImagePrompt(prompt: string, maxChars: number): string {
   return tail ? `${head}${tail}` : head;
 }
 
+/* ---------- B69：图像缓存旁路参数元数据 ----------
+ * 缓存 key 只有文件名，模型/种子/负面词/尺寸变化后旧图会被误命中（改了模型仍复用旧画风）。
+ * 生成时把本次参数摘要写入 `<图>.meta.json`，命中时比对；旧缓存无 meta 视为命中（兼容存量）。 */
+
+interface ImageArtifactMeta {
+  v: 1;
+  adapter: string | null;
+  model: string | null;
+  seed: number | null;
+  negativePrompt: string | null;
+  width: number;
+  height: number;
+}
+
+/** 本次任务对应的生成参数摘要（不写入 prompt：调用方可能只改反馈词，内容复用由调用方决定） */
+function imageMetaForTask(task: ImageTask, cfg: ApiConfig | undefined, negativePrompt: string | undefined): ImageArtifactMeta {
+  return {
+    v: 1,
+    adapter: cfg?.adapter ?? null,
+    model: cfg?.model ?? null,
+    seed: typeof task.seed === "number" ? task.seed : null,
+    negativePrompt: negativePrompt?.trim() ? negativePrompt : null,
+    width: task.width,
+    height: task.height,
+  };
+}
+
+function imageMetaMatches(meta: ImageArtifactMeta, expected: ImageArtifactMeta): boolean {
+  return meta.v === expected.v
+    && meta.adapter === expected.adapter
+    && meta.model === expected.model
+    && meta.seed === expected.seed
+    // 期望值没有负面词（如背景/CG，且用户未配置）时不比较，避免单素材重生成后的旧缓存被误判参数不符而重复付费；
+    // 期望值有负面词时必须一致：人物任务现在带「防半身/裁切」构图负面词，旧的无负面词记录必须视为未命中重画。
+    && (expected.negativePrompt === null || meta.negativePrompt === expected.negativePrompt)
+    && meta.width === expected.width
+    && meta.height === expected.height;
+}
+
+/** 命中校验：无 meta（旧缓存）视为命中以兼容存量；meta 参数不一致 → 缓存作废重生成。 */
+async function cachedImageMetaMatches(path: string, expected: ImageArtifactMeta): Promise<boolean> {
+  try {
+    const { text } = await tauri.readTextFile(`${path}.meta.json`);
+    const meta = JSON.parse(text) as Partial<ImageArtifactMeta>;
+    if (meta?.v !== 1) return true;
+    return imageMetaMatches(meta as ImageArtifactMeta, expected);
+  } catch {
+    return true;
+  }
+}
+
+async function writeImageArtifactMeta(path: string, meta: ImageArtifactMeta): Promise<void> {
+  try {
+    await tauri.writeTextFile(`${path}.meta.json`, JSON.stringify(meta));
+  } catch (e) {
+    // 旁路元数据写失败不影响出图：下次命中按旧缓存处理，仅记录
+    logger.warn("images", "缓存参数旁路元数据写入失败（下次命中按旧缓存处理）", { path, error: errMsg(e) });
+  }
+}
+
+/* ---------- B71：按真实字节签名修正扩展名 ----------
+ * API 可能按内容而非请求 mime 返回 JPEG/WebP，旧实现固定按 mime 写 `.png`，
+ * 落盘扩展名与内容不一致（`.png` 装 JPEG），WebView/游戏引擎按扩展名解码会失败。 */
+
+/** 按 base64 字节魔数识别真实图片格式（PNG/JPEG/WebP/GIF）；识别不出返回 null。 */
+export function detectedImageExtension(dataB64: string): string | null {
+  try {
+    const head = dataB64.replace(/\s+/g, "").slice(0, 32);
+    const bytes = typeof Buffer !== "undefined"
+      ? new Uint8Array(Buffer.from(head, "base64"))
+      : Uint8Array.from(atob(head), (c) => c.charCodeAt(0));
+    if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return "png";
+    if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "jpg";
+    if (bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46
+      && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) return "webp";
+    if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) return "gif";
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** 用真实字节签名改写文件扩展名；未知签名保持原扩展名（保底不破坏现有命名）。 */
+export function withDetectedExt(path: string, dataB64: string): string {
+  const ext = detectedImageExtension(dataB64);
+  if (!ext) return path;
+  const slash = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  const dot = path.lastIndexOf(".");
+  return dot > slash ? `${path.slice(0, dot)}.${ext}` : `${path}.${ext}`;
+}
+
 /** 执行单个图像任务（管线批处理与单素材重生成共用） */
 export async function runImageTask(
   cfg: ApiConfig | undefined,
@@ -840,8 +1006,15 @@ export async function runImageTask(
 
   const cached = opts.force ? null : await cacheHit(cacheDir, task.fileName);
   if (cached) {
-    // 尺寸校验：缓存图尺寸与要求不一致（如旧竖屏背景）→ 视为缓存失效重新生成
-    if (task.width > 0 && task.height > 0) {
+    // B69：旁路参数校验（模型/种子/负面词/尺寸）。无 cfg 时无法重新生成，跳过校验保持旧行为。
+    const metaOk = !cfg || await cachedImageMetaMatches(cached, imageMetaForTask(task, cfg, effectiveNegative(task, opts.negativePrompt)));
+    if (!metaOk) {
+      logger.info("images", "缓存图生成参数（模型/种子/负面词/尺寸）与当前任务不一致，重新生成", {
+        id: task.id,
+        fileName: task.fileName,
+      });
+    } else if (task.width > 0 && task.height > 0) {
+      // 尺寸校验：缓存图尺寸与要求不一致（如旧竖屏背景）→ 视为缓存失效重新生成
       const sizeOk = await tauri.imageSizeMatches(cached, task.width, task.height).catch(() => true);
       if (sizeOk) {
         path = cached;
@@ -872,8 +1045,20 @@ export async function runImageTask(
           mime: mat.mime.startsWith("image/") ? mat.mime : resolvedMaterial.mime,
         };
       } else {
-        await copyMaterial(mat, `${cacheDir}/${task.fileName}`);
-        path = `${cacheDir}/${task.fileName}`;
+        // B71：素材真实字节可能是 JPEG/WebP，落盘后按魔数改名为正确扩展名，避免 `.png` 装 JPEG。
+        const copiedPath = `${cacheDir}/${task.fileName}`;
+        await copyMaterial(mat, copiedPath);
+        let finalPath = copiedPath;
+        try {
+          finalPath = withDetectedExt(copiedPath, await tauri.readFileBase64(copiedPath));
+          if (finalPath !== copiedPath) {
+            await tauri.copyFile(copiedPath, finalPath);
+            await tauri.removePath(copiedPath).catch(() => {});
+          }
+        } catch {
+          /* 读取失败保底用原路径（内容仍可用） */
+        }
+        path = finalPath;
         source = `用户素材 ${mat.name}`;
       }
     }
@@ -980,7 +1165,7 @@ export async function runImageTask(
             references: resolvedReferences,
             size: `${task.width}x${task.height}`,
             seed: task.seed,
-            negativePrompt: opts.negativePrompt,
+            negativePrompt: effectiveNegative(task, opts.negativePrompt),
           });
           break;
         } catch (e) {
@@ -1103,8 +1288,11 @@ export async function runImageTask(
           if (aborted()) return null;
         }
       }
-      const ext = img.mime.includes("jpeg") ? "jpg" : "png";
-      const file = task.fileName.replace(/\.png$/, `.${ext}`);
+      // B71：优先按真实字节签名落扩展名（API 常忽略请求 mime 返回 jpeg/webp）；识别不出再按响应 mime 兜底
+      const detected = detectedImageExtension(img.dataB64);
+      const file = detected
+        ? withDetectedExt(task.fileName, img.dataB64)
+        : task.fileName.replace(/\.png$/, `.${img.mime.includes("jpeg") ? "jpg" : "png"}`);
       path = `${cacheDir}/${file}`;
       await tauri.writeFileBase64(path, img.dataB64);
       source = "AI 生成";
@@ -1147,6 +1335,10 @@ export async function runImageTask(
   }
 
   if (path) {
+    // B69：AI 生成结果写入旁路参数元数据（供下次命中校验）；用户素材拷贝不写，按旧缓存兼容处理。
+    if (source.startsWith("AI 生成") && cfg) {
+      await writeImageArtifactMeta(path, imageMetaForTask(task, cfg, effectiveNegative(task, opts.negativePrompt)));
+    }
     const prefix = source === "缓存" ? "[缓存] " : source.startsWith("用户素材") ? `[用户素材] ` : "";
     log({ step: "图像", message: `${prefix}${task.usage}${source.startsWith("用户素材") ? ` <- ${source.replace("用户素材 ", "")}` : ""}`, level: "success", at: Date.now() });
     logger.debug("images", "图像任务完成", { id: task.id, kind: task.kind, usage: task.usage, source, path });
@@ -1201,6 +1393,16 @@ export async function generateImages(
   const globalCacheCurrent = !approvedBible
     || storedCacheBinding?.globalFingerprint === approvedCacheBinding?.globalFingerprint;
 
+  /** 视觉守门已批准的三视图成品路径（文件存在才算）。B78：守门复用不写 images 缓存目录，
+   *  裁剪/预分区只查缓存会永远认为缺三视图 → 单章反复建任务、进度与计费计数虚增。 */
+  const approvedThreeViewArtifact = async (characterId: string): Promise<string | null> => {
+    if (!approvedBible) return null;
+    const stored = approvedBible.characters?.[characterId]?.threeViewPath;
+    if (!stored) return null;
+    const artifactPath = visualBibleArtifactCachePath(projectOutputDir, stored);
+    return (await tauri.pathExists(artifactPath).catch(() => false)) ? artifactPath : null;
+  };
+
   // 单章模式精简人物/物品构建：已有三视图/物品图成品、且视觉守门修订未变的角色/物品，
   // 根本不建任务（而非建完再跳过）——400+ 任务的 stat 开销与"顺手生成计费"一并消除。
   // 新角色（无三视图）、新物品、视觉守门修订、force/意见、全量模式不受影响。
@@ -1252,6 +1454,26 @@ export async function generateImages(
     };
     const keepChars: CharacterCard[] = [];
     let skippedChars = 0;
+    // B69：裁剪判定同时校验旁路参数 meta——模型/种子/负面词变化后旧缓存不算「已有成品」，
+    // 否则单章模式会因"文件在"直接跳过构建，参数不匹配的旧图永远不重生成。
+    const expectedCharacterMetas = (c: CharacterCard): Map<string, ImageArtifactMeta> => {
+      const metas = new Map<string, ImageArtifactMeta>();
+      if (!cfg) return metas;
+      try {
+        const built = buildImageTasks([], { title: "", characters: [c], scenes: [], items: [] }, {
+          figureEmotions,
+          detail: figureDetail,
+          threeView,
+          actions: withActions,
+          baseSeed,
+          styleAnchor: approvedBible ? false : styleAnchor,
+        });
+        for (const t of built) if (t.fileName) metas.set(t.fileName, imageMetaForTask(t, cfg, effectiveNegative(t, DEFAULT_NEGATIVE)));
+      } catch {
+        /* 单角色任务构建失败时退回旧行为（无 meta 视为命中），主流程构建会再抛 */
+      }
+      return metas;
+    };
     for (const c of taskCards.characters) {
       const revised = !!approvedCacheBinding
         && storedCacheBinding?.characterRevisions[c.id] !== approvedCacheBinding.characterRevisions[c.id];
@@ -1261,16 +1483,20 @@ export async function generateImages(
       } catch {
         hasThree = null;
       }
+      // B78：缓存目录没有时再看视觉守门三视图（获批三视图的复用产物）
+      if (!hasThree) hasThree = await approvedThreeViewArtifact(c.id);
       if (!hasThree || revised) {
         keepChars.push(c);
         continue;
       }
       // 只有三视图还不够：开启表情差分 / 切到完整档 / 新增服装动作后，
       // 缺的差分若因为"三视图存在"被一起裁掉，单章和队列都永远补不上。
+      const expectedMetas = expectedCharacterMetas(c);
       let complete = true;
       for (const name of derivativeFileNames(c)) {
         const hit = await cacheHit(imageCacheDir, name).catch(() => null);
-        if (!hit) {
+        const expected = expectedMetas.get(name);
+        if (!hit || (expected && !(await cachedImageMetaMatches(hit, expected)))) {
           complete = false;
           break;
         }
@@ -1287,7 +1513,11 @@ export async function generateImages(
       } catch {
         hasItem = null;
       }
-      if (!hasItem) keepItems.push(it);
+      const itemTask = cfg
+        ? buildImageTasks([], { title: "", characters: [], scenes: [], items: [it] }, { styleAnchor: false })[0]
+        : undefined;
+        const expectedMeta = itemTask?.fileName ? imageMetaForTask(itemTask, cfg, effectiveNegative(itemTask, DEFAULT_NEGATIVE)) : null;
+      if (!hasItem || (expectedMeta && !(await cachedImageMetaMatches(hasItem, expectedMeta)))) keepItems.push(it);
       else skippedItems++;
     }
     if (skippedChars > 0 || skippedItems > 0) {
@@ -1302,7 +1532,6 @@ export async function generateImages(
   }
 
   const tasks = buildImageTasks(chapters, taskCards, {
-    figurePerCharacter: 1,
     cgPerChapter,
     maxPerChapter,
     figureEmotions,
@@ -1350,6 +1579,51 @@ export async function generateImages(
 
   // 任务 key 覆盖计数：同一 id 多次产出（scene.id 重复等）会互相覆盖 → 记录差异让用户可察觉
   let overwriteCount = 0;
+  // B68：assets.json 落盘改为内存缓冲 + 节流合并写。
+  // 旧实现每张图成功都调用 updateAssetMap（全量读 + 全量写），400 张图 = 400 次递增全量重写（O(n²)）。
+  // 现在：每 12 张或 2s（先到者）合并写一次，函数结束前强制 flush；失败只告警不阻断出图。
+  // 取舍：单张完成瞬间前端读到的 assets.json 可能滞后到上一批（最迟约 2s）；前端生成期本就有
+  // 2s 轮询 assets.json（stores/generate.ts startAssetLiveRefresh），素材页以轮询为准不会漏图。
+  const ASSET_FLUSH_MAX_PENDING = 12;
+  const ASSET_FLUSH_INTERVAL_MS = 2000;
+  let assetsPending = 0;
+  let assetFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  let assetFlushChain: Promise<void> = Promise.resolve();
+  let assetFlushWarned = false;
+  const flushAssetsNow = (): Promise<void> => {
+    if (assetsPending === 0) return assetFlushChain;
+    assetsPending = 0;
+    if (assetFlushTimer !== null) {
+      clearTimeout(assetFlushTimer);
+      assetFlushTimer = null;
+    }
+    const merge = updateAssetMap(projectOutputDir, (assets) => {
+      Object.assign(assets.bg, result.bg);
+      Object.assign(assets.cg, result.cg);
+      Object.assign(assets.figure, result.figure);
+      Object.assign(assets.item, result.item);
+    }).catch((e) => {
+      // 写失败不能阻断整批生成：文件已落盘，结束后会再 flush 一次；仅首次告警避免刷屏
+      if (!assetFlushWarned) {
+        assetFlushWarned = true;
+        logger.warn("images", "assets.json 增量写入失败（素材页可能滞后，流程结束时会再写一次）", { error: errMsg(e) });
+      }
+    });
+    assetFlushChain = assetFlushChain.then(() => merge, () => merge);
+    return assetFlushChain;
+  };
+  const scheduleAssetFlush = (): void => {
+    if (assetsPending >= ASSET_FLUSH_MAX_PENDING) {
+      void flushAssetsNow();
+      return;
+    }
+    if (assetFlushTimer !== null) return;
+    assetFlushTimer = setTimeout(() => {
+      assetFlushTimer = null;
+      void flushAssetsNow();
+    }, ASSET_FLUSH_INTERVAL_MS);
+  };
+
   const record = (task: ImageTask, path: string) => {
     const map =
       task.kind === "background" ? result.bg
@@ -1367,20 +1641,15 @@ export async function generateImages(
       case "item": result.item[task.id] = path; break;
       case "anchor": break;
     }
-  };
-
-  const write = async (): Promise<void> => {
-    await updateAssetMap(projectOutputDir, (assets) => {
-      Object.assign(assets.bg, result.bg);
-      Object.assign(assets.cg, result.cg);
-      Object.assign(assets.figure, result.figure);
-      Object.assign(assets.item, result.item);
-    });
+    if (map) {
+      assetsPending++;
+      scheduleAssetFlush();
+    }
   };
 
   // 静默预分区：纯文件缓存命中的任务直接记入结果，不走执行/进度/写盘链路。
-  // 解决"点一次图像重生成，全书 N 张图挨个走一遍进度"——命中只是本地文件存在性＋尺寸检查，
-  // 不产生 API 调用。force/用户素材/视觉守门三视图/尺寸不符等情况仍进 pending，由 runImageTask 原逻辑处理。
+  // 解决"点一次图像重生成，全书 N 张图挨个走一遍进度"——命中只是本地文件存在性＋尺寸检查＋meta 参数校验，
+  // 不产生 API 调用。force/用户素材/尺寸或参数不符等情况仍进 pending，由 runImageTask 原逻辑处理。
   // （imageCacheDir 见函数开头，单章精简已复用）
   const pending: ImageTask[] = [];
   let cacheReused = 0;
@@ -1389,13 +1658,27 @@ export async function generateImages(
       pending.push(task);
       continue;
     }
+    // B78：视觉守门已批准三视图的复用（runImageTask 直接引用守门产物、不写 images 缓存）直接记入结果，
+    // 不进 pending → 不发进度、不计 generatedCount，修复三视图"假生成"导致的计数虚增。
+    const bibleThreeView = task.kind === "threeview" && task.characterId
+      ? await approvedThreeViewArtifact(task.characterId)
+      : null;
+    if (bibleThreeView) {
+      record(task, bibleThreeView);
+      cacheReused++;
+      continue;
+    }
     let hit: string | null = null;
     try {
       const c = await cacheHit(imageCacheDir, task.fileName);
-      if (c && task.width > 0 && task.height > 0) {
-        hit = (await tauri.imageSizeMatches(c, task.width, task.height).catch(() => true)) ? c : null;
-      } else {
-        hit = c;
+      // B69：旁路参数 meta 不一致的旧缓存视为未命中（重生成）；无 meta 的存量缓存仍命中。
+      const metaOk = !!c && (!cfg || await cachedImageMetaMatches(c, imageMetaForTask(task, cfg, effectiveNegative(task, DEFAULT_NEGATIVE))));
+      if (c && metaOk) {
+        if (task.width > 0 && task.height > 0) {
+          hit = (await tauri.imageSizeMatches(c, task.width, task.height).catch(() => true)) ? c : null;
+        } else {
+          hit = c;
+        }
       }
     } catch {
       hit = null;
@@ -1495,11 +1778,17 @@ export async function generateImages(
     });
   }
 
+  /** B74：视觉通道级致命错误（配置错误/模型不支持看图/响应非法）。
+   *  此类错误对每个任务都会重复发生，继续执行只会持续付费；记录为共享状态后，
+   *  所有 worker 在循环入口/下一轮停止派发（已在途的请求无法取消，允许跑完），
+   *  函数末尾仍向调用方抛出，保持原错误契约。 */
+  let fatalError: VisionApiError | null = null;
+
   const runPass = async (pass: ImageTask[], anchorPath?: string) => {
     let idx = 0;
     const worker = async () => {
       while (idx < pass.length) {
-        if (isAborted?.()) return;
+        if (fatalError || isAborted?.()) return;
         const task = pass[idx++];
         try {
           const p = await runImageTask(cfg, task, cacheRoot, log, {
@@ -1518,17 +1807,20 @@ export async function generateImages(
           if (p) {
             record(task, p);
             if (!materialFree.has(task)) generatedCount++;
-            // 先落盘 assets.json 再发进度事件：前端 progress 回调立即读 assets.json 时，
-            // 新图映射已写入 → 素材页真正「生成一张显示一个」。
-            // （旧顺序先 emitProgress 后 persistIncremental，前端读到旧数据导致中途不刷新）
-            await write();
+            // B68：只登记缓冲并按节流合并落盘（每 12 张 / 2s），不再逐张全量重写 assets.json；
+            // 前端素材页由 2s 轮询 assets.json 兜底刷新，逐步接近旧「先落盘再发进度」的可见性。
           } else if (isAborted?.()) {
             // 已中止且本任务未产出：不计进度、不上屏（避免停止后进度条继续涨）
             return;
           }
           emitProgress(task);
         } catch (e) {
-          if (e instanceof VisionApiError) throw e;
+          if (e instanceof VisionApiError) {
+            // B74：不在这里直接 throw——throw 会让 Promise.all 立即拒绝而其余 worker 继续跑完
+            // 各自剩余的任务（每个都付费）；改为登记共享致命错误，循环入口统一退出。
+            fatalError ??= e;
+            return;
+          }
           emitProgress(task, "（失败）");
           // 单任务失败不阻断整章：记录并继续
           failed.push({
@@ -1556,20 +1848,26 @@ export async function generateImages(
   let anchorPath: string | undefined;
   const anchorTask = pending.find((t) => t.kind === "anchor");
   if (anchorTask) {
-    const p = await runImageTask(cfg, anchorTask, cacheRoot, log, {
-      materials,
-      force: imageForceFor(anchorTask),
-      isAborted,
-      figureBase: result.figure,
-      visualBible: approvedBible,
-      outputDir: projectOutputDir,
-      verifyCfg,
-      negativePrompt: DEFAULT_NEGATIVE,
-    });
-    emitProgress(anchorTask);
-    if (p) {
-      anchorPath = p;
-      generatedCount++;
+    // B74：锚点走独立调用，视觉致命错误同样登记为共享状态（先收尾 flush，末尾统一抛出）
+    try {
+      const p = await runImageTask(cfg, anchorTask, cacheRoot, log, {
+        materials,
+        force: imageForceFor(anchorTask),
+        isAborted,
+        figureBase: result.figure,
+        visualBible: approvedBible,
+        outputDir: projectOutputDir,
+        verifyCfg,
+        negativePrompt: DEFAULT_NEGATIVE,
+      });
+      emitProgress(anchorTask);
+      if (p) {
+        anchorPath = p;
+        generatedCount++;
+      }
+    } catch (e) {
+      if (e instanceof VisionApiError) fatalError ??= e;
+      else throw e;
     }
   } else {
     // 锚点命中缓存：静默解析路径供背景/CG 引用，不执行、不发进度
@@ -1584,12 +1882,29 @@ export async function generateImages(
   }
   if (isAborted?.()) {
     log({ step: "图像", message: "已中止（后续图片任务不再继续，已生成的保留）", level: "warn", at: Date.now() });
-  } else {
+  } else if (!fatalError) {
+    // B74：一旦出现视觉致命错误，后续 pass 不再启动（避免成批重复付费请求）
     await runPass(leadingPass, anchorPath);
-    await runPass(firstPass, anchorPath);
-    await runPass(emotionPass, anchorPath);
-    await runPass(actionPass, anchorPath);
+    if (!fatalError) await runPass(firstPass, anchorPath);
+    if (!fatalError) await runPass(emotionPass, anchorPath);
+    if (!fatalError) await runPass(actionPass, anchorPath);
   }
+  if (fatalError) {
+    log({
+      step: "图像",
+      message: `视觉通道致命错误，已停止派发剩余图片任务（已生成的保留）：${errMsg(fatalError).slice(0, 160)}`,
+      level: "error",
+      at: Date.now(),
+    });
+  }
+
+  // B68：函数结束前强制 flush（含中止/部分失败的分支）：已生成的图映射必须全部落盘，
+  // 后续「组装」阶段与下次运行都依赖 assets.json 完整。
+  if (assetFlushTimer !== null) {
+    clearTimeout(assetFlushTimer);
+    assetFlushTimer = null;
+  }
+  await flushAssetsNow();
 
   for (const chapter of chapters) {
     for (const scene of chapter.scenes) {
@@ -1632,6 +1947,9 @@ export async function generateImages(
   if (approvedBible && cfg) {
     await tauri.writeTextFile(visualBibleCacheMarker, JSON.stringify(approvedCacheBinding));
   }
+
+  // B74：视觉致命错误在收尾（flush / 缓存绑定标记）完成后统一抛出，保持「仍向调用方抛出」的契约
+  if (fatalError) throw fatalError;
 
   return { images: result, failed, generated: generatedCount };
 }
@@ -1796,7 +2114,6 @@ export async function repairImageAssets(
   }
   if (opts.cards) {
     const tasks = buildImageTasks(opts.chapters ?? [], opts.cards, {
-      figurePerCharacter: 1,
       cgPerChapter: opts.cgPerChapter ?? 0,
       maxPerChapter: opts.maxPerChapter ?? 0,
       figureEmotions: opts.figureEmotions,
@@ -1910,6 +2227,8 @@ export async function repairImageAssets(
       if (e.isDir) continue;
       const lower = e.name.toLowerCase();
       if (lower.startsWith("anchor_")) continue;
+      // B69 的旁路参数元数据 `<图>.meta.json` 也带管理前缀，但它本就不在映射里，不能被当孤儿删掉
+      if (lower.endsWith(".meta.json")) continue;
       if (!MANAGED_IMAGE_PREFIXES.some((pre) => lower.startsWith(pre))) continue;
       if (!referenced.has(lower)) {
         await tauri.removePath(e.path).catch(() => {});

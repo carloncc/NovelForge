@@ -26,7 +26,7 @@ async function main(): Promise<void> {
   console.log(`[3] 剧本: ${scripts.length}章 ${totalLines}句台词 CG事件:${cgCount} 物品事件:${itemEvCount}`);
 
   const assets = { bg: {}, cg: {}, figure: {}, item: {}, vocal: {} };
-  const renderOpts = { title: cards.title, gameKey: gameKeyFor(cards.title), characters: cards.characters, items: cards.items, assets };
+  const renderOpts = { characters: cards.characters, items: cards.items, assets };
   for (const s of scripts) {
     const txt = renderChapter(s, renderOpts, scripts.length);
     validateTxt(txt, s.chapter + 1);

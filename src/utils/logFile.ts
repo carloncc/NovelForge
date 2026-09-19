@@ -31,22 +31,30 @@ function format(entry: LogEntry): string {
 }
 
 async function flush(): Promise<void> {
+  if (!logFilePath) return;
   const lines = buffer.splice(0, buffer.length);
-  if (!lines.length || !logFilePath) return;
+  if (!lines.length) return;
   const filePath = logFilePath;
   writeQueue = writeQueue.then(async () => {
     try {
+      // B99：tauri 没有 append API，折中为「读取已有内容 + 追加」；只有超过行数上限时才做
+      // split/join 截断压缩。旧实现每次 flush（最多每秒/每 50 行）都全量读改写 + 全量 split，
+      // 日志文件大时把主线程拖慢。
       let existing = "";
       if (await tauri.pathExists(filePath)) {
-        const result = await tauri.readTextFile(filePath);
-        existing = result.text;
+        existing = (await tauri.readTextFile(filePath)).text;
       }
       const merged = existing ? `${existing}\n${lines.join("\n")}` : lines.join("\n");
-      const trimmed = merged.split("\n").slice(-LOG_LINE_LIMIT).join("\n");
-      await tauri.writeTextFile(filePath, trimmed);
+      const projectedLines = existing ? existing.split("\n").length + lines.length : lines.length;
+      const next = projectedLines > LOG_LINE_LIMIT ? merged.split("\n").slice(-LOG_LINE_LIMIT).join("\n") : merged;
+      await tauri.writeTextFile(filePath, next);
     } catch (error) {
-      // 日志写入失败不应打断主流程
-      console.error("[logFile] 写入日志文件失败", error);
+      // B99：写失败不能丢行——放回 buffer 头部（保持时间顺序），下次 flush 重试。
+      // 旧实现直接丢弃，磁盘日志会静默缺一段，恰好掩盖故障现场。
+      buffer.unshift(...lines);
+      // 若磁盘持续不可写，缓冲也不能无限增长占内存：封顶到与文件一致的行数，只保留最近的行
+      if (buffer.length > LOG_LINE_LIMIT) buffer.splice(0, buffer.length - LOG_LINE_LIMIT);
+      console.error("[logFile] 写入日志文件失败（日志行已放回缓冲，稍后重试）", error);
     }
   });
   await writeQueue;

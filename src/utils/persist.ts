@@ -191,11 +191,28 @@ export async function saveProjectState(state: {
         })),
       };
     }
+  } else {
+    // 无 sourcePath（示例小说/资产阶段占位/源文件恢复失败）时不能把磁盘上已保存的 novel 段抹掉：
+    // 旧实现整文件覆盖，会丢失 sourcePaths/章节标题/enabled 停用标记，导致换项目后无法恢复。
+    try {
+      const file = stateFile(state.outputDir);
+      if (await tauri.pathExists(file)) {
+        const { text } = await tauri.readTextFile(file);
+        const existing = JSON.parse(text) as PersistedState;
+        if (existing && typeof existing === "object" && existing.novel) persistedState.novel = existing.novel;
+      }
+    } catch {
+      /* 读不出旧状态时按无 novel 处理 */
+    }
   }
   if (state.lastResult) {
+    // B33：无条件剥离卡片内联参考图。旧实现只在有 visualBible 时剥离，
+    // 没有 visualBible 的项目会把每个角色的 base64 参考图重复写进 project_state.json
+    //（几十 MB 的 JSON，保存/加载都卡）；参考图本身已以路径（referenceImagePath）或在磁盘卡片工作副本里持久化。
+    // 恢复侧对 referenceImage 缺失本来就有兼容（字段可选，视觉圣经迁移会按 path 处理）。
     persistedState.lastResult = {
       ...state.lastResult,
-      cards: state.visualBible ? withoutInlineReferences(state.lastResult.cards) : state.lastResult.cards,
+      cards: withoutInlineReferences(state.lastResult.cards),
     };
   }
   await tauri.writeTextFile(stateFile(state.outputDir), JSON.stringify(persistedState, null, 2));
@@ -233,6 +250,7 @@ export async function restoreProjectState(outputDir: string): Promise<{
     const persistedState = parsePersistedState(JSON.parse(text));
 
     let novel: NovelDoc | null = null;
+    let importError: string | undefined;
     const sourcePaths = persistedState.novel?.sourcePaths?.length
       ? persistedState.novel.sourcePaths
       : persistedState.novel?.sourcePath
@@ -240,33 +258,39 @@ export async function restoreProjectState(outputDir: string): Promise<{
         : [];
     const existingPaths = sourcePaths.filter((p) => p);
     if (existingPaths.length && (await Promise.all(existingPaths.map((p) => tauri.pathExists(p)))).every(Boolean)) {
-      const fresh = existingPaths.length > 1
-        ? await importNovelFiles(existingPaths)
-        : await importNovelFile(existingPaths[0]);
-      const snapshot = persistedState.novel?.splitChapters;
-      // 快照指纹匹配 → 使用 AI 分章快照恢复（源文件未变化）；否则重新正则切分 + 应用保存的标题/启用
-      if (snapshot && snapshot.chapters?.length && snapshot.fp === splitSnapshotFingerprint(fresh)) {
-        fresh.chapters = snapshot.chapters.map((c) => ({
-          index: c.index,
-          title: c.title,
-          text: c.text,
-          charCount: c.text.length,
-          enabled: c.enabled,
-        }));
-      } else {
-        const saved = new Map(persistedState.novel!.chapters.map((c) => [c.index, c]));
-        fresh.chapters = fresh.chapters.map((ch, i) => {
-          const s = saved.get(ch.index);
-          if (s) {
-            ch.title = s.title || ch.title;
-            ch.enabled = s.enabled;
-          }
-          return ch;
-        });
+      try {
+        const fresh = existingPaths.length > 1
+          ? await importNovelFiles(existingPaths)
+          : await importNovelFile(existingPaths[0]);
+        const snapshot = persistedState.novel?.splitChapters;
+        // 快照指纹匹配 → 使用 AI 分章快照恢复（源文件未变化）；否则重新正则切分 + 应用保存的标题/启用
+        if (snapshot && snapshot.chapters?.length && snapshot.fp === splitSnapshotFingerprint(fresh)) {
+          fresh.chapters = snapshot.chapters.map((c) => ({
+            index: c.index,
+            title: c.title,
+            text: c.text,
+            charCount: c.text.length,
+            enabled: c.enabled,
+          }));
+        } else {
+          const saved = new Map(persistedState.novel!.chapters.map((c) => [c.index, c]));
+          fresh.chapters = fresh.chapters.map((ch, i) => {
+            const s = saved.get(ch.index);
+            if (s) {
+              ch.title = s.title || ch.title;
+              ch.enabled = s.enabled;
+            }
+            return ch;
+          });
+        }
+        fresh.fileName = persistedState.novel!.fileName || fresh.fileName;
+        fresh.encoding = persistedState.novel!.encoding || fresh.encoding;
+        novel = fresh;
+      } catch (error) {
+        // B100：源文件"存在"但导入失败（编码损坏/读取竞态）时不能把它抛进外层 catch 直接返回 loadError：
+        // 那会跳过下面的分章缓存兜底，重启后逐章生成入口整块消失。这里降级到缓存并把错误附在 warning 上。
+        importError = error instanceof Error ? error.message : String(error);
       }
-      fresh.fileName = persistedState.novel!.fileName || fresh.fileName;
-      fresh.encoding = persistedState.novel!.encoding || fresh.encoding;
-      novel = fresh;
     }
 
     // 源文件缺失/不可读（重命名、移动、清理过下载目录，或导入时就没有真实路径）时，
@@ -284,7 +308,18 @@ export async function restoreProjectState(outputDir: string): Promise<{
 
     const warnings = [...loadedBible.warnings];
     if (novelRestoredFromSplitCache) {
-      warnings.push("源小说文件不可读，已用分章缓存重建小说：分章/剧本/图像/逐章生成可继续使用，但「重新分章」等依赖原文的操作需要重新导入小说");
+      warnings.push(
+        importError
+          ? `源小说文件导入失败（${importError}），已用分章缓存重建小说：分章/剧本/图像/逐章生成可继续使用，但「重新分章」等依赖原文的操作需要重新导入小说`
+          : "源小说文件不可读，已用分章缓存重建小说：分章/剧本/图像/逐章生成可继续使用，但「重新分章」等依赖原文的操作需要重新导入小说",
+      );
+    } else if (!novel && (importError || persistedState.novel)) {
+      // B100：完全无缓存时给出明确 warning（旧实现静默返回 novel=null，用户只看到「还没有小说」）
+      warnings.push(
+        importError
+          ? `源小说文件导入失败（${importError}），且没有可用的分章缓存，逐章生成不可用：请重新导入小说`
+          : "源小说文件不可读，且没有可用的分章缓存，逐章生成不可用：请重新导入小说",
+      );
     }
     const persistedCards = workingCards ?? persistedState.lastResult?.cards;
     let visualBible = loadedBible.visualBible;
@@ -331,14 +366,6 @@ export async function restoreProjectState(outputDir: string): Promise<{
       loadError: error instanceof Error ? error.message : String(error),
     };
   }
-}
-
-export function splitChaptersForRestore(text: string, title: string): ChapterInfo[] {
-  const chapters = splitChaptersForFallback(text);
-  if (chapters.length === 1 && !/^第.+章/.test(chapters[0].title)) {
-    chapters[0].title = title;
-  }
-  return chapters;
 }
 
 /** 是否应持久化 AI 分章快照：非占位单章，且章节正文与正则切分结果不同（说明是 AI 分章） */

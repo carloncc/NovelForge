@@ -161,8 +161,9 @@ function main(): void {
   ];
   const out8 = renderChapter(s8, { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets: assetsCt, introCard: false }, 1);
   assert(out8.includes("changeFigure:f_linche_battle.png"), "换装句应切服装立绘");
-  // 第二句 emotion=happy 但已换装：服装图无表情差分，应沿用服装而非 happy 图
-  assert(!out8.includes("f_linche_happy.png"), "换装期间不应切表情差分");
+  // 第二句 emotion=happy 但已换装：优先找该服装的表情差分（未生成）→ 回退默认服装的表情差分。
+  // 旧行为换装期间完全放弃表情（哭泣/大笑只有平静脸）；现在有表情胜过无表情，服装表情差分建议后续补齐
+  assert(out8.includes("f_linche_happy.png"), "换装期间无服装差分时应回退默认服装的表情差分");
   // 第三句未知服装 id：回退默认立绘不断线
   assert(out8.includes("changeFigure:f_linche.png"), "未知服装应回退默认立绘");
 
