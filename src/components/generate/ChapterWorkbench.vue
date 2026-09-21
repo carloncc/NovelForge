@@ -1,9 +1,10 @@
 ﻿<script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type { ChapterInfo } from "../../core/types";
 import type { ChapterLight } from "../../composables/useChapterStatus";
 import { emptyChapterLight, isChapterContentComplete } from "../../composables/useChapterStatus";
 import { t } from "../../i18n";
+import { useGenerateController } from "../../stores/generate";
 
 const props = defineProps<{
   chapters: ChapterInfo[];
@@ -16,12 +17,9 @@ const props = defineProps<{
   queueRunning: boolean;
   includeVoice: boolean;
   hasCards: boolean;
-  opinion: string;
   splitMetaText: string;
   splitOk: boolean;
   splitConfirmed: boolean;
-  splitMinChapterChars: number;
-  splitKeepSpecials: boolean;
   /** 图片总账文案：图片共 N 张 · 已生成 X · 待生成 Y（生成前可见，stores/generate 计算） */
   imageSummaryText: string;
   /** 有失败记录的章节（novel index）：列表优先展示并显示「失败」状态 */
@@ -34,34 +32,18 @@ const emit = defineEmits<{
   regenPart: [novelIndex: number, part: "script" | "image" | "voice"];
   toggle: [novelIndex: number];
   select: [novelIndex: number, checked: boolean];
-  selectIncomplete: [];
-  selectNone: [];
   runSelected: [];
   runQueue: [];
   stopQueue: [];
-  append: [];
   previewSplit: [];
-  confirmSplit: [];
   prepare: [];
   updateIncludeVoice: [value: boolean];
-  updateOpinion: [value: string];
   updateFeedback: [novelIndex: number, value: string];
   updateForce: [novelIndex: number, value: boolean];
-  updateSplitMinChapterChars: [value: number];
-  updateSplitKeepSpecials: [value: boolean];
 }>();
 
-const opinionDraft = ref(props.opinion);
-watch(
-  () => props.opinion,
-  (v) => {
-    if (v !== opinionDraft.value) opinionDraft.value = v;
-  },
-);
-function onOpinionInput(value: string): void {
-  opinionDraft.value = value;
-  emit("updateOpinion", value);
-}
+// 工具栏「重跑选中」要对多章依次 await，emit 无法等待，因此这里直接调 store（页面拥有同一单例）
+const { runChapterFullRegen, runChapterPartRegen } = useGenerateController();
 
 const lightOf = (idx: number): ChapterLight => props.lights[idx] ?? emptyChapterLight();
 
@@ -87,34 +69,116 @@ function chipOf(l: ChapterLight, failed = false): { text: string; cls: string } 
   return { text: t("已完成"), cls: "ok" };
 }
 
-/** 列表默认只显示「未完成 + 失败」的章节：大部头不再一屏 20+ 行；全部完成时只留一行结论 */
-const showAllChapters = ref(false);
 const failedSet = computed(() => new Set(props.failedChapters));
-const visibleChapters = computed(() => {
-  if (showAllChapters.value) return props.chapters;
-  return props.chapters.filter((c) => !isChapterContentComplete(lightOf(c.index)) || failedSet.value.has(c.index));
-});
 
-const incompleteCount = computed(
-  () => props.chapters.filter((c) => !isChapterContentComplete(lightOf(c.index))).length,
+/** 单章排序权重：失败 → 未生成 → 缺图/缺配音/旧缓存 → 已完成 → 已停用（停用章沉底但可勾选） */
+function rankOf(c: ChapterInfo): number {
+  if (c.enabled === false) return 4;
+  if (failedSet.value.has(c.index)) return 0;
+  const l = lightOf(c.index);
+  if (!l.script) return 1;
+  if (l.legacyScript) return 2;
+  if (l.imageTotal > 0 && l.imageDone < l.imageTotal) return 2;
+  if (!l.voiceSkipped && l.voiceTotal > 0 && l.voiceDone < l.voiceTotal) return 2;
+  return 3;
+}
+
+interface ChapterRow {
+  chapter: ChapterInfo;
+  isDisabled: boolean;
+  chip: { text: string; cls: string };
+}
+
+/** 启用 / 已停用合并成一张列表：不再有单独小节，也不再有折叠或显示开关 */
+const rows = computed<ChapterRow[]>(() =>
+  [...props.chapters, ...props.disabledChapters]
+    .map((chapter) => ({ chapter, rank: rankOf(chapter) }))
+    .sort((a, b) => a.rank - b.rank)
+    .map(({ chapter }) => ({
+      chapter,
+      isDisabled: chapter.enabled === false,
+      chip: chipOf(lightOf(chapter.index), failedSet.value.has(chapter.index)),
+    })),
 );
+
 const selectedCount = computed(() => props.selected.length);
 const locked = computed(() => props.disabled || props.queueRunning);
 /** 主按钮文案随选择变化：有勾选=生成选中，无勾选=补全未完成（唯一下一步动作） */
-const primaryLabel = computed(() =>
-  selectedCount.value ? `${t("生成选中")}（${selectedCount.value}）` : `${t("补全未完成")}${incompleteCount.value ? `（${incompleteCount.value}）` : ""}`,
-);
+const primaryLabel = computed(() => (selectedCount.value ? t("生成选中") : t("补全未完成")));
 function runPrimary(): void {
   if (selectedCount.value) emit("runSelected");
   else emit("runQueue");
 }
-/** 选择开关：把「全选未完成 / 清空选择」收敛成一个文本链接 */
-function selectToggle(): void {
-  if (selectedCount.value) emit("selectNone");
-  else emit("selectIncomplete");
-}
+
 const legacyScriptCount = computed(() => props.chapters.filter((c) => lightOf(c.index).legacyScript).length);
-defineExpose({ incompleteCount });
+
+/* ---- 工具栏浮层：唯一的批量入口（意见 / 分项重跑 / 全量 / 启停），行内不再有任何按钮 ---- */
+const menuOpen = ref(false);
+function closeMenu(): void {
+  menuOpen.value = false;
+}
+function toggleMenu(): void {
+  menuOpen.value = !menuOpen.value;
+}
+function onDocPointerDown(e: MouseEvent): void {
+  const el = e.target as HTMLElement | null;
+  if (el?.closest(".wb-toolbar-menu")) return;
+  closeMenu();
+}
+function onDocKeydown(e: KeyboardEvent): void {
+  if (e.key === "Escape") closeMenu();
+}
+onMounted(() => {
+  document.addEventListener("pointerdown", onDocPointerDown, true);
+  document.addEventListener("keydown", onDocKeydown);
+});
+onBeforeUnmount(() => {
+  document.removeEventListener("pointerdown", onDocPointerDown, true);
+  document.removeEventListener("keydown", onDocKeydown);
+});
+watch(
+  () => props.selected.length,
+  (n) => {
+    if (!n) closeMenu();
+  },
+);
+
+const selection = computed(() => new Set(props.selected));
+const selectedRows = computed(() => rows.value.filter((r) => selection.value.has(r.chapter.index)));
+/** 重跑 / 全量只作用于选中且启用的章节：停用章不参与生成 */
+const selectedEnabled = computed(() => selectedRows.value.filter((r) => !r.isDisabled).map((r) => r.chapter.index));
+/** 启停二选一：全部选中都是停用章才显示「启用选中」，混选时按「停用选中」处理 */
+const toggleLabel = computed(() => (selectedRows.value.length && selectedRows.value.every((r) => r.isDisabled) ? t("启用选中") : t("停用选中")));
+
+/** 意见写入所有选中章节：一致才回填，避免把上一章的意见显示成下一章的值 */
+const menuFeedback = computed(() => {
+  const list = props.selected;
+  if (!list.length) return "";
+  const first = props.feedback[list[0]] ?? "";
+  return list.every((i) => (props.feedback[i] ?? "") === first) ? first : "";
+});
+function onMenuFeedback(value: string): void {
+  for (const i of props.selected) emit("updateFeedback", i, value);
+}
+async function regenSelectedPart(part: "script" | "image" | "voice"): Promise<void> {
+  closeMenu();
+  for (const i of selectedEnabled.value) await runChapterPartRegen(i, part);
+}
+async function regenSelectedFull(): Promise<void> {
+  closeMenu();
+  for (const i of selectedEnabled.value) {
+    emit("updateForce", i, true);
+    try {
+      await runChapterFullRegen(i);
+    } finally {
+      emit("updateForce", i, false);
+    }
+  }
+}
+function toggleSelected(): void {
+  closeMenu();
+  for (const i of props.selected) emit("toggle", i);
+}
 </script>
 
 <template>
@@ -122,29 +186,27 @@ defineExpose({ incompleteCount });
     <div class="card-head">
       <h3>{{ t("逐章生成") }}</h3>
       <div class="card-actions">
-        <span class="tag" :class="splitOk ? 'ok' : 'warn'">{{ splitMetaText }}</span>
+        <!-- 分章状态只读：非「已核对」口径时把下一步指向「生成设置」页 -->
+        <span
+          class="tag"
+          :class="splitOk ? 'ok' : 'warn'"
+          :title="splitOk ? undefined : t('到「生成设置」里重新分章或标记已核对')"
+        >{{ splitMetaText }}</span>
         <span v-if="splitConfirmed" class="tag ok">{{ t("已核对") }}</span>
-        <button v-if="chapters.length" class="link-btn" @click="showAllChapters = !showAllChapters">
-          {{ showAllChapters ? t("只看未完成") : `${t("显示全部")}（${chapters.length} ${t("章")}）` }}
-        </button>
       </div>
     </div>
 
-    <div v-if="!hasCards" class="wb-notice">
+    <!-- 空态只留「AI 分章」（它自带分章＋提取），此时再提示「先提取卡片」是重复且无从下手的选择 -->
+    <div v-if="!hasCards && rows.length" class="wb-notice">
       <div>
         <strong>{{ t("还缺角色 / 场景 / 物品卡") }}</strong>
         <p>{{ t("逐章生成需要先有卡片，才能把原文变成剧本与图像。") }}</p>
       </div>
-      <button class="link-btn" :disabled="locked" @click="emit('prepare')">{{ t("先提取卡片") }}</button>
+      <button class="btn secondary small" :disabled="locked" @click="emit('prepare')">{{ t("先提取卡片") }}</button>
     </div>
 
-    <!-- 唯一主按钮：勾选了章节=生成选中；未勾选=补全未完成 -->
-    <div class="wb-toolbar wb-primary">
-      <button class="link-btn" :disabled="locked" @click="selectToggle">
-        {{ selectedCount ? t("清空选择") : `${t("全选未完成")}${incompleteCount ? `（${incompleteCount}）` : ""}` }}
-      </button>
-      <span class="hint">{{ t("已选") }} {{ selectedCount }} / {{ chapters.length }}</span>
-      <span class="grow" />
+    <!-- 工具栏四项：含配音 / 已选计数 / 重跑选中浮层 / 唯一主按钮 -->
+    <div class="wb-toolbar">
       <label class="opt-item mb-0" :title="t('勾选后单章链路会把该章台词一起配音（会产生 TTS 费用）')">
         <input
           type="checkbox"
@@ -154,133 +216,73 @@ defineExpose({ incompleteCount });
         />
         {{ t("含配音") }}
       </label>
+      <span class="hint">{{ t("已选") }} {{ selectedCount }} / {{ rows.length }}</span>
+      <span class="grow" />
+      <div class="wb-toolbar-menu">
+        <button
+          class="btn secondary small"
+          :disabled="selectedCount === 0 || locked"
+          :aria-expanded="menuOpen"
+          aria-haspopup="true"
+          @click="toggleMenu"
+        >{{ t("重跑选中") }} ▾</button>
+        <div v-if="menuOpen" class="wb-menu" role="menu" :aria-label="t('重跑选中')">
+          <input
+            class="wb-feedback"
+            type="text"
+            :value="menuFeedback"
+            :placeholder="t('意见（可选）：本章节奏太慢…')"
+            :disabled="locked"
+            @input="onMenuFeedback(($event.target as HTMLInputElement).value)"
+          />
+          <div class="wb-menu-row">
+            <button class="btn small" role="menuitem" :disabled="locked" @click="regenSelectedPart('script')">{{ t("重跑剧本") }}</button>
+            <button class="btn small" role="menuitem" :disabled="locked" @click="regenSelectedPart('image')">{{ t("重跑图像") }}</button>
+            <button class="btn small" role="menuitem" :disabled="locked" @click="regenSelectedPart('voice')">{{ t("重跑配音") }}</button>
+          </div>
+          <div class="wb-menu-row">
+            <button class="btn small" role="menuitem" :disabled="locked" @click="regenSelectedFull">{{ t("全量重跑") }}</button>
+            <button class="btn small" role="menuitem" :disabled="locked" @click="toggleSelected">{{ toggleLabel }}</button>
+          </div>
+        </div>
+      </div>
       <button v-if="!queueRunning" class="btn" :disabled="locked" @click="runPrimary">{{ primaryLabel }}</button>
       <button v-else class="btn danger" @click="emit('stopQueue')">{{ t("停止队列") }}</button>
     </div>
-    <p class="hint">{{ t("勾选章节后点主按钮生成选中；未勾选时补全未完成。逐章意见 / 全量 / 分项重跑在该行「重跑」里。") }}</p>
+    <p class="hint">{{ t("勾选章节后点主按钮生成；未勾选时按顺序补全未完成。分项重跑 / 全量 / 启停都在「重跑选中」里。") }}</p>
     <p class="hint"><strong>{{ t("图片统计：") }}</strong>{{ imageSummaryText }}</p>
 
-    <details class="wb-adv">
-      <summary class="hint">{{ t("分章设置与意见") }}</summary>
-      <div class="wb-toolbar mt-3">
-        <input
-          class="grow"
-          type="text"
-          :value="opinionDraft"
-          :placeholder="t('分章意见（可选）：如“第×章太长请拆分”…')"
-          :disabled="locked"
-          @input="onOpinionInput(($event.target as HTMLInputElement).value)"
-        />
-        <button class="btn small" :disabled="locked" @click="emit('previewSplit')">{{ t("AI 分章") }}</button>
-        <button class="link-btn" :disabled="locked || !chapters.length" @click="emit('confirmSplit')">
-          {{ splitConfirmed ? t("分章已核对") : t("标记为已核对") }}
-        </button>
-        <button class="link-btn" :disabled="locked" @click="emit('append')">{{ t("追加新章节") }}</button>
-      </div>
-      <div class="wb-toolbar mt-2">
-        <label class="opt-item mb-0">
-          <span>{{ t("碎章合并阈值") }}</span>
-          <input
-            type="number"
-            :value="splitMinChapterChars"
-            min="0"
-            step="500"
-            style="width: 90px"
-            :disabled="locked"
-            @input="emit('updateSplitMinChapterChars', Number(($event.target as HTMLInputElement).value))"
-          />
-          <span class="hint">{{ t("字") }}</span>
-        </label>
-        <label class="opt-item mb-0">
-          <input
-            type="checkbox"
-            :checked="splitKeepSpecials"
-            :disabled="locked"
-            @change="emit('updateSplitKeepSpecials', ($event.target as HTMLInputElement).checked)"
-          />
-          {{ t("保留特殊章节") }}
-        </label>
-      </div>
-    </details>
+    <!-- 一行细提示即可，不再占一个色块 -->
+    <p v-if="legacyScriptCount" class="hint">
+      <strong>{{ t("旧版剧本缓存未纳入校验") }}：</strong>{{ legacyScriptCount }}{{ t("章的剧本缓存没有指纹（旧版），场景/人物可能已过期，图像数按旧剧本估算；建议对这些章重跑一次「剧本」。") }}
+    </p>
 
-    <div v-if="legacyScriptCount" class="wb-notice">
-      <div>
-        <strong>{{ t("旧版剧本缓存未纳入校验") }}</strong>
-        <p>{{ legacyScriptCount }}{{ t("章的剧本缓存没有指纹（旧版），场景/人物可能已过期，图像数按旧剧本估算；建议对这些章重跑一次「剧本」。") }}</p>
-      </div>
+    <div v-if="!rows.length" class="wb-empty">
+      <p class="hint mb-0">{{ t("还没有章节：点下方按钮用 AI 分章把小说切成可逐章生成的章节") }}</p>
+      <button class="btn small" :disabled="locked" @click="emit('previewSplit')">{{ t("AI 分章") }}</button>
     </div>
-
-    <div class="wb-list">
+    <div v-else class="wb-list">
       <div
-        v-for="c in visibleChapters"
-        :key="c.index"
+        v-for="row in rows"
+        :key="row.chapter.index"
         class="stage-row"
-        :class="{ 'is-done': isChapterContentComplete(lightOf(c.index)) }"
+        :class="{ 'is-done': !row.isDisabled && isChapterContentComplete(lightOf(row.chapter.index)), 'is-off': row.isDisabled }"
       >
         <label class="wb-check" :title="t('加入「生成选中」批量队列')">
           <input
             type="checkbox"
-            :checked="selected.includes(c.index)"
+            :checked="selected.includes(row.chapter.index)"
             :disabled="locked"
-            @change="emit('select', c.index, ($event.target as HTMLInputElement).checked)"
+            @change="emit('select', row.chapter.index, ($event.target as HTMLInputElement).checked)"
           />
         </label>
         <div class="stage-row-label wb-title">
-          <b class="text-ellipsis" :title="titleOf(c)">{{ titleOf(c) }}</b>
-          <span class="tag" :class="chipOf(lightOf(c.index), failedSet.has(c.index)).cls">{{ chipOf(lightOf(c.index), failedSet.has(c.index)).text }}</span>
+          <b class="text-ellipsis" :title="titleOf(row.chapter)">{{ titleOf(row.chapter) }}</b>
+          <span class="tag" :class="row.chip.cls">{{ row.chip.text }}</span>
+          <span v-if="row.isDisabled" class="tag">{{ t("已停用") }}</span>
         </div>
-        <details class="wb-more">
-          <summary class="link-btn">{{ t("重跑") }}</summary>
-          <div class="wb-more-body">
-            <input
-              class="wb-feedback"
-              type="text"
-              :value="feedback[c.index] ?? ''"
-              :placeholder="t('意见（可选）：本章节奏太慢…')"
-              :disabled="locked"
-              @input="emit('updateFeedback', c.index, ($event.target as HTMLInputElement).value)"
-            />
-            <button class="btn small" :disabled="locked" @click="emit('regen', c.index)">{{ t("生成本章") }}</button>
-            <label class="opt-item mb-0" :title="t('勾选后该章跳过缓存直接重写（同范围图像同步强制）')">
-              <input
-                type="checkbox"
-                :checked="!!force[c.index]"
-                :disabled="locked"
-                @change="emit('updateForce', c.index, ($event.target as HTMLInputElement).checked)"
-              />
-              {{ t("全量") }}
-            </label>
-            <button class="btn small" :disabled="locked" :title="t('重写本章剧本，并按新剧本重画本章图片（不含配音）')" @click="emit('regenPart', c.index, 'script')">
-              {{ t("剧本") }}
-            </button>
-            <button class="btn small" :disabled="locked" :title="t('只重画本章背景/CG，剧本与配音不动')" @click="emit('regenPart', c.index, 'image')">
-              {{ t("图像") }}
-            </button>
-            <button class="btn small" :disabled="locked" :title="t('只重配本章台词配音，剧本与图像不动')" @click="emit('regenPart', c.index, 'voice')">
-              {{ t("配音") }}
-            </button>
-            <button class="btn small" :disabled="locked" @click="emit('toggle', c.index)">{{ t("停用") }}</button>
-          </div>
-        </details>
       </div>
-      <p v-if="!chapters.length" class="hint">
-        {{ t("还没有章节：展开上方「分章设置与意见」点「AI 分章」把小说切成可逐章生成的章节。") }}
-      </p>
-      <p v-else-if="!visibleChapters.length" class="hint" style="color: var(--ok)">
-        {{ t("全部章节已完成") }}
-      </p>
     </div>
-
-    <details v-if="disabledChapters.length" class="wb-adv">
-      <summary class="hint">{{ t("已停用章节") }}（{{ disabledChapters.length }}）</summary>
-      <div v-for="c in disabledChapters" :key="c.index" class="stage-row" style="opacity: 0.65">
-        <div class="stage-row-label wb-title">
-          <b class="text-ellipsis" :title="titleOf(c)">{{ titleOf(c) }}</b>
-          <span class="faint small">{{ (c.charCount ?? 0).toLocaleString() }}{{ t("字") }}</span>
-        </div>
-        <button class="btn small" :disabled="locked" @click="emit('toggle', c.index)">{{ t("启用") }}</button>
-      </div>
-    </details>
   </div>
 </template>
 
@@ -290,11 +292,8 @@ defineExpose({ incompleteCount });
   flex-wrap: wrap;
   align-items: center;
   gap: 8px;
-  margin-bottom: 10px;
-}
-.wb-primary {
   margin-top: 4px;
-  margin-bottom: 6px;
+  margin-bottom: 10px;
 }
 .wb-notice {
   display: flex;
@@ -319,6 +318,10 @@ defineExpose({ incompleteCount });
 .wb-list .stage-row.is-done {
   border-color: var(--ok-soft, rgba(47, 158, 68, 0.25));
 }
+/* 已停用章沉底并淡化，但保留勾选框（供「启用选中」使用） */
+.wb-list .stage-row.is-off {
+  opacity: 0.6;
+}
 .wb-check {
   display: flex;
   align-items: center;
@@ -328,51 +331,41 @@ defineExpose({ incompleteCount });
   min-width: 0;
   flex: 1;
 }
-.wb-feedback {
-  min-width: 140px;
-  flex: 1;
+.wb-empty {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-start;
 }
-/* 每章的「重跑」：默认收起为文本链接，展开后独占一行；
-   鼠标设备下整行不再常驻 22 个链接（悬停/键盘聚焦时才显出），触屏设备保持可见可点 */
-.wb-more {
+/* 浮层菜单：工具栏唯一的批量入口，absolute 不占常驻空间 */
+.wb-toolbar-menu {
   position: relative;
+  display: flex;
+  align-items: center;
 }
-.wb-more summary {
-  list-style: none;
-  cursor: pointer;
+.wb-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 260px;
+  padding: 10px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-hover);
 }
-@media (hover: hover) {
-  .wb-more summary {
-    opacity: 0;
-    transition: opacity 0.15s ease;
-  }
-  .stage-row:hover .wb-more summary,
-  .stage-row:focus-within .wb-more summary,
-  .wb-more[open] summary {
-    opacity: 1;
-  }
-}
-.wb-more summary::-webkit-details-marker {
-  display: none;
-}
-.wb-more[open] {
-  flex-basis: 100%;
-}
-.wb-more-body {
+.wb-menu-row {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 8px;
-  margin-top: 6px;
-  padding: 8px 10px;
-  background: var(--bg-card);
-  border: 1px dashed var(--border);
-  border-radius: var(--radius-sm);
 }
-.wb-adv {
-  margin-bottom: 10px;
-}
-.wb-adv summary {
-  cursor: pointer;
+.wb-feedback {
+  min-width: 140px;
+  flex: 1;
 }
 </style>

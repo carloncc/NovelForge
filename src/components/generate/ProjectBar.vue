@@ -27,8 +27,8 @@ const locked = computed(() => busy.value || !!assetBusy.value || queueRunning.va
         :placeholder="t('输出目录')"
         :title="projectState.outputDir || t('未设置输出目录')"
       />
-      <button class="link-btn" :disabled="locked" @click="browseOutputDir">{{ t("浏览…") }}</button>
-      <button class="link-btn" :disabled="locked" @click="loadProjectState">{{ t("加载该项目") }}</button>
+      <button class="btn secondary small" :disabled="locked" @click="browseOutputDir">{{ t("浏览…") }}</button>
+      <button class="btn secondary small" :disabled="locked" @click="loadProjectState">{{ t("加载该项目") }}</button>
     </div>
   </div>
 </template>

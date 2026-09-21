@@ -29,7 +29,7 @@ function gotoScriptRegen(): void {
 </script>
 
 <template>
-<div v-if="tab === 'video' || tab === 'asset'">
+<div v-if="tab === 'products'">
   <div class="card" v-if="videoPoints.length">
     <div class="card-head">
       <h3>{{ t("AI 推荐的视频演出位（{n} 个）", { n: videoPoints.length }) }}</h3>

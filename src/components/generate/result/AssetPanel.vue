@@ -91,7 +91,7 @@ watch(assetTab, () => {
 </script>
 
 <template>
-<div v-if="tab === 'asset'">
+<div v-if="tab === 'products'">
   <div v-if="!projectState.lastResult || !assetMap" class="empty">
     <img src="/src/assets/empty-generate.png" alt="" style="width: 220px; opacity: 0.9; margin-bottom: 12px" />
     <p>{{ t("暂无素材（生成后出现）。生成后可在本页对单张立绘、背景、CG、物品图或单句配音单独重新生成。") }}</p>

@@ -516,21 +516,29 @@ body {
   }
 }
 
-/* ===== 文本链接按钮（降级操作专用：无按钮外观，只有下划线） ===== */
+/* ===== 轻量按钮（原下划线文字链接：统一改成普通按钮外观，不用文字链接） ===== */
 .link-btn {
-  background: none;
-  border: none;
-  padding: 0;
-  color: var(--primary);
-  font-size: inherit;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 4px 10px;
+  color: var(--text);
+  font-size: 12.5px;
   font-family: inherit;
+  line-height: 1.5;
   cursor: pointer;
-  text-decoration: underline;
-  text-underline-offset: 2px;
+  text-decoration: none;
+  transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease);
 }
 
 .link-btn:hover {
-  filter: brightness(1.15);
+  background: var(--bg-hover);
+  border-color: var(--primary);
+  color: var(--primary);
 }
 
 .link-btn:disabled {
@@ -2083,7 +2091,7 @@ details.card[open] > summary.card-head h3::before {
   object-fit: contain;
 }
 
-/* 折叠区：服装锚点 / 提示词默认收起，减少 9 角色堆叠高度 */
+/* 小节框：服装锚点 / 提示词（不再折叠，全部直出） */
 .vb-fold {
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
@@ -2093,7 +2101,6 @@ details.card[open] > summary.card-head h3::before {
 }
 
 .vb-fold-summary {
-  cursor: pointer;
   padding: var(--space-2) var(--space-3);
   font-size: 12.5px;
   font-weight: 600;
@@ -2101,27 +2108,6 @@ details.card[open] > summary.card-head h3::before {
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  list-style: none;
-  user-select: none;
-}
-
-.vb-fold-summary::-webkit-details-marker {
-  display: none;
-}
-
-.vb-fold-summary::before {
-  content: "▸";
-  color: var(--text-faint);
-  font-size: 12px;
-  transition: transform var(--dur) var(--ease);
-}
-
-.vb-fold[open] > .vb-fold-summary::before {
-  transform: rotate(90deg);
-}
-
-.vb-fold-summary:hover {
-  color: var(--primary);
 }
 
 .vb-costume-grid {

@@ -56,7 +56,7 @@ function clearScriptOpinions(): void {
 </script>
 
 <template>
-<div v-if="tab === 'script'">
+<div v-if="tab === 'products'">
   <div class="card">
     <div class="card-head">
       <h3>{{ t("分章剧本（按意见重写）") }}</h3>

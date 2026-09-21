@@ -86,7 +86,7 @@ import type { ChapterScript } from "../core/types";
  * - 运行中途切换到别的页面再回来，状态与进行中的队列不会丢。
  */
 
-const tab = ref<"run" | "cards" | "video" | "script" | "log" | "failed" | "asset" | "bible">("run");
+const tab = ref<"run" | "products" | "settings" | "log">("run");
 
 /* ---- 生成范围（互斥）：逐章生成 / 整书生成 / 单阶段重跑 ---- */
 type RunMode = "full" | "stage" | "chapter";
@@ -111,22 +111,6 @@ watch(runMode, (m) => {
   }
 });
 
-/** 设置抽屉展开状态：跨页面/重启记住（无记录时默认收起，减少首屏控件） */
-const SETTINGS_OPEN_KEY = "novelforge:generate-settings-open";
-const settingsOpen = ref<boolean>((() => {
-  try {
-    return localStorage.getItem(SETTINGS_OPEN_KEY) === "1";
-  } catch {
-    return false;
-  }
-})());
-watch(settingsOpen, (v) => {
-  try {
-    localStorage.setItem(SETTINGS_OPEN_KEY, v ? "1" : "0");
-  } catch {
-    /* 忽略 */
-  }
-});
 // 载入小说后自动落到「逐章生成」（仅发生在「从无小说变为有小说」时）
 watch(
   () => projectState.novel,
@@ -790,7 +774,7 @@ async function runChapterBatchInner(indices: number[]): Promise<void> {
       at: Date.now(),
     });
   }
-  if (tab.value === "script") void loadScripts();
+  if (tab.value === "products") void loadScripts();
   // 收尾时重算一次（不用队列开始时的快照）：队列中途批准了视觉守门时，后面的章节是带着图像跑的，
   // 不能再按旧快照去提示"图片未生成"并记一份假的待补计划
   const imagesBlockedNow = projectState.options.useImage && visualBibleNeedsReview(projectState.visualBible);
@@ -1664,7 +1648,7 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
       if (!prepared) return false;
     } else if (!hasPreparedCards) {
       error.value = t("请先运行文本阶段，生成角色卡片后再确认视觉守门");
-      tab.value = "bible";
+      tab.value = "settings";
       return false;
     }
     // 章节范围要用「本次实际生效的值」：opts 未显式给定时沿用全局勾选（与后面管线启动同口径），
@@ -1678,7 +1662,7 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
       forceStages: opts.forceStages,
       feedback: opts.feedback,
     });
-    tab.value = "bible";
+    tab.value = "settings";
     pushLog({
       step: "视觉守门",
       message: t("图像生成前需要确认视觉守门；文本阶段已准备，请选择来源并创建/重新确认草稿"),
@@ -1968,7 +1952,7 @@ async function prepareVisualBible(): Promise<void> {
     ? selectedTextStages
     : (["split", "extract", "script"] as StageKey[]).filter((stage) => stage !== "translate");
   const prepared = await execute({ stages, clearLogsFirst: false });
-  if (prepared) tab.value = "bible";
+  if (prepared) tab.value = "settings";
 }
 
 async function resumeAfterVisualApproval(): Promise<void> {
@@ -2132,7 +2116,7 @@ function runStageRegen(stage: StageKey): void {
     // 图像要过视觉守门：交给守门页，批准后由 resumeAfterVisualApproval 续跑这批阶段
     if (plan.stages.includes("image") && visualBibleNeedsReview(projectState.visualBible)) {
       setPendingResume(plan.stages, { rerunChapters: rerunChapters.value });
-      tab.value = "bible";
+      tab.value = "settings";
       pushLog({
         step: "视觉守门",
         message: `下游待补齐：${plan.stages.map((s) => STAGE_LABELS[s]).join(" → ")}；请先确认视觉守门，批准后自动续跑`,
@@ -2373,7 +2357,7 @@ async function runChapterFullRegen(novelIdx: number, opts?: { fromQueueBatch?: b
   if (chapterFailed && forceAll) chapterForce.value[novelIdx] = true;
   void loadAssetMapNow(true);
   // 剧本页没开着就不必全量重读 game/scene（100 章规模下每次单章都读一遍很重）
-  if (tab.value === "script") void loadScripts();
+  if (tab.value === "products") void loadScripts();
   // 章节状态在 execute 的 finally 已全量刷新，这里不再重复
   if (!ok && !opts?.fromQueueBatch && !chapterFailed && error.value.includes("已中止组装以保护已有游戏内容")) {
     // 组装保护：剧本（+图像）其实已经落盘成功，只是还有章节没剧本、组装会缩水被拦。
@@ -2515,7 +2499,7 @@ async function runChapterPartRegen(novelIdx: number, part: "script" | "image" | 
   // 剧本重写成功才消费意见；失败保留，便于直接重试
   if (part === "script" && ok && !chapterFailed) scriptChapterFeedback.value[novelIdx] = "";
   void loadAssetMapNow(true);
-  if (tab.value === "script") void loadScripts();
+  if (tab.value === "products") void loadScripts();
   // 章节状态在 execute 的 finally 已全量刷新，这里不再重复
   if (
     !ok &&
@@ -4183,7 +4167,6 @@ export const generateStore = {
   STAGE_LABELS,
   initialRunMode,
   runMode,
-  settingsOpen,
   runModeHint,
   goFullMode,
   error,

@@ -1051,11 +1051,11 @@ async function regenCostumeSheet(characterId: string, costumeId: string): Promis
                 >{{ t("应用参考图") }}</button>
               </div>
             </div>
-            <details v-if="costumeSheetsFor(row.id).length" class="vb-fold">
-              <summary class="vb-fold-summary">
+            <div v-if="costumeSheetsFor(row.id).length" class="vb-fold">
+              <div class="vb-fold-summary">
                 {{ t("服装三视图锚点（换装用）") }}
                 <span class="vb-section-hint">{{ costumeSheetsFor(row.id).length }}{{ t("套") }}</span>
-              </summary>
+              </div>
               <div class="vb-costume-grid">
                 <div v-for="cs in costumeSheetsFor(row.id)" :key="cs.costumeId" class="vb-costume-cell">
                   <div
@@ -1076,9 +1076,9 @@ async function regenCostumeSheet(characterId: string, costumeId: string): Promis
                   </div>
                 </div>
               </div>
-            </details>
-            <details class="vb-fold">
-              <summary class="vb-fold-summary">{{ t("三视图提示词") }}</summary>
+            </div>
+            <div class="vb-fold">
+              <div class="vb-fold-summary">{{ t("三视图提示词") }}</div>
               <div class="vb-prompt-body">
                 <code>{{ bible.characters[row.id]?.prompt || t("暂无") }}</code>
                 <button
@@ -1091,7 +1091,7 @@ async function regenCostumeSheet(characterId: string, costumeId: string): Promis
                   {{ t("重新生成描述") }}
                 </button>
               </div>
-            </details>
+            </div>
             <p v-if="charErrors[row.id]" class="vb-error">{{ charErrors[row.id] }}</p>
           </div>
         </div>

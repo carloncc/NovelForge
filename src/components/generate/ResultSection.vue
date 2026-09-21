@@ -7,6 +7,7 @@ import AssetPanel from "./result/AssetPanel.vue";
 import VideoPanel from "./result/VideoPanel.vue";
 import ScriptPanel from "./result/ScriptPanel.vue";
 import FailedPanel from "./result/FailedPanel.vue";
+import LogPanel from "./result/LogPanel.vue";
 import { useGenerateController } from "../../stores/generate";
 
 /** UI15：用户可见数字按当前界面语言本地化；渲染时读取 currentLang，切语言后自动重渲染 */
@@ -14,7 +15,7 @@ function fmtNumber(n: number): string {
   return n.toLocaleString(currentLang.value);
 }
 
-// 结果区：错误提示 + 分组 tab；产物面板拆分为 result/ 下四个子组件。
+// 结果区：错误提示 + 4 个一级 tab（运行 / 产物 / 设定 / 日志）；相关面板在各自 tab 内堆叠直出。
 const {
   tab,
   runMode,
@@ -41,17 +42,13 @@ const {
   <p v-if="error" class="muted mt-3" style="color: var(--err)">{{ error }}</p>
 
   <div class="tabs">
-    <span class="tab-group">{{ t("运行") }}</span>
-    <button class="tab" :class="{ active: tab === 'run' }" @click="tab = 'run'">{{ t("状态与费用") }}</button>
-    <span class="tab-group">{{ t("产物") }}</span>
-    <button class="tab" :class="{ active: tab === 'script' }" @click="tab = 'script'; loadScripts()">{{ t("剧本") }}</button>
-    <button class="tab" :class="{ active: tab === 'asset' }" @click="tab = 'asset'; loadAssetMapNow(); checkVideos()">{{ t("素材与视频") }}</button>
-    <span class="tab-group">{{ t("设定") }}</span>
-    <button class="tab" :class="{ active: tab === 'cards' }" @click="tab = 'cards'">{{ t("卡片编辑") }}</button>
-    <button class="tab" :class="{ active: tab === 'bible' }" @click="tab = 'bible'">
-      {{ t("视觉守门") }}
+    <button class="tab" :class="{ active: tab === 'run' }" @click="tab = 'run'">{{ t("运行") }}</button>
+    <button class="tab" :class="{ active: tab === 'products' }" @click="tab = 'products'; loadScripts(); loadAssetMapNow(); checkVideos()">{{ t("产物") }}</button>
+    <button class="tab" :class="{ active: tab === 'settings' }" @click="tab = 'settings'">
+      {{ t("设定") }}
       <span v-if="visualBibleReviewNeeded" class="tab-badge">{{ t("待确认") }}</span>
     </button>
+    <button class="tab" :class="{ active: tab === 'log' }" @click="tab = 'log'">{{ t("日志") }}</button>
   </div>
 
   <div v-if="tab === 'run'">
@@ -96,28 +93,28 @@ const {
       </div>
     </div>
 
-    <!-- 失败项并入「运行」：出问题时只在一个地方处理；日志已移到生成页主页面常驻显示 -->
+    <!-- 失败项并入「运行」：出问题时只在一个地方处理；日志已独立为「日志」tab -->
     <FailedPanel />
   </div>
 
-  <div v-else-if="tab === 'cards'">
+  <div v-else-if="tab === 'products'">
+    <!-- 剧本 → 素材 → 视频：三块直出堆叠，各自的卡头就是小节标题 -->
+    <ScriptPanel />
+    <AssetPanel />
+    <VideoPanel />
+  </div>
+
+  <div v-else-if="tab === 'settings'">
     <EditCards v-if="projectState.lastResult" :cards="projectState.lastResult.cards" @saved="onCardsSaved" />
     <div v-else class="empty">
       <img src="/src/assets/empty-generate.png" alt="" style="width: 240px; opacity: 0.9; margin-bottom: 12px" />
       <p>{{ t("尚无生成结果，先运行一次生成") }}</p>
       <button class="btn small" @click="runMode = 'full'">{{ t("去整书生成") }}</button>
     </div>
+    <VisualBiblePanel class="mt-4" @approve="resumeAfterVisualApproval" @changed="onVisualBibleChanged" @prepare="prepareVisualBible" />
   </div>
 
-  <div v-else-if="tab === 'bible'">
-    <VisualBiblePanel @approve="resumeAfterVisualApproval" @changed="onVisualBibleChanged" @prepare="prepareVisualBible" />
-  </div>
-
-  <AssetPanel />
-
-  <VideoPanel />
-
-  <ScriptPanel />
+  <LogPanel v-else-if="tab === 'log'" />
 
   <p v-if="copiedMsg" :style="{ color: copiedMsgLevel === 'err' ? 'var(--err)' : 'var(--ok)', fontSize: '12px', marginTop: '6px' }">{{ copiedMsg }}</p>
 </template>
