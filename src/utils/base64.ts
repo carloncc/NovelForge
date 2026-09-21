@@ -10,3 +10,14 @@ export function b64encode(data: Uint8Array): string {
   }
   return btoa(binary);
 }
+
+/** base64 → Uint8Array（Node/Browser 通用：优先 Buffer，回退 atob） */
+export function b64decode(dataB64: string): Uint8Array {
+  if (typeof Buffer !== "undefined") {
+    return new Uint8Array(Buffer.from(dataB64, "base64"));
+  }
+  const bin = atob(dataB64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}

@@ -361,6 +361,9 @@ export interface ImageTask {
   sceneId?: string;
   /** 图片小说分镜在场景内的序号（0-based，仅 kind=shot） */
   shotIndex?: number;
+  /** 差分生成方式（仅表情差分）：expression=优先走 GPT-Image 编辑端点（只改表情、其余保持）；
+   *  其他模型/编辑失败时自动回退参考图生图 */
+  editVariant?: "expression";
 }
 
 export interface ProjectMeta {

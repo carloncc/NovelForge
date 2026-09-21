@@ -172,6 +172,13 @@
 - 项目栏从「嵌套折叠」改为设置内扁平一行（状态标签 + 输出目录输入 + 浏览/加载），少一层折叠
 - 逐章列表的「重跑」链接在鼠标设备上默认隐藏、悬停/键盘聚焦才显示（触屏设备保持可见），20+ 行不再常驻 20+ 个链接
 
+### 新增（表情差分走 GPT-Image 编辑模式 2026-09-21）
+- 表情差分（非 normal）在 **GPT-Image 系线路**上优先走官方 `POST /v1/images/edits`：以现有立绘为原图，指令只改表情并列出「保持不变清单」（身份/发型/服装/姿势/构图/光影/绿幕底/画风）——姿势与构图不再因重画而漂移，切换表情不跳图
+- **其他模型/线路保持原样**（三视图/普通立绘 + 参考图生图）；编辑端点不可用或调用失败（线路不支持/审核/网络）自动回退原路径，不影响出图
+- 实现：新增 `src/api/imageEdits.ts`（`supportsImageEdits` 判定 GPT-Image 家族 + multipart 拼装 + 经 `runWithImageLimit` 复用图像并发限流）；multipart 通过 `tauri.http` 的 bodyBase64 直发，Tauri 与网页版两条传输无需 Rust/代理改动；`ImageTask.editVariant` 标记表情差分任务
+- 测试：`unit-image-edits`（模型白名单、multipart 字段/字节无损、任务标记、编辑指令包含保持不变清单）；全套 **72/72**、build 通过
+- 依据：OpenAI 官方 SDK `openai@7.20.0` 类型定义（本机直连 developers.openai.com 被 403，改用官方 SDK 作为官网事实来源）；顺带核实：edits 无 `moderation` 参数、`input_fidelity` 对 gpt-image-2 为「忽略」、`transparent` 对 gpt-image-2 属 preview（2.5 flare/sunburst 才正式支持）
+
 ### 修复 + 新增（游戏文案正确性与立绘半身取景 2026-09-21）
 - 修复：作品标题解析错误——游戏标题/菜单/PWA 显示成了小说文件名（用户实测「175812 gbk」）。新增 `resolveProjectTitle`：导出标题 → 卡片标题（过滤纯数字/编码标记等垃圾串）→ 输出目录名 → 文件名兜底；提取与组装两处统一使用
 - 修复：章节标题卡重复前缀（「第 1 章 · 第一卷 第一章 成功回避死亡结局」）——标题本身已含「第X章/第X卷」时不再拼接前缀

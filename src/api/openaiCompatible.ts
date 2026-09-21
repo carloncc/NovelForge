@@ -58,6 +58,11 @@ export function setImageConcurrency(cfg: ApiConfig, n: number): void {
   imageLimiterFor(cfg).setMaxConcurrent(Math.max(1, Math.min(IMAGE_MAX_CONCURRENT, Math.floor(n) || 1)));
 }
 
+/** 在图像 API 的并发限流下执行（供编辑端点等旁路请求复用，与 generateImage 同口径） */
+export function runWithImageLimit<T>(cfg: ApiConfig, task: () => Promise<T>): Promise<T> {
+  return imageLimiterFor(cfg).run(task);
+}
+
 /**
  * 文本/视觉 LLM 请求并发上限（按 API 隔离，各配置互不影响）。
  * 文本请求体可达 2 万+ 字符，并发过大会同时向文本 API 发大请求，触发网关限流 / error sending request。

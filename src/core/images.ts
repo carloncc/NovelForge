@@ -15,6 +15,7 @@ import type {
 import type { ApiConfig } from "./types";
 import { generateImage, ReferenceImageError, VisionApiError, setImageConcurrency, chatCompletion } from "../api/openaiCompatible";
 import { referenceRouteRejection, resolveImageModelCapabilities } from "../api/providers";
+import { editImageVariant, supportsImageEdits } from "../api/imageEdits";
 import { verifyImage } from "./selfcheck";
 import { describeReferenceImageCached } from "./recognize";
 import { tauri } from "../utils/tauri";
@@ -125,6 +126,25 @@ function emotionPrompt(base: string, emo: string, label?: string): string {
 // 严禁模型自行脑补手势——此前的 "clearly performing the described hand gesture"
 // 会逼模型给纯表情动作（如撒娇鼓脸）凭空配一个举手，出来全是怪动作。
 const ACTION_CLARITY_HINT = ", perform only the pose elements explicitly described above, everything else in a natural relaxed standing pose with arms resting naturally at sides, do not invent any hand gestures, no raised hands, no waving, no pointing, no peace sign, no thumbs up, no hands on hips unless explicitly described, full body visible";
+
+/** 表情差分编辑指令（GPT-Image 编辑模式）：只改表情 + 明确的保持不变清单（模型对"保持不变"更敏感） */
+const EMOTION_EDIT_HINT: Record<string, string> = {
+  happy: "happy, smiling brightly with cheerful eyes and mouth",
+  sad: "sad, sorrowful expression with downturned mouth and teary eyes",
+  angry: "angry, frowning with furrowed brows and sharp eyes",
+  surprised: "surprised, wide eyes and slightly open mouth",
+  shy: "shy, blushing with slightly averted eyes",
+};
+
+export function expressionEditPrompt(task: ImageTask): string {
+  const key = (task.emotion ?? "").toLowerCase();
+  const hint = EMOTION_EDIT_HINT[key] ?? (key || "the requested emotion");
+  return [
+    `Edit this character sprite: change ONLY the facial expression to "${hint}".`,
+    "Keep everything else exactly the same: identical character and face, same hairstyle and hair color, same outfit and accessories, same body pose and arm position, same framing and crop, same lighting and shadows, same plain green screen background, same anime art style.",
+    "Do not redesign or restyle the character. Do not change the pose. Do not add text, watermark, logos, extra hands or extra limbs.",
+  ].join(" ");
+}
 
 // 统一画风：保证同一项目内所有立绘/背景/CG 视觉风格一致（同一个"维度"）
 const DEFAULT_STYLE =
@@ -393,6 +413,8 @@ export function buildImageTasks(
           id: isNormal ? char.id : `${char.id}_${emoId}`,
           characterId: char.id,
           emotion: emoId,
+          // 表情差分：GPT-Image 线路优先走编辑端点（以普通立绘为原图，只改表情、其余保持）
+          ...(isNormal ? {} : { editVariant: "expression" as const }),
           prompt: emotionPrompt(char.imagePrompt, emoId, emoRaw) + REF_HINT + figureStyle + FIGURE_BG_SUFFIX,
           refFromTask: isNormal ? (threeView ? `${char.id}_threeview` : undefined) : char.id,
           fileName: `figure_${sanitizeId(char.id)}_${emoId}.png`,
@@ -1217,13 +1239,46 @@ export async function runImageTask(
       }
       // 生成失败自动重试：分类驱动 + 内容审查自动改写提示词 + 递增间隔（1s→10s→20s→…→60s 封顶）
       const retryCount = Math.max(0, opts.retryCount ?? 3) - 1;
-      let img: { dataB64: string; mime: string };
+      let img: { dataB64: string; mime: string } = { dataB64: "", mime: "" };
+      // 表情差分编辑模式（仅 GPT-Image 系）：以现有立绘为原图只改表情，姿势/构图/服装保持一致。
+      // 其他线路不支持编辑端点 → 直接走原路径；编辑失败 → 回退参考图生图（不影响出图）。
+      let edited = false;
+      if (task.editVariant === "expression" && supportsImageEdits(cfg?.model) && !aborted()) {
+        const basePath = task.refFromTask ? opts.figureBase?.[task.refFromTask] : undefined;
+        if (basePath && (await tauri.pathExists(basePath).catch(() => false))) {
+          try {
+            const baseB64 = await tauri.readFileBase64(basePath);
+            img = await editImageVariant(cfg!, {
+              prompt: expressionEditPrompt(task),
+              imageB64: baseB64,
+              imageMime: imageMimeForPath(basePath),
+              width: task.width,
+              height: task.height,
+            });
+            edited = true;
+            log({
+              step: "图像",
+              message: `表情差分走编辑模式（只改表情，姿势/构图保持）：${task.usage}`,
+              level: "info",
+              at: Date.now(),
+            });
+          } catch (e) {
+            logger.warn("images", "表情差分编辑模式失败，回退参考图生图", { id: task.id, error: errMsg(e).slice(0, 200) });
+            log({
+              step: "图像",
+              message: `编辑模式不可用，改用参考图生图：${task.usage}（${errMsg(e).slice(0, 80)}）`,
+              level: "warn",
+              at: Date.now(),
+            });
+          }
+        }
+      }
       let prompt = finalPrompt;
       // 内容审查改写阶梯：0=原提示词 → 1=规则改写 → 2=LLM 语义改写 → 3=追加全年龄安全后缀
       let moderationStage = 0;
       // 提示词超长压缩：服务端报错携带上限时按上限压缩重试 1 次（覆盖未预设上限的服务）
       let promptFitted = false;
-      for (let attempt = 0; ; attempt++) {
+      for (let attempt = 0; !edited; attempt++) {
         // 已中止：不再发起新的付费生成请求（本书最主要的花钱点）
         if (aborted()) return null;
         try {
