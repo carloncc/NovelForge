@@ -93,6 +93,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::http_request,
+            commands::cancel_http_request,
             commands::read_text_file,
             commands::write_text_file,
             commands::read_file_base64,
@@ -102,6 +103,7 @@ pub fn run() {
             commands::mkdir_all,
             commands::copy_file,
             commands::replace_path,
+            commands::cleanup_stale_files,
             commands::copy_dir_all,
             commands::remove_path,
             commands::path_exists,

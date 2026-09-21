@@ -1,4 +1,5 @@
 import { tauri } from "../utils/tauri";
+import { activeAbortSignal } from "./abort";
 import { version as APP_VERSION } from "../../package.json";
 import type { ApiConfig, ChannelKey, ImageModelCapabilities, ImageReference } from "../core/types";
 import { unifiedImage, unifiedTts, utf8FromB64 } from "./universal";
@@ -132,7 +133,7 @@ export function disposeLimiters(): void {
       ...headersFor(cfg),
     },
     timeoutSecs: 20,
-  });
+  }, activeAbortSignal());
   if (response.status >= 400) {
     const raw = utf8FromB64(response.bodyBase64).slice(0, 400);
     log.error("api", "拉取模型列表失败", { url, status: response.status, raw });
@@ -401,7 +402,6 @@ export async function withRetry<T>(
   fn: () => Promise<T>,
   opts?: { retries?: number; delayFor?: (attempt: number) => number; signal?: AbortSignal },
 ): Promise<T> {
-  let lastErr: unknown;
   const retries = opts?.retries ?? 4;
   const delayFor = opts?.delayFor ?? retryDelayFor;
   for (let attempt = 0; ; attempt++) {
@@ -409,7 +409,6 @@ export async function withRetry<T>(
     try {
       return await fn();
     } catch (e) {
-      lastErr = e;
       // 视觉能力不支持/响应结构非法：模型就是不看图或返回空，重试 4 次只会白烧付费请求（B92）
       if (e instanceof VisionApiError && (e.code === "VISION_CAPABILITY_UNSUPPORTED" || e.code === "VISION_RESPONSE_INVALID")) {
         throw e;
@@ -430,7 +429,6 @@ export async function withRetry<T>(
       await sleepAbortable(delay, opts?.signal);
     }
   }
-  throw lastErr;
 }
 
 export function retryDelayFor(attempt: number): number {
@@ -500,7 +498,7 @@ export async function chatCompletion(
       headers: headersFor(cfg),
       body: JSON.stringify(requestBody),
       timeoutSecs: opts.timeoutSecs ?? 180,
-    });
+    }, opts.signal ?? activeAbortSignal());
     const text = b64ToUtf8(res.bodyBase64);
     if (res.status >= 500 || res.status === 429) {
       log.warn("api", `chatCompletion HTTP ${res.status}`, { url, raw: text.slice(0, 600) });
@@ -895,7 +893,7 @@ export async function chatVision(
       headers: headersFor(cfg),
       body: JSON.stringify(body),
       timeoutSecs: opts.timeoutSecs ?? 120,
-    });
+    }, opts.signal ?? activeAbortSignal());
     if (res.status >= 500 || res.status === 429) {
       log.error("api", `chatVision 服务端错误 ${res.status}`, { url: chatUrl, model: cfg.model });
       throw { status: res.status, message: `HTTP ${res.status}` };

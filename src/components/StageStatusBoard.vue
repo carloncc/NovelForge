@@ -55,11 +55,17 @@ const stageOrder = computed(() => STAGE_ORDER);
         <b>{{ t(STAGE_LABELS[s]) }}</b>
         <span class="stage-state-text" :class="statuses[s]">{{ stateText(statuses[s], s) }}</span>
       </div>
-      <input v-if="showFeedback(s)" type="text" v-model="feedback[s]" :disabled="busy" :placeholder="s === 'voice' ? t('意见（填了=全书重配，计费）') : t('意见（填了=全量重生成，计费）')" />
-      <label v-if="showForce(s)" class="opt-item mb-0" :title="t('勾选后无视缓存全量重跑该阶段（计费），不需要填意见；执行前会二次确认')">
-        <input type="checkbox" v-model="force[s]" :disabled="busy" />
-        {{ t("全量") }}
-      </label>
+      <!-- 意见与全量收进折叠：每行默认只有「状态 + 重新生成」两个焦点，面板不再一屏 20+ 控件 -->
+      <details v-if="showFeedback(s)" class="stage-more">
+        <summary class="link-btn">{{ t("意见/全量") }}</summary>
+        <div class="stage-more-body">
+          <input type="text" v-model="feedback[s]" :disabled="busy" :placeholder="s === 'voice' ? t('意见（填了=全书重配，计费）') : t('意见（填了=全量重生成，计费）')" />
+          <label v-if="showForce(s)" class="opt-item mb-0" :title="t('勾选后无视缓存全量重跑该阶段（计费），不需要填意见；执行前会二次确认')">
+            <input type="checkbox" v-model="force[s]" :disabled="busy" />
+            {{ t("全量") }}
+          </label>
+        </div>
+      </details>
       <button
         class="btn small"
         :disabled="busy"
@@ -118,5 +124,34 @@ const stageOrder = computed(() => STAGE_ORDER);
 }
 .stage-state-text.running {
   color: var(--accent);
+}
+/* 每行的「意见/全量」：默认收起为文本链接，展开后独占一行 */
+.stage-more {
+  position: relative;
+}
+.stage-more summary {
+  list-style: none;
+  cursor: pointer;
+}
+.stage-more summary::-webkit-details-marker {
+  display: none;
+}
+.stage-more[open] {
+  flex-basis: 100%;
+}
+.stage-more-body {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  padding: 8px 10px;
+  background: var(--bg-card);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+}
+.stage-more-body input[type="text"] {
+  min-width: 160px;
+  flex: 1;
 }
 </style>

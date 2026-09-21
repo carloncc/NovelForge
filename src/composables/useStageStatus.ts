@@ -3,7 +3,7 @@ import type { ApiConfig, AssetMap, FailedTask, GenerationOptions, NovelDoc, Pipe
 import { STAGE_ORDER, STEP_TO_STAGE } from "../core/types";
 import { buildImageTasks } from "../core/images";
 import { buildVoiceJobs } from "../core/voice";
-import { scriptCacheRest, titleHash } from "../core/cache";
+import { scriptCacheRest, scriptFingerprint, titleHash, cardsFingerprint } from "../core/cache";
 import { tauri } from "../utils/tauri";
 import { parseAssetMap } from "../core/assetMap";
 
@@ -23,6 +23,8 @@ export interface StageStatusInput {
   getResult: () => PipelineResult | null;
   getOptions: () => GenerationOptions;
   getTtsConfig: () => ApiConfig | undefined;
+  /** 文本 LLM 是否可用：决定提取阶段认哪份卡片（正式 cards.json / 演示 cards_demo.json，见 #792） */
+  getLlmAvailable: () => boolean;
 }
 
 export function useStageStatus(input: StageStatusInput) {
@@ -91,6 +93,20 @@ export function useStageStatus(input: StageStatusInput) {
     return matched;
   }
 
+  /** 卡片指纹（剧本缓存键的一部分）：按当前模式优先读对应卡片文件；读不到时用空串（此时脚本计数必然为 0） */
+  async function readCardsFingerprint(metaDir: string, formal: boolean): Promise<string> {
+    for (const f of formal ? ["cards.json", "cards_demo.json"] : ["cards_demo.json", "cards.json"]) {
+      try {
+        const { text } = await tauri.readTextFile(`${metaDir}/${f}`);
+        const parsed = JSON.parse(text) as { characters?: { id: string; name?: string }[] };
+        if (Array.isArray(parsed.characters)) return cardsFingerprint(parsed);
+      } catch {
+        /* 换下一个 */
+      }
+    }
+    return "";
+  }
+
   async function assetMap(dir: string): Promise<AssetMap | undefined> {
     try {
       const { text } = await tauri.readTextFile(`${dir}/.novel2vn/assets.json`);
@@ -144,15 +160,18 @@ export function useStageStatus(input: StageStatusInput) {
       return;
     }
     const metaDir = `${dir}/.novel2vn`;
-    const [split, cards, demoCards, meta] = await Promise.all([
+    const [split, cards, demoCards, meta, cardsFp] = await Promise.all([
       pathExists(`${metaDir}/split.json`),
       pathExists(`${metaDir}/cards.json`),
       pathExists(`${metaDir}/cards_demo.json`),
       pathExists(`${metaDir}/meta.json`),
+      readCardsFingerprint(metaDir, input.getLlmAvailable()),
     ]);
     if (token !== refreshToken) return;
     base.split = split || (novel?.chapters.length ?? 0) > 1;
-    base.extract = cards || demoCards;
+    // demo/正式隔离（#792）：提取阶段只看当前模式对应的卡片文件，
+    // 否则演示模式会被正式 cards.json 点绿（或反之），与剧本缓存前缀口径不一致
+    base.extract = input.getLlmAvailable() ? cards : demoCards;
     base.assemble = meta;
 
     const activeCount = novel?.chapters.filter((c) => c.enabled !== false).length ?? 0;
@@ -176,8 +195,8 @@ export function useStageStatus(input: StageStatusInput) {
     // 剧本：逐章校验与「当前标题＋正文＋文风（翻译感知）」指纹匹配的缓存（正式/演示前缀都认），
     // 只有数量达标才判完成（旧实现只数文件个数，改写正文/换文风后旧残留仍会点绿）
     const styleFrag = (() => {
-      const style = (input.getOptions().scriptStyle ?? "").trim();
-      return style ? `_st${titleHash(style)}` : "";
+      const options = input.getOptions();
+      return scriptFingerprint({ style: options.scriptStyle, compressNarration: options.compressNarration, cardsFp });
     })();
     const freshScripts = await countFreshScripts(metaDir, lang, enabledChapters, styleFrag);
     if (token !== refreshToken) return;

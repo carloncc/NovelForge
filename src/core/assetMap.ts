@@ -5,7 +5,7 @@ import { log } from "../utils/logger";
 const updateChains = new Map<string, Promise<void>>();
 
 export function emptyAssetMap(): AssetMap {
-  return { bg: {}, cg: {}, figure: {}, item: {}, vocal: {} };
+  return { bg: {}, cg: {}, figure: {}, item: {}, vocal: {}, shot: {} };
 }
 
 function stringMap(input: unknown, field: keyof AssetMap): Record<string, string> {
@@ -25,6 +25,8 @@ export function parseAssetMap(input: unknown): AssetMap {
     figure: stringMap(record.figure, "figure"),
     item: stringMap(record.item, "item"),
     vocal: stringMap(record.vocal, "vocal"),
+    // 图片小说分镜（可选字段）：旧 assets.json 没有该键时按空处理
+    shot: stringMap(record.shot, "shot"),
   };
 }
 

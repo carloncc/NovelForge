@@ -142,6 +142,37 @@ function main(): void {
   const afterRe = verifyScriptAgainstSource(srcFixed, repairedScript.scenes, characters);
   assert(!afterRe.speakerIssues.some((i) => i.reason === "context-mismatch"), "修正后说话人存疑应消失");
 
+  // 段落覆盖率（#794）：对话全保但旁白/描写被删光时必须被发现
+  const srcNarration = [
+    "夜色像墨一样压下来，城门的火把在风里摇晃，守夜人握紧了剑柄。",
+    "他想起十年前那个同样寒冷的夜晚，父亲在城墙上倒下时说的话。",
+    "远处传来脚步声，越来越近，他抬头望向官道的尽头。",
+    "「谁在那里？」他压低声音问道。",
+  ].join("\n");
+  const onlyDialogue = verifyScriptAgainstSource(srcNarration, [
+    { lines: [{ type: "dialogue", characterId: "yuto", text: "谁在那里？" }] },
+  ], characters);
+  assert(onlyDialogue.paragraphCount === 4, `原文应有 4 段，实际 ${onlyDialogue.paragraphCount}`);
+  assert(onlyDialogue.coveredParagraphCount === 1, `只有对话段被覆盖，实际 ${onlyDialogue.coveredParagraphCount}`);
+  assert(onlyDialogue.narrationRatio < 0.4, `旁白删光后段落覆盖率应偏低，实际 ${onlyDialogue.narrationRatio}`);
+
+  const keepNarration = verifyScriptAgainstSource(srcNarration, [
+    {
+      lines: [
+        { type: "narration", text: "夜色像墨一样压下来，城门的火把在风里摇晃，守夜人握紧了剑柄。" },
+        { type: "narration", text: "他想起十年前那个同样寒冷的夜晚，父亲在城墙上倒下时说的话。" },
+        { type: "narration", text: "远处传来脚步声，越来越近，他抬头望向官道的尽头。" },
+        { type: "dialogue", characterId: "yuto", text: "谁在那里？" },
+      ],
+    },
+  ], characters);
+  assert(keepNarration.coveredParagraphCount === 4, `旁白保留时段落应全部覆盖，实际 ${keepNarration.coveredParagraphCount}`);
+  assert(keepNarration.narrationRatio === 1, `旁白保留时段落覆盖率应为 1，实际 ${keepNarration.narrationRatio}`);
+
+  // 无段落（极短原文）时不误报
+  const tiny = verifyScriptAgainstSource("「走。」", [{ lines: [{ type: "dialogue", characterId: "yuto", text: "走。" }] }], characters);
+  assert(tiny.paragraphCount === 0 && tiny.narrationRatio === 1, "无长段落时段落覆盖率应为 1（不误报）");
+
   console.log("=== script verify tests passed ===");
 }
 

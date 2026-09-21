@@ -1,6 +1,7 @@
 import type { ApiConfig, ImageReference } from "../core/types";
 import { rawReferenceBase64, ReferenceImageError, referenceDataUrl, referenceRouteRejection } from "./providers";
 import { tauri } from "../utils/tauri";
+import { activeAbortSignal } from "./abort";
 import { log } from "../utils/logger";
 import { classifyError } from "../utils/errorClassifier";
 import { normalizeProviderBaseUrl, customHeadersFor, joinApiPath } from "./baseUrl";
@@ -332,7 +333,7 @@ async function decodeResult(
   }
   if (encoding === "none" || /^https?:\/\//i.test(value)) {
     if (/^https?:\/\//i.test(value)) {
-      const res = await tauri.http({ method: "GET", url: value, timeoutSecs: 120 });
+      const res = await tauri.http({ method: "GET", url: value, timeoutSecs: 120 }, activeAbortSignal());
       // 之前不检查状态码：403/404 的错误 JSON 也会被当成"图片数据"返回（静默产出损坏文件）
       if (res.status < 200 || res.status >= 300) {
         let detail = "";
@@ -497,7 +498,7 @@ async function requestWithRetry(
         headers,
         body: payload,
         timeoutSecs: 300,
-      });
+      }, activeAbortSignal());
       // 只在需要时解码响应体：rawResponse 的成功路径可能是几 MB 的音频/图片字节，
       // 每次都转成字符串（旧 postJson 为解析 JSON 才需要）会白白构造大字符串
       const needRaw = res.status >= 400 || options?.parseJson === true;
@@ -596,7 +597,7 @@ async function getJson(cfg: ApiConfig, url: string, template: AdapterTemplate, i
         url,
         headers: { ...authHeaders(cfg, template), ...customHeadersFor(cfg) },
         timeoutSecs: 60,
-      });
+      }, activeAbortSignal());
       const raw = utf8FromB64(res.bodyBase64);
       if (res.status >= 500 || res.status === 429) {
         throw { status: res.status, message: `HTTP ${res.status}` };

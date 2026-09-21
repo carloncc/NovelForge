@@ -110,10 +110,14 @@ async function httpFallback(args: {
   body?: string;
   bodyBase64?: string;
   timeoutSecs?: number;
-}): Promise<HttpResult> {
-  if (isWebRuntime()) return (await webRuntime()).webHttp(args);
+}, signal?: AbortSignal): Promise<HttpResult> {
+  if (isWebRuntime()) return (await webRuntime()).webHttp({ ...args, signal });
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), (args.timeoutSecs ?? 120) * 1000);
+  // 外部中止（「停止」）与超时共用一个 controller：任一触发即中断 fetch
+  const onAbort = (): void => controller.abort();
+  if (signal?.aborted) controller.abort();
+  signal?.addEventListener("abort", onAbort, { once: true });
   try {
     const resp = await fetch(args.url, {
       method: args.method,
@@ -129,6 +133,35 @@ async function httpFallback(args: {
     };
   } finally {
     clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort);
+  }
+}
+
+/* #784：在途 HTTP 请求取消。每个带 signal 的 Tauri 请求分配 requestId，
+   abort 时调用 Rust cancel_http_request 中断 reqwest 请求（AbortHandle.abort）。 */
+let nextHttpRequestId = 1;
+async function invokeHttpWithCancel(
+  args: {
+    method: string;
+    url: string;
+    headers?: Record<string, string>;
+    body?: string;
+    bodyBase64?: string;
+    timeoutSecs?: number;
+  },
+  signal?: AbortSignal,
+): Promise<HttpResult> {
+  if (!signal) return invoke("http_request", { args });
+  if (signal.aborted) throw new Error("已中止");
+  const requestId = nextHttpRequestId++;
+  const onAbort = (): void => {
+    void invoke("cancel_http_request", { requestId }).catch(() => undefined);
+  };
+  signal.addEventListener("abort", onAbort, { once: true });
+  try {
+    return await invoke("http_request", { args, requestId });
+  } finally {
+    signal.removeEventListener("abort", onAbort);
   }
 }
 
@@ -270,9 +303,9 @@ export const tauri = {
     body?: string;
     bodyBase64?: string;
     timeoutSecs?: number;
-  }): Promise<HttpResult> => {
-    if (isTauri()) return invoke("http_request", { args });
-    return httpFallback(args);
+  }, signal?: AbortSignal): Promise<HttpResult> => {
+    if (isTauri()) return invokeHttpWithCancel(args, signal);
+    return httpFallback(args, signal);
   }),
   readTextFile: wrap("readTextFile", (path: string): Promise<{ text: string; encoding: string }> => {
     if (isTauri()) return invoke("read_text_file", { path });
@@ -348,8 +381,13 @@ export const tauri = {
       }
     });
   }),
-  removePath: wrap("removePath", (path: string): Promise<void> => {
-    if (isTauri()) return invoke("remove_path", { path });
+  /** 启动清理崩溃残留（#783）：删除本程序原子写留下的 .tmp、恢复/清理 .replace-backup。
+   *  仅 Tauri 运行时产生这类文件；Web/Node 直接返回 0。 */
+  cleanupStaleFiles: wrap("cleanupStaleFiles", (root: string, maxDepth?: number): Promise<{ removed: number; restored: number }> => {
+    if (isTauri()) return invoke("cleanup_stale_files", { root, maxDepth }) as Promise<{ removed: number; restored: number }>;
+    return Promise.resolve({ removed: 0, restored: 0 });
+  }),
+  removePath: wrap("removePath", (path: string): Promise<void> => {    if (isTauri()) return invoke("remove_path", { path });
     if (isWebRuntime()) return webRuntime().then((web) => web.webRemovePath(path));
     return import("node:fs/promises").then(async (fs) => {
       await fs.rm(path, { recursive: true, force: true });

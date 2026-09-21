@@ -4,7 +4,7 @@ import StageStatusBoard from "../StageStatusBoard.vue";
 import { projectState } from "../../stores/project";
 import { useGenerateController } from "../../stores/generate";
 
-const { busy, stageStatus, failedCounts, stageFeedback, stageForce, runStageRegen, goFullMode } =
+const { busy, stageStatus, failedCounts, stageFeedback, stageForce, runStageRegen, goFullMode, imagePlanText } =
   useGenerateController();
 </script>
 
@@ -43,6 +43,8 @@ const { busy, stageStatus, failedCounts, stageFeedback, stageForce, runStageRege
           <span>{{ t("组装为本地操作（不计费）：关闭「跑完自动补齐下游」后，需手动点「组装」刷新预览") }}</span>
         </span>
       </div>
+
+      <p class="hint mt-2"><strong>{{ t("图片统计：") }}</strong>{{ imagePlanText }}</p>
 
       <details class="mt-3">
         <summary class="hint" style="cursor: pointer">{{ t("说明：重跑口径与计费") }}</summary>

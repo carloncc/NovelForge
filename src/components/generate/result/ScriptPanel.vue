@@ -3,7 +3,7 @@ import { computed } from "vue";
 import { t } from "../../../i18n";
 import { projectState } from "../../../stores/project";
 import { tauri } from "../../../utils/tauri";
-import { SCRIPT_MIN_KEPT_RATIO } from "../../../core/script";
+import { SCRIPT_MIN_KEPT_RATIO, SCRIPT_MIN_NARRATION_RATIO } from "../../../core/script";
 import { useGenerateController } from "../../../stores/generate";
 
 // 结果区子面板：状态全部来自 generate store。
@@ -93,6 +93,11 @@ function clearScriptOpinions(): void {
       <div class="stage-row-label" style="margin-bottom: 6px">
         <b>{{ chapterLabel(rep) }}</b>
         <span class="tag" :class="rep.keptRatio >= SCRIPT_MIN_KEPT_RATIO ? 'ok' : 'warn'">{{ t("覆盖率") }}{{ Math.round(rep.keptRatio * 100) }}%（{{ rep.dialogueCount }}/{{ rep.originalQuoteCount }}）</span>
+        <span
+          v-if="typeof rep.narrationRatio === 'number'"
+          class="tag"
+          :class="rep.narrationRatio >= SCRIPT_MIN_NARRATION_RATIO ? 'ok' : 'warn'"
+        >{{ t("段落覆盖") }}{{ Math.round(rep.narrationRatio * 100) }}%（{{ rep.coveredParagraphCount }}/{{ rep.paragraphCount }}）</span>
         <span v-if="visibleVerifyIssues(rep).length" class="tag err">{{ t("存疑") }}{{ visibleVerifyIssues(rep).length }}</span>
         <span v-else class="tag ok">{{ t("无存疑") }}</span>
         <span v-if="trivialVerifyCount(rep) && !showTrivialVerify" class="hint">{{ t("另有") }}{{ trivialVerifyCount(rep) }}{{ t("条短句乱序已折叠") }}</span>

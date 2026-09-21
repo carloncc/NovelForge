@@ -1,6 +1,6 @@
 import { join, normalize } from "node:path";
 import { isPathInside, validateProxyUrl } from "../vite.config";
-import { webHttp } from "../src/utils/webRuntime";
+import { ProxyHttpError, webHttp } from "../src/utils/webRuntime";
 
 function assert(condition: boolean, message: string): void {
   if (!condition) throw new Error(message);
@@ -13,6 +13,7 @@ assert(!isPathInside(base, join(base, "..", "outside.txt")), "parent traversal m
 
 assert(validateProxyUrl("https://api.example.com/v1").protocol === "https:", "HTTPS proxy targets must be accepted");
 assert(validateProxyUrl("http://127.0.0.1:11434/v1").hostname === "127.0.0.1", "local HTTP targets must remain available for Ollama");
+assert(validateProxyUrl("http://localhost:1234/v1").hostname === "localhost", "localhost must remain available for local models");
 for (const target of ["file:///etc/passwd", "ftp://example.com/file", "not-a-url"]) {
   let rejected = false;
   try {
@@ -21,6 +22,26 @@ for (const target of ["file:///etc/passwd", "ftp://example.com/file", "not-a-url
     rejected = true;
   }
   assert(rejected, `unsafe proxy target must be rejected: ${target}`);
+}
+// #791 私网/链路本地/云元数据：同源脚本被注入时不能借代理探测内网
+for (const target of [
+  "http://169.254.169.254/latest/meta-data",
+  "http://10.0.0.5/v1",
+  "http://172.20.3.4/v1",
+  "http://192.168.1.10:8080/v1",
+  "http://0.0.0.0:8000/v1",
+  "http://100.64.0.1/v1",
+  "http://[fe80::1]/v1",
+  "http://[fd00::1]/v1",
+  "http://[::ffff:192.168.0.1]/v1",
+]) {
+  let rejected = false;
+  try {
+    validateProxyUrl(target);
+  } catch {
+    rejected = true;
+  }
+  assert(rejected, `private/metadata proxy target must be rejected: ${target}`);
 }
 
 const SESSION_PATH = "/__novelforge/session";
@@ -58,14 +79,16 @@ async function testProxyHttpErrorIsNotReplayedDirectly(): Promise<void> {
     return new Response("bad gateway", { status: 502 });
   };
   try {
-    let message = "";
+    let error: unknown;
     try {
       await webHttp({ method: "POST", url: "https://api.example.com/paid", body: "{}" });
-    } catch (error) {
-      message = error instanceof Error ? error.message : String(error);
+    } catch (e) {
+      error = e;
     }
     // 代理已把请求真实发往厂商（可能已计费），502 时静默直连会重复发送同一个付费 POST
-    assert(/代理不可用 502/.test(message), `proxy 502 must surface as a proxy error, got: ${message}`);
+    // 断言类型与状态码而非文案：文案随界面语言变化（英文环境为 "Proxy unavailable 502..."）
+    assert(error instanceof ProxyHttpError, `proxy 502 must surface as ProxyHttpError, got: ${String(error)}`);
+    assert((error as ProxyHttpError).status === 502, `proxy 502 must keep its HTTP status, got: ${(error as ProxyHttpError).status}`);
     assert(networkCalls === 1, `proxy 5xx must not trigger a direct replay, network calls: ${networkCalls}`);
   } finally {
     globalThis.fetch = originalFetch;

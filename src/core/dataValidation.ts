@@ -59,6 +59,21 @@ export function parseChapterScript(input: unknown): ChapterScript {
         }
       }
     }
+    if (scene.shots !== undefined) {
+      // 图片小说分镜（#807）：坏数据不得写入剧本缓存——prompt 空会让生图必然失败，
+      // triggerLineIndex 越界会让切换点丢失/崩溃。校验不过整章判损坏，重跑即可。
+      if (!Array.isArray(scene.shots)) throw new Error("chapter scene has an invalid shots");
+      const lineCount = (scene.lines as unknown[]).length;
+      for (const shotInput of scene.shots as unknown[]) {
+        const shot = record(shotInput, "chapter shot");
+        if (typeof shot.id !== "string" || !shot.id.trim()) throw new Error("chapter shot has an invalid id");
+        if (typeof shot.prompt !== "string" || !shot.prompt.trim()) throw new Error("chapter shot has an invalid prompt");
+        const trigger = shot.triggerLineIndex;
+        if (!Number.isInteger(trigger) || (trigger as number) < 0 || (trigger as number) > Math.max(0, lineCount - 1)) {
+          throw new Error("chapter shot has an invalid triggerLineIndex");
+        }
+      }
+    }
   }
   return chapter as unknown as ChapterScript;
 }

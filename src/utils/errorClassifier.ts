@@ -72,6 +72,9 @@ const PATTERNS: Record<Exclude<ErrorClass, "unknown">, RegExp[]> = {
     /超过.{0,8}(上限|最大|长度|限制)|超长|过长/i,
     /参数错误|参数不合法|格式错误|不存在|不支持/i,
     /错误[：:]\s*4\d\d/i,
+    // 剧本「scenes 为空」＝模型输出被截断/JSON 修复失败：脚本层已带提示重试过一次，
+    // 外层不再退避重跑整章（避免每个失败章节放大成 4 次整章付费调用）
+    /未产出任何场景|scenes 为空|无 scenes/i,
   ],
   network: [
     /timeout|timed ?out/i,

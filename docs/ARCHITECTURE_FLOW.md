@@ -390,3 +390,28 @@ flowchart LR
 
 验证：探针截图确认主页面为「设置行 → 逐章清单 → 主按钮 → 产物行」；章节状态词/运行前后切换正常；`vue-tsc --noUnusedLocals`、60/60 单测、`npm run build`、0 console error。
 
+### 7.12 图片小说（纯图片模式）v1（2026-09-20，ReqFlow #803–#813）
+
+在同一套核心能力上加一条与立绘版并列的产出链路，两条链路共享「原文与分章」，其余全部独立：
+
+```mermaid
+flowchart LR
+  A[主项目：导入/分章] -->|复用章节| B[图片小说：提取卡片]
+  B --> C["分镜剧本 scriptChapter(mode=imageOnly)\nshots[]: prompt + triggerLineIndex"]
+  C --> D["图片通道 buildImageTasks(mode=imageOnly)\n三视图(identity) + 分镜 1536x1024 (+物品图可选)"]
+  D --> E["渲染 renderChapter(mode=imageOnly)\n跳过 changeFigure 全族，按 triggerLineIndex 淡入换图"]
+  E --> F["组装 assembleProject(mode=imageOnly)\nshot_*.png → game/background/"]
+  F --> G[新页面自带 预览 / 导出 zip]
+```
+
+| 维度 | 立绘版（sprite） | 图片小说（imageOnly） |
+|---|---|---|
+| 入口/状态 | 生成项目页 + generate store | 侧栏「图片小说」+ 独立 `stores/imageStory.ts`（独立持久化） |
+| 输出目录 | `<所选目录>/<书名>/` | `<所选目录>/<书名>-图片版/` |
+| 剧本缓存指纹 | `scriptFingerprint({style, compressNarration})` | 追加 `visualMode:"imageOnly"` → 两套缓存互不命中 |
+| 图片任务 | 三视图 + 立绘/表情/动作/服装 + 背景/CG + 物品 | 三视图（参考） + 分镜 shot +（可选）物品；不抠图 |
+| 画面切换 | changeFigure 舞台 + changeBg 场景 | 无立绘；`changeBg shot -duration=400 -ease=easeInOut` 只淡入 |
+| 费用控制 | 图像自检/预算/重跑 | 三个旋钮（每场景/每章/总量，0=不限）+ 实时张数与费用 + 到上限可续跑 |
+
+关键约束：三视图失败不为该角色生成分镜（禁止静默降级为纯文生图）；shots 坏数据不写缓存；`AssetMap.shot` 为新增可选字段（旧 `assets.json` 兼容）。测试：`unit-image-story-tasks/render/validate` + 指纹隔离断言。
+

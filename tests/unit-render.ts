@@ -63,7 +63,7 @@ function main(): void {
   assert(out1.includes("\\:"), "冒号未转义");
   assert(out1.includes("\\`"), "反引号未转义");
   assert(out1.includes("\\\\"), "反斜杠未转义");
-  assert(nonCommentLines(out1).length === 12, "行数异常（label+清场3+章节标题卡+changeBg+推近+playEffect+changeFigure+2句+end）");
+  assert(nonCommentLines(out1).length === 17, "行数异常（label+清场3+跨章复位4+章节标题卡+changeBg+推近+playEffect+changeFigure+取景+2句+end）");
 
   // 2) 恶意角色名 → 不产生裸分号注入
   const s2 = makeScript();
@@ -214,6 +214,45 @@ function main(): void {
   const dia13 = nonCommentLines(out13).filter((l) => l.startsWith("林澈:"));
   assert(dia13.length === 1, `有配音的长台词应保持单条，实际 ${dia13.length}`);
   assert(dia13[0].includes("v_ch0_s1_0.mp3"), "配音应挂在唯一一条消息上");
+
+  // 14) 跨章演出复位（#789）：上一章的 BGM/黑边/滤镜不残留在下一章
+  const ch1 = makeScript({
+    scenes: [{
+      id: "s1",
+      location: "决战之地",
+      atmosphere: "紧张激烈的战斗",
+      time: "夜晚",
+      bgPrompt: "bg",
+      itemEvents: [],
+      lines: [{ type: "narration", text: "决战开始。" }],
+      figures: [],
+    }],
+  });
+  const battleAssets: RenderAssets = { ...assets, bgm: { s1: "/x/bgm_battle.mp3" } };
+  const outCh1 = renderChapter(ch1, { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets: battleAssets, introCard: false }, 1);
+  assert(outCh1.includes("filmMode:true;"), "紧张场景应开启电影黑边");
+  assert(outCh1.includes("bgm:bgm_battle.mp3"), "战斗场景应播放 BGM");
+
+  const ch2 = makeScript({
+    chapter: 1,
+    title: "第二章",
+    scenes: [{
+      id: "s2",
+      location: "清晨的村庄",
+      atmosphere: "宁静",
+      time: "清晨",
+      bgPrompt: "bg",
+      itemEvents: [],
+      lines: [{ type: "narration", text: "清晨。" }],
+      figures: [],
+    }],
+  });
+  const quietAssets: RenderAssets = { bg: { s2: "/x/bg_s2.png" }, cg: {}, figure: {}, item: {}, vocal: {} };
+  const outCh2 = renderChapter(ch2, { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets: quietAssets, introCard: false }, 2);
+  assert(outCh2.includes("bgm:none -enter=0"), "章首应显式停止上一章残留的 BGM");
+  assert(outCh2.includes("filmMode:none;"), "章首应显式关闭上一章残留的电影黑边");
+  assert(outCh2.includes('setTransform:{"oldFilm":0}'), "章首应复位 oldFilm 滤镜");
+  assert(outCh2.includes('setTransform:{"godrayFilm":0}'), "章首应复位 godrayFilm 滤镜");
 
   console.log("=== 渲染注入边界测试通过 ===");
 }

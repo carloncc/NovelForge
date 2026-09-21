@@ -35,8 +35,10 @@ const DEFAULT_OPTIONS: GenerationOptions = {
   useImage: true,
   useTts: false,
   useVideoPoints: true,
-  useBgm: false,
-  useSe: false,
+  // 声音默认开启（#536）：无 BGM 文件时不输出 bgm 指令；内置 SE 有文件就播，
+  // 避免新项目默认成「哑剧」（此前默认关闭，标题页与所有场景静音）
+  useBgm: true,
+  useSe: true,
   figureEmotions: true,
   figureDetail: "full",
   figureActions: true,

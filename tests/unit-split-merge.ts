@@ -1,4 +1,4 @@
-import { mergeTinyChapters, protectSpecialBlocks, MIN_CHAPTER_CHARS } from "../src/core/split";
+import { mergeTinyChapters, protectSpecialBlocks, protectNumberedBlocks, MIN_CHAPTER_CHARS } from "../src/core/split";
 import type { ChapterInfo } from "../src/core/types";
 
 function assert(cond: boolean, msg: string): void {
@@ -23,9 +23,21 @@ function main(): void {
 
   // 首章碎章并入后一章，保留后者标题
   {
-    const { chapters, merged } = mergeTinyChapters([ch(0, "楔子", 500), ch(1, "第一章", 20000)]);
+    const { chapters, merged } = mergeTinyChapters([ch(0, "作者的话", 500), ch(1, "第一章", 20000)]);
     assert(merged === 1 && chapters.length === 1, "首章碎章应合并");
     assert(chapters[0].title === "第一章", "应保留后一章标题");
+  }
+
+  // 真章节（编号章）即使很短也不合并（用户实测：22/23 章被误并入 21 章）
+  {
+    const r = mergeTinyChapters([ch(0, "20.哥布林杀手的微小荣光", 7938), ch(1, "21.一线之隔的天真", 16007), ch(2, "22.献给你", 1200), ch(3, "23.序幕", 900)]);
+    assert(r.merged === 0 && r.chapters.length === 4, "编号真章节不应被碎章合并");
+  }
+
+  // 序/楔子等主线标记同样不合并
+  {
+    const r = mergeTinyChapters([ch(0, "楔子", 500), ch(1, "第一章", 20000)]);
+    assert(r.merged === 0 && r.chapters.length === 2, "楔子属于主线章节，不应并入第一章");
   }
 
   // 中部碎章（插图）并入前一章
@@ -80,6 +92,19 @@ function main(): void {
     const marks: { blockIndex: number; raw: string }[] = [];
     assert(protectSpecialBlocks(["第一章正文"], discard, marks) === 0, "普通块不应被救");
     assert(discard.has(1), "普通块应留在丢弃集");
+  }
+
+  // 编号真章节保护（始终生效）：被 LLM 标成杂项的编号章必须救回并立章
+  {
+    const blocks = ["第一章 正文", "22.献给你\n正文", "1、节选\n正文", "广告关注公众号", "序章\n正文"];
+    const discard = new Set([2, 3, 4, 5]);
+    const marks: { blockIndex: number; raw: string }[] = [{ blockIndex: 1, raw: "第一章" }];
+    const kept = protectNumberedBlocks(blocks, discard, marks);
+    assert(kept === 3, `应救回 3 个编号章，实际 ${kept}`);
+    assert(!discard.has(2) && !discard.has(3) && !discard.has(5), "编号/序章块应移出丢弃集");
+    assert(discard.has(4), "普通杂项应保留在丢弃集");
+    assert(marks.some((m) => m.blockIndex === 2 && m.raw.startsWith("22.")), "救回的块应就地立章");
+    for (let i = 1; i < marks.length; i++) assert(marks[i].blockIndex > marks[i - 1].blockIndex, "marks 应保持有序");
   }
 
   console.log("=== split merge tests passed ===");

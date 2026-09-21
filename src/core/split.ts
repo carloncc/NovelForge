@@ -1,6 +1,27 @@
 import type { ApiConfig, ChapterInfo } from "./types";
 import { chatJson } from "../api/openaiCompatible";
+import { estimateCharsPerToken, inputCharBudgetForText } from "../api/providers";
 import { log } from "../utils/logger";
+
+/** 剧本阶段的输出上限（token，与 script.ts 一致）：单章原文体量必须让「忠实全文」的剧本产出装得下 */
+const SCRIPT_OUTPUT_TOKENS = 32_768;
+
+/**
+ * 单章字数预算（#800）：旧实现固定 40000 字，长章忠实改编需要的输出可达数万 token，
+ * 逼近/超过 32k 输出上限，模型被迫压缩省旁白，越长丢得越多。这里按上下文与输出上限自适应：
+ * - 输出约束：32768 token × 语种字符/token × 0.8 余量（中文约 1.5 万字，英文可到十万字）
+ * - 输入约束：单请求输入预算的一半（给角色卡/场景卡/系统提示留位置）
+ * 极端小上下文模型仍保底 6000 字（再小会把章节切得无法阅读）。
+ */
+export function chapterCharBudget(
+  cfg: { model?: string; extra?: Record<string, unknown> } | undefined,
+  text: string,
+): number {
+  const cpt = estimateCharsPerToken(text);
+  const outputBound = Math.floor(SCRIPT_OUTPUT_TOKENS * cpt * 0.8);
+  const inputBound = Math.floor(inputCharBudgetForText(cfg, text) * 0.5);
+  return Math.max(6000, Math.min(30_000, outputBound, inputBound));
+}
 
 /**
  * AI 分章：把未切章的小说全文按章节边界切分为多个章节，并丢弃不适合进入视觉小说的杂项内容。
@@ -223,12 +244,41 @@ export function protectSpecialBlocks(
  * 碎章合并：小于 minChars 的章节并入相邻章节（优先并入前一章；首章并入后一章并保留后者标题）。
  * 解决"插图/后记/特典独占一章"这类机械感；纯函数，可单测。
  */
+/** 真章节标题（编号章 / 序/楔子/终章等）：即使低于阈值也不参与碎章合并——
+ *  合并只面向后记/插图/特典/作者的话等附加内容与无题碎片。
+ *  用户实测：编号很短的 22、23 章被误并入第 21 章，章节列表少了 2 章。 */
+const REAL_CHAPTER_TITLE_RE = /^\s*(?:第\s*[0-9零〇一二三四五六七八九十百千万两]+\s*[章回节话篇部幕卷]|\d{1,4}\s*[.、．)）]|序章?|序幕|序言|楔子|引子|终章|尾声|正篇|本篇)/;
+
+/**
+ * 编号真章节保护（始终生效，不依赖 keepSpecials）：被 LLM 标成杂项的块，
+ * 只要首行是「第X章 / N. / 序章 / 楔子」样式就移出丢弃集并就地立章——
+ * 漏识别时静默丢章远严重于多留一个块。返回救回数。
+ */
+export function protectNumberedBlocks(
+  blocks: string[],
+  discardSet: Set<number>,
+  marks: { blockIndex: number; raw: string }[],
+): number {
+  let kept = 0;
+  for (const idx of [...discardSet].sort((a, b) => a - b)) {
+    const firstLine = (blocks[idx - 1] || "").split("\n")[0].trim().slice(0, 40);
+    if (firstLine.length < 2 || !REAL_CHAPTER_TITLE_RE.test(firstLine)) continue;
+    discardSet.delete(idx);
+    if (!marks.some((m) => m.blockIndex === idx)) marks.push({ blockIndex: idx, raw: firstLine.slice(0, 20) });
+    kept++;
+  }
+  marks.sort((a, b) => a.blockIndex - b.blockIndex);
+  return kept;
+}
+
 export function mergeTinyChapters(chapters: ChapterInfo[], minChars = MIN_CHAPTER_CHARS): { chapters: ChapterInfo[]; merged: number } {
   const out = chapters.map((c) => ({ ...c }));
   let merged = 0;
   for (let i = 0; i < out.length; i++) {
     if (out.length <= 1) break;
     if (out[i].text.length >= minChars) continue;
+    // 真章节不合并：短是正常的（编号章/序/楔子等），只有附加内容才该并进相邻章
+    if (REAL_CHAPTER_TITLE_RE.test(out[i].title ?? "")) continue;
     if (i === 0) {
       out[1].text = `${out[0].text}\n\n${out[1].text}`;
       out[1].charCount = out[1].text.length;
@@ -385,6 +435,9 @@ export async function aiSplitChapters(
 
   // 章节标题块不应被当作杂项丢弃
   for (const m of uniqueMarks) discardSet.delete(m.blockIndex);
+  // 编号真章节保护（始终生效）：LLM 漏识别时也不能静默丢章
+  const keptNumbered = protectNumberedBlocks(blocks, discardSet, uniqueMarks);
+  if (keptNumbered > 0) log.warn("split", `救回 ${keptNumbered} 个被误标为杂项的编号章节`, {});
   // 特殊章节保护（keepSpecials）：后记/番外/特典/插图等不许当杂项丢
   let keptSpecials = 0;
   if (opts?.keepSpecials) keptSpecials = protectSpecialBlocks(blocks, discardSet, uniqueMarks);

@@ -10,9 +10,11 @@ import type {
   Line,
   SceneCard,
   SceneJSON,
+  Shot,
 } from "./types";
 import { chatJson } from "../api/openaiCompatible";
-import { resolveContextLength } from "../api/providers";
+import { estimateCharsPerToken, outputTokensForText } from "../api/providers";
+import { splitNovelForAgent } from "./textSplit";
 import { log as logger } from "../utils/logger";
 import { tauri } from "../utils/tauri";
 import { scriptCacheRest } from "./cache";
@@ -64,14 +66,36 @@ interface ScriptModel {
         text: string;
       }[];
     }[];
+    /** 图片小说分镜（mode=imageOnly 时模型输出）：整幅插画 + 切换行号 */
+    shots?: {
+      id?: string;
+      prompt: string;
+      triggerLineIndex?: number;
+      characters?: string[];
+      note?: string;
+    }[];
   }[];
 }
+
+/** 图片小说模式的系统提示补充（#807）：覆盖 sprite 版的 CG/立绘规则，改为分镜产出 */
+const IMAGE_ONLY_RULES = `
+【本次为「图片小说」模式（无立绘、无人物演出 UI），以下规则覆盖上文冲突项】
+A. 不输出 cg 字段（画面由 shots 承担）；不输出 action/costume 字段（没有立绘）。
+B. 每个场景必须输出 shots 数组：按剧情需要 1-N 张全屏插画（以用户消息中的「每场景张数」为准，未指定时按剧情需要、宁精勿滥），代表该场景的关键画面。
+C. 每个 shot 字段：
+   - id：场景内短标识（如 s1_1；可省略，系统会补）
+   - prompt：英文整幅插画提示词，必须包含：出场角色（外貌/服装/表情/动作，与角色卡一致）+ 场景环境 + 构图 + 16:9 横构图；风格为动漫插画；不要绿幕/纯色背景描述（这是整幅画面，不是立绘）
+   - triggerLineIndex：在第几句台词前切换到该图（0-based，必须落在本场景 lines 范围内；同一张图覆盖的连续对话应属于同一画面）
+   - characters：画面中出现的角色卡 id 数组（没有角色就留空数组）
+   - note：可选，10 字内中文短标题（如「城门对峙」）
+D. 一张图覆盖的连续对话应属于同一画面（同一地点/时间/氛围）；画面切换点放在场景转换、情绪转折、时间跳跃处。
+E. lines 的说话人、台词保真与上文规则一致（对话逐句保留，旁白按「旁白处理策略」）。`;
 
 const SYSTEM_PROMPT = `你是视觉小说编剧。根据小说章节文本与角色卡、物品卡，将该章改编为视觉小说分镜 JSON。
 
 规则：
-1. 忠实于原文，对话尽量使用原文台词；旁白精简提炼。
-2. 每章拆分为 2-6 个场景（scene）。每个场景 = 一个地点 + 一段连续剧情。
+1. 忠实于原文，对话尽量使用原文台词；旁白/描写按用户消息中的「旁白处理策略」执行。
+2. 场景划分：按原文的地点/时间/情节段落变化切分（每个场景 = 一个地点 + 一段连续剧情），宁多勿并——多地点/行旅/任务推进类章节必须保留移动、路线与时间推进的过渡描写，不要为了凑少量场景把不同地点硬合并；常规章节约 2-10 个，上限 20 仅作极端保护。
 3. 场景字段：
    - id: 唯一标识（如 s1）
    - location / atmosphere / time: 对应场景卡，若不在场景卡中则新写
@@ -85,8 +109,7 @@ const SYSTEM_PROMPT = `你是视觉小说编剧。根据小说章节文本与角
     - 可选 costume: 仅当剧情明确写了换装（换上礼服/战斗服/睡衣等）时，从该角色的"服装列表"(见角色卡)中选填 costume: "服装id"；换装后该角色后续台词自动沿用该服装直到再次标注，没有换装情节就省略该字段
    - narration: {type:"narration", text}
    - 内心独白: {type:"narration", monologue:true, text}（按原文比例保留，不要机械砍数量）
-5. CG 事件：挑本章最具画面感的"名场面"（战斗高潮、重要相遇、宏大场景），
-   只为一个场景写 cg（每章最多 1 个，多写的会被系统丢弃）：
+5. CG 事件：为本章的名场面写 1-3 个 cg（战斗高潮、重要相遇、关键转折、地图/景观大场面等；每个场景最多 1 个），按画面张力排序，宁缺毋滥、不要为凑数硬加；超过 3 个的部分会被系统丢弃：
    {title, description(一两句), imagePrompt(整幅插画，含人物，电影构图，动漫风)}
 6. 视频推荐点 videoPoints：对本章最具"动感"的名场面（战斗、追逐、大雨、重要转身等）标记 1-3 个视频推荐点（按剧情需要，不设上限）：
    {id: 短标识(如 op1、ch2_battle), title, description(一两句), videoPrompt(可直接用于 AI 视频生成平台的英文提示词：画面内容/运镜/时长/风格), durationSecs: 建议时长秒数}
@@ -94,17 +117,19 @@ const SYSTEM_PROMPT = `你是视觉小说编剧。根据小说章节文本与角
 7. 物品事件 itemEvents：当剧情中出现"获得/交接/展示/使用重要物品"时，在该场景标记：
    {itemId: 物品卡id, action: "obtain"|"exchange"|"show"|"key", description}
    triggerIndex 我会在渲染时根据文本顺序自动对齐，你只需把 itemEvents 写在对应场景中。
+   若原文包含地图/路线、任务委托、组织制度、货币器物等关键设定，可收录为物品卡（name/note 保留原文关键信息，不要概括掉细节）。
 8. 分支选择 choices（可选）：当剧情出现真正的"抉择时刻"（如留下/离开、相信/怀疑、帮助/旁观等影响角色关系的关键决定）时，
-   在该场景写 choices 数组（一个场景最多 1 次，每章最多 1 次）：
-   - 每个选项 {id: 短标识, prompt: 选项按钮文本（简洁有力，2-8 字）, lines: 该选项后的短暂分支剧情（1-4 句 dialogue/narration，格式与 lines 相同）}
+   在该场景写 choices 数组（按剧情需要可出现多处，不要强行加）：
+   - 每个选项 {id: 短标识, prompt: 选项按钮文本（简洁有力，2-8 字）, lines: 该选项后的分支剧情（1-4 句 dialogue/narration，格式与 lines 相同）}；每个场景保留 2-4 个选项
    - 分支剧情必须自然收束，玩家选择后最终都会汇合回主线继续，不要写 end / jump / 跳转指令
    - 没有真正的抉择时刻就不要写 choices，宁可全线性也不强行加
  9. 每章最后可以安排到下一章的自然收束，不要写 end 指令。
 10. 只输出 JSON，不要输出任何文字。
-11. 台词完整性（硬约束，优先级高于精简）：
+11. 台词完整性（硬约束，优先级最高）：
     - 原文「」内的每一句对话都必须原样保留，一句不许删、一句不许合并，短句/语气词（嗯、诶、真的……？等）同样不许丢；
-    - 只允许压缩旁白，禁止改写对话文字（仅允许统一标点）；
-    - 内心独白按原文比例保留，不要机械砍到只剩 2 条。
+    - 禁止改写对话文字（仅允许统一标点）；
+    - 内心独白按原文比例保留，不要机械砍到只剩 2 条；
+    - 旁白/心理/环境/氛围描写按用户消息中的「旁白处理策略」执行。
 12. 说话人判定（硬约束）：
     - 每个 dialogue 的 characterId 必须能在上下文中找到依据（引号前后的人名＋说/道/问/喊等动词，或明确的行为主体）；
     - 引用中的第三人称点名不能倒置（例如台词含"对优斗来说"时，说话人绝不能是优斗本人）；
@@ -136,78 +161,109 @@ export interface ScriptChapterOptions {
   style?: string;
   /** 用户对上一版剧本的意见，重新生成时严格参考 */
   feedback?: string;
+  /** 旁白压缩（#801）：true=精简提炼旁白；缺省/false=忠实保留全文旁白（默认） */
+  compressNarration?: boolean;
+  /** 视觉模式（#807）：sprite=立绘版（默认）；imageOnly=图片小说（产出 shots 分镜，不产 cg/立绘字段） */
+  mode?: "sprite" | "imageOnly";
+  /** 图片小说：每场景分镜张数目标（0/缺省=不限，按剧情需要；仅图片小说模式生效） */
+  shotsPerScene?: number;
 }
 
-export async function scriptChapter(
+/** 旁白处理策略文案（#793/#801，纯函数供单测）：
+ *  默认忠实全文（旧提示词明文授权「压缩旁白」，描写/心理/环境被系统性砍掉）；
+ *  开启压缩开关时才注入精简授权。 */
+export function narrationPolicyText(compressNarration?: boolean): string {
+  return compressNarration
+    ? "旁白处理策略（精简模式）：可以精简提炼旁白（合并同义重复、压缩冗长描述），但不得删除关键剧情信息；对话仍逐句保留。"
+    : "旁白处理策略（忠实全文，硬约束）：必须完整保留原文全部旁白与心理/环境/氛围描写，只可合并同义重复句，禁止删减任何带信息量/情绪/伏笔的句子；原文每个自然段至少要产出一条 line（narration 或 dialogue）。";
+}
+
+/** 剧本分块（纯函数，供单测）：按「输出预算 × 语种字符/token × 0.65」估算单块可承载的正文体量，
+ *  超长章节按段落边界切块（忠实全文模式下避免整章输出被截断 → scenes 为空）。 */
+export function planScriptChunks(
   cfg: ApiConfig,
   chapter: ChapterInfo,
+  systemPrompt: string,
+  extra: string[],
   cards: ExtractionResult,
-  onUsage?: (pt: number, ct: number) => void,
-  opts: ScriptChapterOptions = {},
-): Promise<ChapterScript> {
-  const extra: string[] = [];
-  if (opts.style) {
-    extra.push(`\n文风要求：请严格按「${opts.style}」这一风格来编写/改写本章的台词与旁白（包括遣词、语气、节奏），但保持人物设定与剧情走向不变。`);
-  }
-  if (opts.feedback) {
-    extra.push(`\n用户的修改意见（重新生成时请严格参考并落实）：${opts.feedback}`);
-  }
-  const user = [
+): string[] {
+  const probeTokens = outputTokensForText(cfg, `${systemPrompt}\n${buildScriptUser(chapter, cards, extra, chapter.text.slice(0, 4000))}`);
+  const cpt = estimateCharsPerToken(chapter.text);
+  const chunkBudget = Math.max(3000, Math.floor(probeTokens * cpt * 0.65));
+  return chapter.text.length <= chunkBudget ? [chapter.text] : splitNovelForAgent(chapter.text, chunkBudget);
+}
+
+/** 剧本用户消息（单次生成与分块生成共用） */
+function buildScriptUser(
+  chapter: ChapterInfo,
+  cards: ExtractionResult,
+  extra: string[],
+  body: string,
+  partNote = "",
+): string {
+  return [
     `章节：第 ${chapter.index + 1} 章 ${chapter.title}`,
     `\n角色卡：\n${buildCharacterContext(cards.characters)}`,
     `\n物品卡：\n${buildItemContext(cards.items)}`,
     `\n场景卡：\n${cards.scenes.map((s) => `${s.id}（${s.location}）：${s.atmosphere}`).join("\n")}`,
     ...extra,
-    `\n章节正文：\n${chapter.text}`,
+    partNote,
+    `\n章节正文：\n${body}`,
   ].join("\n");
+}
 
-  // 剧本输出 token 上限：取模型上下文与 32k 的较小值。
-  // 注意不要随 contextLength 无限放大（用户配置 1M 上下文时若 max_tokens=240k，
-  // 多数代理会拒绝返回 400 Param Incorrect）；32k 足够容纳一章完整剧本 + 推理思考。
-  const scriptOutputTokens = Math.min(resolveContextLength(cfg), 32_768);
-  // 剧本请求体大、输出长：给足超时（默认 180s 对不稳定中转代理偏紧，放宽到 300s）
-  const model = await chatJson<ScriptModel>(cfg, SYSTEM_PROMPT, user, { maxTokens: scriptOutputTokens, onUsage, timeoutSecs: 300 });
-
-  const resolveSceneId = makeSceneIdResolver(cards, chapter.index);
-  const mapLine = (l: ScriptModel["scenes"][number]["lines"][number]): Line => {
-    // speed/ttsEmotion 透传给配音：旧实现整段丢弃，模型标注的语速/情绪永远到不了 TTS；
-    // 非法值静默降级为缺省（speed 仅接受 0.5-2 的数字，ttsEmotion 仅接受非空字符串）
-    const speed = typeof l.speed === "number" && Number.isFinite(l.speed) && l.speed >= 0.5 && l.speed <= 2
-      ? l.speed
-      : undefined;
-    const ttsEmotion = typeof l.ttsEmotion === "string" && l.ttsEmotion.trim() ? l.ttsEmotion.trim() : undefined;
-    if (l.type !== "dialogue") {
-      return {
-        type: "narration" as const,
-        text: l.text,
-        monologue: !!l.monologue,
-      };
-    }
-    // UI101：characterId 缺失/非法（空、narrator 占位、不在角色卡中）时降级为旁白并保留原句。
-    // 旧实现静默归给 characters[0]，朗读者会看到错误的人名/立绘/音色。
-    const charId = typeof l.characterId === "string" ? l.characterId.trim() : "";
-    if (!charId || charId === "narrator" || !cards.characters.some((c) => c.id === charId)) {
-      return { type: "narration" as const, text: l.text };
-    }
+/** 剧本单行映射（sprite/imageOnly 共用）：
+ *  speed/ttsEmotion 透传；characterId 缺失/非法（空、narrator、不在卡片中）降级为旁白并保留原句。 */
+function mapScriptLine(l: ScriptModel["scenes"][number]["lines"][number], cards: ExtractionResult): Line {
+  const speed = typeof l.speed === "number" && Number.isFinite(l.speed) && l.speed >= 0.5 && l.speed <= 2
+    ? l.speed
+    : undefined;
+  const ttsEmotion = typeof l.ttsEmotion === "string" && l.ttsEmotion.trim() ? l.ttsEmotion.trim() : undefined;
+  if (l.type !== "dialogue") {
     return {
-      type: "dialogue" as const,
-      characterId: charId,
-      emotion: l.emotion || "normal",
-      action: l.action || undefined,
-      costume: l.costume || undefined,
-      speed,
-      ttsEmotion,
+      type: "narration" as const,
       text: l.text,
+      monologue: !!l.monologue,
     };
+  }
+  const charId = typeof l.characterId === "string" ? l.characterId.trim() : "";
+  if (!charId || charId === "narrator" || !cards.characters.some((c) => c.id === charId)) {
+    return { type: "narration" as const, text: l.text };
+  }
+  return {
+    type: "dialogue" as const,
+    characterId: charId,
+    emotion: l.emotion || "normal",
+    action: l.action || undefined,
+    costume: l.costume || undefined,
+    speed,
+    ttsEmotion,
+    text: l.text,
   };
-  // 分支/CG 每章配额（与 prompt 规则一致，超出部分丢弃并告警——静默丢剧情比丢 CG 更难察觉）
-  let chapterChoiceUsed = false;
-  let chapterCgUsed = false;
-  const scenes: SceneJSON[] = (model.scenes || []).map((s, i) => {
+}
+
+/** 剧本场景映射上下文（跨分块共享：场景 id 去重与 CG 配额按整章累计） */
+interface ScriptSceneContext {
+  chapter: ChapterInfo;
+  cards: ExtractionResult;
+  imageOnly: boolean;
+  shotsPerScene?: number;
+  resolveSceneId: (s: ScriptModel["scenes"][number], fallbackIndex: number) => string;
+  cgCount: { value: number };
+}
+
+/** 把一次模型回执映射为场景数组（含分支/CG/物品/视频位/分镜清洗与配额） */
+function mapScriptScenes(model: ScriptModel, ctx: ScriptSceneContext): SceneJSON[] {
+  // 分支/CG 配额：与 prompt 规则一致（#795/#798）。超出上限的只告警并放弃多余项，
+  // 不做静默截断——静默丢剧情比丢 CG 更难察觉。
+  const CG_PER_CHAPTER_MAX = 3;
+  const CHOICES_PER_SCENE_MAX = 4;
+  const CHOICE_LINES_SOFT_MAX = 12;
+  return (model.scenes || []).map((s, i) => {
     const lines: Line[] = (s.lines || [])
       // 过滤空文本行：LLM 可能输出无 text 的 narration/dialogue，会令渲染阶段 esc(undefined) 崩溃
       .filter((l) => typeof l?.text === "string" && l.text.trim().length > 0)
-      .map(mapLine);
+      .map((l) => mapScriptLine(l, ctx.cards));
 
     const rawItemEvents = s.itemEvents || [];
     const itemEvents: ItemEvent[] = rawItemEvents.map((ie, j) => ({
@@ -222,11 +278,11 @@ export async function scriptChapter(
     }));
 
     let cgEvent: CgEvent | undefined;
-    if (s.cg) {
-      if (chapterCgUsed) {
-        logger.warn("script", "CG 超过每章 1 个，已丢弃多余 CG", { scene: s.id || i, title: s.cg.title });
+    if (s.cg && !ctx.imageOnly) {
+      if (ctx.cgCount.value >= CG_PER_CHAPTER_MAX) {
+        logger.warn("script", `CG 超过每章 ${CG_PER_CHAPTER_MAX} 个上限，已丢弃多余 CG`, { scene: s.id || i, title: s.cg.title });
       } else {
-        chapterCgUsed = true;
+        ctx.cgCount.value++;
         cgEvent = {
           triggerIndex: Math.max(0, Math.floor(lines.length / 3)),
           title: s.cg.title,
@@ -237,31 +293,64 @@ export async function scriptChapter(
       }
     }
 
-    // 分支：prompt 约定一个场景最多 1 次、每章最多 1 次；代码按同一口径执行（旧实现每场景留 3 条，与文案矛盾）
+    // 分支（#798）：按剧情可出现多处；每场景保留 2-4 个选项，分支台词只做超长告警不截断
+    // （旧实现每章只留第一个分支、每场景只留 1 条、分支台词砍到 6 句，原著支线大量丢失）
     const rawChoices = s.choices || [];
     let choices: Choice[] = [];
     if (rawChoices.length > 0) {
-      if (chapterChoiceUsed) {
-        logger.warn("script", "分支选项超过每章 1 次，已丢弃多余分支", { scene: s.id || i, total: rawChoices.length });
-      } else {
-        if (rawChoices.length > 1) {
-          logger.warn("script", "分支选项超过每场景 1 次，已截断", { scene: s.id || i, total: rawChoices.length, kept: 1 });
+      if (rawChoices.length > CHOICES_PER_SCENE_MAX) {
+        logger.warn("script", `分支选项超过每场景 ${CHOICES_PER_SCENE_MAX} 个，已保留前 ${CHOICES_PER_SCENE_MAX} 个`, {
+          scene: s.id || i,
+          total: rawChoices.length,
+        });
+      }
+      choices = rawChoices.slice(0, CHOICES_PER_SCENE_MAX).map((c, k) => {
+        const branchLines = (c.lines || []).filter((l) => typeof l?.text === "string" && l.text.trim().length > 0);
+        if (branchLines.length > CHOICE_LINES_SOFT_MAX) {
+          logger.warn("script", `分支台词较长（${branchLines.length} 句），已全部保留`, { scene: s.id || i, choice: k });
         }
-        chapterChoiceUsed = true;
-        choices = rawChoices.slice(0, 1).map((c, k) => ({
+        return {
           id: c.id || `choice_${s.id || i}_${k}`,
           prompt: (c.prompt || "继续").slice(0, 20),
-          lines: (c.lines || []).filter((l) => typeof l?.text === "string" && l.text.trim().length > 0).slice(0, 6).map(mapLine),
-        }));
-        const first = rawChoices[0];
-        if (first && (first.lines || []).length > 6) {
-          logger.warn("script", "分支台词超限截断", { scene: s.id || i, choice: 0, total: (first.lines || []).length, kept: 6 });
-        }
+          lines: branchLines.map((l) => mapScriptLine(l, ctx.cards)),
+        };
+      });
+    }
+
+    // 图片小说分镜（#807）：清洗 + 触发行号钳制到 lines 范围内 + 按用户旋钮裁剪（超出告警，不静默丢）
+    const sceneId = ctx.resolveSceneId(s, i);
+    let shots: Shot[] | undefined;
+    if (ctx.imageOnly) {
+      const rawShots = Array.isArray(s.shots) ? s.shots : [];
+      const limit = ctx.shotsPerScene && ctx.shotsPerScene > 0 ? ctx.shotsPerScene : 0;
+      if (limit > 0 && rawShots.length > limit) {
+        logger.warn("script", `第 ${ctx.chapter.index + 1} 章场景 ${sceneId} 分镜超过每场景 ${limit} 张，已保留前 ${limit} 张（可提高上限后重跑）`, {
+          scene: sceneId,
+          total: rawShots.length,
+        });
       }
+      const kept = limit > 0 ? rawShots.slice(0, limit) : rawShots;
+      shots = kept
+        .filter((sh) => sh && typeof sh.prompt === "string" && sh.prompt.trim())
+        .map((sh, k) => {
+          const rawTrigger = Number(sh.triggerLineIndex ?? 0);
+          const triggerLineIndex = Number.isFinite(rawTrigger) ? Math.min(Math.max(0, Math.floor(rawTrigger)), Math.max(0, lines.length - 1)) : 0;
+          const characters = Array.isArray(sh.characters)
+            ? sh.characters.filter((id) => typeof id === "string" && ctx.cards.characters.some((c) => c.id === id))
+            : undefined;
+          return {
+            id: `${sceneId}_shot${k + 1}`,
+            prompt: sh.prompt.trim(),
+            triggerLineIndex,
+            ...(characters && characters.length ? { characters } : {}),
+            ...(typeof sh.note === "string" && sh.note.trim() ? { note: sh.note.trim().slice(0, 20) } : {}),
+          };
+        });
+      if (!shots.length) shots = undefined;
     }
 
     return {
-      id: resolveSceneId(s, i),
+      id: sceneId,
       location: s.location,
       atmosphere: s.atmosphere,
       time: s.time,
@@ -283,16 +372,88 @@ export async function scriptChapter(
       lines,
       figures: [],
       choices: choices.length ? choices : undefined,
+      ...(shots && shots.length ? { shots } : {}),
     };
   });
+}
+
+export async function scriptChapter(
+  cfg: ApiConfig,
+  chapter: ChapterInfo,
+  cards: ExtractionResult,
+  onUsage?: (pt: number, ct: number) => void,
+  opts: ScriptChapterOptions = {},
+): Promise<ChapterScript> {
+  const imageOnly = opts.mode === "imageOnly";
+  const extra: string[] = [];
+  if (opts.style) {
+    extra.push(`\n文风要求：请严格按「${opts.style}」这一风格来编写/改写本章的台词与旁白（包括遣词、语气、节奏），但保持人物设定与剧情走向不变。`);
+  }
+  if (opts.feedback) {
+    extra.push(`\n用户的修改意见（重新生成时请严格参考并落实）：${opts.feedback}`);
+  }
+  // 旁白处理策略（#793/#801）：默认忠实全文——旧提示词明文授权「压缩旁白」，
+  // 描写/心理/环境被系统性砍掉；改为按开关条件注入，开启时才允许精简。
+  extra.push(`\n${narrationPolicyText(opts.compressNarration)}`);
+  if (imageOnly) {
+    // 图片小说：分镜张数目标（用户旋钮，0=不限）+ 模式补充规则
+    extra.push(
+      `\n每场景张数：${opts.shotsPerScene && opts.shotsPerScene > 0 ? `每场景最多 ${opts.shotsPerScene} 张（按剧情需要，宁缺毋滥）` : "不限，按剧情需要决定（宁缺毋滥）"}。`,
+    );
+  }
+  // 剧本输出与分块（#800 落地 + 忠实全文回归修复）：忠实模式下长章输出极易被截断，
+  // 「scenes 为空」正是截断/JSON 修复失败的典型表现——先按「输出预算可承载的正文体量」把章节切块，
+  // 逐块生成后合并场景（场景 id 跨块去重）；空 scenes 带明确反馈重试一次，仍失败才进失败项。
+  const systemPrompt = imageOnly ? `${SYSTEM_PROMPT}\n${IMAGE_ONLY_RULES}` : SYSTEM_PROMPT;
+  const parts = planScriptChunks(cfg, chapter, systemPrompt, extra, cards);
+  const resolveSceneId = makeSceneIdResolver(cards, chapter.index);
+  const mapCtx: ScriptSceneContext = {
+    chapter,
+    cards,
+    imageOnly,
+    shotsPerScene: opts.shotsPerScene,
+    resolveSceneId,
+    cgCount: { value: 0 },
+  };
+
+  const scenes: SceneJSON[] = [];
+  let title = chapter.title;
+  for (let i = 0; i < parts.length; i++) {
+    const partNote = parts.length > 1
+      ? `\n\n【本章分 ${parts.length} 部分生成】这是第 ${i + 1}/${parts.length} 部分：只输出这部分正文对应的场景与台词；不要在本部分结尾写章节收束、不要写 end；不要把其它部分的内容补进来。`
+      : "";
+    const user = buildScriptUser(chapter, cards, extra, parts[i], partNote);
+    const maxTokens = outputTokensForText(cfg, `${systemPrompt}\n${user}`);
+    let model = await chatJson<ScriptModel>(cfg, systemPrompt, user, { maxTokens, onUsage, timeoutSecs: 300 });
+    let partScenes = mapScriptScenes(model, mapCtx);
+    if (!partScenes.length) {
+      logger.warn("script", `第 ${chapter.index + 1} 章${parts.length > 1 ? ` 第 ${i + 1}/${parts.length} 部分` : ""}未产出场景，带提示重试一次`, {});
+      model = await chatJson<ScriptModel>(
+        cfg,
+        systemPrompt,
+        `${user}\n\n注意：上一次回复没有 scenes 数组或 scenes 为空。请输出严格 JSON，且 scenes 至少包含本部分正文的第一个场景（含完整的 lines 台词）。`,
+        { maxTokens, onUsage, timeoutSecs: 300 },
+      );
+      partScenes = mapScriptScenes(model, mapCtx);
+    }
+    if (!partScenes.length) {
+      throw new Error(
+        `第 ${chapter.index + 1} 章剧本未产出任何场景${parts.length > 1 ? `（第 ${i + 1}/${parts.length} 部分）` : ""}：模型返回无 scenes（常见于输出被截断或 JSON 修复失败）。本章未写入缓存，请直接重试；若反复失败可开启「压缩旁白」或改用输出上限更高的模型`,
+      );
+    }
+    if (parts.length > 1 && i === 0) {
+      const partTitle = (model as { title?: unknown }).title;
+      if (typeof partTitle === "string" && partTitle.trim()) title = partTitle.trim();
+    }
+    scenes.push(...partScenes);
+  }
 
   return {
     chapter: chapter.index,
-    title: chapter.title,
-    scenes: scenes.length ? scenes : [fallbackScene(chapter, cards)],
+    title,
+    scenes,
   };
 }
-
 /**
  * 把剧本里的场景 id 解析为「全局唯一 + 可关联场景卡」的 id：
  * 1. 优先匹配场景卡：location 完全一致 → 复用场景卡 id（保证背景图按场景卡去重/关联）
@@ -334,26 +495,6 @@ function makeSceneIdResolver(cards: ExtractionResult, chapterIndex: number) {
     used.add(`${base}_${n}`);
     return `${base}_${n}`;
   }
-}
-
-function fallbackScene(chapter: ChapterInfo, cards: ExtractionResult): SceneJSON {
-  const sc = cards.scenes[0];
-  const lines: Line[] = [
-    { type: "narration", text: chapter.text.slice(0, 200) },
-    ...cards.characters.slice(0, 2).map(
-      (c): Line => ({ type: "dialogue", characterId: c.id, emotion: "normal", text: "……" }),
-    ),
-  ];
-  return {
-    id: "s1",
-    location: sc?.location || "未知地点",
-    atmosphere: sc?.atmosphere || "",
-    time: sc?.time || "",
-    bgPrompt: sc?.imagePrompt || "anime background, dim room",
-    lines,
-    figures: [],
-    itemEvents: [],
-  };
 }
 
 /* ==================== 演示模式（无 API key 时） ==================== */
@@ -599,9 +740,39 @@ export interface ScriptVerifyResult {
   originalQuoteCount: number;
   dialogueCount: number;
   keptRatio: number;
+  /** 原文自然段数（≥12 字的行） */
+  paragraphCount: number;
+  /** 剧本中有对应内容的段落数（#794：旁白/描写被删减的度量） */
+  coveredParagraphCount: number;
+  /** 段落覆盖率（paragraphCount 为 0 时记 1） */
+  narrationRatio: number;
   notFoundCount: number;
   orderSuspectCount: number;
   speakerIssues: SpeakerIssue[];
+}
+
+/** 段落覆盖率（#794）：逐段检查原文段落是否在剧本里有对应内容。
+ *  旧核对只数「引语 vs dialogue」，旁白/心理/环境被删光时 keptRatio≈1 照样判通过；
+ *  这里用段落样本（首/尾 16 字）与剧本行文本互查，作为旁白保真的兜底度量。 */
+function narrationCoverage(
+  src: string,
+  scenes: { lines: { text: string }[] }[],
+): { paragraphCount: number; coveredParagraphCount: number } {
+  const paragraphs = src
+    .split(/\n+/)
+    .map((p) => p.trim())
+    .filter((p) => p.length >= 12);
+  if (!paragraphs.length) return { paragraphCount: 0, coveredParagraphCount: 0 };
+  const lineTexts = scenes
+    .flatMap((s) => s.lines.map((l) => (l.text || "").trim()))
+    .filter((t) => t.length >= 4);
+  let covered = 0;
+  for (const p of paragraphs) {
+    const head = p.slice(0, 16);
+    const tail = p.length > 16 ? p.slice(-16) : head;
+    if (lineTexts.some((t) => t.includes(head) || t.includes(tail) || p.includes(t))) covered++;
+  }
+  return { paragraphCount: paragraphs.length, coveredParagraphCount: covered };
 }
 
 /**
@@ -765,10 +936,14 @@ export function verifyScriptAgainstSource(
     });
   });
 
+  const coverage = narrationCoverage(src, scenes);
   return {
     originalQuoteCount,
     dialogueCount,
     keptRatio: originalQuoteCount > 0 ? dialogueCount / originalQuoteCount : 1,
+    paragraphCount: coverage.paragraphCount,
+    coveredParagraphCount: coverage.coveredParagraphCount,
+    narrationRatio: coverage.paragraphCount > 0 ? coverage.coveredParagraphCount / coverage.paragraphCount : 1,
     notFoundCount,
     orderSuspectCount,
     speakerIssues,
@@ -777,6 +952,9 @@ export function verifyScriptAgainstSource(
 
 /** 覆盖率低于此值且原文引语足够多时，管线自动重写该章一次（最多 1 次） */
 export const SCRIPT_MIN_KEPT_RATIO = 0.85;
+
+/** 段落覆盖率低于此值且原文段落足够多时（且未开启压缩旁白），管线自动重写该章一次（#794） */
+export const SCRIPT_MIN_NARRATION_RATIO = 0.6;
 
 /** 存疑项稳定 key（忽略表用）：场景序号:行序号:原因 */
 export function verifyIssueKey(sceneIndex: number, lineIndex: number, reason: SpeakerIssue["reason"]): string {

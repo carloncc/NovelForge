@@ -37,6 +37,36 @@ function referenceRoleInstructions(references: ImageReference[]): string {
   return `\n\n${labels.join("\n")}\nDo not judge identity from STYLE or STRUCTURE reference images.`;
 }
 
+/** 负面词表：回覆中出现且未被否定时判不通过 */
+const NEGATIVE_TERMS = ["不符合", "不满足", "有问题", "畸形", "变形", "不是同一", "不同角色", "无法判断", "未知", "看不清", "不能确定"];
+
+/** 负面词紧邻前的否定词（无畸形 / 没有变形 / 未见明显变形），命中说明是在描述「没问题」 */
+const NEGATION_BEFORE_TERM = /(不|无|没|未)[^。！？!?；;，,、]{0,6}$/;
+
+/**
+ * 判定回覆是否通过。模型通过时也会复述检查项（如「符合，人物无畸形」），
+ * 早期实现按「含负面词即不通过」会把这些正向描述误判为失败（#780），
+ * 这里改为：只有未被否定的负面词才判不通过。
+ */
+export function parseSelfCheckReply(reply: string): SelfCheckResult {
+  const trimmed = reply.trim();
+  let failed = false;
+  for (const term of NEGATIVE_TERMS) {
+    let from = 0;
+    for (;;) {
+      const at = trimmed.indexOf(term, from);
+      if (at < 0) break;
+      from = at + term.length;
+      const before = trimmed.slice(Math.max(0, at - 12), at);
+      if (NEGATION_BEFORE_TERM.test(before)) continue;
+      failed = true;
+      break;
+    }
+    if (failed) break;
+  }
+  return { ok: /^符合/.test(trimmed) && !failed, reason: trimmed.slice(0, 200) };
+}
+
 /** 用多模态模型核对生成图是否达标；判断结果正常返回，配置/能力/服务不可用错误向上抛出。 */
 export async function verifyImage(
   cfg: ApiConfig,
@@ -55,11 +85,7 @@ export async function verifyImage(
       { maxTokens: 200, onUsage: options.onUsage },
       references,
     );
-    const trimmed = reply.trim();
-    // 严格判定：必须明确以“符合”开头且不含否定/无法判断词；空回复、无法判断一律判不通过，避免假阳性放行畸形图
-    const ok = /^符合/.test(trimmed)
-      && !/(不符合|不满足|有问题|畸形|变形|不是同一|不同角色|无法判断|未知|看不清|不能确定)/.test(trimmed);
-    return { ok, reason: trimmed.slice(0, 200) };
+    return parseSelfCheckReply(reply);
   } catch (e) {
     if (e instanceof VisionApiError) throw e;
     const message = e instanceof Error ? e.message : String((e as { message?: unknown })?.message ?? e);

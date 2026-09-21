@@ -294,6 +294,41 @@ export interface SceneJSON {
   choices?: Choice[];
   bgm?: string;
   videoPoints?: VideoSuggestion[];
+  /** 图片小说分镜（#806/#810）：全屏插画随对话切换；sprite 模式为空 */
+  shots?: Shot[];
+}
+
+/**
+ * 图片小说分镜：一张全屏插画 + 在对话中的切换点。
+ * prompt 为英文整幅插画提示词（含角色/动作/表情/构图/场景）；triggerLineIndex 指向 SceneJSON.lines 的 0-based 行号。
+ */
+export interface Shot {
+  id: string;
+  prompt: string;
+  triggerLineIndex: number;
+  /** 出场角色 id（用于三视图 identity 参考；#814 决策 7） */
+  characters?: string[];
+  /** 供鉴赏室显示的短标题（可选） */
+  note?: string;
+}
+
+/** 图片小说页面专属选项（#806；与 GenerationOptions 重叠的字段复用同名语义） */
+export interface ImageStoryOptions {
+  /** 每场景分镜张数（0=不限，由剧本模型按剧情决定） */
+  shotsPerScene: number;
+  /** 每章分镜总量上限（0=不限） */
+  shotsPerChapter: number;
+  /** 全局分镜总量/预算上限（0=不限；到达上限停止派发新任务并可续跑） */
+  shotsTotal: number;
+  imageStyle: string;
+  imageSeed: number;
+  imageSelfCheck?: boolean;
+  /** 是否生成物品图（图片小说默认关闭） */
+  includeItems?: boolean;
+  /** 目标语言（空=原文；复用主项目分章/翻译能力） */
+  language?: string;
+  /** 风格锚点（画风基准图；同时用于主题取色） */
+  styleAnchor?: boolean;
 }
 
 export interface ChapterScript {
@@ -303,7 +338,7 @@ export interface ChapterScript {
 }
 
 export interface ImageTask {
-  kind: "figure" | "background" | "cg" | "item" | "threeview" | "action" | "anchor";
+  kind: "figure" | "background" | "cg" | "item" | "threeview" | "action" | "anchor" | "shot";
   id: string;
   /** 该任务所属章节（仅背景/CG：ChapterScript.chapter，0-based 连续编号）；用于按章精确强制重画 */
   chapter?: number;
@@ -322,6 +357,10 @@ export interface ImageTask {
   usage?: string;
   /** 确定性种子（用于同一项目多次生成保持风格稳定） */
   seed?: number;
+  /** 图片小说分镜所属场景 id（仅 kind=shot） */
+  sceneId?: string;
+  /** 图片小说分镜在场景内的序号（0-based，仅 kind=shot） */
+  shotIndex?: number;
 }
 
 export interface ProjectMeta {
@@ -396,6 +435,8 @@ export interface AssetMap {
   figure: Record<string, string>;
   item: Record<string, string>;
   vocal: Record<string, string>;
+  /** 图片小说分镜图（shot.id → 文件路径）；立绘版项目该字段为空/缺省 */
+  shot?: Record<string, string>;
 }
 
 /** 每个阶段的「重生成意见」，在重跑该阶段时注入给 LLM */
@@ -433,7 +474,7 @@ export interface GenerationOptions {
   useTts: boolean;
   useVideoPoints: boolean;
   useBgm: boolean;
-  /** 环境音效（SE）：按场景氛围播放内置雨/雷/风等音效；默认关闭，需要氛围音时再打开 */
+  /** 环境音效（SE）：按场景氛围播放内置雨/雷/风等音效；默认开启，无声氛围需求可关闭 */
   useSe?: boolean;
   figureEmotions: boolean;
   /** 人物图详细度：core=标准5表情＋无服装差分（省图省钱）；full=AI全量表情＋服装＋动作（默认，保持现状） */
@@ -479,6 +520,8 @@ export interface GenerationOptions {
   styleAnchor?: boolean;
   /** 剧本文风描述（如"古风典雅""幽默风趣"），LLM 按此风格改写台词与旁白；留空不调整 */
   scriptStyle?: string;
+  /** 旁白压缩开关（#801）：false（默认）=忠实保留原文全部旁白/心理/环境描写；true=精简提炼旁白（剧本更短更快） */
+  compressNarration?: boolean;
   /** 提取卡片使用 Agent 模式（多步自主扫描 + 工具调用），长小说更稳、可逐步补全 */
   extractAgent?: boolean;
   /** 目标语言（如 en/ja），把小说翻译成该语言后再生成；空 = 使用原文 */

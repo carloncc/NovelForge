@@ -39,6 +39,7 @@ import {
 import { reCutoutAsset, buildImageTasks, repairImageAssets } from "../core/images";
 import { repairVoiceAssets } from "../core/voice";
 import { planStageCascade } from "../core/stageCascade";
+import { missingImagesInChapters, summarizeImagePlan } from "../core/imageStats";
 import { recognizeStyle } from "../core/recognize";
 import { configIsUsable } from "../api/providers";
 import { useAssetThumbs, ensureAssetLoaded, clearThumbCache } from "../composables/useAssetThumbs";
@@ -56,8 +57,8 @@ import {
 } from "../core/visualBible";
 import { emptyAssetMap, parseAssetMap, updateAssetMap, listAssetBackups, restoreAssetBackup } from "../core/assetMap";
 import { parseChapterScript } from "../core/dataValidation";
-import { scriptCacheFileName, scriptCacheRest, titleHash } from "../core/cache";
-import { mergeFailedTasks, mutateFailedTasks } from "../core/failedTasks";
+import { scriptCacheFileName, scriptCacheRest, scriptFingerprint, titleHash, cardsFingerprint } from "../core/cache";
+import { mergeFailedTasks, mutateFailedTasks, readFailedTasks, visibleFailedTasks } from "../core/failedTasks";
 import {
   applySpeakerFix,
   deleteScriptLine,
@@ -105,6 +106,23 @@ const runMode = ref<RunMode>(initialRunMode());
 watch(runMode, (m) => {
   try {
     localStorage.setItem(RUN_MODE_KEY, m);
+  } catch {
+    /* 忽略 */
+  }
+});
+
+/** 设置抽屉展开状态：跨页面/重启记住（无记录时默认收起，减少首屏控件） */
+const SETTINGS_OPEN_KEY = "novelforge:generate-settings-open";
+const settingsOpen = ref<boolean>((() => {
+  try {
+    return localStorage.getItem(SETTINGS_OPEN_KEY) === "1";
+  } catch {
+    return false;
+  }
+})());
+watch(settingsOpen, (v) => {
+  try {
+    localStorage.setItem(SETTINGS_OPEN_KEY, v ? "1" : "0");
   } catch {
     /* 忽略 */
   }
@@ -179,6 +197,19 @@ function clearPendingResume(): void {
 const pipelineRef = ref<Pipeline | null>(null);
 /** 中止/异常路径从 Pipeline 收回的失败任务（未完成 run 的失败项也可见） */
 const lastRunFailedTasks = ref<FailedTask[]>([]);
+/**
+ * 磁盘上的失败项（failed.json）——失败列表的唯一事实来源：
+ * 管线/素材重试都会读写 failed.json；旧实现只看 projectState.lastResult.failedTasks（快照，永不刷新），
+ * 导致「点重试成功后报错仍挂在页面上」（用户实测）。现在统一从 failed.json 读取并随运行/重试刷新。
+ */
+const persistedFailedTasks = ref<FailedTask[]>([]);
+
+export async function refreshFailedTasks(): Promise<void> {
+  const dir = projectState.outputDir;
+  persistedFailedTasks.value = dir ? await readFailedTasks(dir) : [];
+  // 同步快照（项目状态持久化不再保留过期失败项）
+  if (projectState.lastResult) projectState.lastResult.failedTasks = failedTasks.value.slice();
+}
 const scriptFiles = ref<{ name: string; text: string }[]>([]);
 const currentScript = ref("");
 const videoStatus = ref<Record<string, boolean>>({});
@@ -255,12 +286,17 @@ const costText = computed(() => {
 });
 
 const failedTasks = computed<FailedTask[]>(() => {
-  const persisted = projectState.lastResult?.failedTasks ?? [];
-  const extra = lastRunFailedTasks.value.filter(
-    (f) => !persisted.some((x) => x.id === f.id),
-  );
-  return [...persisted, ...extra];
+  // 事实来源：failed.json（persistedFailedTasks）∪ 本次运行内存列表；按「身份」去重
+  // （图像 bg/cg 共用 scene.id，只按 id 去重会互相抵消）
+  return visibleFailedTasks(persistedFailedTasks.value, lastRunFailedTasks.value);
 });
+// 换项目/恢复项目后刷新磁盘失败项（启动时 outputDir 从空变为路径也会触发）
+watch(
+  () => projectState.outputDir,
+  () => {
+    void refreshFailedTasks();
+  },
+);
 // 同步到轻量模块（App.vue 侧栏失败徽标用；避免外层组件引入整个 store）。
 // immediate：启动恢复出的历史失败项也要立即可见（此前 watch 不立即执行，徽标要等下一次变化才出现）
 watch(failedTasks, (list) => runStatusSetFailed(list.length), { immediate: true });
@@ -320,6 +356,7 @@ const stageStatus = useStageStatus({
   getResult: () => projectState.lastResult,
   getOptions: () => projectState.options,
   getTtsConfig: () => activeConfig("tts"),
+  getLlmAvailable: () => !!activeConfig("llm")?.apiKey,
 });
 
 /** 每个阶段失败任务数（用于徽标显示） */
@@ -346,6 +383,39 @@ const chapterStatus = useChapterStatus({
 
 const enabledNovelChapters = computed(() => projectState.novel?.chapters.filter((c) => c.enabled !== false) ?? []);
 const disabledNovelChapters = computed(() => projectState.novel?.chapters.filter((c) => c.enabled === false) ?? []);
+
+/**
+ * 图片计划统计（生成前先算总账）：按章节灯聚合「共多少张 / 已生成 / 待生成」。
+ * 只统计已有剧本的章节（没有剧本算不出本章要用哪些图）；未生成剧本的章节单独计数如实说明。
+ */
+const imagePlanSummary = computed(() =>
+  summarizeImagePlan(
+    chapterStatus.lights,
+    enabledNovelChapters.value.map((c) => c.index),
+  ),
+);
+
+/** 生成前的图片总账文案：图像关闭 / 未配置 API / 尚无剧本都给出明确说法，不让用户猜 */
+const imagePlanText = computed(() => {
+  if (!projectState.options.useImage) return t("图像已关闭（可在「生成内容」开启）");
+  if (!activeConfig("image")?.apiKey) return t("未配置图像 API，图片不会生成");
+  const s = imagePlanSummary.value;
+  if (!s.knownChapters) return t("剧本生成后自动计算图片总数");
+  const base = t("图片共 {total} 张：已生成 {done} · 待生成 {missing}", { total: s.total, done: s.done, missing: s.missing });
+  return s.unknownChapters ? `${base}${t("（另有 {n} 章未生成剧本，未计入）", { n: s.unknownChapters })}` : base;
+});
+
+/** 指定章节范围内待生成的图片张数（按章节灯聚合；缺剧本的章节不计入） */
+function missingImagesForChapters(indices: number[]): number {
+  return missingImagesInChapters(chapterStatus.lights, indices);
+}
+
+/** 批量运行确认里的图片开销提示（图像关闭/未配置/未知时不显示） */
+function imageBatchNote(indices: number[]): string {
+  if (!projectState.options.useImage || !activeConfig("image")?.apiKey) return "";
+  const missing = missingImagesForChapters(indices);
+  return missing > 0 ? t("；图像待生成约 {n} 张", { n: missing }) : "";
+}
 
 /** 停用/启用章节（持久化；停用后管线跳过该章，编号会前移，配音 key 随之变化） */
 function toggleNovelChapter(novelIdx: number): void {
@@ -637,9 +707,10 @@ async function runChapterBatch(indices: number[]): Promise<void> {
     error.value = t("请先在「导入小说」页导入小说（或加载示例小说）");
     return;
   }
-  // 计费批量操作前置确认：章节数 + 是否含配音（剧本/图像按缓存只补缺失，但缺失部分会计费）
+  // 计费批量操作前置确认：章节数 + 是否含配音 + 图片总账（剧本/图像按缓存只补缺失，但缺失部分会计费）
   const voiceNote = chapterIncludeVoice.value ? "，含配音（TTS 计费）" : "";
-  if (!window.confirm(`将逐章生成 ${indices.length} 个章节${voiceNote}：剧本/图像按缓存只补缺失（已完成的不会重复计费）。继续吗？`)) return;
+  const imageNote = imageBatchNote(indices);
+  if (!window.confirm(`将逐章生成 ${indices.length} 个章节${voiceNote}${imageNote}：剧本/图像按缓存只补缺失（已完成的不会重复计费）。继续吗？`)) return;
   const token = claimQueue();
   if (token === null) return;
   try {
@@ -765,19 +836,21 @@ async function runChapterQueue(): Promise<void> {
     error.value = t("请先在「导入小说」页导入小说（或加载示例小说）");
     return;
   }
+  // 先刷新章节灯再算「未完成」与图片总账，确认框里的张数才是真实值
+  await chapterStatus.refresh();
+  const pending = novel.chapters
+    .filter((c) => c.enabled !== false && !isChapterContentComplete(chapterStatus.lights[c.index] ?? emptyChapterLight()))
+    .map((c) => c.index);
+  if (!pending.length) {
+    pushLog({ step: "单章", message: "全部启用章节的内容（剧本＋图像）均已完成，无需再跑", level: "success", at: Date.now() });
+    return;
+  }
   // 计费批量操作前置确认（逐章链可能跑图像/配音，只补缺失但缺失部分会计费）
-  if (!window.confirm("顺序补全：将把所有未完成章节依次生成（逐章跑，按当前内容设置执行；图像/配音只补缺失但会计费）。继续吗？")) return;
+  const imageNote = imageBatchNote(pending);
+  if (!window.confirm(`顺序补全：将依次生成 ${pending.length} 个未完成章节${imageNote}（逐章跑，按当前内容设置执行；图像/配音只补缺失但会计费）。继续吗？`)) return;
   const token = claimQueue();
   if (token === null) return;
   try {
-    await chapterStatus.refresh();
-    const pending = novel.chapters
-      .filter((c) => c.enabled !== false && !isChapterContentComplete(chapterStatus.lights[c.index] ?? emptyChapterLight()))
-      .map((c) => c.index);
-    if (!pending.length) {
-      pushLog({ step: "单章", message: "全部启用章节的内容（剧本＋图像）均已完成，无需再跑", level: "success", at: Date.now() });
-      return;
-    }
     await runChapterBatchInner(pending);
   } finally {
     releaseQueue(token);
@@ -1823,6 +1896,8 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
     void chapterStatus.refresh();
     // 运行日志自动落盘（含失败/中止）：下次出事先看 .novel2vn/logs/run-*.log
     void persistRunLog();
+    // 失败列表以 failed.json 为准刷新：重跑成功的章节/图片/配音立即从页面消失
+    void refreshFailedTasks();
   }
 }
 
@@ -3557,6 +3632,10 @@ interface VerifyReportRow {
   keptRatio: number;
   originalQuoteCount: number;
   dialogueCount: number;
+  /** 段落覆盖率（#794）：旧报告没有该字段，属可选 */
+  paragraphCount?: number;
+  coveredParagraphCount?: number;
+  narrationRatio?: number;
   notFoundCount: number;
   ignored: string[];
   issues: SpeakerIssue[];
@@ -3580,6 +3659,25 @@ function isTrivialVerifyIssue(issue: SpeakerIssue): boolean {
   return issue.reason === "order-suspect" && (issue.text || "").length < 6;
 }
 
+/** 卡片指纹（剧本缓存键的一部分）：与管线同源，优先用内存卡片，其次读磁盘工作副本。
+ *  重新提取导致角色 id 变化时，旧剧本按指纹自动失效（否则渲染人名会退化成内部 id）。 */
+async function cardsFpForScript(): Promise<string> {
+  const cards = projectState.lastResult?.cards;
+  if (cards?.characters?.length) return cardsFingerprint(cards);
+  const dir = projectState.outputDir;
+  if (!dir) return "";
+  for (const f of ["cards.json", "cards_demo.json"]) {
+    try {
+      const { text } = await tauri.readTextFile(`${dir}/.novel2vn/${f}`);
+      const parsed = JSON.parse(text) as { characters?: { id: string; name?: string }[] };
+      if (Array.isArray(parsed.characters)) return cardsFingerprint(parsed);
+    } catch {
+      /* 换下一个 */
+    }
+  }
+  return "";
+}
+
 async function loadVerifyReports(): Promise<void> {
   verifyReports.value = [];
   const out = projectState.outputDir;
@@ -3597,7 +3695,11 @@ async function loadVerifyReports(): Promise<void> {
       const ch0 = projectState.novel?.chapters.find((c) => c.index === rep.chapterIndex);
       if (ch0) {
         const style0 = (projectState.options.scriptStyle ?? "").trim();
-        const rest0 = scriptCacheRest(ch0.title, ch0.text || "", style0 ? `_st${titleHash(style0)}` : "");
+        const rest0 = scriptCacheRest(
+          ch0.title,
+          ch0.text || "",
+          scriptFingerprint({ style: style0, compressNarration: projectState.options.compressNarration, cardsFp: await cardsFpForScript() }),
+        );
         if (rep.textFp !== rest0) continue;
       }
       const ch = projectState.novel?.chapters.find((c) => c.index === rep.chapterIndex);
@@ -3607,6 +3709,9 @@ async function loadVerifyReports(): Promise<void> {
         keptRatio: rep.result.keptRatio,
         originalQuoteCount: rep.result.originalQuoteCount,
         dialogueCount: rep.result.dialogueCount,
+        paragraphCount: rep.result.paragraphCount,
+        coveredParagraphCount: rep.result.coveredParagraphCount,
+        narrationRatio: rep.result.narrationRatio,
         notFoundCount: rep.result.notFoundCount,
         ignored: rep.ignored,
         issues: rep.result.speakerIssues,
@@ -3659,7 +3764,7 @@ async function verifyScriptCacheTarget(chapterIndex: number): Promise<{ path: st
   const ch = await sourceChapterFor(raw);
   const demo = !activeConfig("llm")?.apiKey;
   const style = (projectState.options.scriptStyle ?? "").trim();
-  const styleFrag = style ? `_st${titleHash(style)}` : "";
+  const styleFrag = scriptFingerprint({ style, compressNarration: projectState.options.compressNarration, cardsFp: await cardsFpForScript() });
   const path = scriptCacheFileName(`${out}/.novel2vn/cache`, demo, ch.index, ch.title, ch.text || "", styleFrag);
   try {
     const { text } = await tauri.readTextFile(path);
@@ -3691,7 +3796,7 @@ async function reverifyChapter(chapter: { index: number; title: string; text: st
   if (!out || !chars) return;
   const demo = !activeConfig("llm")?.apiKey;
   const style = (projectState.options.scriptStyle ?? "").trim();
-  const styleFrag = style ? `_st${titleHash(style)}` : "";
+  const styleFrag = scriptFingerprint({ style, compressNarration: projectState.options.compressNarration, cardsFp: await cardsFpForScript() });
   const cacheDir = `${out}/.novel2vn/cache`;
   const path = scriptVerifyFileName(cacheDir, demo, chapter.index, chapter.title, chapter.text || "", styleFrag);
   const prev = await readScriptVerify(path);
@@ -3789,7 +3894,7 @@ async function ignoreVerifyIssue(rep: VerifyReportRow, issue: SpeakerIssue & { k
   try {
     const demo = !activeConfig("llm")?.apiKey;
     const style = (projectState.options.scriptStyle ?? "").trim();
-    const styleFrag = style ? `_st${titleHash(style)}` : "";
+    const styleFrag = scriptFingerprint({ style, compressNarration: projectState.options.compressNarration, cardsFp: await cardsFpForScript() });
     const cacheDir = `${out}/.novel2vn/cache`;
     const path = scriptVerifyFileName(cacheDir, demo, ch.index, ch.title, ch.text || "", styleFrag);
     const prev = await readScriptVerify(path);
@@ -3887,6 +3992,8 @@ async function retryFailedTask(f: FailedTask): Promise<void> {
     const idx = parseInt(f.id.replace("chapter_", ""), 10) - 1;
     if (!Number.isFinite(idx) || idx < 0) return;
     await runChapterPartRegen(idx, "script");
+    // 以 failed.json 为准刷新（重跑成功的章节立即从失败列表消失）
+    void refreshFailedTasks();
     return;
   }
   if (f.kind === "tts") {
@@ -3922,6 +4029,7 @@ async function retryFailedTask(f: FailedTask): Promise<void> {
       assetBusy.value = "";
       resetRegenState();
       await loadAssetMapNow(true);
+      void refreshFailedTasks();
     }
     return;
   }
@@ -3963,6 +4071,7 @@ async function retryFailedTask(f: FailedTask): Promise<void> {
       assetBusy.value = "";
       resetRegenState();
       await loadAssetMapNow(true);
+      void refreshFailedTasks();
     }
     return;
   }
@@ -4074,6 +4183,7 @@ export const generateStore = {
   STAGE_LABELS,
   initialRunMode,
   runMode,
+  settingsOpen,
   runModeHint,
   goFullMode,
   error,
@@ -4250,6 +4360,8 @@ export const generateStore = {
   importVideo,
   onVideoImportFile,
   loadScripts,
+  imagePlanSummary,
+  imagePlanText,
   verifyReports,
   showTrivialVerify,
   verifyBusy,

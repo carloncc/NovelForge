@@ -19,6 +19,7 @@ import { useGenerateController } from "../stores/generate";
 const {
   tab,
   runMode,
+  settingsOpen,
   busy,
   liveProgress,
   livePct,
@@ -30,7 +31,6 @@ const {
   copiedMsgLevel,
   LOG_RENDER_LIMIT,
   pendingResumeStages,
-  pendingResumeScope,
   clearPendingResume,
   STAGE_LABELS,
   pipelineSteps,
@@ -66,6 +66,7 @@ const {
   preview,
   runChapterFullRegen,
   runChapterPartRegen,
+  imagePlanText,
   appendInput,
   pickAppendFile,
   onAppendFile,
@@ -73,33 +74,73 @@ const {
   stopping,
 } = useGenerateController();
 
-/* 主页面只保留：状态 → 章节列表 → 唯一主按钮；设置与产物各收进一行折叠入口 */
+/* 页面结构（重构后）：任务区在前（范围 + 该范围的主操作），配置/日志/产物各收一行。
+   默认视野 = 页头 → 状态横幅 → 进度（运行时）→ 范围切换 → 任务卡 → 设置/日志/产物折叠行 */
 
-/* UI13：原先在 setup 期一次性 t()，切换界面语言后摘要仍停留在旧语言；
-   改为 computed 后随 currentLang 响应式重算，使用处需通过 .value 访问 */
-const RUN_MODE_LABEL = computed<Record<string, string>>(() => ({
-  chapter: t("逐章补全"),
-  full: t("整书生成"),
-  stage: t("单阶段重跑"),
-}));
 /* UI15：日志时间按界面语言本地化；函数在渲染时读取 currentLang，切语言后自动重渲染 */
 function formatTime(ms: number): string {
   return new Date(ms).toLocaleTimeString(currentLang.value === "zh-CN" ? "zh-CN" : currentLang.value);
 }
+/** 设置摘要：项目（目录尾名/未载入）+ 关键开关；展开状态跨重启记忆（stores/generate.settingsOpen） */
 const settingsSummary = computed(() => {
   const o = projectState.options;
-  const parts = [
-    projectState.novel?.fileName ?? t("未选择小说"),
-    RUN_MODE_LABEL.value[runMode.value] ?? runMode.value,
+  const tail = (projectState.outputDir || "").split(/[\\/]/).filter(Boolean).pop();
+  const project = projectState.novel ? (tail || t("已载入小说")) : t("未载入小说");
+  return [
+    project,
     `${t("图像")}${o.useImage ? "✓" : "×"}`,
     `${t("配音")}${o.useTts ? "✓" : "×"}`,
-  ];
-  return parts.join(" · ");
+    `${t("旁白")}${o.compressNarration ? t("精简") : t("忠实")}`,
+  ].join(" · ");
 });
+
+/* 有失败记录的章节（novel index）：章节列表据此显示「失败」并优先保留可见 */
+const failedChapterIndexes = computed(() =>
+  failedTasks.value
+    .filter((f) => f.kind === "script" && /^chapter_\d+$/.test(f.id))
+    .map((f) => Number(f.id.replace("chapter_", "")) - 1),
+);
 
 const scriptDoneCount = computed(
   () => Object.values(chapterStatus.lights).filter((l) => l.script).length,
 );
+
+/** 一个横幅原则：失败项 > 视觉守门 > 续跑计划，只显示最高优先级的一条（旧实现三条可同时堆叠） */
+const notice = computed<{ kind: string; title: string; text: string; action: string; run: () => void } | null>(() => {
+  if (failedTasks.value.length) {
+    return {
+      kind: "fail-banner",
+      title: `${t("有失败任务待处理：")}${failedTasks.value.length} ${t("项")}`,
+      text: t("失败项已按原因分类；可逐项查看并重试，或一键按失败原因自动重跑（限流/超时会自动等待）。"),
+      action: `${t("处理失败项")}（${failedTasks.value.length}）`,
+      run: () => {
+        tab.value = "run";
+        resultsOpen.value = true;
+      },
+    };
+  }
+  if (visualBibleReviewNeeded.value) {
+    return {
+      kind: "vb-banner",
+      title: t("图像生成前需要确认视觉守门"),
+      text: t("统一风格与角色三视图尚未批准，图像阶段会先停在这里。"),
+      action: t("去确认"),
+      run: () => {
+        tab.value = "bible";
+      },
+    };
+  }
+  if (pendingResumeStages.value.length) {
+    return {
+      kind: "vb-banner",
+      title: t("已排队的续跑计划（等视觉守门批准后自动执行）"),
+      text: `${t("阶段：")}${pendingResumeStages.value.map((s) => t(STAGE_LABELS[s])).join(" → ")}`,
+      action: t("取消计划"),
+      run: () => clearPendingResume(),
+    };
+  }
+  return null;
+});
 const resultsSummary = computed(() => {
   const total = enabledNovelChapters.value.length;
   const fail = failedTasks.value.length;
@@ -115,6 +156,10 @@ watch(tab, (v) => {
   // tab 已经是 run 时 watch 不触发，所以点击「处理失败项」这类跳转必须自己把抽屉打开，否则点击无反应
   if (v !== "run") resultsOpen.value = true;
 });
+
+/** 日志卡只在有日志或运行中出现：空闲 + 无日志时不再常驻一张空卡片 */
+const showLogs = computed(() => busy.value || projectState.logs.length > 0);
+/** 运行中自动把日志面板滚到底由 logPanelRef 处理；这里只保证运行时卡片存在 */
 </script>
 
 <template>
@@ -128,34 +173,13 @@ watch(tab, (v) => {
       >{{ stopping ? t("正在停止…") : t("停止") }}</button>
     </PageHead>
 
-    <!-- 只有需要用户决策时才出现的横幅，每个最多一个入口 -->
-    <div v-if="failedTasks.length" class="vb-banner fail-banner">
+    <!-- 状态横幅：同一时刻最多一条（失败 > 守门 > 续跑），每个最多一个入口 -->
+    <div v-if="notice" class="vb-banner" :class="notice.kind">
       <div>
-        <strong>{{ t("有失败任务待处理：") }}{{ failedTasks.length }} {{ t("项") }}</strong>
-        <p>{{ t("失败项已按原因分类；可逐项查看并重试，或一键按失败原因自动重跑（限流/超时会自动等待）。") }}</p>
+        <strong>{{ notice.title }}</strong>
+        <p>{{ notice.text }}</p>
       </div>
-      <!-- tab 已是 run 时 watch(tab) 不会触发，必须同时显式展开产物抽屉，否则按钮看起来没反应 -->
-      <button class="btn secondary small" @click="tab = 'run'; resultsOpen = true">{{ t("处理失败项") }}（{{ failedTasks.length }}）</button>
-    </div>
-
-    <div v-if="visualBibleReviewNeeded" class="vb-banner">
-      <div>
-        <strong>{{ t("图像生成前需要确认视觉守门") }}</strong>
-        <p>{{ t("统一风格与角色三视图尚未批准，图像阶段会先停在这里。") }}</p>
-      </div>
-      <button class="btn secondary small" @click="tab = 'bible'">{{ t("去确认") }}</button>
-    </div>
-
-    <div v-if="pendingResumeStages.length" class="vb-banner">
-      <div>
-        <strong>{{ t("已排队的续跑计划（等视觉守门批准后自动执行）") }}</strong>
-        <p>
-          {{ t("阶段：") }}{{ pendingResumeStages.map((s) => t(STAGE_LABELS[s])).join(" → ") }}
-          <template v-if="pendingResumeScope?.rerunChapters?.length"> · {{ t("章节：第") }} {{ pendingResumeScope.rerunChapters.map((n) => n + 1).join("、") }} {{ t("章") }}</template>
-          <template v-else-if="pendingResumeScope?.rerunChapters === null"> · {{ t("章节：全书") }}</template>
-        </p>
-      </div>
-      <button class="btn ghost small" @click="clearPendingResume">{{ t("取消计划") }}</button>
+      <button class="btn secondary small" @click="notice.run()">{{ notice.action }}</button>
     </div>
 
     <!-- 进度：运行中给醒目的百分比进度条 + 阶段名；结束后保留步骤条 -->
@@ -181,20 +205,9 @@ watch(tab, (v) => {
       />
     </div>
 
-    <!-- 设置抽屉：生成方式 / 项目目录 / 生成内容与高级项（默认展开） -->
-    <details class="card gen-settings" open>
-      <summary class="gen-summary">
-        <strong>{{ t("设置") }}</strong>
-        <span class="hint">{{ settingsSummary }}</span>
-      </summary>
-      <div class="mt-3">
-        <ScopeTabs v-model="runMode" :disabled="queueRunning" />
-        <ProjectBar />
-        <OptionsPanel />
-      </div>
-    </details>
+    <!-- 任务区：先生成范围，再是该范围的唯一主操作 -->
+    <ScopeTabs v-model="runMode" :disabled="queueRunning" />
 
-    <!-- 主区域：章节列表 + 唯一主按钮 -->
     <template v-if="runMode === 'chapter'">
       <input ref="appendInput" type="file" accept=".txt,text/plain" style="display: none" @change="onAppendFile" />
       <ChapterWorkbench
@@ -215,6 +228,8 @@ watch(tab, (v) => {
         :split-confirmed="splitConfirmed"
         :split-min-chapter-chars="projectState.options.splitMinChapterChars ?? 0"
         :split-keep-specials="projectState.options.splitKeepSpecials ?? false"
+        :image-summary-text="imagePlanText"
+        :failed-chapters="failedChapterIndexes"
         @regen="runChapterFullRegen"
         @regen-part="runChapterPartRegen"
         @toggle="toggleNovelChapter"
@@ -249,10 +264,29 @@ watch(tab, (v) => {
       <StageRunPanel />
     </template>
 
-    <!-- 运行日志：常驻主页面（生成时实时滚动），不再藏在产物抽屉里 -->
-    <div class="card">
-      <div class="card-head">
-        <h3>{{ t("运行日志") }}</h3>
+    <!-- 设置抽屉：项目目录 + 生成内容与高级项；展开状态跨重启记忆 -->
+    <details
+      class="card gen-settings"
+      :open="settingsOpen"
+      @toggle="settingsOpen = ($event.target as HTMLDetailsElement).open"
+    >
+      <summary class="gen-summary">
+        <strong>{{ t("设置") }}</strong>
+        <span class="hint">{{ settingsSummary }}</span>
+      </summary>
+      <div class="mt-3">
+        <ProjectBar />
+        <OptionsPanel />
+      </div>
+    </details>
+
+    <!-- 运行日志：运行时自动展开，空闲时可折叠成一行；有日志才出现 -->
+    <details v-if="showLogs" class="card" :open="busy">
+      <summary class="gen-summary">
+        <strong>{{ t("运行日志") }}</strong>
+        <span class="hint">{{ t("最近 {n} 条", { n: visibleLogs.length }) }}</span>
+      </summary>
+      <div class="card-head mt-3">
         <div class="card-actions">
           <!-- UI10：仅阶段名（step）接入词典；日志正文是运行时拼接的中文（含章节名/路径），无法逐条翻译，如实提示 -->
           <span class="hint" style="align-self: center">{{ t("日志内容为运行记录，暂未全部本地化") }}</span>
@@ -274,7 +308,7 @@ watch(tab, (v) => {
         <p v-if="!visibleLogs.length" class="faint small">{{ t("暂无日志：开始生成后会在这里实时滚动显示") }}</p>
       </div>
       <p v-if="copiedMsg" class="hint mt-2" :style="{ color: copiedMsgLevel === 'err' ? 'var(--err)' : 'var(--ok)' }">{{ copiedMsg }}</p>
-    </div>
+    </details>
 
     <!-- 产物抽屉：整个结果区（运行/产物/设定）默认收起，跳转时自动展开 -->
     <details

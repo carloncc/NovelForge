@@ -70,3 +70,10 @@ export function mergeFailedTasks(list: FailedTask[], incoming: FailedTask[]): Fa
   for (const f of incoming) map.set(failedTaskIdentity(f), f);
   return [...map.values()];
 }
+
+/** 展示用失败列表：磁盘（failed.json）为事实来源，内存本次运行结果补充；按身份去重。
+ *  图像 bg/cg 共用 scene.id——只按 id 去重会互相抵消（用户实测「重试成功仍显示失败」的根因之一）。 */
+export function visibleFailedTasks(persisted: FailedTask[], current: FailedTask[]): FailedTask[] {
+  const seen = new Set(persisted.map((f) => failedTaskIdentity(f)));
+  return [...persisted, ...current.filter((f) => !seen.has(failedTaskIdentity(f)))];
+}

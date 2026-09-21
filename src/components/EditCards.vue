@@ -169,12 +169,13 @@ async function onVoiceFile(e: Event): Promise<void> {
   finally { voiceBusy.value = null; }
 }
 
-/** 停止当前录音，释放媒体流与计时器 */
+/** 停止当前录音，释放媒体流与计时器（并清空引用，避免残留 inactive 实例被下一轮复用） */
 function stopRecordingNow(): void {
   if (recordTimer !== undefined) { window.clearInterval(recordTimer); recordTimer = undefined; }
   if (recorderRef.value && recorderRef.value.state !== "inactive") {
     try { recorderRef.value.stop(); } catch { /* 已停止 */ }
   }
+  recorderRef.value = null;
   recordStreamRef.value?.getTracks().forEach((track) => track.stop());
   recordStreamRef.value = null;
 }
@@ -326,7 +327,7 @@ async function aiCastVoices(): Promise<void> {
   castBusy.value = true;
   setSavedMsg(t("AI 正在挑选音色…"));
   try {
-    const assignments = await aiAssignVoices(cfg, targets);
+    const assignments = await aiAssignVoices(cfg, targets, voiceLibraryFor(activeConfig("tts")));
     const byId = new Map(local.value.characters.map((c) => [c.id, c]));
     let n = 0;
     for (const a of assignments) {

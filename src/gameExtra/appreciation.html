@@ -82,6 +82,7 @@
     <button class="tab active" data-tab="figure" data-i18n="t-figure">立绘鉴赏</button>
     <button class="tab" data-tab="cg" data-i18n="t-cg">CG 画廊</button>
     <button class="tab" data-tab="bg" data-i18n="t-bg">背景画廊</button>
+  <button class="tab" data-tab="shot" data-i18n="t-shot">分镜画廊</button>
     <button class="tab" data-tab="char" data-i18n="t-char">角色图鉴</button>
     <button class="tab" data-tab="bgm" data-i18n="t-bgm">音乐鉴赏</button>
   </div>
@@ -118,6 +119,11 @@
     <div class="grid" id="bgGrid"></div>
   </div>
 
+  <div class="panel" id="panel-shot">
+    <div class="chips" id="shotChips"></div>
+    <div class="grid" id="shotGrid"></div>
+  </div>
+
   <div class="panel" id="panel-char">
     <div class="grid" id="charGrid"></div>
   </div>
@@ -138,10 +144,11 @@
 <script src="./appreciation-data.js"></script>
 <script>
 (function () {
-  var D = window.APPRECIATION_DATA || { lang: "", characters: [], cgs: [], bgs: [], bgms: [] };
+  var D = window.APPRECIATION_DATA || { lang: "", characters: [], cgs: [], bgs: [], bgms: [], shots: [] };
   if (!D.cgs) D.cgs = [];
   if (!D.bgs) D.bgs = [];
   if (!D.bgms) D.bgms = [];
+  if (!D.shots) D.shots = [];
 
   /** 与生成端 render.ts sanitizeId 同一规则：路径两段（角色/服装/动作）都必须消毒，否则特殊字符盲拼必 404（UI105） */
   function nfSanitize(id) {
@@ -149,7 +156,7 @@
   }
 
   var I18N = {
-    zh_CN: { subtitle: "鉴赏室", "t-figure": "立绘鉴赏", "t-cg": "CG 画廊", "t-bg": "背景画廊", "t-char": "角色图鉴", "t-bgm": "音乐鉴赏",
+    zh_CN: { subtitle: "鉴赏室", "t-figure": "立绘鉴赏", "t-cg": "CG 画廊", "t-bg": "背景画廊", "t-shot": "分镜画廊", "t-char": "角色图鉴", "t-bgm": "音乐鉴赏",
       "c-char": "角色", "c-costume": "服装", "c-emotion": "表情", "c-action": "动作", "c-zoom": "远近 / 缩放", "c-bg": "显示背景色",
       "c-prev": "上一张", "c-next": "下一张", "c-fit": "复位", "a-none": "无动作", empty: "暂无内容", voice: "音色", desc: "简介", cloth: "服装",
       "c-default": "默认服装", "e-normal": "默认", "e-happy": "开心", "e-sad": "悲伤", "e-angry": "愤怒", "e-surprised": "惊讶",
@@ -158,7 +165,7 @@
       "nf-figure": "该角色尚未生成立绘，生成后回到本页即可鉴赏", "nf-costume": "该服装立绘尚未生成（可在图像阶段补齐）",
       "nf-action": "该动作立绘尚未生成（可在图像阶段补齐）", "nf-emotion": "该表情差分尚未生成（可在图像阶段补齐）",
       "nf-file": "图片文件不存在，可能未生成或已被删除", "bad-combo": "该组合不存在（服装差分只有默认表情）" },
-    zh_TW: { subtitle: "鑑賞室", "t-figure": "立繪鑑賞", "t-cg": "CG 畫廊", "t-bg": "背景畫廊", "t-char": "角色圖鑑", "t-bgm": "音樂鑑賞",
+    zh_TW: { subtitle: "鑑賞室", "t-figure": "立繪鑑賞", "t-cg": "CG 畫廊", "t-bg": "背景畫廊", "t-shot": "分鏡畫廊", "t-char": "角色圖鑑", "t-bgm": "音樂鑑賞",
       "c-char": "角色", "c-costume": "服裝", "c-emotion": "表情", "c-action": "動作", "c-zoom": "遠近 / 縮放", "c-bg": "顯示背景色",
       "c-prev": "上一張", "c-next": "下一張", "c-fit": "復位", "a-none": "無動作", empty: "暫無內容", voice: "音色", desc: "簡介", cloth: "服裝",
       "c-default": "預設服裝", "e-normal": "預設", "e-happy": "開心", "e-sad": "悲傷", "e-angry": "憤怒", "e-surprised": "驚訝",
@@ -167,7 +174,7 @@
       "nf-figure": "該角色尚未生成立繪，生成後回到本頁即可鑑賞", "nf-costume": "該服裝立繪尚未生成（可在圖像階段補齊）",
       "nf-action": "該動作立繪尚未生成（可在圖像階段補齊）", "nf-emotion": "該表情差分尚未生成（可在圖像階段補齊）",
       "nf-file": "圖片檔案不存在，可能未生成或已被刪除", "bad-combo": "該組合不存在（服裝差分只有預設表情）" },
-    en: { subtitle: "Appreciation", "t-figure": "Sprites", "t-cg": "CG Gallery", "t-bg": "Backgrounds", "t-char": "Characters", "t-bgm": "Music",
+    en: { subtitle: "Appreciation", "t-figure": "Sprites", "t-cg": "CG Gallery", "t-bg": "Backgrounds", "t-shot": "Storyboards", "t-char": "Characters", "t-bgm": "Music",
       "c-char": "Character", "c-costume": "Costume", "c-emotion": "Expression", "c-action": "Pose", "c-zoom": "Zoom", "c-bg": "Show background",
       "c-prev": "Previous", "c-next": "Next", "c-fit": "Reset", "a-none": "No pose", empty: "Nothing here yet", voice: "Voice", desc: "About", cloth: "Outfit",
       "c-default": "Default outfit", "e-normal": "Normal", "e-happy": "Happy", "e-sad": "Sad", "e-angry": "Angry", "e-surprised": "Surprised",
@@ -176,7 +183,7 @@
       "nf-figure": "This character has no sprite yet. Generate images to see it here.", "nf-costume": "This costume sprite has not been generated yet.",
       "nf-action": "This pose sprite has not been generated yet.", "nf-emotion": "This expression variant has not been generated yet.",
       "nf-file": "Image file is missing (not generated or deleted).", "bad-combo": "This combination does not exist (costume variants only have the default expression)." },
-    ja: { subtitle: "鑑賞室", "t-figure": "立ち絵鑑賞", "t-cg": "CGギャラリー", "t-bg": "背景ギャラリー", "t-char": "キャラ図鑑", "t-bgm": "音楽鑑賞",
+    ja: { subtitle: "鑑賞室", "t-figure": "立ち絵鑑賞", "t-cg": "CGギャラリー", "t-bg": "背景ギャラリー", "t-shot": "絵コンテ", "t-char": "キャラ図鑑", "t-bgm": "音楽鑑賞",
       "c-char": "キャラクター", "c-costume": "衣装", "c-emotion": "表情", "c-action": "ポーズ", "c-zoom": "ズーム", "c-bg": "背景色を表示",
       "c-prev": "前へ", "c-next": "次へ", "c-fit": "リセット", "a-none": "ポーズなし", empty: "まだ何もありません", voice: "ボイス", desc: "紹介", cloth: "衣装",
       "c-default": "デフォルト衣装", "e-normal": "通常", "e-happy": "笑顔", "e-sad": "悲しい", "e-angry": "怒り", "e-surprised": "驚き",
@@ -185,7 +192,7 @@
       "nf-figure": "このキャラクターの立ち絵はまだありません", "nf-costume": "この衣装の立ち絵はまだ生成されていません",
       "nf-action": "このポーズの立ち絵はまだ生成されていません", "nf-emotion": "この表情差分はまだ生成されていません",
       "nf-file": "画像ファイルが存在しません（未生成または削除済み）", "bad-combo": "この組み合わせは存在しません（衣装差分はデフォルト表情のみ）" },
-    ko: { subtitle: "감상실", "t-figure": "스프라이트 감상", "t-cg": "CG 갤러리", "t-bg": "배경 갤러리", "t-char": "캐릭터 도감", "t-bgm": "음악 감상",
+    ko: { subtitle: "감상실", "t-figure": "스프라이트 감상", "t-cg": "CG 갤러리", "t-bg": "배경 갤러리", "t-shot": "콘티", "t-char": "캐릭터 도감", "t-bgm": "음악 감상",
       "c-char": "캐릭터", "c-costume": "의상", "c-emotion": "표정", "c-action": "포즈", "c-zoom": "확대/축소", "c-bg": "배경색 표시",
       "c-prev": "이전", "c-next": "다음", "c-fit": "초기화", "a-none": "포즈 없음", empty: "아직 내용이 없습니다", voice: "음성", desc: "소개", cloth: "의상",
       "c-default": "기본 의상", "e-normal": "기본", "e-happy": "기쁨", "e-sad": "슬픔", "e-angry": "분노", "e-surprised": "놀람",
@@ -386,7 +393,7 @@
   var lbIndex = -1;
   var lbZoom = 1;
 
-  function galleryData(kind) { return kind === "cg" ? D.cgs : D.bgs; }
+  function galleryData(kind) { return kind === "cg" ? D.cgs : kind === "bg" ? D.bgs : D.shots; }
   function chapterKey(item) { return item.chapter != null ? String(item.chapter) : "0"; }
   function chapterLabel(key) {
     if (key === "0") return t("other");
@@ -576,6 +583,7 @@
     renderStats();
     renderGallery("cg");
     renderGallery("bg");
+    renderGallery("shot");
     renderChars();
     renderBgm();
   }

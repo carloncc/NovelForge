@@ -282,6 +282,21 @@ export function inputCharBudgetForText(cfg: { model?: string; extra?: Record<str
 }
 
 /**
+ * 单次请求的输出 token 预算：从上下文里扣掉输入估算与固定余量。
+ * 旧实现直接用 min(context, 32768) 不扣输入，小上下文模型 input+maxTokens 直接超上下文，
+ * 请求报错或输出被截断（翻译 #781 / 提取补全 #637 共用）。
+ */
+export function outputTokensForText(
+  cfg: { model?: string; extra?: Record<string, unknown> } | undefined,
+  text: string,
+  cap = 32_768,
+): number {
+  const context = resolveContextLength(cfg);
+  const inputTokens = Math.ceil(text.length / Math.max(0.1, estimateCharsPerToken(text)));
+  return Math.max(512, Math.min(cap, context - inputTokens - 1_000));
+}
+
+/**
  * 根据模型上下文算"安全输入字符预算"。
  * - 无原文时的粗估：1 token ≈ 1.5 字符（偏英文）；有原文请用 inputCharBudgetForText
  *   （中文小说实际约 0.6 字符/token，用 1.5 会超预算触发网关 500）

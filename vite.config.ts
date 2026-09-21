@@ -237,6 +237,48 @@ export function isPathInside(base: string, target: string): boolean {
   return rel === "" || (!isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`));
 }
 
+/** 私网/链路本地 IPv4 段（#791，纵深防御）：云元数据 169.254.0.0/16、RFC1918、CGNAT、0.0.0.0。
+ *  回环（127.0.0.0/8）必须保留——Ollama 等本机模型服务依赖它。 */
+function ipv4IsBlocked(host: string): boolean {
+  const m = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (!m) return false;
+  const a = Number(m[1]);
+  const b = Number(m[2]);
+  if (a === 127) return false;
+  if (a === 10 || a === 0) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 169 && b === 254) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true;
+  return false;
+}
+
+/** IPv4 映射 IPv6 的两种写法：点分（::ffff:192.168.0.1）与 Node URL 归一化后的十六进制（::ffff:c0a8:1） */
+function ipv4MappedIsBlocked(rest: string): boolean {
+  if (rest.includes(".")) return ipv4IsBlocked(rest);
+  const parts = rest.split(":");
+  if (parts.length !== 2) return false;
+  const hi = parseInt(parts[0], 16);
+  const lo = parseInt(parts[1], 16);
+  if (!Number.isFinite(hi) || !Number.isFinite(lo)) return false;
+  return ipv4IsBlocked(`${hi >> 8}.${hi & 0xff}.${lo >> 8}.${lo & 0xff}`);
+}
+
+/** 目标主机是否属于私网/链路本地（含 IPv6：fe80::/10、fc00::/7、IPv4 映射） */
+function hostIsBlocked(hostname: string): boolean {
+  let h = (hostname || "").toLowerCase();
+  if (h.startsWith("[") && h.endsWith("]")) h = h.slice(1, -1);
+  if (h === "localhost" || h === "::1") return false;
+  if (h.includes(":")) {
+    if (h.startsWith("::ffff:")) return ipv4MappedIsBlocked(h.slice(7));
+    if (/^fe[89ab]/.test(h)) return true;
+    if (/^f[cd]/.test(h)) return true;
+    if (h === "::") return true;
+    return false;
+  }
+  return ipv4IsBlocked(h);
+}
+
 export function validateProxyUrl(raw: string): URL {
   let url: URL;
   try {
@@ -245,6 +287,7 @@ export function validateProxyUrl(raw: string): URL {
     throw new Error("invalid proxy URL");
   }
   if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("proxy protocol is not allowed");
+  if (hostIsBlocked(url.hostname)) throw new Error("proxy target host is not allowed");
   return url;
 }
 

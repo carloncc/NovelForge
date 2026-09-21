@@ -1,6 +1,6 @@
 import type { CharacterAction, CharacterCard, CharacterCostume, ExtractionResult, ItemCard, SceneCard } from "./types";
 import { chatJson } from "../api/openaiCompatible";
-import { inputCharBudget, resolveContextLength } from "../api/providers";
+import { inputCharBudget, outputTokensForText } from "../api/providers";
 import { voiceLibraryFor } from "../stores/config";
 import { pickVoiceForGender, voiceGenderOf } from "./minimaxVoices";
 import { normalizeEntityId } from "./ids";
@@ -227,8 +227,10 @@ export async function extractFromNovel(
   title: string,
   onUsage?: (pt: number, ct: number) => void,
   feedback?: string,
+  voiceLib?: string[],
 ): Promise<ExtractionResult> {
-  const lib = voiceLibraryFor(cfg);
+  // 音色库来自 TTS 配置（由调用方传入）；缺省时回退到旧口径（按 cfg 推断，见 #788）
+  const lib = voiceLib ?? voiceLibraryFor(cfg);
   const fb = feedback ? `\n\n用户对上一版提取结果的修改意见（请严格参考并落实）：${feedback}` : "";
   // 按性别标注音色，帮助 AI 给角色分配符合性别的音色（覆盖 MiniMax 官方表与常见音色名，不靠 ID 前缀猜）
   const genderedLib = lib
@@ -239,7 +241,8 @@ export async function extractFromNovel(
     })
     .join(", ");
   const user = `小说标题：${title}\n\n可用音色列表（已标注性别）：${genderedLib}\n\n请为每个角色挑选与其 gender 匹配性别的音色。${fb}\n\n以下是小说全文（按模型上下文动态截断，剩余部分将不被 LLM 看到）：\n${truncate(novelText, inputCharBudget(cfg))}`;
-  const outputTokens = Math.min(resolveContextLength(cfg), 32_768);
+  // 输出预算必须扣除输入估算（旧实现 min(context,32768) 在小上下文模型上 input+output 超上下文）
+  const outputTokens = outputTokensForText(cfg, `${SYSTEM_PROMPT}\n${user}`);
   const result = await chatJson<ExtractionResult>(cfg, SYSTEM_PROMPT, user, { maxTokens: outputTokens, onUsage });
   return normalizeExtractionResult(result, lib, title);
 }

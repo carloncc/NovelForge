@@ -71,8 +71,52 @@ async fn limited_response_bytes(mut response: reqwest::Response) -> Result<Vec<u
 }
 
 #[tauri::command]
-pub async fn http_request(args: HttpRequestArgs) -> Result<Value, String> {
-    let target = http_target(&args)?;
+pub async fn http_request(args: HttpRequestArgs, request_id: Option<u64>) -> Result<Value, String> {
+    // #784：支持取消的在途请求。无 request_id（旧调用方/一次性请求）时直接在当前任务执行；
+    // 有 request_id 时把请求放进独立任务，注册 abort 句柄，前端「停止」可中断在途请求
+    //（否则点停止后最长仍会跑完 600s 并继续计费）。
+    if request_id.is_none() {
+        return do_http_request(args).await;
+    }
+    let handle = tauri::async_runtime::spawn(async move { do_http_request(args).await });
+    let id = request_id.unwrap();
+    {
+        let abort = handle.inner().abort_handle();
+        if let Ok(mut registry) = http_aborts().lock() {
+            registry.insert(id, Box::new(move || abort.abort()));
+        }
+    }
+    let result = handle.await.map_err(|e| format!("请求被取消或任务失败: {e}"))?;
+    if let Ok(mut registry) = http_aborts().lock() {
+        registry.remove(&id);
+    }
+    result
+}
+
+/// 取消在途 HTTP 请求（#784）：应前端「停止」的调用；返回是否命中在途请求
+#[tauri::command]
+pub fn cancel_http_request(request_id: u64) -> Result<bool, String> {
+    let cancel = http_aborts()
+        .lock()
+        .map_err(|_| "锁获取失败".to_string())?
+        .remove(&request_id);
+    match cancel {
+        Some(cancel) => {
+            cancel();
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+type HttpAbortFn = Box<dyn Fn() + Send + Sync>;
+
+fn http_aborts() -> &'static std::sync::Mutex<HashMap<u64, HttpAbortFn>> {
+    static REGISTRY: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, HttpAbortFn>>> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+async fn do_http_request(args: HttpRequestArgs) -> Result<Value, String> {    let target = http_target(&args)?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(args.timeout_secs.clamp(1, 600)))
         // 禁止跟随重定向：否则 302/307 可跳到内网/元数据地址完成 SSRF 绕过，
@@ -319,9 +363,79 @@ pub fn replace_path(src: String, dst: String) -> Result<(), String> {
     Ok(())
 }
 
+/// 原子写临时文件名：`<name>.<pid>.<seq>.tmp`（与本文件 atomic_write_temp_path 同构）
+fn is_atomic_tmp_name(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".tmp") else {
+        return false;
+    };
+    let mut parts = stem.rsplitn(3, '.');
+    let seq = parts.next();
+    let pid = parts.next();
+    let rest = parts.next();
+    match (rest, pid, seq) {
+        (Some(rest), Some(pid), Some(seq)) => {
+            !rest.is_empty()
+                && !pid.is_empty()
+                && !seq.is_empty()
+                && pid.chars().all(|c| c.is_ascii_digit())
+                && seq.chars().all(|c| c.is_ascii_digit())
+        }
+        _ => false,
+    }
+}
+
+/// 递归清理崩溃残留（#783）：删除本程序产生的 .tmp，恢复/清理 .replace-backup。
+/// - `.replace-backup`：原路径缺失说明替换在「已备份、未发布」处中断 → 恢复备份；
+///   原路径存在说明发布已完成、只是备份没清掉 → 删除备份（以新内容为准）。
+fn cleanup_stale_dir(dir: &Path, depth: usize, removed: &mut u64, restored: &mut u64) {
+    if depth == 0 {
+        return;
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // 不跟随符号链接：只处理真实目录/文件
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_dir {
+            cleanup_stale_dir(&path, depth - 1, removed, restored);
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if let Some(target) = name.strip_suffix(".replace-backup") {
+            let original = path.with_file_name(target);
+            if original.exists() {
+                if std::fs::remove_file(&path).is_ok() {
+                    *removed += 1;
+                }
+            } else if std::fs::rename(&path, &original).is_ok() {
+                *restored += 1;
+            }
+            continue;
+        }
+        if is_atomic_tmp_name(&name) && std::fs::remove_file(&path).is_ok() {
+            *removed += 1;
+        }
+    }
+}
+
+/// 启动清理入口：扫描项目目录并清理崩溃残留（非递归到符号链接之外，深度默认 6）
 #[tauri::command]
-pub async fn copy_dir_all(src: String, dst: String) -> Result<(), String> {
-    // 递归复制目录是磁盘密集阻塞操作，放阻塞线程池
+pub fn cleanup_stale_files(root: String, max_depth: Option<usize>) -> Result<Value, String> {
+    let path = PathBuf::from(&root);
+    if !path.is_dir() {
+        return Ok(serde_json::json!({ "removed": 0, "restored": 0 }));
+    }
+    let mut removed = 0u64;
+    let mut restored = 0u64;
+    cleanup_stale_dir(&path, max_depth.unwrap_or(6).clamp(1, 16), &mut removed, &mut restored);
+    Ok(serde_json::json!({ "removed": removed, "restored": restored }))
+}
+
+#[tauri::command]
+pub async fn copy_dir_all(src: String, dst: String) -> Result<(), String> {    // 递归复制目录是磁盘密集阻塞操作，放阻塞线程池
     tauri::async_runtime::spawn_blocking(move || {
         copy_dir_recursive(Path::new(&src), Path::new(&dst))
     })
@@ -467,13 +581,16 @@ pub fn write_api_secrets(secrets: HashMap<String, String>) -> Result<(), String>
 
 #[tauri::command]
 pub fn start_preview_server(root: String) -> Result<Value, String> {
-    let handle = server::start(&root)?;
-    let port = handle.port();
     let running = &preview().running;
     let mut guard = running.lock().map_err(|_| "锁获取失败".to_string())?;
+    // 先释放旧实例再绑定端口（#782）：旧实现先 start 后 stop，连点「启动/刷新」时
+    // 第二次绑定会在旧实例释放前失败，报「端口 17892 被占用」。
+    // guard.take() 取出的 handle 在块结束时 drop，Arc<Server> 随之释放监听 socket。
     if let Some(old) = guard.take() {
         old.stop();
     }
+    let handle = server::start(&root)?;
+    let port = handle.port();
     *guard = Some(handle);
     Ok(serde_json::json!({
         "url": format!("http://127.0.0.1:{port}/index.html"),
@@ -770,7 +887,7 @@ fn write_zip_contents(
 
 #[cfg(test)]
 mod atomic_write_tests {
-    use super::{atomic_write, atomic_write_temp_path, http_target, validate_secret_id, HttpRequestArgs};
+    use super::{atomic_write, atomic_write_temp_path, cancel_http_request, cleanup_stale_dir, http_aborts, http_target, is_atomic_tmp_name, validate_secret_id, HttpRequestArgs};
     use std::collections::HashMap;
 
     #[test]
@@ -804,8 +921,51 @@ mod atomic_write_tests {
     }
 
     #[test]
-    fn secret_ids_reject_unsafe_values() {
-        assert!(validate_secret_id("llm-config_1").is_ok());
+    fn atomic_tmp_name_matches_only_own_pattern() {
+        assert!(is_atomic_tmp_name("assets.json.1234.5.tmp"));
+        assert!(is_atomic_tmp_name("project_state.json.99.0.tmp"));
+        assert!(!is_atomic_tmp_name("assets.json.tmp"));
+        assert!(!is_atomic_tmp_name("notes.tmp"));
+        assert!(!is_atomic_tmp_name("assets.json.abc.5.tmp"));
+        assert!(!is_atomic_tmp_name("assets.json.1234.5.bak"));
+    }
+
+    #[test]
+    fn cleanup_removes_tmp_and_restores_backup() {
+        let dir = std::env::temp_dir().join("novelforge_cleanup_stale_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("cache")).unwrap();
+        // 崩溃残留：临时文件
+        std::fs::write(dir.join("cache").join("assets.json.1234.5.tmp"), b"partial").unwrap();
+        // 崩溃残留：替换中断（原路径缺失）→ 应恢复
+        std::fs::write(dir.join("orphan.bin.replace-backup"), b"old").unwrap();
+        // 替换已完成、备份未清 → 应删除备份
+        std::fs::write(dir.join("game.txt"), b"new").unwrap();
+        std::fs::write(dir.join("game.txt.replace-backup"), b"old").unwrap();
+
+        let mut removed = 0u64;
+        let mut restored = 0u64;
+        cleanup_stale_dir(&dir, 6, &mut removed, &mut restored);
+
+        assert_eq!(removed, 2, "应删除 1 个 .tmp 与 1 个已完成替换的备份");
+        assert_eq!(restored, 1, "应恢复 1 个中断替换的备份");
+        assert!(!dir.join("cache").join("assets.json.1234.5.tmp").exists());
+        assert_eq!(std::fs::read_to_string(dir.join("game.txt")).unwrap(), "new");
+        assert!(!dir.join("game.txt.replace-backup").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancel_http_request_hits_registered_request_only_once() {
+        // #784：注册空操作（避免真实网络），取消应命中一次，再次取消应未命中
+        http_aborts().lock().unwrap().insert(424242, Box::new(|| {}));
+        assert!(cancel_http_request(424242).unwrap(), "首次取消应命中在途请求");
+        assert!(!cancel_http_request(424242).unwrap(), "重复取消不应再次命中");
+    }
+
+    #[test]
+    fn secret_ids_reject_unsafe_values() {        assert!(validate_secret_id("llm-config_1").is_ok());
         assert!(validate_secret_id("").is_err());
         assert!(validate_secret_id("../credential").is_err());
         assert!(validate_secret_id(&"x".repeat(129)).is_err());

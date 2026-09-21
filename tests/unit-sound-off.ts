@@ -1,9 +1,9 @@
 ﻿/**
- * 关闭声音（BGM/SE）：默认必须静音，且老项目/老存档不能被"重新打开声音"。
+ * 声音默认开启（#536）：新项目开箱有声（BGM/SE），用户可自行关闭。
  * 覆盖三处：
- *  1) 默认选项 useBgm / useSe 均为 false（新项目开箱静音）
+ *  1) 默认选项 useBgm / useSe 均为 true（此前默认静音，成品像「哑剧」）
  *  2) renderChapter 的 useSe 口径：false 不输出 playEffect、true 输出、undefined 兼容旧行为
- *  3) 项目恢复时用 DEFAULT_OPTIONS 兜底：老 project_state.json 缺 useSe 也不会恢复成开声音
+ *  3) 项目恢复时用 DEFAULT_OPTIONS 兜底：老 project_state.json 缺字段时按新默认（开启）恢复
  */
 import { renderChapter } from "../src/core/render";
 import type { ChapterScript, CharacterCard, ExtractionResult, RenderAssets } from "../src/core/types";
@@ -45,13 +45,13 @@ function renderWith(useSe: boolean | undefined): string {
 }
 
 function main(): void {
-  // 1) 默认选项即静音
-  assert(projectState.options.useBgm === false, "默认 useBgm 必须为 false（开箱静音）");
-  assert(projectState.options.useSe === false, "默认 useSe 必须为 false（开箱静音）");
+  // 1) 默认选项即有声（#536）
+  assert(projectState.options.useBgm === true, "默认 useBgm 必须为 true（有 BGM 文件就播）");
+  assert(projectState.options.useSe === true, "默认 useSe 必须为 true（有内置 SE 就播）");
 
-  // 2) renderChapter 的 useSe 口径
+  // 2) renderChapter 的 useSe 口径：显式关闭仍然静音
   const off = renderWith(false);
-  assert(!off.includes("playEffect:"), "useSe=false 不应输出任何 playEffect（成品静音）");
+  assert(!off.includes("playEffect:"), "useSe=false 不应输出任何 playEffect（用户主动关闭）");
   assert(!off.includes(".wav"), "useSe=false 不应引用任何音频文件");
 
   const on = renderWith(true);
@@ -60,14 +60,14 @@ function main(): void {
   const legacy = renderWith(undefined);
   assert(legacy.includes("playEffect:se_rain.wav"), "useSe 未设置（旧项目）应保持旧行为（输出 SE）");
 
-  // 3) 老存档恢复：options 里没有 useSe 时必须落回默认的 false，而不是被打开
+  // 3) 老存档恢复：缺字段时按新默认（开启）兜底，而不是永久静音
   const restored = { ...projectState.options } as Record<string, unknown>;
   delete restored.useSe;
   delete restored.useBgm;
-  const merged = { useBgm: false, useSe: false, ...restored };
-  assert(merged.useSe === false, "老 project_state.json 缺 useSe 时恢复后必须仍是静音");
+  const merged = { useBgm: projectState.options.useBgm, useSe: projectState.options.useSe, ...restored };
+  assert(merged.useSe === true && merged.useBgm === true, "老 project_state.json 缺字段时按新默认（开启）恢复");
 
-  console.log("=== 关闭声音（默认静音）测试通过 ===");
+  console.log("=== 声音默认开启测试通过 ===");
 }
 
 main();

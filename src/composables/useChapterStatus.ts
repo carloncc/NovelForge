@@ -2,7 +2,7 @@ import { reactive } from "vue";
 import type { ApiConfig, ChapterScript, GenerationOptions, NovelDoc, PipelineResult } from "../core/types";
 import { chapterScopeImageTasks } from "../core/chapterAssets";
 import { buildVoiceJobs } from "../core/voice";
-import { scriptCacheRest, titleHash } from "../core/cache";
+import { scriptCacheRest, scriptFingerprint, titleHash, cardsFingerprint } from "../core/cache";
 import { parseChapterScript } from "../core/dataValidation";
 import { readAssetMap } from "../core/assetMap";
 import { tauri } from "../utils/tauri";
@@ -90,26 +90,36 @@ export function useChapterStatus(input: ChapterStatusInput) {
     return { title: ch.title, text: ch.text };
   }
 
-  /** 卡片（角色＋物品）：章节图像口径要按「本章出场角色/物品」收窄，所以物品也要读 */
+  /** 卡片（角色＋物品＋场景）：章节图像口径要按「本章出场角色/物品」收窄，所以物品也要读；
+   *  demo/正式隔离（#792）：优先读当前模式对应的文件，避免演示模式按正式卡算任务数。
+   *  卡片指纹（id+名称）参与剧本缓存键——卡片变了旧剧本必须失效。 */
   async function loadCards(
     dir: string,
-  ): Promise<{ characters: { id: string; name: string }[]; items: { id: string; name: string }[] } | null> {
-    for (const f of ["cards.json", "cards_demo.json"]) {
+    demo: boolean,
+  ): Promise<{ characters: { id: string; name: string }[]; items: { id: string; name: string }[]; scenes: { id: string; location?: string }[] } | null> {
+    for (const f of demo ? ["cards_demo.json", "cards.json"] : ["cards.json", "cards_demo.json"]) {
       try {
         const { text } = await tauri.readTextFile(`${dir}/.novel2vn/${f}`);
         const parsed = JSON.parse(text) as {
           characters?: { id: string; name: string }[];
           items?: { id: string; name: string }[];
+          scenes?: { id: string; location?: string }[];
         };
         if (parsed && Array.isArray(parsed.characters)) {
-          return { characters: parsed.characters, items: Array.isArray(parsed.items) ? parsed.items : [] };
+          return {
+            characters: parsed.characters,
+            items: Array.isArray(parsed.items) ? parsed.items : [],
+            scenes: Array.isArray(parsed.scenes) ? parsed.scenes : [],
+          };
         }
       } catch {
         /* 换下一个 */
       }
     }
     const cached = input.getResult()?.cards;
-    return cached ? { characters: cached.characters, items: cached.items ?? [] } : null;
+    return cached
+      ? { characters: cached.characters, items: cached.items ?? [], scenes: cached.scenes ?? [] }
+      : null;
   }
 
   /** B30：刷新并发令牌。多次 refresh 重叠时（配置/卡片变化与生成结束几乎同时触发），
@@ -123,9 +133,16 @@ export function useChapterStatus(input: ChapterStatusInput) {
     if (!dir || !novel) return;
     const options = input.getOptions();
     const enabled = novel.chapters.filter((c) => c.enabled !== false);
-    const style = (options.scriptStyle ?? "").trim();
-    const styleFrag = style ? `_st${titleHash(style)}` : "";
     const demo = !input.getLlmAvailable();
+    // 卡片先读（卡片指纹要进剧本缓存键；图像口径也要用卡片）
+    const cardsInfo = await loadCards(dir, demo);
+    if (token !== refreshToken) return;
+    const style = (options.scriptStyle ?? "").trim();
+    const styleFrag = scriptFingerprint({
+      style,
+      compressNarration: options.compressNarration,
+      cardsFp: cardsInfo ? cardsFingerprint(cardsInfo) : "",
+    });
     const cacheDir = `${dir}/.novel2vn/cache`;
     const lang = (options.language ?? "").trim();
 
@@ -184,7 +201,6 @@ export function useChapterStatus(input: ChapterStatusInput) {
     } catch {
       /* 无映射则全 0 */
     }
-    const cardsInfo = await loadCards(dir);
     const characters = cardsInfo?.characters ?? [];
     const items = cardsInfo?.items ?? [];
     // activeConfig("tts") 永远返回一个对象（可能只是没填 Key 的默认配置），

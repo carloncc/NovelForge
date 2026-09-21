@@ -7,6 +7,8 @@ export interface RenderAssets {
   item: Record<string, string>;
   vocal: Record<string, string>;
   bgm?: Record<string, string>;
+  /** 图片小说分镜图（shot.id → 文件路径）；sprite 模式下为空 */
+  shot?: Record<string, string>;
 }
 
 export interface RenderOptions {
@@ -23,6 +25,10 @@ export interface RenderOptions {
   seVolume?: number;
   /** 环境音效（SE，按场景氛围播放雨/雷/风等）：新项目默认关闭；undefined 兼容旧项目仍输出，false 时不输出 playEffect，成品完全静音 */
   useSe?: boolean;
+  /** 视觉模式（#810）：sprite=立绘版（默认）；imageOnly=图片小说——跳过 changeFigure 全家族，按 shot.triggerLineIndex 淡入切换全屏图 */
+  mode?: "sprite" | "imageOnly";
+  /** 立绘取景：bust=游戏内半身取景（默认，配合全身素材）；full=按原图整身显示 */
+  figureFraming?: "bust" | "full";
 }
 
 export function sanitizeId(id: string): string {
@@ -119,6 +125,13 @@ function getBaseName(f: string): string {
 /* ===== 人物动作：入场动画 + 情绪动作 + 剧情镜头震动 ===== */
 
 const ENTRANCES = ["enter-from-left", "enter-from-right", "enter-from-bottom"];
+
+/** 全身立绘 → 游戏内半身取景：素材按 head-to-feet 生成，舞台用「放大 + 下移」取到头像~大腿的构图
+ *（近似旧版 thighs-up 立绘观感）。数值按「1920×1080 舞台 + 1024² 立绘 contain 到高度」几何推算：
+ *  原图高 1080 居中 → 放大 1.75 = 1890，再下移 350 → 可见顶部约 57%（头到腿）。 */
+const FIGURE_FRAMING = '{"scale":{"x":1.75,"y":1.75},"position":{"x":0,"y":350}}';
+/** 高潮句推近：在半身取景基础上再放大一档（取到头~腰），结束后回到 FIGURE_FRAMING */
+const FIGURE_FRAMING_ZOOM = '{"scale":{"x":1.96,"y":1.96},"position":{"x":0,"y":518}}';
 
 /** BGM 鉴赏显示名：按文件名关键词给出中文氛围标签，未命中则清洗文件名（去掉 _- 与扩展名） */
 const BGM_MOOD_LABELS: Array<[RegExp, string]> = [
@@ -270,11 +283,13 @@ function renderItemEvent(scene: SceneJSON, idx: number, opts: RenderOptions, ite
   const safeItemId = sanitizeId(ev.itemId);
   const out: string[] = [];
   out.push(`; ---- 物品演出：${name} ----`);
-  if (file) {
+  // 图片小说模式无立绘舞台：物品图标演出（changeFigure -id=item_*）跳过，只保留文字卡
+  const iconEnabled = file && opts.mode !== "imageOnly";
+  if (iconEnabled) {
     out.push(`changeFigure:${getBaseName(file)} -id=item_${safeItemId} -next;`);
   }
   out.push(`intro:「${esc(item?.name || ev.itemId)}」|${desc} -hold -backgroundColor=rgba(0,0,0,0.45);`);
-  if (file) {
+  if (iconEnabled) {
     out.push(`changeFigure:none -id=item_${safeItemId} -next;`);
   }
   return out;
@@ -286,20 +301,35 @@ export function renderChapter(
   chapterCount: number,
 ): string {
   const out: string[] = [];
+  const imageOnly = opts.mode === "imageOnly";
   out.push(`; ===== 第 ${chapter.chapter + 1} 章 ${comment(chapter.title)} =====`);
   out.push(`; 由 NovelForge 自动生成`);
   out.push("");
   // 章节标签：供 WebGAL 流程图（任务/章节选择界面）显示与跳转
   out.push(`label:ch${chapter.chapter + 1}_${sanitizeLabel(chapter.title)};`);
-  // 清场：避免上一章节的立绘残留
+  // 清场：避免上一章节的立绘残留（图片小说模式无立绘，整族 changeFigure 指令都不输出，见 #810）
   const useActions = opts.figureActions !== false;
   const clearExit = useActions ? " -exit=exit" : "";
-  out.push(`changeFigure:none -left${clearExit} -next;`);
-  out.push(`changeFigure:none${clearExit} -next;`);
-  out.push(`changeFigure:none -right${clearExit} -next;`);
-  // 章节标题卡：黑屏全屏章节名（成熟视觉小说标配，点击继续）
+  if (!imageOnly) {
+    out.push(`changeFigure:none -left${clearExit} -next;`);
+    out.push(`changeFigure:none${clearExit} -next;`);
+    out.push(`changeFigure:none -right${clearExit} -next;`);
+  }
+  // 跨章演出复位（#789）：引擎的 changeScene 不清舞台，上一章的 BGM/黑边/滤镜会残留进本章。
+  // 章首显式归零，避免「上一章的紧张黑边/胶片颗粒/音乐带进本章无配乐场景」。
+  out.push(`; ---- 跨章复位 ----`);
+  out.push(`bgm:none -enter=0 -next;`);
+  out.push(`filmMode:none;`);
+  out.push(`setTransform:{"oldFilm":0} -target=bg-main -duration=0 -next;`);
+  out.push(`setTransform:{"godrayFilm":0} -target=bg-main -duration=0 -next;`);
+  // 章节标题卡：黑屏全屏章节名（成熟视觉小说标配，点击继续）。
+  // 标题本身已含「第X章/第X卷」时不再重复拼「第 N 章 ·」（用户实测：显示成「第 1 章 · 第一卷 第一章 …」）
   out.push(`; ---- 章节标题卡 ----`);
-  out.push(`intro:第 ${chapter.chapter + 1} 章 · ${esc(chapter.title)} -fontColor=rgba(255,255,255,1) -fontSize=large -hold;`);
+  const rawChapterTitle = (chapter.title ?? "").trim();
+  const cardTitle = /第\s*[0-9零〇一二三四五六七八九十百千万两]+\s*[章回节话篇部幕卷]/.test(rawChapterTitle)
+    ? rawChapterTitle
+    : `第 ${chapter.chapter + 1} 章 · ${rawChapterTitle}`;
+  out.push(`intro:${esc(cardTitle)} -fontColor=rgba(255,255,255,1) -fontSize=large -hold;`);
 
   // 舞台立绘管理：同时最多 2 个角色（左/右插槽），新角色出现时按最近说话顺序驱逐
   const stageSlot = new Map<string, "left" | "right">();
@@ -321,11 +351,49 @@ export function renderChapter(
   const charById = new Map(opts.characters.map((c) => [c.id, c]));
   const itemById = new Map(opts.items.map((i) => [i.id, i]));
 
+  // 台词文本输出（立绘版/图片版共用）：超长台词按句拆成多段（每段一条消息 + 独立配音），
+  // 修复「玩家读到全文、听到的却只有前 500 字」的声画不一致
+  const emitDialogueText = (line: Line, scene: SceneJSON, idx: number, name: string): void => {
+    const baseKey = sceneVocalKey(chapter.chapter, scene.id, idx);
+    const vocalFile = opts.assets.vocal[baseKey];
+    const vocalArg = vocalFile ? ` -${getBaseName(vocalFile)}` : "";
+    const speechParts = splitLineForSpeech(line.text);
+    if (speechParts.length > 1) {
+      speechParts.forEach((seg, si) => {
+        const partFile = opts.assets.vocal[sceneVocalKeyPart(baseKey, si, speechParts.length)];
+        out.push(`${name}:${esc(paginateForTextBox(seg))}${partFile ? ` -${getBaseName(partFile)}` : ""};`);
+      });
+    } else {
+      // 长句按句读拆成多条消息（一屏一句）；有配音的保持单条，避免换页掐断语音
+      const segs = splitUnvoicedMessage(line.text, !!vocalFile);
+      segs.forEach((seg, si) => {
+        out.push(`${name}:${esc(paginateForTextBox(seg))}${si === 0 ? vocalArg : ""};`);
+      });
+    }
+  };
+
   // 单句渲染（主流程与分支选择共用），idx 为台词在场景内的配音键序号
   const renderLine = (line: Line, idx: number, scene: SceneJSON): void => {
     // 防御：旧缓存剧本可能含空 text 行，直接跳过避免生成空指令/崩溃
     if (!line || !line.text || !String(line.text).trim()) return;
     if (line.type === "dialogue") {
+      if (imageOnly) {
+        // 图片小说（#810）：无立绘/入场/动作/资料卡；高潮句只做背景震动与虚化，文本与配音与立绘版同口径
+        if (useActions && isDramatic(line.text)) {
+          out.push(`setAnimation:shake -target=bg-main -next;`);
+          out.push(`setTransform:{"blur":5} -target=bg-main -duration=700 -next;`);
+          out.push(`setTransform:{"blur":0} -target=bg-main -duration=900 -next;`);
+        }
+        const speaker = charById.get(line.characterId || "") ?? opts.characters.find((c) => c.id === line.characterId);
+        if (speaker) {
+          emitDialogueText(line, scene, idx, esc(speaker.name));
+        } else {
+          // 说话人不可识别时按旁白输出，避免生成「???」人名
+          const narVocal = opts.assets.vocal[sceneVocalKey(chapter.chapter, scene.id, idx)];
+          out.push(`:${esc(paginateForTextBox(line.text))}${narVocal ? ` -${getBaseName(narVocal)}` : ""};`);
+        }
+        return;
+      }
       // 动作标签吸收：形如「老铁匠叹了口气：」的旁白并入本句
       // （说话人缺失/情绪默认时用标签推断；已有明确说话人的不覆盖，交给核对系统把关）
       const tag = pendingTag;
@@ -412,8 +480,11 @@ export function renderChapter(
           } else {
             out.push(`changeFigure:${getBaseName(displayFile)} -${slot} -next;`);
           }
+          // 半身取景：立绘就位后立即套用取景变换（duration=0 与入场动画不叠加）
+          if (opts.figureFraming !== "full") out.push(`setTransform:${FIGURE_FRAMING} -target=fig-${slot} -duration=0 -next;`);
         } else if (figureChanged) {
           out.push(`changeFigure:${getBaseName(displayFile)} -${slot} -next;`);
+          if (opts.figureFraming !== "full") out.push(`setTransform:${FIGURE_FRAMING} -target=fig-${slot} -duration=0 -next;`);
         }
         lastFigureFile.set(effCharId, displayFile);
       }
@@ -422,12 +493,12 @@ export function renderChapter(
         const motion = motionFor(effEmotion);
         if (motion) out.push(`setTempAnimation:${motion} -target=fig-${slot} -next;`);
       }
-      // 高潮台词演出：背景虚化 + 说话立绘特写推进（1500ms），句末恢复景深
+      // 高潮台词演出：背景虚化 + 说话立绘特写推进（1500ms），句末回到半身取景
       if (useActions && isDramatic(line.text)) {
         if (slot) {
           out.push(`setTransform:{"blur":5} -target=bg-main -duration=700 -next;`);
-          out.push(`setTransform:{"scale":{"x":1.22,"y":1.22},"position":{"x":0,"y":0}} -target=fig-${slot} -duration=1500 -next;`);
-          out.push(`setTransform:{"scale":{"x":1,"y":1}} -target=fig-${slot} -duration=800 -next;`);
+          out.push(`setTransform:${opts.figureFraming === "full" ? '{"scale":{"x":1.22,"y":1.22},"position":{"x":0,"y":0}}' : FIGURE_FRAMING_ZOOM} -target=fig-${slot} -duration=1500 -next;`);
+          out.push(`setTransform:${opts.figureFraming === "full" ? '{"scale":{"x":1,"y":1}}' : FIGURE_FRAMING} -target=fig-${slot} -duration=800 -next;`);
           out.push(`setTransform:{"blur":0} -target=bg-main -duration=800 -next;`);
         }
       }
@@ -446,24 +517,7 @@ export function renderChapter(
         }
       }
       const name = esc(char?.name || effCharId || "???");
-      const baseKey = sceneVocalKey(chapter.chapter, scene.id, idx);
-      const vocalFile = opts.assets.vocal[baseKey];
-      const vocalArg = vocalFile ? ` -${getBaseName(vocalFile)}` : "";
-      // 超长台词（> TTS 合成上限）：按句拆成多段，每段一条消息 + 一段独立配音，
-      // 修复「玩家读到全文、听到的却只有前 500 字」的声画不一致
-      const speechParts = splitLineForSpeech(line.text);
-      if (speechParts.length > 1) {
-        speechParts.forEach((seg, si) => {
-          const partFile = opts.assets.vocal[sceneVocalKeyPart(baseKey, si, speechParts.length)];
-          out.push(`${name}:${esc(paginateForTextBox(seg))}${partFile ? ` -${getBaseName(partFile)}` : ""};`);
-        });
-      } else {
-        // 长句按句读拆成多条消息（一屏一句）；有配音的保持单条，避免换页掐断语音
-        const segs = splitUnvoicedMessage(line.text, !!vocalFile);
-        segs.forEach((seg, si) => {
-          out.push(`${name}:${esc(paginateForTextBox(seg))}${si === 0 ? vocalArg : ""};`);
-        });
-      }
+      emitDialogueText(line, scene, idx, name);
     } else {
       // 旁白与内心独白统一走普通旁白行：intro: 指令不带语音播放，
       // 之前独白渲染成 intro:…-v.mp3 导致引擎忽略语音后缀、独白全程无声。
@@ -544,7 +598,14 @@ export function renderChapter(
     }
 
     const bgFile = opts.assets.bg[scene.id];
-    if (bgFile) {
+    // 图片小说分镜（#810）：按 triggerLineIndex 排序，只保留已有产物的分镜；有分镜时不再铺场景背景
+    const shotList = imageOnly
+      ? (scene.shots ?? [])
+          .map((shot) => ({ shot, file: opts.assets.shot?.[shot.id] }))
+          .filter((entry): entry is { shot: NonNullable<SceneJSON["shots"]>[number]; file: string } => !!entry.file)
+          .sort((a, b) => a.shot.triggerLineIndex - b.shot.triggerLineIndex)
+      : [];
+    if (bgFile && (!imageOnly || !shotList.length)) {
       // 场景切换：干净利落的交叉淡化（WebGAL changeBg 自带透明度淡入，500ms 即完成），
       // 叠加轻微推近（Ken Burns 运镜）制造电影感，符合主流 galgame 的 dissolve 过渡。
       // 注意不要在此叠加 blur 聚焦——changeBg 已含淡入，双重动画叠加是"生硬"的来源。
@@ -553,6 +614,17 @@ export function renderChapter(
         out.push(`setTransform:{"scale":{"x":1.04,"y":1.04}} -target=bg-main -duration=3000 -next;`);
       }
     }
+    // 分镜切换：只淡入（#814 决策 9），不推近；同时解锁鉴赏室（分镜按 CG 画廊展示）
+    let shotCursor = 0;
+    const emitDueShots = (lineIndex: number): void => {
+      while (shotCursor < shotList.length && shotList[shotCursor].shot.triggerLineIndex <= lineIndex) {
+        const { shot, file } = shotList[shotCursor++];
+        out.push(`changeBg:${getBaseName(file)} -duration=400 -ease=easeInOut -next;`);
+        out.push(`unlockCg:${getBaseName(file)} -name=${esc(shot.note || scene.location || "分镜")};`);
+      }
+    };
+    // 触发点 ≤ 0 的分镜在第一句之前就切换
+    if (imageOnly) emitDueShots(0);
     // 环境音效（SE）：按场景氛围匹配播放（用户可用同名文件覆盖内置音效）
     // useSe === false（新项目默认）时完全不输出 playEffect；undefined 兼容旧项目仍按氛围输出
     const se = opts.useSe === false ? null : detectSe(scene);
@@ -577,7 +649,8 @@ export function renderChapter(
     // 直接用 scene.id 查不到会导致 CG 演出整段被跳过；scene.cgFile 是生成阶段写入的捷径，两者都兜底。
     const cgFile = scene.cgFile || opts.assets.cg[`${chapter.chapter}_${scene.id}`] || opts.assets.cg[scene.id];
     const cg = scene.cgEvent;
-    if (cgFile) {
+    // 图片小说模式没有立绘舞台，CG 演出（清场/恢复立绘）整块跳过；分镜已承担画面切换
+    if (cgFile && !imageOnly) {
       // CG 前记录立绘状态：播完 CG 原样恢复（不带入场动画），否则所有角色会带 enter 动画重新跳入
       const cgBefore = stageOrder
         .map((id) => ({ id, slot: stageSlot.get(id), file: lastFigureFile.get(id) }))
@@ -599,6 +672,7 @@ export function renderChapter(
       // 原样恢复 CG 前的立绘（无入场动画；状态同步回填，后续台词按原表情/服装继续）
       for (const b of cgBefore) {
         out.push(`changeFigure:${getBaseName(b.file)} -${b.slot} -next;`);
+        if (opts.figureFraming !== "full") out.push(`setTransform:${FIGURE_FRAMING} -target=fig-${b.slot} -duration=0 -next;`);
         stageSlot.set(b.id, b.slot);
         lastFigureFile.set(b.id, b.file);
         stageOrder.push(b.id);
@@ -614,6 +688,7 @@ export function renderChapter(
     });
 
     scene.lines.forEach((line, i) => {
+      if (imageOnly) emitDueShots(i);
       const evIdxs = eventIdxsByTrigger.get(i);
       if (evIdxs) {
         for (const evIdx of evIdxs) out.push(...renderItemEvent(scene, evIdx, opts, itemById));

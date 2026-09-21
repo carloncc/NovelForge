@@ -1,11 +1,12 @@
 import type { ApiConfig, CharacterAction, CharacterCard, CharacterCostume, ExtractionResult, ItemCard, SceneCard } from "./types";
 import { chatCompletion, chatJson } from "../api/openaiCompatible";
 import type { ChatMessage, ChatTool, ToolCall } from "../api/openaiCompatible";
-import { inputCharBudgetForText, resolveContextLength } from "../api/providers";
+import { inputCharBudgetForText, outputTokensForText } from "../api/providers";
 import { voiceLibraryFor } from "../stores/config";
 import { normalizeExtractionResult } from "./extract";
 import { extractFromNovel } from "./extract";
 import { normalizeEntityId } from "./ids";
+import { splitNovelForAgent } from "./textSplit";
 import { log as logger } from "../utils/logger";
 
 /**
@@ -30,6 +31,8 @@ export interface ExtractAgentOptions {
   feedback?: string;
   /** 分段字数上限（0/缺省 = 自动；手动值只会调小自动预算，不会放大） */
   chunkChars?: number;
+  /** TTS 音色库（决定角色 voiceName 的可选范围；缺省时按传入的 cfg 推断，见 #788） */
+  voiceLib?: string[];
 }
 
 /** 单次工具调用的结构化参数（供状态机执行） */
@@ -376,23 +379,7 @@ export function parseTextAction(content: string): { name: string; data?: Record<
 
 /* ==================== 分片 ==================== */
 
-export function splitNovelForAgent(novelText: string, budget: number): string[] {
-  const chunks: string[] = [];
-  const sep = "\n\n";
-  const budgetSafe = Math.max(100, budget);
-  let start = 0;
-  while (start < novelText.length) {
-    let end = Math.min(start + budgetSafe, novelText.length);
-    if (end < novelText.length) {
-      const boundary = novelText.lastIndexOf(sep, end);
-      if (boundary > start + budgetSafe / 2) end = boundary;
-    }
-    chunks.push(novelText.slice(start, end));
-    start = end;
-  }
-  if (!chunks.length) chunks.push("");
-  return chunks;
-}
+export { splitNovelForAgent };
 
 /* ==================== 扫描循环 ==================== */
 
@@ -610,40 +597,31 @@ const ENRICH_SYSTEM = `你是视觉小说美术与制作总监。下面给出从
 - 补全缺失字段，不要删除已有信息，不要改变 id。
 - 角色/场景/物品数量一律按剧情决定、不设上限（上限会损害最终游戏效果）。`;
 
-async function enrichCards(
-  cfg: ApiConfig,
-  state: ExtractAgentState,
-  title: string,
-  lib: string[],
-  onUsage?: (pt: number, ct: number) => void,
-  feedback?: string,
-): Promise<void> {
-  const payload = {
-    characters: [...state.characters.values()],
-    scenes: [...state.scenes.values()],
-    items: [...state.items.values()],
-  };
-  const fb = feedback ? `\n\n用户意见（请严格参考并落实）：${feedback}` : "";
-  const user = `小说标题：${title}\n\n可用音色列表：${lib.join(", ")}${fb}\n\n当前卡片 JSON：\n${JSON.stringify(payload)}`;
-  const outputTokens = Math.min(resolveContextLength(cfg), 32_768);
-  const enriched = await chatJson<{ characters?: CharacterCard[]; scenes?: SceneCard[]; items?: ItemCard[] }>(
-    cfg,
-    ENRICH_SYSTEM,
-    user,
-    { maxTokens: outputTokens, onUsage },
-  );
+type EnrichKind = "c" | "s" | "i";
 
+interface EnrichEntry {
+  kind: EnrichKind;
+  id: string;
+  card: CharacterCard | SceneCard | ItemCard;
+}
+
+/** 把一批补全结果并回 state（未知 id 丢弃；同 id/同名并入；漏回卡原样保留）。
+ *  返回每类实际被补全的 id 集合（供全部批次结束后统一告警漏回卡）。 */
+function mergeEnrichment(
+  state: ExtractAgentState,
+  enriched: { characters?: CharacterCard[]; scenes?: SceneCard[]; items?: ItemCard[] },
+): { characters: Set<string>; scenes: Set<string>; items: Set<string> } {
   // 返回卡 id 一律先归一化再对齐 state：
   // ① 未知 id 不新增——补全阶段不该造新卡（模型偶尔改名/编 id，新增会与扫描结果重复并多计费）；
   // ② 若返回卡与 state 中某卡同名/同归一化 id，则并入该卡而不是另起一张；
-  // ③ 模型漏回的卡原样保留（防丢卡），但关键字段仍为空的打 warn 方便排查。
+  // ③ 模型漏回的卡原样保留（防丢卡），关键字段为空的告警在全部批次结束后统一打。
+  const returned = { characters: new Set<string>(), scenes: new Set<string>(), items: new Set<string>() };
   if (Array.isArray(enriched.characters)) {
     const byName = new Map<string, string>();
     for (const [id, c] of state.characters) {
       const key = normalizeName(c.name);
       if (key && !byName.has(key)) byName.set(key, id);
     }
-    const returnedIds = new Set<string>();
     for (const c of enriched.characters) {
       if (!c || typeof c !== "object") continue;
       const rawId = str(c.id);
@@ -656,16 +634,11 @@ async function enrichCards(
           : byName.get(normalizeName(str(c.name)));
       if (!targetId) continue;
       const target = state.characters.get(targetId)!;
-      returnedIds.add(targetId);
+      returned.characters.add(targetId);
       // 补全字段：非空新值优先（保持旧行为），数组并集；已有卡的 name 不被覆盖成空
       mergeCharacterPatch(target, c as unknown as Record<string, unknown>);
       target.name = target.name || str(c.name) || targetId;
       target.id = targetId;
-    }
-    for (const [id, card] of state.characters) {
-      if (!returnedIds.has(id) && !card.imagePrompt) {
-        logger.warn("extractAgent", `补全未返回角色卡「${card.name || id}」且 imagePrompt 仍为空，将使用基础提示`, { id });
-      }
     }
   }
   if (Array.isArray(enriched.scenes)) {
@@ -674,7 +647,6 @@ async function enrichCards(
       const key = normalizeName(s.location);
       if (key && !byLocation.has(key)) byLocation.set(key, id);
     }
-    const returnedIds = new Set<string>();
     for (const s of enriched.scenes) {
       if (!s || typeof s !== "object") continue;
       const rawId = str(s.id);
@@ -687,14 +659,9 @@ async function enrichCards(
           : byLocation.get(normalizeName(str(s.location)));
       if (!targetId) continue;
       const target = state.scenes.get(targetId)!;
-      returnedIds.add(targetId);
+      returned.scenes.add(targetId);
       Object.assign(target, pickNonEmpty(s as unknown as Record<string, unknown>));
       target.id = targetId;
-    }
-    for (const [id, card] of state.scenes) {
-      if (!returnedIds.has(id) && !card.imagePrompt) {
-        logger.warn("extractAgent", `补全未返回场景卡「${card.location || id}」且 imagePrompt 仍为空，将使用基础提示`, { id });
-      }
     }
   }
   if (Array.isArray(enriched.items)) {
@@ -703,7 +670,6 @@ async function enrichCards(
       const key = normalizeName(it.name);
       if (key && !byName.has(key)) byName.set(key, id);
     }
-    const returnedIds = new Set<string>();
     for (const it of enriched.items) {
       if (!it || typeof it !== "object") continue;
       const rawId = str(it.id);
@@ -716,15 +682,97 @@ async function enrichCards(
           : byName.get(normalizeName(str(it.name)));
       if (!targetId) continue;
       const target = state.items.get(targetId)!;
-      returnedIds.add(targetId);
+      returned.items.add(targetId);
       Object.assign(target, pickNonEmpty(it as unknown as Record<string, unknown>));
       target.id = targetId;
     }
-    for (const [id, card] of state.items) {
-      if (!returnedIds.has(id) && !card.imagePrompt) {
-        logger.warn("extractAgent", `补全未返回物品卡「${card.name || id}」且 imagePrompt 仍为空，将使用基础提示`, { id });
-      }
+  }
+  return returned;
+}
+
+/** 把条目按 JSON 体积贪心装箱（单条超预算时独占一批），避免一次请求塞下全部卡被截断（#637） */
+export function packEnrichBatches(entries: EnrichEntry[], budget: number): EnrichEntry[][] {
+  const batches: EnrichEntry[][] = [];
+  let current: EnrichEntry[] = [];
+  let currentSize = 0;
+  const safeBudget = Math.max(2000, budget);
+  for (const entry of entries) {
+    const size = JSON.stringify(entry.card).length + 40;
+    if (current.length && currentSize + size > safeBudget) {
+      batches.push(current);
+      current = [];
+      currentSize = 0;
     }
+    current.push(entry);
+    currentSize += size;
+  }
+  if (current.length) batches.push(current);
+  return batches;
+}
+
+function enrichPayloadOf(batch: EnrichEntry[], round: number): Record<string, unknown> {
+  return {
+    characters: batch.filter((e) => e.kind === "c").map((e) => e.card),
+    scenes: batch.filter((e) => e.kind === "s").map((e) => e.card),
+    items: batch.filter((e) => e.kind === "i").map((e) => e.card),
+    ...(round > 0 ? { note: "这是补全轮：只返回仍然缺少 imagePrompt 的卡片，字段补全后原样返回完整卡片" } : {}),
+  };
+}
+
+async function enrichCards(
+  cfg: ApiConfig,
+  state: ExtractAgentState,
+  title: string,
+  lib: string[],
+  onUsage?: (pt: number, ct: number) => void,
+  feedback?: string,
+  log?: AgentLog,
+): Promise<void> {
+  const entries: EnrichEntry[] = [
+    ...[...state.characters].map(([id, card]): EnrichEntry => ({ kind: "c", id, card })),
+    ...[...state.scenes].map(([id, card]): EnrichEntry => ({ kind: "s", id, card })),
+    ...[...state.items].map(([id, card]): EnrichEntry => ({ kind: "i", id, card })),
+  ];
+  if (!entries.length) return;
+  const fb = feedback ? `\n\n用户意见（请严格参考并落实）：${feedback}` : "";
+  const wholeJson = JSON.stringify(enrichPayloadOf(entries, 0));
+  // 输入预算留 20% 余量（系统提示 + 音色列表 + 工具往返），单条超大卡由装箱逻辑独占一批
+  const budget = Math.max(2000, Math.floor(inputCharBudgetForText(cfg, wholeJson) * 0.8) - ENRICH_SYSTEM.length);
+  const batches = packEnrichBatches(entries, budget);
+
+  const runBatch = async (batch: EnrichEntry[], round: number): Promise<void> => {
+    const payload = enrichPayloadOf(batch, round);
+    const user = `小说标题：${title}\n\n可用音色列表：${lib.join(", ")}${fb}\n\n当前卡片 JSON：\n${JSON.stringify(payload)}`;
+    const enriched = await chatJson<{ characters?: CharacterCard[]; scenes?: SceneCard[]; items?: ItemCard[] }>(
+      cfg,
+      ENRICH_SYSTEM,
+      user,
+      { maxTokens: outputTokensForText(cfg, `${ENRICH_SYSTEM}\n${user}`), onUsage },
+    );
+    mergeEnrichment(state, enriched);
+  };
+
+  for (let i = 0; i < batches.length; i++) {
+    log?.(`补全卡片设定 ${i + 1}/${batches.length}（${batches[i].length} 张）…`);
+    await runBatch(batches[i], 0);
+  }
+
+  // 二次补全（#637）：模型漏回或截断导致 imagePrompt 仍为空的卡，单独再补一轮；
+  // 仍为空则告警（后续立绘走基础提示，不再静默使用空壳）
+  const missing = entries.filter((e) => !(e.card as { imagePrompt?: string }).imagePrompt);
+  if (missing.length) {
+    log?.(`仍有 ${missing.length} 张卡片缺少图像提示词，进行二次补全…`, "warn");
+    const retryBatches = packEnrichBatches(missing, budget);
+    for (const batch of retryBatches) await runBatch(batch, 1);
+  }
+  for (const [id, card] of state.characters) {
+    if (!card.imagePrompt) logger.warn("extractAgent", `补全后角色卡「${card.name || id}」仍缺 imagePrompt，将使用基础提示`, { id });
+  }
+  for (const [id, card] of state.scenes) {
+    if (!card.imagePrompt) logger.warn("extractAgent", `补全后场景卡「${card.location || id}」仍缺 imagePrompt，将使用基础提示`, { id });
+  }
+  for (const [id, card] of state.items) {
+    if (!card.imagePrompt) logger.warn("extractAgent", `补全后物品卡「${card.name || id}」仍缺 imagePrompt，将使用基础提示`, { id });
   }
 }
 
@@ -780,7 +828,7 @@ export async function extractFromNovelAgent(
   title: string,
   opts: ExtractAgentOptions = {},
 ): Promise<ExtractionResult> {
-  const lib = voiceLibraryFor(cfg);
+  const lib = opts.voiceLib ?? voiceLibraryFor(cfg);
   const isAborted = opts.isAborted ?? (() => false);
   const onUsage = opts.onUsage;
   const logFn = opts.log;
@@ -826,7 +874,7 @@ export async function extractFromNovelAgent(
   logFn?.(`扫描完成：${state.characters.size} 角色 / ${state.scenes.size} 场景 / ${state.items.size} 物品，正在合并去重…`);
   mergeCandidates(state);
   logFn?.(`合并完成：${state.characters.size} 角色 / ${state.scenes.size} 场景 / ${state.items.size} 物品，正在补全详细设定…`);
-  await enrichCards(cfg, state, title, lib, onUsage, opts.feedback);
+  await enrichCards(cfg, state, title, lib, onUsage, opts.feedback, logFn);
   const result = finalizeState(state, lib, title);
   logFn?.(`Agent 提取完成：${result.characters.length} 角色 / ${result.scenes.length} 场景 / ${result.items.length} 物品`, "success");
   return result;
@@ -842,6 +890,8 @@ export interface ChunkedExtractOptions {
   isAborted?: () => boolean;
   /** 分段字数上限（0/缺省 = 自动；手动值只会调小自动预算，不会放大） */
   chunkChars?: number;
+  /** TTS 音色库（决定角色 voiceName 的可选范围；缺省时按传入的 cfg 推断，见 #788） */
+  voiceLib?: string[];
 }
 
 /** 提取分段预算（纯函数）：自动预算按语种估算，手动值只收紧不放大 */
@@ -867,20 +917,20 @@ export async function extractFromNovelChunked(
   title: string,
   opts: ChunkedExtractOptions = {},
 ): Promise<ExtractionResult> {
-  const lib = voiceLibraryFor(cfg);
+  const lib = opts.voiceLib ?? voiceLibraryFor(cfg);
   const isAborted = opts.isAborted ?? (() => false);
   // 单段预算打八折：给系统提示词留余量（与 Agent 扫描同口径）；
   // 预算按实际语种估算（中文约 0.6 字符/token），否则中文长文单段超大触发网关 500
   const chunks = splitNovelForAgent(fullText, extractChunkBudget(cfg, fullText, opts.chunkChars));
   if (chunks.length <= 1) {
-    return extractFromNovel(cfg, fullText, title, opts.onUsage, opts.feedback);
+    return extractFromNovel(cfg, fullText, title, opts.onUsage, opts.feedback, lib);
   }
   opts.log?.(`小说全文 ${fullText.length} 字超出单次上下文，分 ${chunks.length} 段扫描提取（覆盖全书）…`);
   const state: ExtractAgentState = { characters: new Map(), scenes: new Map(), items: new Map() };
   for (let i = 0; i < chunks.length; i++) {
     if (isAborted()) throw new Error("已中止");
     opts.log?.(`提取第 ${i + 1}/${chunks.length} 段（约${chunks[i].length}字）…`);
-    const part = await extractFromNovel(cfg, chunks[i], title, opts.onUsage, opts.feedback);
+    const part = await extractFromNovel(cfg, chunks[i], title, opts.onUsage, opts.feedback, lib);
     for (const c of part.characters) {
       const prev = state.characters.get(c.id);
       if (prev) mergeCharacter(prev, c);

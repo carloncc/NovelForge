@@ -44,8 +44,9 @@ function webSessionToken(forceRenew = false): Promise<string> {
 /**
  * 代理已返回 HTTP 响应时的错误标记（B97）。
  * 这类失败说明请求已经真实发给厂商（可能已完成/已计费），绝不能回退直连重发。
+ * 导出以便测试按类型/状态码断言（文案随界面语言变化，不参与断言）。
  */
-class ProxyHttpError extends Error {
+export class ProxyHttpError extends Error {
   constructor(message: string, readonly status: number) {
     super(message);
     this.name = "ProxyHttpError";
@@ -69,6 +70,8 @@ export async function webHttp(args: {
   body?: string;
   bodyBase64?: string;
   timeoutSecs?: number;
+  /** #784：外部中止信号（管线「停止」时中断在途 fetch） */
+  signal?: AbortSignal;
 }): Promise<HttpResult> {
   if (!/^https?:\/\//i.test(args.url)) {
     throw new Error(t("仅支持 HTTP/HTTPS API 地址"));
@@ -85,6 +88,7 @@ export async function webHttp(args: {
         bodyBase64: args.bodyBase64,
         timeoutSecs: args.timeoutSecs ?? 120,
       }),
+      signal: args.signal,
     });
     let resp = await send(await webSessionToken());
     if (resp.status === 403) {
@@ -123,9 +127,14 @@ async function directFetch(args: {
   body?: string;
   bodyBase64?: string;
   timeoutSecs?: number;
+  signal?: AbortSignal;
 }): Promise<HttpResult> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), (args.timeoutSecs ?? 120) * 1000);
+  // 外部中止与超时共用一个 controller：任一触发即中断 fetch
+  const onAbort = (): void => controller.abort();
+  if (args.signal?.aborted) controller.abort();
+  args.signal?.addEventListener("abort", onAbort, { once: true });
   try {
     const resp = await fetch(args.url, {
       method: args.method,
@@ -141,6 +150,7 @@ async function directFetch(args: {
     };
   } finally {
     clearTimeout(timer);
+    args.signal?.removeEventListener("abort", onAbort);
   }
 }
 

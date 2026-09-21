@@ -43,6 +43,10 @@ export interface AssembleInput {
   themeFromArtwork?: boolean;
   /** 视觉守门风格参考图（绝对路径），用于主题取色 */
   styleReferencePath?: string;
+  /** 视觉模式（#810）：sprite=立绘版（默认）；imageOnly=图片小说（渲染无立绘、按分镜切图） */
+  mode?: "sprite" | "imageOnly";
+  /** 立绘取景：bust=游戏内半身取景（默认，配合全身素材）；full=按原图整身显示 */
+  figureFraming?: "bust" | "full";
   log: (msg: string) => void;
 }
 
@@ -159,6 +163,8 @@ export async function assembleProject(input: AssembleInput): Promise<{ gameDir: 
       figureEmotions: input.figureEmotions,
       figureActions: input.figureActions,
       useSe: input.useSe,
+      mode: input.mode,
+      figureFraming: input.figureFraming,
     }, chapterCount);
     await tauri.writeTextFile(
       joinPath(normalizedOutputDir, `game/scene/ch${chapter.chapter + 1}.txt`),
@@ -354,13 +360,29 @@ async function writeAppreciation(outputDir: string, input: AssembleInput, bgmMap
     });
   }
   bgs.sort((a, b) => a.chapter - b.chapter || a.file.localeCompare(b.file));
+  // 图片小说分镜画廊（#811）：键为 `<sceneId>_shot<N>`，按章节分组展示
+  const seenShot = new Set<string>();
+  const shots: Array<{ file: string; name: string; chapter: number }> = [];
+  for (const [key, p] of Object.entries(input.assets.shot ?? {})) {
+    const file = basename(p);
+    if (!file || seenShot.has(file)) continue;
+    seenShot.add(file);
+    const sceneId = key.replace(/_shot\d+$/, "");
+    const meta = sceneMeta.get(sceneId) ?? sceneMeta.get(sceneId.replace(/^\d+_/, ""));
+    shots.push({
+      file,
+      name: meta?.location || stripExt(file),
+      chapter: meta?.chapter ?? 1,
+    });
+  }
+  shots.sort((a, b) => a.chapter - b.chapter || a.file.localeCompare(b.file));
   // BGM 鉴赏清单必须用实际 detectBgm 扫到的 bgmMap（input.assets.bgm 恒为空，旧实现导致鉴赏室无 BGM）
   const bgms = [...new Set(Object.values(bgmMap))].map((p) => ({
     file: basename(p),
     name: basename(p).replace(/\.(mp3|ogg|wav|m4a|opus)$/i, ""),
   }));
   // UI97：写入作品语言（与 config.txt 的 Default_Language 同一口径），鉴赏室初始语言不再只看浏览器
-  const data = { lang: input.language ?? "zh_CN", characters, cgs, bgs, bgms };
+  const data = { lang: input.language ?? "zh_CN", characters, cgs, bgs, bgms, shots };
   const js = `window.APPRECIATION_DATA = ${JSON.stringify(data)};\n`;
   try {
     await tauri.writeTextFile(joinPath(outputDir, "appreciation-data.js"), js);
@@ -696,7 +718,62 @@ async function writeBuildInfo(outputDir: string, meta: ProjectMeta): Promise<voi
   }
 }
 
-/** PWA 名称与图标跟随作品（manifest.json + icons/*）；封面图同时用作各尺寸图标 */
+/** PWA 图标尺寸表（与模板 manifest.json 声明一致） */
+const PWA_ICON_SIZES: { name: string; size: number; maskable?: boolean }[] = [
+  { name: "icon-192.png", size: 192 },
+  { name: "icon-512.png", size: 512 },
+  { name: "icon-192-maskable.png", size: 192, maskable: true },
+  { name: "icon-512-maskable.png", size: 512, maskable: true },
+  { name: "apple-touch-icon.png", size: 180 },
+];
+
+/**
+ * 封面 → 各尺寸方形图标（#790）：1920×1080 封面原样改名会让浏览器拒绝作为 PWA 安装图标。
+ * 这里按声明尺寸重绘：contain 缩放 + 封面均值底色（不裁掉标题/两侧内容），
+ * maskable 额外收到 80% 安全区。非浏览器环境（单测/脚本）返回 null，由调用方回退旧拷贝。
+ */
+async function buildPwaIcons(coverB64: string, mime: string): Promise<Record<string, string> | null> {
+  if (typeof document === "undefined") return null;
+  try {
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const el = new Image();
+      el.onload = () => resolve(el);
+      el.onerror = () => reject(new Error("icon source decode failed"));
+      el.src = `data:${mime};base64,${coverB64}`;
+    });
+    // 均值底色：1×1 缩略取像素，作为留白背景（深浅封面都能自然融合）
+    const probe = document.createElement("canvas");
+    probe.width = 1;
+    probe.height = 1;
+    const pctx = probe.getContext("2d");
+    if (!pctx) return null;
+    pctx.drawImage(img, 0, 0, 1, 1);
+    const [r, g, b] = pctx.getImageData(0, 0, 1, 1).data;
+    const out: Record<string, string> = {};
+    for (const { name, size, maskable } of PWA_ICON_SIZES) {
+      const canvas = document.createElement("canvas");
+      canvas.width = size;
+      canvas.height = size;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return null;
+      ctx.fillStyle = `rgb(${r}, ${g}, ${b})`;
+      ctx.fillRect(0, 0, size, size);
+      const box = maskable ? size * 0.8 : size;
+      const scale = Math.min(box / img.width, box / img.height);
+      const w = img.width * scale;
+      const h = img.height * scale;
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = "high";
+      ctx.drawImage(img, (size - w) / 2, (size - h) / 2, w, h);
+      out[name] = canvas.toDataURL("image/png").split(",")[1] ?? "";
+    }
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+/** PWA 名称与图标跟随作品（manifest.json + icons/*）；封面图按声明尺寸裁切成各尺寸图标 */
 async function patchManifestAndIcons(outputDir: string, title: string, coverName?: string): Promise<void> {
   try {
     const manifestPath = joinPath(outputDir, "manifest.json");
@@ -709,11 +786,20 @@ async function patchManifestAndIcons(outputDir: string, title: string, coverName
     /* 模板缺 manifest 不影响游戏 */
   }
   if (!coverName) return;
+  const src = joinPath(outputDir, "game/background", coverName);
   try {
-    const src = joinPath(outputDir, "game/background", coverName);
-    for (const icon of ["icon-192.png", "icon-512.png", "icon-192-maskable.png", "icon-512-maskable.png", "apple-touch-icon.png"]) {
-      const dst = joinPath(outputDir, "icons", icon);
-      await tauri.copyFile(src, dst).catch(() => undefined);
+    const mime = /\.jpe?g$/i.test(coverName) ? "image/jpeg" : /\.webp$/i.test(coverName) ? "image/webp" : "image/png";
+    const icons = await buildPwaIcons(await tauri.readFileBase64(src), mime);
+    if (icons) {
+      await tauri.mkdirAll(joinPath(outputDir, "icons")).catch(() => undefined);
+      for (const [name, data] of Object.entries(icons)) {
+        if (data) await tauri.writeFileBase64(joinPath(outputDir, "icons", name), data).catch(() => undefined);
+      }
+      return;
+    }
+    // 非浏览器环境（单测脚本）：保持旧行为，至少让图标文件存在
+    for (const { name } of PWA_ICON_SIZES) {
+      await tauri.copyFile(src, joinPath(outputDir, "icons", name)).catch(() => undefined);
     }
   } catch {
     /* 图标替换失败不影响游戏 */
@@ -746,6 +832,8 @@ async function copyAssets(assets: RenderAssets, outputDir: string): Promise<void
 
   const jobs: Array<Promise<void>> = [];
   for (const p of Object.values(assets.bg)) jobs.push(copy(p, bgDir));
+  // 图片小说分镜：与背景同目录（WebGAL changeBg 从 game/background 解析）
+  for (const p of Object.values(assets.shot ?? {})) jobs.push(copy(p, bgDir));
   for (const p of Object.values(assets.cg)) jobs.push(copy(p, bgDir));
   for (const p of Object.values(assets.figure)) jobs.push(copy(p, figureDir));
   for (const p of Object.values(assets.item)) jobs.push(copy(p, figureDir));

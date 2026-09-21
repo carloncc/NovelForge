@@ -75,6 +75,7 @@ async function main(): Promise<void> {
       }),
       getOptions: () => options,
       getTtsConfig: () => undefined,
+      getLlmAvailable: () => false,
     });
 
     await status.refresh();

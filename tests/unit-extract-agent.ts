@@ -5,6 +5,7 @@ import {
   finalizeState,
   isToolUnsupportedError,
   mergeCandidates,
+  packEnrichBatches,
   parseTextAction,
   runScanChunk,
   splitNovelForAgent,
@@ -207,6 +208,32 @@ async function main(): Promise<void> {
     assert(extractChunkBudget(cfg, zh, -5) === auto, "负数应等同自动");
     assert(extractChunkBudget(cfg, zh, 40000) === 40000, "手动 40000 应生效");
     assert(extractChunkBudget(cfg, zh, 99999999) === auto, "手动超大值不应放大自动预算");
+  }
+
+  /* ---------- 13) packEnrichBatches：补全分片不丢卡、单卡超预算独占一批（#637） ---------- */
+  {
+    const small = [
+      { kind: "c" as const, id: "a", card: { id: "a", name: "甲", imagePrompt: "" } },
+      { kind: "s" as const, id: "s1", card: { id: "s1", location: "城门", imagePrompt: "" } },
+      { kind: "i" as const, id: "i1", card: { id: "i1", name: "剑", imagePrompt: "" } },
+    ];
+    const one = packEnrichBatches(small as never, 100000);
+    assert(one.length === 1 && one[0].length === 3, "预算充足应单批装下全部卡");
+
+    const many = Array.from({ length: 20 }, (_, i) => ({
+      kind: "c" as const,
+      id: `c${i}`,
+      card: { id: `c${i}`, name: `角色${i}`, imagePrompt: "x".repeat(300) },
+    }));
+    const batches = packEnrichBatches(many as never, 2000);
+    assert(batches.length > 1, "预算不足应切成多批");
+    const covered = batches.flat().map((e) => e.id);
+    assert(covered.length === 20 && new Set(covered).size === 20, "分片必须无损覆盖全部卡且不重复");
+
+    const huge = { kind: "c" as const, id: "huge", card: { id: "huge", name: "巨卡", imagePrompt: "y".repeat(50000) } };
+    const mixed = packEnrichBatches([...many.slice(0, 2), huge] as never, 2000);
+    assert(mixed.some((b) => b.length === 1 && b[0].id === "huge"), "单卡超预算应独占一批且不丢弃");
+    assert(mixed.flat().length === 3, "超预算卡不能挤掉其它卡");
   }
 
   console.log("unit-extract-agent: 全部通过 ✅");

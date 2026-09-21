@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref } from "vue";
 import { t } from "../../i18n";
 import { STAGE_LABELS, STAGE_ORDER } from "../../core/types";
 import { goPage } from "../../stores/nav";
@@ -16,9 +16,18 @@ const {
   rerunChapters,
   toggleAllRerun,
   toggleChapterRerun,
+  imagePlanText,
 } = useGenerateController();
 
+/** 阶段与章节默认折叠成摘要行：默认视野只留「主按钮 + 图片总账」，避免一屏几十个复选框 */
+const stagesOpen = ref(false);
+const chaptersOpen = ref(false);
+
 const allStagesOn = computed(() => STAGE_ORDER.every((s) => selectedStages.value[s]));
+const stageCount = computed(() => STAGE_ORDER.filter((s) => selectedStages.value[s]).length);
+const stageSummary = computed(() =>
+  stageCount.value === STAGE_ORDER.length ? t("全阶段") : `${t("已选")} ${stageCount.value}/${STAGE_ORDER.length}`,
+);
 function toggleStages(): void {
   const next = !allStagesOn.value;
   for (const s of STAGE_ORDER) selectedStages.value[s] = next;
@@ -28,37 +37,40 @@ const allChaptersOn = computed(() => {
   const chapters = projectState.novel?.chapters ?? [];
   return chapters.length > 0 && chapters.every((ch) => rerunChapters.value === null || rerunChapters.value.includes(ch.index));
 });
+const chapterSummary = computed(() =>
+  rerunChapters.value === null ? t("全书") : `${t("已勾选")} ${rerunChapters.value.length} ${t("章")}`,
+);
 function toggleChapters(): void {
   toggleAllRerun(!allChaptersOn.value);
 }
 
 /** 主按钮下方的范围说明：避免按钮写着「整书」实际只跑勾选章节 */
 const scopeHint = computed(() => {
-  const stages = STAGE_ORDER.filter((s) => selectedStages.value[s]).length;
   const scope = rerunChapters.value === null
     ? t("全书")
     : `${t("已勾选")} ${rerunChapters.value.length} ${t("章")}`;
-  return `${t("阶段")} ${stages}/${STAGE_ORDER.length} · ${scope}`;
+  return `${t("阶段")} ${stageCount.value}/${STAGE_ORDER.length} · ${scope}`;
 });
 </script>
 
 <template>
     <div class="card">
+      <!-- 阶段：一行摘要 + 「调整」，默认不再铺 7 个复选框 -->
       <div class="card-head">
         <h3>{{ t("本次执行阶段") }}</h3>
         <div class="card-actions">
-          <button class="link-btn" @click="toggleStages">{{ allStagesOn ? t("全不选") : t("全选") }}</button>
+          <span class="hint">{{ stageSummary }}</span>
+          <button class="link-btn" @click="stagesOpen = !stagesOpen">{{ stagesOpen ? t("收起") : t("调整") }}</button>
+          <button v-if="stagesOpen" class="link-btn" @click="toggleStages">{{ allStagesOn ? t("全不选") : t("全选") }}</button>
         </div>
       </div>
-      <div class="opt-grid">
+      <div v-if="stagesOpen" class="opt-grid">
         <label v-for="s in STAGE_ORDER" :key="s" class="opt-item" :title="stageHint(s)">
           <input type="checkbox" v-model="selectedStages[s]" />
           {{ t(STAGE_LABELS[s]) }}
         </label>
       </div>
-      <p class="hint mt-3">
-        {{ t("未勾选的阶段会复用已有结果（卡片/剧本/素材），不会重新计费；若某阶段从未运行过则会提示需先运行。") }}
-      </p>
+      <p class="hint">{{ t("未勾选的阶段会复用已有结果（卡片/剧本/素材），不会重新计费；若某阶段从未运行过则会提示需先运行。") }}</p>
 
       <!-- 唯一主按钮 -->
       <div class="row mt-3 items-center gap-3" style="flex-wrap: wrap">
@@ -68,9 +80,11 @@ const scopeHint = computed(() => {
         </button>
         <span class="hint">{{ scopeHint }}</span>
       </div>
+      <!-- 图片总账：开始前先知道会生成多少张图（图像阶段勾选时才有意义） -->
+      <p v-if="selectedStages.image" class="hint mt-2"><strong>{{ t("图片统计：") }}</strong>{{ imagePlanText }}</p>
 
       <details v-if="projectState.novel" class="mt-3">
-        <summary class="hint" style="cursor: pointer">{{ t("高级：Agent 模式 / 提取分段 / 章节重跑") }}</summary>
+        <summary class="hint" style="cursor: pointer">{{ t("高级：Agent 模式 / 提取分段 / 章节范围") }}</summary>
         <label class="opt-item mt-3">
           <input type="checkbox" v-model="projectState.options.extractAgent" />
           {{ t("Agent 模式（多步自主扫描 + 工具调用，超长小说更稳）") }}
@@ -80,14 +94,17 @@ const scopeHint = computed(() => {
           <input type="number" v-model.number="projectState.options.extractChunkChars" min="0" step="5000" style="width: 90px" />
           <span class="hint">{{ t("字（0=自动）") }}</span>
         </label>
+        <!-- 章节范围：同样默认折叠，避免 20+ 个复选框铺满一屏 -->
         <div class="card-head mt-3">
-          <h3>{{ t("本次重跑 / 分章节生成章节") }}</h3>
+          <h3>{{ t("章节范围") }}</h3>
           <div class="card-actions">
-            <button class="link-btn" @click="toggleChapters">{{ allChaptersOn ? t("全不选") : t("全选") }}</button>
+            <span class="hint">{{ chapterSummary }}</span>
+            <button class="link-btn" @click="chaptersOpen = !chaptersOpen">{{ chaptersOpen ? t("收起") : t("调整") }}</button>
+            <button v-if="chaptersOpen" class="link-btn" @click="toggleChapters">{{ allChaptersOn ? t("全不选") : t("全选") }}</button>
           </div>
         </div>
         <p class="hint mb-3">{{ t("未勾选章节复用已有缓存；只勾选部分章节时，配音阶段仅生成这些章节的台词（适合分章节批量配音，避免一次性撞限流）。无缓存则跳过") }}</p>
-        <div class="opt-grid">
+        <div v-if="chaptersOpen" class="opt-grid">
           <label v-for="(ch, i) in projectState.novel.chapters" :key="i" class="opt-item">
             <input
               type="checkbox"

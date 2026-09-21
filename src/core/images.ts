@@ -294,6 +294,20 @@ export interface BuildImageTaskOptions {
    * 锚点/三视图/立绘/动作/物品是全项目级任务，不受影响（命中缓存直接复用，且情绪/动作 passes 需要立绘引用）。
    */
   chapterIndexes?: Set<number>;
+  /**
+   * 视觉模式（#806/#809）：sprite=立绘版（默认）；imageOnly=图片小说——
+   * 只产出「角色三视图（identity 参考）＋ 每场景分镜（kind:"shot"）＋（可选）物品图」，
+   * 不产出立绘/表情/动作/服装差分，也不做抠图（透明需求由渲染侧规避）。
+   */
+  mode?: "sprite" | "imageOnly";
+  /** 图片小说：每场景分镜张数上限（0=不限；提示词侧已按用户旋钮约束，这里兜底裁剪并告警） */
+  shotsPerScene?: number;
+  /** 图片小说：每章分镜总量上限（0=不限；超出按顺序裁剪并告警，不允许静默丢弃） */
+  shotsPerChapter?: number;
+  /** 图片小说：全局分镜总量/预算上限（0=不限；到达上限停止派发新任务，已生成产物保留） */
+  shotsTotal?: number;
+  /** 图片小说：是否生成物品图（默认 false，与 #814 的「图片必须含角色」口径一致） */
+  includeItems?: boolean;
 }
 
 export function buildImageTasks(
@@ -316,6 +330,12 @@ export function buildImageTasks(
   // 背景/CG/锚点继续用完整风格（那里的背景描述是合法的）。
   const figureStyle = stripBackground(style);
   const useAnchor = opts.styleAnchor !== false;
+  const imageOnly = opts.mode === "imageOnly";
+  const shotsPerScene = opts.shotsPerScene ?? 0;
+  const shotsPerChapter = opts.shotsPerChapter ?? 0;
+  const shotsTotal = opts.shotsTotal ?? 0;
+  let shotTotalCount = 0;
+  let shotTotalReached = false;
 
   // ① 全项目画风锚点：一张无人物场景基准图，作为所有背景/CG 的画风参考
   if (useAnchor) {
@@ -350,87 +370,133 @@ export function buildImageTasks(
         usage: `三视图-${char.name}`,
       });
     }
-    // ② 立绘（默认姿态）→ 以三视图为参考图
-    // core 档：只用标准 5 表情（忽略 AI 自定义大表情集，省图）；
-    // full 档：优先角色自定义表情集（AI 按剧情提取），缺省用标准 5 表情
-    const baseEmotions = !useEmotions ? ["normal"] : detail === "core" ? FIGURE_EMOTIONS : (char.emotions?.length ? char.emotions : FIGURE_EMOTIONS);
-    // 强制包含 normal 并去重/消毒：表情集缺 normal 会导致默认立绘整张缺失、所有差分 refFromTask 断链；
-    // 自定义表情名含中文/符号时旧实现直接拼文件名（可能路径穿越/覆盖），按动作同一口径 sanitize（原值保留给提示词）
-    const emoList: { raw: string; id: string }[] = [];
-    const seenEmo = new Set<string>();
-    for (const raw of ["normal", ...baseEmotions]) {
-      const id = sanitizeId(String(raw)) || "normal";
-      if (seenEmo.has(id)) continue;
-      seenEmo.add(id);
-      emoList.push({ raw: String(raw), id });
-    }
-    for (const { raw: emoRaw, id: emoId } of emoList) {
-      const isNormal = emoId === "normal";
-      tasks.push({
-        kind: "figure",
-        id: isNormal ? char.id : `${char.id}_${emoId}`,
-        characterId: char.id,
-        emotion: emoId,
-        prompt: emotionPrompt(char.imagePrompt, emoId, emoRaw) + REF_HINT + figureStyle + FIGURE_BG_SUFFIX,
-        refFromTask: isNormal ? (threeView ? `${char.id}_threeview` : undefined) : char.id,
-        fileName: `figure_${sanitizeId(char.id)}_${emoId}.png`,
-        width: 1024,
-        height: 1024,
-        usage: `立绘-${char.name}${isNormal ? "" : `（${emoRaw}）`}`,
-      });
-    }
-    // ②b 服装差分立绘（基于三视图图生图；full 档才生成，core 档跳过以省图；
-    //    每套只生成 normal 姿态作为换装底图，其余表情沿用当前服装）
-    if (threeView && detail !== "core" && Array.isArray(char.costumes)) {
-      for (const ct of char.costumes) {
+    // ② 立绘/表情/动作/服装差分：图片小说模式一律不产出（#809：无立绘、无人物演出 UI）
+    if (!imageOnly) {
+      // ② 立绘（默认姿态）→ 以三视图为参考图
+      // core 档：只用标准 5 表情（忽略 AI 自定义大表情集，省图）；
+      // full 档：优先角色自定义表情集（AI 按剧情提取），缺省用标准 5 表情
+      const baseEmotions = !useEmotions ? ["normal"] : detail === "core" ? FIGURE_EMOTIONS : (char.emotions?.length ? char.emotions : FIGURE_EMOTIONS);
+      // 强制包含 normal 并去重/消毒：表情集缺 normal 会导致默认立绘整张缺失、所有差分 refFromTask 断链；
+      // 自定义表情名含中文/符号时旧实现直接拼文件名（可能路径穿越/覆盖），按动作同一口径 sanitize（原值保留给提示词）
+      const emoList: { raw: string; id: string }[] = [];
+      const seenEmo = new Set<string>();
+      for (const raw of ["normal", ...baseEmotions]) {
+        const id = sanitizeId(String(raw)) || "normal";
+        if (seenEmo.has(id)) continue;
+        seenEmo.add(id);
+        emoList.push({ raw: String(raw), id });
+      }
+      for (const { raw: emoRaw, id: emoId } of emoList) {
+        const isNormal = emoId === "normal";
         tasks.push({
           kind: "figure",
-          id: `${char.id}_ct_${ct.id}`,
+          id: isNormal ? char.id : `${char.id}_${emoId}`,
           characterId: char.id,
-          emotion: "normal",
-          costume: ct.id,
-          prompt: stripBackground(ct.prompt) + REF_HINT + figureStyle + FIGURE_BG_SUFFIX,
-          refFromTask: `${char.id}_threeview`,
-          fileName: `figure_${sanitizeId(char.id)}_ct_${sanitizeId(ct.id)}_normal.png`,
+          emotion: emoId,
+          prompt: emotionPrompt(char.imagePrompt, emoId, emoRaw) + REF_HINT + figureStyle + FIGURE_BG_SUFFIX,
+          refFromTask: isNormal ? (threeView ? `${char.id}_threeview` : undefined) : char.id,
+          fileName: `figure_${sanitizeId(char.id)}_${emoId}.png`,
           width: 1024,
           height: 1024,
-          usage: `立绘-${char.name}-${ct.name}`,
+          usage: `立绘-${char.name}${isNormal ? "" : `（${emoRaw}）`}`,
         });
       }
-    }
-    // ③ 动作立绘（基于三视图图生图；动作数量不限，按角色卡片提取）
-    if (threeView && withActions && Array.isArray(char.actions)) {
-      const actions = maxActionsPerCharacter > 0 ? char.actions.slice(0, maxActionsPerCharacter) : char.actions;
-      for (const a of actions) {
-        tasks.push({
-          kind: "action",
-          id: `${char.id}_act_${a.id}`,
-          characterId: char.id,
-          actionId: a.id,
-          prompt: stripBackground(a.prompt) + ACTION_CLARITY_HINT + REF_HINT + figureStyle + FIGURE_BG_SUFFIX,
-          refFromTask: `${char.id}_threeview`,
-          fileName: `figure_${sanitizeId(char.id)}_act_${sanitizeId(a.id)}.png`,
-          width: 1024,
-          height: 1024,
-          usage: `动作-${char.name}-${a.name}`,
-        });
+      // ②b 服装差分立绘（基于三视图图生图；full 档才生成，core 档跳过以省图；
+      //    每套只生成 normal 姿态作为换装底图，其余表情沿用当前服装）
+      if (threeView && detail !== "core" && Array.isArray(char.costumes)) {
+        for (const ct of char.costumes) {
+          tasks.push({
+            kind: "figure",
+            id: `${char.id}_ct_${ct.id}`,
+            characterId: char.id,
+            emotion: "normal",
+            costume: ct.id,
+            prompt: stripBackground(ct.prompt) + REF_HINT + figureStyle + FIGURE_BG_SUFFIX,
+            refFromTask: `${char.id}_threeview`,
+            fileName: `figure_${sanitizeId(char.id)}_ct_${sanitizeId(ct.id)}_normal.png`,
+            width: 1024,
+            height: 1024,
+            usage: `立绘-${char.name}-${ct.name}`,
+          });
+        }
+      }
+      // ③ 动作立绘（基于三视图图生图；动作数量不限，按角色卡片提取）
+      if (threeView && withActions && Array.isArray(char.actions)) {
+        const actions = maxActionsPerCharacter > 0 ? char.actions.slice(0, maxActionsPerCharacter) : char.actions;
+        for (const a of actions) {
+          tasks.push({
+            kind: "action",
+            id: `${char.id}_act_${a.id}`,
+            characterId: char.id,
+            actionId: a.id,
+            prompt: stripBackground(a.prompt) + ACTION_CLARITY_HINT + REF_HINT + figureStyle + FIGURE_BG_SUFFIX,
+            refFromTask: `${char.id}_threeview`,
+            fileName: `figure_${sanitizeId(char.id)}_act_${sanitizeId(a.id)}.png`,
+            width: 1024,
+            height: 1024,
+            usage: `动作-${char.name}-${a.name}`,
+          });
+        }
       }
     }
   }
 
-  for (const item of cards.items) {
-    tasks.push({
-      kind: "item",
-      id: item.id,
-      prompt: stripBackground(item.imagePrompt) + figureStyle + ITEM_BG_SUFFIX,
-      fileName: `item_${sanitizeId(item.id)}.png`,
-      width: 1024,
-      height: 1024,
-      usage: `物品-${item.name}`,
+  if (!imageOnly || opts.includeItems) {
+    for (const item of cards.items) {
+      tasks.push({
+        kind: "item",
+        id: item.id,
+        prompt: stripBackground(item.imagePrompt) + figureStyle + ITEM_BG_SUFFIX,
+        fileName: `item_${sanitizeId(item.id)}.png`,
+        width: 1024,
+        height: 1024,
+        usage: `物品-${item.name}`,
     });
+  }
   }
 
   for (const chapter of chapters) {
+    // 图片小说（#809）：只构建分镜任务（kind:"shot"）——画面由 shot 承担，
+    // 不产出背景/CG 任务；无 shot 的场景在渲染侧保留上一张图（不会出现黑屏）。
+    if (imageOnly) {
+      if (opts.chapterIndexes && !opts.chapterIndexes.has(chapter.chapter)) continue;
+      let chapterShotCount = 0;
+      for (const scene of chapter.scenes) {
+        const shots = shotsPerScene > 0 ? (scene.shots ?? []).slice(0, shotsPerScene) : (scene.shots ?? []);
+        for (let si = 0; si < shots.length; si++) {
+          if (shotsPerChapter > 0 && chapterShotCount >= shotsPerChapter) {
+            logger.warn("images", `第 ${chapter.chapter + 1} 章分镜超过每章上限 ${shotsPerChapter}，已裁剪多余分镜（可提高上限后重跑）`, { chapter: chapter.chapter });
+            break;
+          }
+          if (shotsTotal > 0 && shotTotalCount >= shotsTotal) {
+            if (!shotTotalReached) {
+              shotTotalReached = true;
+              logger.warn("images", `分镜总量已达上限 ${shotsTotal}，停止派发新分镜（已完成产物保留；提高上限后可续跑）`, { shotsTotal });
+            }
+            break;
+          }
+          const shot = shots[si];
+          const identity = (shot.characters ?? []).find((id) => cards.characters.some((c) => c.id === id));
+          tasks.push({
+            kind: "shot",
+            id: shot.id,
+            chapter: chapter.chapter,
+            sceneId: scene.id,
+            shotIndex: si,
+            ...(identity ? { characterId: identity, refFromTask: `${identity}_threeview` } : {}),
+            prompt: shot.prompt + style,
+            fileName: `shot_ch${chapter.chapter + 1}_${sanitizeId(scene.id)}_${si + 1}.png`,
+            width: 1536,
+            height: 1024,
+            usage: `分镜-${scene.location}${shot.note ? `-${shot.note}` : ""}`,
+          });
+          chapterShotCount++;
+          shotTotalCount++;
+        }
+        if (shotsTotal > 0 && shotTotalCount >= shotsTotal) break;
+      }
+      continue;
+    }
     // 单章节模式：只构建选中章节的背景/CG 任务，其余章节复用已有映射
     if (opts.chapterIndexes && !opts.chapterIndexes.has(chapter.chapter)) continue;
     let count = 0;

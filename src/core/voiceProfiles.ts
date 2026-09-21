@@ -1,6 +1,7 @@
 import type { ApiConfig, VoiceProfile } from "./types";
 import { ttsConfigById, upsertVoiceProfile } from "../stores/config";
 import { tauri } from "../utils/tauri";
+import { activeAbortSignal } from "../api/abort";
 import { minimaxVoiceLabel } from "./minimaxVoices";
 
 function decodeBase64Text(encoded: string): string {
@@ -107,7 +108,7 @@ export async function createMiniMaxVoiceProfile(input: {
   if (input.audioB64.length > 16 * 1024 * 1024) throw new Error("参考音频过大，请选择不超过 12MB 的文件");
   const headers = minimaxAuthHeaders(config);
   const multipart = multipartBody(input.fileName, input.mime, input.audioB64);
-  const upload = jsonResponse(await tauri.http({ method: "POST", url: apiUrl(config, "/v1/files/upload"), headers: { ...headers, "Content-Type": multipart.contentType }, bodyBase64: multipart.bodyBase64 }));
+  const upload = jsonResponse(await tauri.http({ method: "POST", url: apiUrl(config, "/v1/files/upload"), headers: { ...headers, "Content-Type": multipart.contentType }, bodyBase64: multipart.bodyBase64 }, activeAbortSignal()));
   const fileId = extractFileId(upload);
   const clone = jsonResponse(await tauri.http({
     method: "POST",
@@ -119,7 +120,7 @@ export async function createMiniMaxVoiceProfile(input: {
       // 官方示例始终携带 model：指定与配置一致的合成模型，避免默认值导致复刻质量不符预期
       ...(config.model ? { model: config.model } : {}),
     }),
-  }));
+  }, activeAbortSignal()));
   const profile: VoiceProfile = {
     id: crypto.randomUUID(), name: input.name.trim() || "MiniMax 克隆声音", provider: "minimax", ttsConfigId: config.id,
     voiceId: extractVoiceId(clone), status: "ready", consentConfirmedAt: new Date().toISOString(), revision: 1, createdAt: new Date().toISOString(),
@@ -147,7 +148,7 @@ export async function fetchMiniMaxVoices(config: ApiConfig, voiceType: "system" 
     headers: { ...headers, "Content-Type": "application/json" },
     body: JSON.stringify({ voice_type: voiceType }),
     timeoutSecs: 60,
-  });
+  }, activeAbortSignal());
   const payload = jsonResponse(resp);
   if ((payload.base_resp as Record<string, unknown> | undefined)?.status_code !== 0) {
     throw new Error(`MiniMax 音色查询失败：${JSON.stringify(payload.base_resp ?? "")}`);

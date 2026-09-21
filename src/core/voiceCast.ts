@@ -44,12 +44,13 @@ export function applyVoiceAssignments(
   return out;
 }
 
-/** 让 LLM 为角色重新挑音色；返回通过校验的分配结果 */
+/** 让 LLM 为角色重新挑音色；返回通过校验的分配结果。voiceLib 应为 TTS 配置的音色库（缺省时按传入 cfg 推断，见 #788） */
 export async function aiAssignVoices(
   cfg: ApiConfig,
   characters: CharacterCard[],
+  voiceLib?: string[],
 ): Promise<VoiceCastAssignment[]> {
-  const lib = voiceLibraryFor(cfg);
+  const lib = voiceLib ?? voiceLibraryFor(cfg);
   if (!lib.length) throw new Error("音色库为空：请先在「API 配置」里为 TTS 填写音色库");
   const libText = lib
     .map((id) => {

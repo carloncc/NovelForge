@@ -11,32 +11,33 @@ const locked = computed(() => busy.value || !!assetBusy.value || queueRunning.va
 </script>
 
 <template>
-  <details class="card wb-project" :open="!projectState.novel">
-    <summary>
+  <!-- 扁平一行（不再嵌套折叠）：状态标签 + 目录输入 + 浏览/加载；目录信息在外层「设置」摘要也有 -->
+  <div class="wb-project">
+    <div class="wb-project-row">
       <strong>{{ t("项目") }}</strong>
       <span class="tag" :class="projectState.novel ? 'ok' : 'warn'">
         {{ projectState.novel ? t("已载入小说") : t("未载入小说") }}
       </span>
       <span v-if="projectState.lastResult" class="tag ok">{{ t("已有生成结果") }}</span>
-      <code class="hint text-ellipsis" style="margin-left: auto; max-width: 46%" :title="projectState.outputDir || t('未设置输出目录')">{{ projectState.outputDir || t("未设置输出目录") }}</code>
-    </summary>
-    <div class="row mt-3">
-      <input type="text" v-model="outputDirDraft" class="grow" :disabled="locked" />
+      <input
+        type="text"
+        v-model="outputDirDraft"
+        class="grow"
+        :disabled="locked"
+        :placeholder="t('输出目录')"
+        :title="projectState.outputDir || t('未设置输出目录')"
+      />
       <button class="link-btn" :disabled="locked" @click="browseOutputDir">{{ t("浏览…") }}</button>
       <button class="link-btn" :disabled="locked" @click="loadProjectState">{{ t("加载该项目") }}</button>
     </div>
-  </details>
+  </div>
 </template>
 
 <style scoped>
-.wb-project summary {
+.wb-project-row {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
-  cursor: pointer;
-  list-style: none;
-}
-.wb-project summary::-webkit-details-marker {
-  display: none;
 }
 </style>

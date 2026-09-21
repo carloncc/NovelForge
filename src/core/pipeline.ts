@@ -22,15 +22,16 @@ import type { RenderAssets, WebgalLanguage } from "./render";
 import { sanitizeId, inferWebgalLanguage } from "./render";
 import { demoExtract } from "./extract";
 import { extractFromNovelAgent, extractFromNovelChunked, mergeCharacter, normalizeName } from "./extractAgent";
-import { scriptChapter, demoScriptAll, verifyScriptAgainstSource, scriptVerifyFileName, readScriptVerify, writeScriptVerify, SCRIPT_MIN_KEPT_RATIO } from "./script";
+import { scriptChapter, demoScriptAll, verifyScriptAgainstSource, scriptVerifyFileName, readScriptVerify, writeScriptVerify, SCRIPT_MIN_KEPT_RATIO, SCRIPT_MIN_NARRATION_RATIO } from "./script";
 import type { ScriptVerifyResult } from "./script";
 import { translateChapter } from "./translate";
-import { aiSplitChapters, splitChaptersForFallback } from "./split";
+import { aiSplitChapters, chapterCharBudget, splitChaptersForFallback } from "./split";
 import type { AiSplitOptions, SplitStats } from "./split";
 import { generateImages } from "./images";
 import { generateVoice, vocalKeysForChapters } from "./voice";
 import { assembleProject, gameKeyFor } from "./project";
-import { cacheDirFor, titleHash, scriptCacheRest, scriptCacheFileName } from "./cache";
+import { cacheDirFor, titleHash, scriptCacheRest, scriptCacheFileName, scriptFingerprint, cardsFingerprint } from "./cache";
+import { resolveProjectTitle } from "./title";
 export { titleHash, scriptCacheRest, scriptCacheFileName };
 import { normalizeNovelText } from "./chapters";
 import { tauri } from "../utils/tauri";
@@ -38,7 +39,9 @@ import { errMsg } from "../utils/errors";
 import { classifyError } from "../utils/errorClassifier";
 import { log as logger } from "../utils/logger";
 import { configIsUsable } from "../api/providers";
+import { setActiveAbortSignal } from "../api/abort";
 import { concurrencyFor } from "../stores/configMigration";
+import { voiceLibraryFor } from "../stores/config";
 import { setLlmConcurrency } from "../api/openaiCompatible";
 import { assertVisualBibleApprovalStatus, assertVisualBibleReadyForImages } from "./visualBible";
 import { readAssetMap, updateAssetMap, backupAssetMap } from "./assetMap";
@@ -166,7 +169,8 @@ async function splitNovelForPipeline(
   }
   if (out) out.method = "ai";
   const stats: SplitStats = {};
-  const chapters = await aiSplitChapters(cfg, fullText, onUsage, 40000, feedback, concurrency, stats, splitOpts);
+  // 单章预算自适应（#800）：按模型上下文与剧本输出上限算，避免超长章忠实改编时丢旁白
+  const chapters = await aiSplitChapters(cfg, fullText, onUsage, chapterCharBudget(cfg, fullText), feedback, concurrency, stats, splitOpts);
   if (out) out.stats = stats;
   return chapters;
 }
@@ -457,6 +461,8 @@ export class Pipeline {
   };
   private cacheRoot = "";
   private aborted = false;
+  /** #784：在途请求的中止桥——stop 时 abort，让 API 层（Tauri/Web 两条传输）中断已发出的请求 */
+  private abortController = new AbortController();
   private failedTasks: FailedTask[] = [];
   /** 本次运行中成功产出的任务 id：跨运行收敛 failed.json（成功过的不再留在失败列表） */
   private succeededTaskIds = new Set<string>();
@@ -479,6 +485,8 @@ export class Pipeline {
 
   abort(): void {
     this.aborted = true;
+    // #784：同时中断在途 HTTP 请求（不再等它跑完并继续计费）
+    this.abortController.abort();
   }
 
   private recordFailure(f: FailedTask): void {
@@ -566,8 +574,28 @@ export class Pipeline {
   }
 
   private scriptStyleFrag(): string {
-    const style = (this.options.scriptStyle ?? "").trim();
-    return style ? `_st${titleHash(style)}` : "";
+    return scriptFingerprint({
+      style: this.options.scriptStyle,
+      compressNarration: this.options.compressNarration,
+      cardsFp: this.cardsFp,
+    });
+  }
+
+  /** 卡片指纹（缓存键的一部分）：提取阶段拿到卡片后立即计算；卡片 id/名称变化 → 旧剧本自动失效 */
+  private cardsFp = "";
+
+  private refreshCardsFp(cards: ExtractionResult | undefined): void {
+    this.cardsFp = cards ? cardsFingerprint(cards) : "";
+  }
+
+  /** 作品标题解析：导出标题 → 卡片标题 → 输出目录名 → 文件名（过滤「175812 gbk」这类垃圾串） */
+  private titleFor(cardsTitle?: string): string {
+    return resolveProjectTitle({
+      exportTitle: this.options.exportTitle,
+      cardsTitle,
+      outputDir: this.input.outputDir,
+      fileName: this.input.novel.fileName,
+    });
   }
 
   /**
@@ -1384,8 +1412,21 @@ export class Pipeline {
     return new Set([...(base ?? []), ...forced]);
   }
 
+  /** 运行入口（#784）：统一管理全局中止信号的生命周期 */
   async run(): Promise<PipelineResult> {
+    try {
+      return await this.runInner();
+    } finally {
+      // 清除信号：避免「停止过的运行」把之后独立发起的请求（单素材重生成等）也当成已中止
+      setActiveAbortSignal(undefined);
+    }
+  }
+
+  private async runInner(): Promise<PipelineResult> {
     const { input } = this;
+    // #784：把本次运行的中止信号挂到 API 层——「停止」可立即中断在途请求（Tauri 侧经 cancel_http_request）
+    if (this.abortController.signal.aborted) this.abortController = new AbortController();
+    setActiveAbortSignal(this.abortController.signal);
     this.cacheRoot = `${input.outputDir}/.novel2vn/cache`;
     const runStart = logger.time("pipeline", "管线整体运行");
     // 文本/视觉请求限流跟随各 API 自己的并发配置（各 API 互不影响）
@@ -1535,7 +1576,7 @@ export class Pipeline {
         if (canTranslate && appendLang) {
           tailText = await this.appendTailForExtract(tailText, appendLang);
         }
-        const title = workingNovel.fileName.replace(/\.txt$/i, "");
+        const title = this.titleFor();
         try {
           const useAgent = !!this.options.extractAgent;
           const runTailExtract = (): Promise<ExtractionResult> =>
@@ -1545,12 +1586,14 @@ export class Pipeline {
                   isAborted: () => this.aborted,
                   log: (message, level = "info") => log({ step: "提取", message, level, at: Date.now() }),
                   chunkChars: this.options.extractChunkChars,
+                  voiceLib: voiceLibraryFor(input.tts),
                 })
               : extractFromNovelChunked(input.llm!, tailText, title, {
                   onUsage,
                   isAborted: () => this.aborted,
                   log: (message, level = "info") => log({ step: "提取", message, level, at: Date.now() }),
                   chunkChars: this.options.extractChunkChars,
+                  voiceLib: voiceLibraryFor(input.tts),
                 });
           const fresh = demo
             ? demoExtract(tailText, title)
@@ -1602,23 +1645,25 @@ export class Pipeline {
             log({ step: "提取", message, level, at: Date.now() });
           const runExtract = (): Promise<ExtractionResult> =>
             useAgent
-              ? extractFromNovelAgent(input.llm!, workingNovel.fullText, workingNovel.fileName.replace(/\.txt$/i, ""), {
+              ? extractFromNovelAgent(input.llm!, workingNovel.fullText, this.titleFor(), {
                   onUsage,
                   isAborted: () => this.aborted,
                   feedback: extractFeedback,
                   log: extractLog,
                   chunkChars: this.options.extractChunkChars,
+                  voiceLib: voiceLibraryFor(input.tts),
                 })
               // 经典模式也分段全书扫描：旧单次截断只看前文，长篇后半人物永远提不出来
-              : extractFromNovelChunked(input.llm!, workingNovel.fullText, workingNovel.fileName.replace(/\.txt$/i, ""), {
+              : extractFromNovelChunked(input.llm!, workingNovel.fullText, this.titleFor(), {
                   onUsage,
                   feedback: extractFeedback,
                   isAborted: () => this.aborted,
                   log: extractLog,
                   chunkChars: this.options.extractChunkChars,
+                  voiceLib: voiceLibraryFor(input.tts),
                 });
           cards = demo
-            ? demoExtract(workingNovel.fullText, workingNovel.fileName.replace(/\.txt$/i, ""))
+            ? demoExtract(workingNovel.fullText, this.titleFor())
             : await withTextRetry(runExtract, {
                 isAborted: () => this.aborted,
                 onRetry: (attempt, delay, e) =>
@@ -1691,6 +1736,8 @@ export class Pipeline {
         throw new Error("未勾选「提取」阶段且无卡片缓存，请先勾选提取或加载已有项目");
       }
     }
+    // 卡片指纹进入剧本缓存键：卡片 id/名称变化时旧剧本自动失效（避免渲染人名退化成内部 id）
+    this.refreshCardsFp(cards);
     this.checkAbort();
 
     /* ==================== ③ 分章剧本 ==================== */
@@ -1732,7 +1779,7 @@ export class Pipeline {
         }
       }
       const style = (this.options.scriptStyle ?? "").trim();
-      const styleFrag = style ? `_st${titleHash(style)}` : "";
+      const styleFrag = scriptFingerprint({ style, compressNarration: this.options.compressNarration });
       // 先清理与当前章节失配的过期剧本缓存（重分章/重翻译/改标题正文/换文风后残留），
       // 避免旧剧本混入本次结果；旧版无指纹文件保留（加载时兼容并提示重跑）
       const prunedScripts = await this.pruneStaleScriptCache(workingChapters, styleFrag, demo);
@@ -1841,6 +1888,7 @@ export class Pipeline {
                   : await withTextRetry(
                       () => scriptChapter(input.llm!, chapter, cards!, onUsage, {
                         style: style || undefined,
+                        compressNarration: this.options.compressNarration,
                         feedback: this.feedback.script?.[chapter.index],
                       }),
                       {
@@ -1918,10 +1966,16 @@ export class Pipeline {
               };
               try {
                 let vr = await this.verifyAndPersistScript(chapter, script, cards!.characters, demo, styleFrag, true);
-                if (!demo && !hasFeedback && !chapterForce && vr.originalQuoteCount >= 5 && vr.keptRatio < SCRIPT_MIN_KEPT_RATIO) {
+                // 保真触发（#794）：引语覆盖率不足，或——未开启压缩旁白时——段落覆盖率不足。
+                // 后者让「对话全保但旁白/描写被删光」也能被发现并重写。
+                const quoteWeak = vr.originalQuoteCount >= 5 && vr.keptRatio < SCRIPT_MIN_KEPT_RATIO;
+                const narrationWeak = !this.options.compressNarration
+                  && vr.paragraphCount >= 5
+                  && vr.narrationRatio < SCRIPT_MIN_NARRATION_RATIO;
+                if (!demo && !hasFeedback && !chapterForce && (quoteWeak || narrationWeak)) {
                   log({
                     step: "剧本",
-                    message: `第 ${chapter.index + 1} 章覆盖率仅 ${Math.round(vr.keptRatio * 100)}%（低于 ${Math.round(SCRIPT_MIN_KEPT_RATIO * 100)}%），自动重写一次补足遗漏台词…`,
+                    message: `第 ${chapter.index + 1} 章保真不足（引语覆盖 ${Math.round(vr.keptRatio * 100)}%、段落覆盖 ${Math.round(vr.narrationRatio * 100)}%），自动重写一次补足遗漏内容…`,
                     level: "warn",
                     at: Date.now(),
                   });
@@ -1929,7 +1983,8 @@ export class Pipeline {
                     script = await withTextRetry(
                       () => scriptChapter(input.llm!, chapter, cards!, onUsage, {
                         style: style || undefined,
-                        feedback: `保真复核未通过：上一版只覆盖原文 ${Math.round(vr.keptRatio * 100)}% 引语，请逐段核对原文把遗漏的对话与关键旁白补全，不要新增原文没有的台词，不要张冠李戴说话人。`,
+                        compressNarration: this.options.compressNarration,
+                        feedback: `保真复核未通过：上一版引语覆盖率 ${Math.round(vr.keptRatio * 100)}%、段落覆盖率 ${Math.round(vr.narrationRatio * 100)}%。请逐段核对原文，把遗漏的对话与关键旁白/心理/环境描写全部补全（每个自然段至少一条 line），不要新增原文没有的台词，不要张冠李戴说话人。`,
                       }),
                       {
                         isAborted: () => this.aborted,
@@ -2299,8 +2354,8 @@ export class Pipeline {
       meta = await this.loadMeta();
       if (!meta) {
         meta = {
-          title: cards!.title || workingNovel.fileName.replace(/\.txt$/i, ""),
-          gameKey: gameKeyFor(cards!.title || workingNovel.fileName),
+          title: this.titleFor(cards!.title),
+          gameKey: gameKeyFor(this.titleFor(cards!.title)),
           chapterCount: chapters.length,
           charCount: cards!.characters.length,
           sceneCount: chapters.reduce((n, c) => n + c.scenes.length, 0),
@@ -2312,8 +2367,8 @@ export class Pipeline {
       }
     } else if (stages.has("assemble")) {
       log({ step: "组装", message: `组装项目到 ${input.outputDir}…`, level: "info", at: Date.now() });
-      // 导出页设置优先（重新组装不再覆盖自定义标题/Game_key）；未设置时按卡片标题自动派生
-      const exportTitle = this.options.exportTitle?.trim() || cards!.title || workingNovel.fileName.replace(/\.txt$/i, "");
+      // 导出页设置优先（重新组装不再覆盖自定义标题/Game_key）；未设置时按「卡片标题 → 目录名 → 文件名」解析
+      const exportTitle = this.titleFor(cards!.title);
       const exportGameKey = /^[a-zA-Z0-9]{6,10}$/.test(this.options.exportGameKey?.trim() ?? "")
         ? this.options.exportGameKey!.trim()
         : gameKeyFor(exportTitle);
@@ -2352,8 +2407,8 @@ export class Pipeline {
       meta = await this.loadMeta();
       if (!meta) {
         meta = {
-          title: cards!.title || workingNovel.fileName.replace(/\.txt$/i, ""),
-          gameKey: gameKeyFor(cards!.title || workingNovel.fileName),
+          title: this.titleFor(cards!.title),
+          gameKey: gameKeyFor(this.titleFor(cards!.title)),
           chapterCount: chapters.length,
           charCount: cards!.characters.length,
           sceneCount: chapters.reduce((n, c) => n + c.scenes.length, 0),

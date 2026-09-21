@@ -55,7 +55,12 @@ function main(): void {
   assert(out0.includes("changeFigure:none -left"), "章首应清左位立绘");
   assert(out0.split("\n").some((l) => /^changeFigure:none( -exit=exit)? -next;$/.test(l.trim())), "章首应清中位立绘");
   assert(out0.includes("changeFigure:none -right"), "章首应清右位立绘");
-  assert(out0.includes("intro:第 1 章 · 第1章 -fontColor=rgba(255,255,255,1) -fontSize=large -hold;"), "章首应有章节标题卡");
+  // 标题已含「第X章」时不再重复拼接前缀（用户实测：曾显示成「第 1 章 · 第一卷 第一章 …」）
+  assert(out0.includes("intro:第1章 -fontColor=rgba(255,255,255,1) -fontSize=large -hold;"), "章首应有章节标题卡（标题已含第X章时不重复前缀）");
+  // 半身取景：立绘就位后套用取景变换；figureFraming=full 时整身显示
+  assert(out0.includes('setTransform:{"scale":{"x":1.75,"y":1.75},"position":{"x":0,"y":350}} -target=fig-left'), "立绘应套用半身取景");
+  const outFull = renderChapter(chapter(0), { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets, figureFraming: "full" }, 2);
+  assert(!outFull.includes('"scale":{"x":1.75'), "figureFraming=full 时不应套用取景缩放");
 
   // 1) 登场资料卡：首次出场插入旁白资料（立绘可见），之后不再重复
   const seen = new Set<string>();
@@ -121,7 +126,8 @@ function main(): void {
   assert(!outEmoOff.includes("f_linche_happy"), "表情开关关闭不应切换表情立绘");
   const chNoBgm = chapter(0, false);
   const outNoBgm = renderChapter(chNoBgm, { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets: { ...assets, bgm: {} }, introCard: false }, 2);
-  assert(!outNoBgm.includes("bgm:"), "无 BGM 文件不应输出 bgm 指令");
+  // 章首的跨章复位会输出 bgm:none（#789），这不属于「播放 BGM」——此处不应出现任何 bgm:<文件>
+  assert(!/bgm:(?!none)[^;\s]+/.test(outNoBgm), `无 BGM 文件不应播放任何 BGM 文件，实际: ${outNoBgm.split("\n").filter((l) => l.startsWith("bgm:")).join(" | ")}`);
 
   // 6) BGM 串场修复：首场景有 BGM、后续场景无匹配 BGM → 应输出 bgm:none 淡出停止
   const multiAssets: RenderAssets = {
@@ -141,7 +147,8 @@ function main(): void {
   });
   const outMulti = renderChapter(chMulti, { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets: multiAssets, introCard: false }, 2);
   const bgmIdx = outMulti.indexOf("bgm:calm_piano.mp3");
-  const stopIdx = outMulti.indexOf("bgm:none");
+  // 章首跨章复位也会输出 bgm:none（#789）——这里要的是「播放之后」的淡出停止
+  const stopIdx = outMulti.indexOf("bgm:none", Math.max(0, bgmIdx));
   assert(bgmIdx >= 0 && stopIdx > bgmIdx, "无匹配 BGM 的场景应淡出停止上一首 BGM");
 
   console.log("=== 登场演出/视频位测试通过 ===");

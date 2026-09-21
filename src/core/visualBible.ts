@@ -1914,7 +1914,8 @@ export async function loadVisualBible(outputDir: string, activeCharacterIds?: st
   }
   const manifestPath = visualBibleManifestPath(outputDir);
   if (!(await tauri.pathExists(manifestPath).catch(() => false))) {
-    return { visualBible: null, warnings: [...warnings, `Visual bible manifest is missing: ${manifestPath}`] };
+    // 提示性状态而非错误：首次出图前本就没有清单，管线会自动创建草稿
+    return { visualBible: null, warnings: [...warnings, "还没有视觉守门清单：首次生成图片时会自动创建草稿并请你确认（无需手动处理）"] };
   }
   try {
     const { text } = await tauri.readTextFile(manifestPath);

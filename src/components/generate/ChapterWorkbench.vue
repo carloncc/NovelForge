@@ -22,6 +22,10 @@ const props = defineProps<{
   splitConfirmed: boolean;
   splitMinChapterChars: number;
   splitKeepSpecials: boolean;
+  /** 图片总账文案：图片共 N 张 · 已生成 X · 待生成 Y（生成前可见，stores/generate 计算） */
+  imageSummaryText: string;
+  /** 有失败记录的章节（novel index）：列表优先展示并显示「失败」状态 */
+  failedChapters: number[];
 }>();
 
 const emit = defineEmits<{
@@ -71,16 +75,25 @@ function titleOf(c: ChapterInfo): string {
 
 /**
  * 单章状态：只给一个明确的中文结论，不再堆「剧本× 图像— 配音—」这类符号。
- * 判定口径：未生成 → 旧缓存 → 缺图 x/y → 缺配音 x/y → 已完成。
+ * 判定口径：失败 → 未生成 → 旧缓存 → 缺图 x/y → 缺配音 x/y → 已完成。
  * 图像关闭（total=0）与未配置 TTS（voiceSkipped）不参与判定，避免显示成「缺失」。
  */
-function chipOf(l: ChapterLight): { text: string; cls: string } {
+function chipOf(l: ChapterLight, failed = false): { text: string; cls: string } {
+  if (failed) return { text: t("失败"), cls: "err" };
   if (!l.script) return { text: t("未生成"), cls: "" };
   if (l.legacyScript) return { text: t("旧缓存"), cls: "warn" };
   if (l.imageTotal > 0 && l.imageDone < l.imageTotal) return { text: `${t("缺图")} ${l.imageDone}/${l.imageTotal}`, cls: "warn" };
   if (!l.voiceSkipped && l.voiceTotal > 0 && l.voiceDone < l.voiceTotal) return { text: `${t("缺配音")} ${l.voiceDone}/${l.voiceTotal}`, cls: "warn" };
   return { text: t("已完成"), cls: "ok" };
 }
+
+/** 列表默认只显示「未完成 + 失败」的章节：大部头不再一屏 20+ 行；全部完成时只留一行结论 */
+const showAllChapters = ref(false);
+const failedSet = computed(() => new Set(props.failedChapters));
+const visibleChapters = computed(() => {
+  if (showAllChapters.value) return props.chapters;
+  return props.chapters.filter((c) => !isChapterContentComplete(lightOf(c.index)) || failedSet.value.has(c.index));
+});
 
 const incompleteCount = computed(
   () => props.chapters.filter((c) => !isChapterContentComplete(lightOf(c.index))).length,
@@ -111,6 +124,9 @@ defineExpose({ incompleteCount });
       <div class="card-actions">
         <span class="tag" :class="splitOk ? 'ok' : 'warn'">{{ splitMetaText }}</span>
         <span v-if="splitConfirmed" class="tag ok">{{ t("已核对") }}</span>
+        <button v-if="chapters.length" class="link-btn" @click="showAllChapters = !showAllChapters">
+          {{ showAllChapters ? t("只看未完成") : `${t("显示全部")}（${chapters.length} ${t("章")}）` }}
+        </button>
       </div>
     </div>
 
@@ -142,6 +158,7 @@ defineExpose({ incompleteCount });
       <button v-else class="btn danger" @click="emit('stopQueue')">{{ t("停止队列") }}</button>
     </div>
     <p class="hint">{{ t("勾选章节后点主按钮生成选中；未勾选时补全未完成。逐章意见 / 全量 / 分项重跑在该行「重跑」里。") }}</p>
+    <p class="hint"><strong>{{ t("图片统计：") }}</strong>{{ imageSummaryText }}</p>
 
     <details class="wb-adv">
       <summary class="hint">{{ t("分章设置与意见") }}</summary>
@@ -195,7 +212,7 @@ defineExpose({ incompleteCount });
 
     <div class="wb-list">
       <div
-        v-for="c in chapters"
+        v-for="c in visibleChapters"
         :key="c.index"
         class="stage-row"
         :class="{ 'is-done': isChapterContentComplete(lightOf(c.index)) }"
@@ -210,8 +227,7 @@ defineExpose({ incompleteCount });
         </label>
         <div class="stage-row-label wb-title">
           <b class="text-ellipsis" :title="titleOf(c)">{{ titleOf(c) }}</b>
-          <span class="tag" :class="chipOf(lightOf(c.index)).cls">{{ chipOf(lightOf(c.index)).text }}</span>
-          <span class="faint small">{{ (c.charCount ?? 0).toLocaleString() }}{{ t("字") }}</span>
+          <span class="tag" :class="chipOf(lightOf(c.index), failedSet.has(c.index)).cls">{{ chipOf(lightOf(c.index), failedSet.has(c.index)).text }}</span>
         </div>
         <details class="wb-more">
           <summary class="link-btn">{{ t("重跑") }}</summary>
@@ -249,6 +265,9 @@ defineExpose({ incompleteCount });
       </div>
       <p v-if="!chapters.length" class="hint">
         {{ t("还没有章节：展开上方「分章设置与意见」点「AI 分章」把小说切成可逐章生成的章节。") }}
+      </p>
+      <p v-else-if="!visibleChapters.length" class="hint" style="color: var(--ok)">
+        {{ t("全部章节已完成") }}
       </p>
     </div>
 
@@ -313,13 +332,25 @@ defineExpose({ incompleteCount });
   min-width: 140px;
   flex: 1;
 }
-/* 每章的「重跑」：默认收起为文本链接，展开后独占一行 */
+/* 每章的「重跑」：默认收起为文本链接，展开后独占一行；
+   鼠标设备下整行不再常驻 22 个链接（悬停/键盘聚焦时才显出），触屏设备保持可见可点 */
 .wb-more {
   position: relative;
 }
 .wb-more summary {
   list-style: none;
   cursor: pointer;
+}
+@media (hover: hover) {
+  .wb-more summary {
+    opacity: 0;
+    transition: opacity 0.15s ease;
+  }
+  .stage-row:hover .wb-more summary,
+  .stage-row:focus-within .wb-more summary,
+  .wb-more[open] summary {
+    opacity: 1;
+  }
 }
 .wb-more summary::-webkit-details-marker {
   display: none;

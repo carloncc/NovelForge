@@ -16,9 +16,14 @@ function main(): void {
   assert(classifyError(new Error("抱歉，我不能帮助生成带有性化描写的未成年角色图像。"), 400) === "content_moderation", "中文未成年性化 400");
   assert(classifyError(new Error("The image was rejected for explicit adult content"), 400) === "content_moderation", "英文 explicit adult 400");
 
+  // 剧本「scenes 为空」（输出截断/JSON 修复失败）：脚本层已自带一次纠正重试，外层不再退避重跑整章
+  assert(
+    classifyError(new Error("第 6 章剧本未产出任何场景（模型返回 scenes 为空）")) === "invalid_param",
+    "scenes 为空应判输出/参数类（不触发整章退避重试）",
+  );
+
   // 限流
-  assert(classifyError(new Error("HTTP 429 too many requests")) === "rate_limit", "429");
-  assert(classifyError(new Error("rate limit exceeded")) === "rate_limit", "rate limit");
+  assert(classifyError(new Error("HTTP 429 too many requests")) === "rate_limit", "429");  assert(classifyError(new Error("rate limit exceeded")) === "rate_limit", "rate limit");
   assert(classifyError(new Error("insufficient balance, please recharge")) === "rate_limit", "余额不足");
   assert(classifyError(new Error("额度不足")) === "rate_limit", "中文额度");
   // B94：部分服务把限流回成 400，文本带 rate limit 时必须当限流（否则不会退避重试）
