@@ -17,6 +17,8 @@ import { generateImage, ReferenceImageError, VisionApiError, setImageConcurrency
 import { referenceRouteRejection, resolveImageModelCapabilities } from "../api/providers";
 import { editImageVariant, supportsImageEdits } from "../api/imageEdits";
 import { verifyImage } from "./selfcheck";
+import { runFaceCompositeTask } from "./faceComposite";
+import { formatSpriteVerifyFailure, isExpressionDiffTask, verifyExpressionFiles } from "./spriteVerify";
 import { describeReferenceImageCached } from "./recognize";
 import { tauri } from "../utils/tauri";
 import { errMsg } from "../utils/errors";
@@ -326,8 +328,24 @@ export interface BuildImageTaskOptions {
   shotsPerChapter?: number;
   /** 图片小说：全局分镜总量/预算上限（0=不限；到达上限停止派发新任务，已生成产物保留） */
   shotsTotal?: number;
-  /** 图片小说：是否生成物品图（默认 false，与 #814 的「图片必须含角色」口径一致） */
+  /** 图片小说：是否生成物品图（默认 false，与 #814 的「图片必须含角色」口径一致）
+   *  注意：#1099 起 imageOnly 模式一律跳过物品图（渲染端不展示物品图标），该开关只在立绘版生效 */
   includeItems?: boolean;
+}
+
+/** 图片小说分镜任务的附加字段（#1133）：多人同框时除主身份外的其余角色三视图作追加 identity 参考 */
+export interface ShotImageTask extends ImageTask {
+  /** 该分镜的全部出场角色卡片 id（按剧本顺序，已过滤无效 id）：守卫与日志用 */
+  shotCharacterIds?: string[];
+  /** 除主身份外还需追加三视图参考的任务 id（`<角色id>_threeview`，按顺序） */
+  refFromTasks?: string[];
+}
+
+/** 分镜任务的全部出场角色：优先取构建时写入的全量列表，兼容旧字段单角色 */
+export function shotCharacterIdsOf(task: ImageTask): string[] {
+  const all = (task as ShotImageTask).shotCharacterIds;
+  if (Array.isArray(all) && all.length) return all.filter((id) => typeof id === "string" && id);
+  return task.characterId ? [task.characterId] : [];
 }
 
 export function buildImageTasks(
@@ -463,7 +481,15 @@ export function buildImageTasks(
     }
   }
 
-  if (!imageOnly || opts.includeItems) {
+  if (imageOnly) {
+    // #1099：图片小说渲染端明确跳过物品图标演出（render.ts 只输出 intro 文字卡）、鉴赏室也不收录物品，
+    // 生成即「付费后游戏内看不到」——这里直接不构建物品任务并告警，不再让开关静默烧钱。
+    if (opts.includeItems) {
+      logger.warn("images", "图片小说模式暂不支持物品图展示（渲染与鉴赏室都不展示），已跳过物品图生成", {
+        items: cards.items.length,
+      });
+    }
+  } else {
     for (const item of cards.items) {
       tasks.push({
         kind: "item",
@@ -473,8 +499,8 @@ export function buildImageTasks(
         width: 1024,
         height: 1024,
         usage: `物品-${item.name}`,
-    });
-  }
+      });
+    }
   }
 
   for (const chapter of chapters) {
@@ -498,20 +524,30 @@ export function buildImageTasks(
             break;
           }
           const shot = shots[si];
-          const identity = (shot.characters ?? []).find((id) => cards.characters.some((c) => c.id === id));
-          tasks.push({
+          // #1133：多人同框是常态——主身份取第一个有效角色，其余角色三视图作为追加 identity 参考，
+          // 并把全部出场角色写进任务（守卫「任一角色三视图失败即不为该分镜付费生成」依赖它）。
+          const shotCharacters = (shot.characters ?? []).filter((id) => cards.characters.some((c) => c.id === id));
+          const identity = shotCharacters[0];
+          const extraIdentities = shotCharacters.slice(1);
+          const characterNames = shotCharacters
+            .map((id) => cards.characters.find((c) => c.id === id)?.name || id)
+            .join("/");
+          const shotTask: ShotImageTask = {
             kind: "shot",
             id: shot.id,
             chapter: chapter.chapter,
             sceneId: scene.id,
             shotIndex: si,
             ...(identity ? { characterId: identity, refFromTask: `${identity}_threeview` } : {}),
+            ...(extraIdentities.length ? { refFromTasks: extraIdentities.map((id) => `${id}_threeview`) } : {}),
+            ...(shotCharacters.length ? { shotCharacterIds: shotCharacters } : {}),
             prompt: shot.prompt + style,
             fileName: `shot_ch${chapter.chapter + 1}_${sanitizeId(scene.id)}_${si + 1}.png`,
             width: 1536,
             height: 1024,
-            usage: `分镜-${scene.location}${shot.note ? `-${shot.note}` : ""}`,
-          });
+            usage: `分镜-${scene.location}${shot.note ? `-${shot.note}` : ""}${shotCharacters.length > 1 ? `（${characterNames}）` : ""}`,
+          };
+          tasks.push(shotTask);
           chapterShotCount++;
           shotTotalCount++;
         }
@@ -852,6 +888,21 @@ export async function resolveImageTaskReferences(
         `Identity reference missing for task ${task.id} (refFromTask=${task.refFromTask})`,
         "REFERENCE_MISSING",
       );
+    }
+    // #1133：多人分镜的其余出场角色三视图作为追加 identity 参考（非必需——模型参考图上限不足时
+    // 由 routeImageReferences 按序截断，避免 3 人以上同框直接 REFERENCE_UNSUPPORTED 硬失败）。
+    for (const refTask of (task as ShotImageTask).refFromTasks ?? []) {
+      const extraPath = context.figureBase?.[refTask];
+      if (!extraPath) continue;
+      try {
+        references.push(await fileReference(extraPath, "identity", `Generated identity ${refTask} for ${task.id}`, false));
+      } catch (e) {
+        logger.warn("images", "分镜追加身份参考读取失败（按已有参考继续）", {
+          task: task.id,
+          refTask,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
     }
   } else if (characterDerivative && bibleCharacter) {
     try {
@@ -1240,10 +1291,47 @@ export async function runImageTask(
       // 生成失败自动重试：分类驱动 + 内容审查自动改写提示词 + 递增间隔（1s→10s→20s→…→60s 封顶）
       const retryCount = Math.max(0, opts.retryCount ?? 3) - 1;
       let img: { dataB64: string; mime: string } = { dataB64: "", mime: "" };
+      // #1086 脸部局部合成差分（默认关闭）：task.faceComposite === true 才走；
+      // 按 rig.crop 裁脸重绘表情并合成回原图（身体/alpha 冻结，合成后过 #1084 核验）。
+      // 缺省/false 走现有整张生成旧路径；失败显式抛错（可单张重试），仅 faceCompositeFallback 才回退旧路径。
+      let composited = false;
+      if (task.faceComposite === true && !aborted()) {
+        const basePath = task.refFromTask ? opts.figureBase?.[task.refFromTask] : undefined;
+        const projectDir = opts.outputDir ?? cacheRoot.replace(/[\\/]\.novel2vn[\\/]cache[\\/]?$/, "");
+        try {
+          const out = await runFaceCompositeTask({
+            task,
+            basePath,
+            outputDir: projectDir,
+            imageCfg: cfg!,
+            visionCfg: opts.visionCfg,
+            faceEditPrompt: expressionEditPrompt(task),
+            log,
+          });
+          img = { dataB64: out.dataB64, mime: "image/png" };
+          composited = true;
+          log({
+            step: "图像",
+            message: `表情差分走脸部合成（身体/alpha 冻结，已过像素核验）：${task.usage}`,
+            level: "info",
+            at: Date.now(),
+          });
+        } catch (e) {
+          if (!task.faceCompositeFallback) throw e;
+          logger.warn("images", "脸部合成失败，按开关回退整张生成旧路径", { id: task.id, error: errMsg(e).slice(0, 200) });
+          log({
+            step: "图像",
+            message: `脸部合成不可用，改用整张生成旧路径：${task.usage}（${errMsg(e).slice(0, 80)}）`,
+            level: "warn",
+            at: Date.now(),
+          });
+        }
+      }
       // 表情差分编辑模式（仅 GPT-Image 系）：以现有立绘为原图只改表情，姿势/构图/服装保持一致。
       // 其他线路不支持编辑端点 → 直接走原路径；编辑失败 → 回退参考图生图（不影响出图）。
+      // #1086 脸部合成已成功时跳过（composited 优先）。
       let edited = false;
-      if (task.editVariant === "expression" && supportsImageEdits(cfg?.model) && !aborted()) {
+      if (task.editVariant === "expression" && !composited && supportsImageEdits(cfg?.model) && !aborted()) {
         const basePath = task.refFromTask ? opts.figureBase?.[task.refFromTask] : undefined;
         if (basePath && (await tauri.pathExists(basePath).catch(() => false))) {
           try {
@@ -1278,7 +1366,7 @@ export async function runImageTask(
       let moderationStage = 0;
       // 提示词超长压缩：服务端报错携带上限时按上限压缩重试 1 次（覆盖未预设上限的服务）
       let promptFitted = false;
-      for (let attempt = 0; !edited; attempt++) {
+      for (let attempt = 0; !edited && !composited; attempt++) {
         // 已中止：不再发起新的付费生成请求（本书最主要的花钱点）
         if (aborted()) return null;
         try {
@@ -1452,6 +1540,30 @@ export async function runImageTask(
     } catch (e) {
       if (e instanceof VisionApiError) throw e;
       log({ step: "图像", message: `自检过程出错（保留原图）：${task.usage}（${errMsg(e).slice(0, 120)}）`, level: "warn", at: Date.now() });
+    }
+  }
+
+  // #1084 表情差分像素核验（只读、best-effort）：表情任务落盘后，用 base 立绘校验
+  // 允许区外 RGBA + 整幅 alpha 逐像素一致；不合格抛错记失败项（可单张重生成），日志带差异像素数与 bbox。
+  // Node/解码不可用或缺少 base 时 verifyExpressionFiles 返回 null = 跳过，不记失败。
+  if (path && isExpressionDiffTask(task) && !aborted()) {
+    const basePath = task.refFromTask ? opts.figureBase?.[task.refFromTask] : undefined;
+    if (basePath) {
+      try {
+        const vr = await verifyExpressionFiles(basePath, path);
+        if (vr && !vr.ok) {
+          const msg = formatSpriteVerifyFailure(task.usage ?? task.id, vr);
+          logger.warn("images", "表情差分核验未通过（已记失败项，可单张重生成）", { id: task.id, ...vr });
+          log({ step: "图像", message: msg, level: "error", at: Date.now(), taskId: task.id, taskKind: "image" });
+          await tauri.removePath(path).catch(() => {});
+          throw new Error(msg);
+        }
+      } catch (e) {
+        // 核验自身的读图/解码失败已在 verifyExpressionFiles 内消化（返回 null 跳过）；
+        // 这里只透出「核验未通过」的显式失败，其他意外错误降级为 warn 保留原图。
+        if (e instanceof Error && e.message.startsWith("表情差分核验未通过")) throw e;
+        logger.warn("images", "表情差分核验过程出错（保留原图）", { id: task.id, error: errMsg(e).slice(0, 160) });
+      }
     }
   }
 

@@ -45,8 +45,6 @@ export interface AssembleInput {
   styleReferencePath?: string;
   /** 视觉模式（#810）：sprite=立绘版（默认）；imageOnly=图片小说（渲染无立绘、按分镜切图） */
   mode?: "sprite" | "imageOnly";
-  /** 立绘取景：bust=游戏内半身取景（默认，配合全身素材）；full=按原图整身显示 */
-  figureFraming?: "bust" | "full";
   log: (msg: string) => void;
 }
 
@@ -164,7 +162,6 @@ export async function assembleProject(input: AssembleInput): Promise<{ gameDir: 
       figureActions: input.figureActions,
       useSe: input.useSe,
       mode: input.mode,
-      figureFraming: input.figureFraming,
     }, chapterCount);
     await tauri.writeTextFile(
       joinPath(normalizedOutputDir, `game/scene/ch${chapter.chapter + 1}.txt`),
@@ -983,7 +980,9 @@ async function injectBrandFooter(outputDir: string, title: string): Promise<void
   }
 }
 
-async function writeExportGuide(outputDir: string, title: string): Promise<void> {
+/** 导出说明文本（纯函数，便于单测）：BGM 关键词必须成组，SE 段落整体放在 BGM 列表之后。
+ *  旧实现把 SE 说明插在 BGM 列表中间，导致「欢快/神秘」两条 BGM 关键词看起来像 SE 规则（#1114）。 */
+export function buildExportGuideText(title: string, outputDir: string): string {
   const lines = [
     `「${title}」导出说明（NovelForge 生成）`,
     "==============================================",
@@ -1009,22 +1008,52 @@ async function writeExportGuide(outputDir: string, title: string): Promise<void>
     "   视频推荐位：见同目录 video_plan.txt",
     "   鉴赏室（立绘换装/表情/缩放、CG 画廊、角色图鉴、BGM 试听）：打开 appreciation.html",
     "   游戏内设置（音量/文本速度/自动播放/跳过/存档管理）：标题界面「选项」/ 游戏中右上角菜单",
-    "   BGM：把音乐文件（mp3/ogg）放入 game/bgm/，文件名含关键词自动按氛围播放：",
+    "   BGM：把音乐文件（mp3/ogg/m4a）放入 game/bgm/，文件名含关键词自动按氛围播放：",
     "     战斗氛围 → 文件名含 battle/war/fight（如 battle_theme.mp3）",
     "     宁静氛围 → 文件名含 calm/peace/piano（如 calm_piano.mp3）",
     "     悲伤氛围 → 文件名含 sad/sorrow（如 sad_theme.mp3）",
-    "   环境音效（SE）：内置雨/雷/风/战斗/门/脚步/挥剑/张力音效已放入 game/vocal/（se_*.wav），按场景氛围自动播放；",
-    "     用同名文件（如 se_rain.wav）替换可自定义音效；不需要可在 vocal 里删除对应文件",
     "     欢快氛围 → 文件名含 happy/joy/bright（如 happy_theme.mp3）",
     "     神秘氛围 → 文件名含 mystery/dark/moon（如 mystery_theme.mp3）",
+    "   环境音效（SE）：内置雨/雷/风/战斗/门/脚步/挥剑/张力音效已放入 game/vocal/（se_*.wav），按场景氛围自动播放；",
+    "     用同名文件（如 se_rain.wav）替换可自定义音效；不需要可在 vocal 里删除对应文件",
     "",
     "注意：发布时须保留 WebGAL 版权声明（MPL-2.0），游戏本身版权归你所有。",
   ];
-  await tauri.writeTextFile(joinPath(outputDir, "导出说明.txt"), lines.join("\n"));
+  return lines.join("\n");
 }
 
+async function writeExportGuide(outputDir: string, title: string): Promise<void> {
+  await tauri.writeTextFile(joinPath(outputDir, "导出说明.txt"), buildExportGuideText(title, outputDir));
+}
+
+/** 标题稳定哈希（FNV-1a + murmur3 收尾）：同一标题每次一致，不同标题高概率分散。
+ *  与 detectBgm 的 stableHash 分开命名，避免语义混淆。 */
+function titleHash32(text: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  h ^= h >>> 16;
+  h = Math.imul(h, 0x85ebca6b);
+  h ^= h >>> 13;
+  h = Math.imul(h, 0xc2b2ae35);
+  h ^= h >>> 16;
+  return h >>> 0;
+}
+
+/**
+ * Game_key 派生（#1105）：WebGAL 用它命名存档（`${gameKey}-saves`）与已读记录。
+ * 旧实现对标题做 ASCII 清洗后截 8 位：纯中文标题清洗结果为空 → 所有中文作品得到同一个 key，
+ * 同源预览时「继续游戏/跳过已读」跨作品串档；前 8 位字母数字相同的标题也会碰撞。
+ * 现在 = 可读 ASCII 前缀（4 位，不足补 x，纯中文用 nov2）+ 标题哈希（基 36，4 位），
+ * 同一标题稳定、不同标题分散，且始终是 8 位字母数字（符合导出页 6-10 位校验）。
+ */
 export function gameKeyFor(title: string): string {
-  const key = title.replace(/[^a-zA-Z0-9]/g, "").slice(0, 8);
-  const pad = "a1b2c3d4";
-  return (key || "nov2vn") + pad.slice(0, Math.max(0, 8 - (key || "nov2vn").length));
+  const raw = (title || "").trim();
+  const ascii = raw.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
+  // 短标题（如 "a"）前缀不足 4 位时补 x：不补会导致 key 短于 6 位，被导出页校验拒绝（单测回归）
+  const prefix = (ascii.slice(0, 4) || "nov2").padEnd(4, "x");
+  const hash = (titleHash32(raw) % 36 ** 4).toString(36).padStart(4, "0");
+  return (prefix + hash).slice(0, 8);
 }

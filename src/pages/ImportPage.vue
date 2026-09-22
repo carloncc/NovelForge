@@ -6,7 +6,7 @@ import { upsertProject, removeProjectEntry, readDirNovelIdentity, decideNovelImp
 import { configState, addRecentOutputDir, removeRecentOutputDir } from "../stores/config";
 import { importNovelFile, importNovelFiles } from "../core/chapters";
 import { tauri, isTauri } from "../utils/tauri";
-import { vfsWriteTextFile, vfsWriteFileBase64 } from "../utils/vfsWeb";
+import { vfsWriteTextFile, vfsWriteFileBase64, vfsListDir, decodeNovelBytes, uniqueImportPath } from "../utils/vfsWeb";
 import { DEMO_NOVEL } from "../core/demoNovel";
 import type { MaterialAsset, NovelDoc } from "../core/types";
 import { splitChapters } from "../core/chapters";
@@ -36,6 +36,8 @@ function confirmRemoveMaterial(path: string, name: string): void {
 
 const error = ref("");
 const importing = ref(false);
+// 非错误提示（网页版编码识别结果等，成功导入后保留展示）
+const notice = ref("");
 // 素材大图预览（点击缩略图打开，复用现有 AssetPreview）
 const previewMaterial = ref<MaterialAsset | null>(null);
 const novelInput = ref<HTMLInputElement | null>(null);
@@ -91,17 +93,35 @@ async function onNovelFile(e: Event): Promise<void> {
   if (!guardRunning(t("导入小说"))) return;
   if (projectState.novel && !window.confirm(t("将覆盖当前已导入的「{name}」。继续吗？", { name: projectState.novel.fileName }))) return;
   error.value = "";
+  notice.value = "";
   importing.value = true;
   try {
+    // #1138：VFS 以路径为键，同名文件会互相覆盖。预填本批已用 + 目录已有路径，去重追加 _2/_3…
+    const used = new Set<string>();
+    try {
+      for (const e of await vfsListDir("/app/novel")) used.add(e.path);
+    } catch {
+      /* 目录尚不存在时视为空 */
+    }
     const vPaths: string[] = [];
+    const detected: string[] = [];
     for (const file of files) {
-      const text = await file.text();
-      const vPath = `/app/novel/${file.name}`;
+      // #1117：读 ArrayBuffer 后嗅探编码（UTF-8 非法时按 GBK/BIG5 解码），不用 file.text()
+      const { text, encoding } = decodeNovelBytes(await file.arrayBuffer());
+      detected.push(encoding);
+      const vPath = uniqueImportPath(used, "/app/novel", file.name);
       await vfsWriteTextFile(vPath, text);
       vPaths.push(vPath);
     }
-    projectState.novel = vPaths.length > 1 ? await importNovelFiles(vPaths) : await importNovelFile(vPaths[0]);
-    await guardNovelDir(projectState.novel);
+    const doc = vPaths.length > 1 ? await importNovelFiles(vPaths) : await importNovelFile(vPaths[0]);
+    // 网页版 readTextFile 恒报 UTF-8：用嗅探到的真实编码覆盖展示
+    doc.encoding = [...new Set(detected)].join("/");
+    if (detected.some((e) => e !== "UTF-8")) {
+      notice.value = t("检测到文件编码为 {encoding}，已自动转换", { encoding: doc.encoding });
+    }
+    await guardNovelDir(doc);
+    projectState.novel = doc;
+    log.info("page", "导入小说成功", { fileCount: vPaths.length, chapters: doc.chapters.length, charCount: doc.fullText.length, encoding: doc.encoding });
   } catch (err) {
     error.value = (err as Error).message;
   } finally {
@@ -273,10 +293,11 @@ async function newProject(): Promise<void> {
 }
 
 /** 导入保护：新小说与当前目录快照不是同一本时，建议独立目录防串味。
- * 确定=自动建「小说名」子目录并切换；取消=留在当前目录（会覆盖旧缓存）。 */
+ *  确定=自动建「小说名」子目录并切换；取消=留在当前目录（会覆盖旧缓存）。
+ *  #1118：网页版同样执行（VFS 快照 + VFS 建目录），默认 /app/exports 下每本书一个子目录。 */
 async function guardNovelDir(doc: { fileName: string; chapters: { title: string }[] }): Promise<void> {
   const dir = projectState.outputDir;
-  if (!dir || !isTauri()) return;
+  if (!dir) return;
   const snap = await readDirNovelIdentity(dir);
   const decision = decideNovelImport(snap, { fileName: doc.fileName, titleSig: doc.chapters.map((c) => c.title).join("|") });
   if (decision !== "different") return;
@@ -304,6 +325,7 @@ async function guardNovelDir(doc: { fileName: string; chapters: { title: string 
     </PageHead>
 
     <p v-if="error" class="err-text mt-2">{{ error }}</p>
+    <p v-if="notice" class="hint mt-2">{{ notice }}</p>
 
     <div class="card">
       <div class="card-head">

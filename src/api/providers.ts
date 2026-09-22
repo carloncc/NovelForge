@@ -32,6 +32,12 @@ export function referenceRouteRejection(message: string): string | undefined {
   return "当前图片线路不接受带参考图的请求（服务端限制了请求体大小，且回执明确说明不支持图像输入/图生图）。请在「API 配置 > 图片生成」对该线路重新点一次「测试连接」，让程序自动修正它的图像能力；或改选支持参考图/图生图的线路或模型。";
 }
 
+/**
+ * #1125：参考图能力冲突（参考图数 > 0 但未启用图生图 / 模型不支持参考图）时的失败提示。
+ * 运行期批量失败的信息里必须带上「去哪修」，否则用户只看到英文错误，联想不到配置页那个开关。
+ */
+const REFERENCE_UNSUPPORTED_HINT = "请在「API 配置 > 图像 API > 图片模型能力」中启用「图生图」（或点「一键修复」），或把「参考图数量」设为 0，然后重跑本阶段。";
+
 const NO_IMAGE_REFERENCES: ImageModelCapabilities = {
   maxReferenceImages: 0,
   supportsSeed: false,
@@ -62,6 +68,43 @@ const KNOWN_IMAGE_CAPABILITIES: Record<string, ImageModelCapabilities> = {
   },
 };
 
+/**
+ * 已知模型族前缀（#1149）：中转站/网关普遍给模型加前缀或后缀
+ * （`openai/gpt-image-2`、`Qwen/Qwen-Image-Edit-2509:free`、`gpt-image-2-2026-01-15`），
+ * 归一化后仍对不上时按族前缀命中，避免同一模型被静默降级成「0 参考图、不支持图生图」。
+ */
+const KNOWN_IMAGE_CAPABILITY_FAMILIES: { prefix: string; capabilities: ImageModelCapabilities }[] = [
+  {
+    prefix: "qwen-image-edit",
+    capabilities: { maxReferenceImages: 3, supportsSeed: true, supportsImageEdit: true, referenceEncoding: "data-url" },
+  },
+  {
+    prefix: "gpt-image",
+    capabilities: { maxReferenceImages: 3, supportsSeed: false, supportsImageEdit: true, referenceEncoding: "raw-base64" },
+  },
+  {
+    prefix: "image-01",
+    capabilities: { maxReferenceImages: 3, supportsSeed: false, supportsImageEdit: true, referenceEncoding: "raw-base64" },
+  },
+];
+
+/**
+ * 归一化模型 id（#1149）：小写、去 vendor 前缀（取最后一段）、去 `:tag`/`@snapshot` 后缀。
+ * 例：`siliconflow/Qwen/Qwen-Image-Edit-2509:free` → `qwen-image-edit-2509`；
+ *     `openai/gpt-image-2` → `gpt-image-2`。
+ */
+export function normalizeModelId(model: string | undefined): string {
+  const raw = (model ?? "").trim().toLowerCase();
+  if (!raw) return "";
+  const basename = raw.split("/").pop() ?? raw;
+  return basename.split(/[:@]/)[0].trim();
+}
+
+/** 图片能力冲突判定（#1125，纯函数供配置页与单测共用）：参考图数 > 0 但未启用图生图 */
+export function isImageCapabilityConflict(capabilities: { maxReferenceImages: number; supportsImageEdit: boolean }): boolean {
+  return capabilities.maxReferenceImages > 0 && !capabilities.supportsImageEdit;
+}
+
 function customImageCapabilities(raw: unknown): ImageModelCapabilities | undefined {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
   const candidate = raw as Partial<ImageModelCapabilities>;
@@ -80,16 +123,27 @@ function customImageCapabilities(raw: unknown): ImageModelCapabilities | undefin
 }
 
 export function knownImageModelCapabilities(model: string): ImageModelCapabilities | undefined {
-  const known = KNOWN_IMAGE_CAPABILITIES[model.trim()];
-  return known ? { ...known } : undefined;
+  const normalized = normalizeModelId(model);
+  if (!normalized) return undefined;
+  const exact = KNOWN_IMAGE_CAPABILITIES[model.trim()]
+    ?? Object.entries(KNOWN_IMAGE_CAPABILITIES).find(([key]) => normalizeModelId(key) === normalized)?.[1];
+  if (exact) return { ...exact };
+  const family = KNOWN_IMAGE_CAPABILITY_FAMILIES.find((entry) => normalized.startsWith(entry.prefix));
+  return family ? { ...family.capabilities } : undefined;
+}
+
+/** 能力表是否识别该模型（配置页据此提示「请点一次测试连接自动探测」，#1149b） */
+export function imageModelIsRecognized(model: string): boolean {
+  return knownImageModelCapabilities(model) !== undefined;
 }
 
 export function resolveImageModelCapabilities(config: ApiConfig): ImageModelCapabilities {
   const stored = customImageCapabilities(config.extra?.imageCapabilities);
   const stamp = config.extra?.imageCapabilitiesModel;
   const known = knownImageModelCapabilities(config.model);
-  // 新探测/手动写入都带模型标记：同模型直接信任；换模型后自动作废（防止旧模型能力套到新模型上）
-  if (stored && stamp === config.model) return stored;
+  // 新探测/手动写入都带模型标记：同模型直接信任；换模型后自动作废（防止旧模型能力套到新模型上）。
+  // #1149：标记比较也要归一化——网关给模型加前缀/后缀后，探测结果不应被误判为「换了模型」而作废
+  if (stored && typeof stamp === "string" && normalizeModelId(stamp) === normalizeModelId(config.model)) return stored;
   // 旧版遗留（无标记）只在「内置表不认识该模型」时继续信任：内置表优先，
   // 且不因缺少标记就丢掉未知模型上用户已有的正能力
   if (stored && stamp === undefined && !known) return stored;
@@ -151,11 +205,14 @@ export function routeImageReferences(config: ApiConfig, references: ImageReferen
   const requiredCount = unique.filter(referenceIsRequired).length;
   if (!capabilities.supportsImageEdit || capabilities.maxReferenceImages === 0) {
     if (requiredCount === 0) return [];
-    throw new ReferenceImageError(`Model ${config.model} does not support required image references`, "REFERENCE_UNSUPPORTED");
+    throw new ReferenceImageError(
+      `Model ${config.model} does not support required image references（该线路/模型当前被判定为不支持参考图或图生图）。${REFERENCE_UNSUPPORTED_HINT}`,
+      "REFERENCE_UNSUPPORTED",
+    );
   }
   if (requiredCount > capabilities.maxReferenceImages) {
     throw new ReferenceImageError(
-      `Model ${config.model} accepts ${capabilities.maxReferenceImages} references but ${requiredCount} required identity/style references were supplied`,
+      `Model ${config.model} accepts ${capabilities.maxReferenceImages} references but ${requiredCount} required identity/style references were supplied（参考图数量超过该模型能力上限）。${REFERENCE_UNSUPPORTED_HINT}`,
       "REFERENCE_UNSUPPORTED",
     );
   }
@@ -165,7 +222,7 @@ export function routeImageReferences(config: ApiConfig, references: ImageReferen
     .find(referenceIsRequired);
   if (discardedRequired) {
     throw new ReferenceImageError(
-      `Model ${config.model} would discard required ${discardedRequired.role} reference because of its ${capabilities.maxReferenceImages}-image limit`,
+      `Model ${config.model} would discard required ${discardedRequired.role} reference because of its ${capabilities.maxReferenceImages}-image limit（参考图数量超过该模型能力上限）。${REFERENCE_UNSUPPORTED_HINT}`,
       "REFERENCE_UNSUPPORTED",
     );
   }
@@ -240,6 +297,8 @@ function extractContextLength(record: Record<string, unknown>): number | undefin
 /**
  * 解析一个 API 配置的最终上下文 token 数。
  * 优先级：手动覆盖 (cfg.extra.contextLength) > /models 探测 > 默认 128K
+ * #1149：/models 探测结果与配置里的模型名都要归一化后比较（网关加前缀/后缀/`:free` 时
+ * 仍能命中，否则会静默回退 128K 导致长章超限报错）。
  */
 export function resolveContextLength(cfg: { model?: string; extra?: Record<string, unknown> } | undefined): number {
   if (!cfg) return DEFAULT_CONTEXT_LENGTH;
@@ -251,8 +310,19 @@ export function resolveContextLength(cfg: { model?: string; extra?: Record<strin
   const discovered = Array.isArray(cfg.extra?.discoveredModels)
     ? (cfg.extra!.discoveredModels as DiscoveredModel[])
     : [];
-  const hit = discovered.find((m) => m.id === cfg.model && typeof m.contextLength === "number");
-  if (hit?.contextLength) return hit.contextLength;
+  const normalized = normalizeModelId(cfg.model);
+  if (normalized) {
+    const usable = discovered.filter((m) => typeof m.contextLength === "number");
+    const hit = usable.find((m) => m.id === cfg.model)
+      ?? usable.find((m) => normalizeModelId(m.id) === normalized)
+      // 前缀命中：探测列表里是完整 id（`Qwen/Qwen3-235B-A22B-Instruct`），配置里填的是族名
+      ?? usable.find((m) => normalizeModelId(m.id).startsWith(normalized) || normalized.startsWith(normalizeModelId(m.id)));
+    if (hit?.contextLength) return hit.contextLength;
+  }
+  // 回退默认值也记一条 warn：便于定位「为什么长章被截断/超上下文」
+  if (discovered.length) {
+    console.warn(`[providers] 未能从 /models 探测结果匹配模型「${cfg.model ?? ""}」的上下文长度，回退默认 ${DEFAULT_CONTEXT_LENGTH} token`);
+  }
   return DEFAULT_CONTEXT_LENGTH;
 }
 

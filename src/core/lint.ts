@@ -21,6 +21,40 @@ export interface LintReport {
   };
 }
 
+/** 导出检查错误的分类（#1107）：素材缺失多由模板/环境回填问题导致，用户无法在生成页修复；
+ *  语法/结构错误属产物可修复缺陷，打包前建议先修。分类只用于提示与留痕，不改变拦截行为。 */
+export interface LintErrorBreakdown {
+  /** 素材引用缺失（scope 为「素材(...)」或 message 含「引用缺失/配音缺失」） */
+  missingAsset: LintIssue[];
+  /** 语法/结构等产物自身缺陷 */
+  fixable: LintIssue[];
+}
+
+export function classifyLintErrors(errors: LintIssue[]): LintErrorBreakdown {
+  const missingAsset: LintIssue[] = [];
+  const fixable: LintIssue[] = [];
+  for (const issue of errors) {
+    const missing =
+      issue.scope.startsWith("素材") ||
+      issue.message.includes("引用缺失") ||
+      issue.message.includes("配音缺失");
+    (missing ? missingAsset : fixable).push(issue);
+  }
+  return { missingAsset, fixable };
+}
+
+/** 「仍然导出」二次确认文案（纯函数，便于单测）：必须带上数量与风险说明 */
+export function buildExportOverridePrompt(report: LintReport): string {
+  const { missingAsset, fixable } = classifyLintErrors(report.errors);
+  return [
+    `导出检查发现 ${report.errors.length} 个错误：`,
+    `· 素材引用缺失 ${missingAsset.length} 个（常由模板/环境回填问题导致，可能无法在本机修复）`,
+    `· 语法/结构等 ${fixable.length} 个（建议先修复，否则游戏可能黑屏或卡住）`,
+    "",
+    "仍然打包吗？生成的 zip 可能缺少素材或存在无法运行的场景。",
+  ].join("\n");
+}
+
 // 白名单 = render.ts 实际会输出的指令集合（含 filmMode/setFilter），避免把指令误判成台词。
 const CMD_RE = /^(changeBg|changeFigure|intro|bgm|playEffect|end|changeScene|unlockCg|unlockBgm|label|jumpLabel|choose|playVideo|filmMode|setFilter|setAnimation|setTempAnimation|setTransform):.*;$/;
 const END_RE = /^end;$/;

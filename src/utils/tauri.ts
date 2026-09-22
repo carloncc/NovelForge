@@ -38,6 +38,13 @@ export interface CutoutModelStatus {
   total: number;
   error: string | null;
   installed: boolean;
+  /** 安装判定依据（#1129）：missing / ok / corrupt（Rust 侧返回，旧状态缺省时为 undefined） */
+  integrity?: string;
+  integrity_reason?: string | null;
+  /** 当前实际使用的模型目录（#1130：用户可写目录，不再是 resource_dir） */
+  dir?: string | null;
+  /** 目录是否可写：false 时下载必然失败，需提示用户改用便携版/手动放置 */
+  writable?: boolean;
 }
 
 export interface CutoutModelDownloadRequest {
@@ -295,6 +302,22 @@ function failureLogLevel(name: string, errText: string): "error" | "warn" | "deb
   return "error";
 }
 
+/** Node 环境（单元测试/脚本）的默认目录：优先环境变量，其次当前工作目录下的 output。
+ *  #1131：禁止再硬编码开发机绝对路径（如 /root/my_project/game）。 */
+export function nodeDefaultDir(kind: "output" | "resources"): string {
+  const fromEnv = typeof process !== "undefined" ? (process.env?.NOVELFORGE_OUTPUT_DIR ?? "").trim() : "";
+  if (fromEnv) return kind === "output" ? fromEnv : `${fromEnv.replace(/\/+$/, "")}/resources`;
+  if (typeof process !== "undefined" && typeof process.cwd === "function") {
+    try {
+      const cwd = process.cwd().replace(/\\/g, "/");
+      return kind === "output" ? `${cwd}/output` : `${cwd}/resources`;
+    } catch {
+      /* 回退默认 */
+    }
+  }
+  return kind === "output" ? "/app/exports" : "/app/template";
+}
+
 export const tauri = {
   http: wrap("http", (args: {
     method: string;
@@ -412,7 +435,8 @@ export const tauri = {
   resourceDir: wrap("resourceDir", (): Promise<string> => {
     if (isTauri()) return invoke("resource_dir");
     if (isWebRuntime()) return Promise.resolve("/app/template");
-    return Promise.resolve("/root/my_project/novelforge/resources");
+    // #1131：Node 分支取当前工作目录（可用 NOVELFORGE_OUTPUT_DIR 覆盖），不保留开发机路径
+    return Promise.resolve(nodeDefaultDir("resources"));
   }),
   readConfig: wrap("readConfig", (): Promise<string> => {
     if (isTauri()) return invoke("read_config");
@@ -450,7 +474,8 @@ export const tauri = {
   getDefaultOutputDir: wrap("getDefaultOutputDir", (): Promise<string> => {
     if (isTauri()) return invoke("get_default_output_dir");
     if (isWebRuntime()) return Promise.resolve("/app/exports");
-    return Promise.resolve("/root/my_project/game");
+    // #1131：Node 分支取环境变量 NOVELFORGE_OUTPUT_DIR 或当前工作目录 output，不保留开发机路径
+    return Promise.resolve(nodeDefaultDir("output"));
   }),
   cutoutImage: wrap("cutoutImage", (dataB64: string, threshold?: number): Promise<{ dataB64: string; method: string }> => {
     if (isTauri())
@@ -528,6 +553,30 @@ export const tauri = {
 };
 
 /**
+ * 目标 zip 是否位于源目录内部（#1116）：桌面版把包存到项目目录里时，Rust 先创建 zip 再遍历源目录，
+ * 正在写入的 zip 自身会成为打包条目（半成品副本）。比较前统一分隔符、去掉尾斜杠与冗余「.」段；
+ * Windows 盘符/路径大小写不敏感，这里统一按小写比较（Linux 上极少数大小写不同的路径会被保守拒绝）。
+ */
+export function isPathInsideDir(dir: string, target: string): boolean {
+  const norm = (p: string): string => {
+    const parts = p.replace(/\\/g, "/").split("/");
+    const out: string[] = [];
+    for (const part of parts) {
+      if (!part || part === ".") continue;
+      if (part === "..") {
+        out.pop();
+        continue;
+      }
+      out.push(part.toLowerCase());
+    }
+    return out.join("/");
+  };
+  const d = norm(dir);
+  const t = norm(target);
+  return d.length > 0 && t.startsWith(`${d}/`);
+}
+
+/**
  * 网页版专用：打包 zip 并在浏览器中直接下载。
  * 大字节不进 tauri 日志包装层（成功日志会 truncate 序列化返回值，47MB 会被拖成分钟级）。
  */
@@ -535,8 +584,9 @@ export async function downloadZipWeb(
   sourceDir: string,
   exclude: string[],
   downloadName: string,
+  onProgress?: (done: number, total: number) => void,
 ): Promise<{ fileCount: number; sizeBytes: number }> {
   if (!isWebRuntime()) throw new Error("当前环境不是网页版");
   const web = await webRuntime();
-  return web.webDownloadZip(sourceDir, exclude, downloadName);
+  return web.webDownloadZip(sourceDir, exclude, downloadName, onProgress);
 }

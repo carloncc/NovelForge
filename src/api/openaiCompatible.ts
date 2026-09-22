@@ -280,6 +280,24 @@ export interface ChatOptions {
    * AbortController.signal 后透传给 chatCompletion / chatJson / chatVision。
    */
   signal?: AbortSignal;
+  /**
+   * 模型请求进度事件（可选）：chatJson/chatCompletion 在「请求重试、预算升级、收到响应、
+   * 截断续写、JSON 修复」时触发。调用方可据此打面向用户的进度日志，避免长调用期间无输出。
+   * 不传则行为与旧版完全一致。
+   */
+  onEvent?: (e: LlmProgressEvent) => void;
+}
+
+/** 模型请求进度事件：供长调用（剧本/提取等）向用户透出"正在发生什么" */
+export interface LlmProgressEvent {
+  kind: "retry" | "escalate" | "response" | "continue" | "repair";
+  /** 第几次（retry=withRetry 轮次；escalate=升级级数；response=累计请求数；continue/repair=轮次） */
+  attempt: number;
+  finishReason?: string;
+  contentLen?: number;
+  accumulatedLen?: number;
+  delayMs?: number;
+  message?: string;
 }
 
 /** OpenAI 兼容 tool 定义（function calling） */
@@ -405,7 +423,7 @@ function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
  */
 export async function withRetry<T>(
   fn: () => Promise<T>,
-  opts?: { retries?: number; delayFor?: (attempt: number) => number; signal?: AbortSignal },
+  opts?: { retries?: number; delayFor?: (attempt: number) => number; signal?: AbortSignal; onRetry?: (attempt: number, delayMs: number, err: unknown) => void },
 ): Promise<T> {
   const retries = opts?.retries ?? 4;
   const delayFor = opts?.delayFor ?? retryDelayFor;
@@ -426,11 +444,15 @@ export async function withRetry<T>(
         throw e;
       }
       if (attempt >= retries) throw e;
-      const delay = delayFor(attempt);
-      log.warn("api", `请求失败，${delay / 1000}s 后第 ${attempt + 1} 次重试`, {
+      // 后端过载/限流（429/502/503/504）：1s/10s 的退避等于轰炸已过载的后端，延长 6 倍
+      // （约 6s/60s/120s/180s）给服务端恢复时间；普通网络错误保持原退避
+      const overloaded = status === 429 || status === 502 || status === 503 || status === 504;
+      const delay = overloaded ? delayFor(attempt) * 6 : delayFor(attempt);
+      log.warn("api", `请求失败，${delay / 1000}s 后第 ${attempt + 1} 次重试${overloaded ? "（后端过载/限流，已延长等待）" : ""}`, {
         status: status ?? 0,
         message: String(e instanceof Error ? e.message : e).slice(0, 300),
       });
+      opts?.onRetry?.(attempt + 1, delay, e);
       await sleepAbortable(delay, opts?.signal);
     }
   }
@@ -607,6 +629,13 @@ export async function chatCompletion(
         empty,
         brokenJson,
       });
+      opts.onEvent?.({
+        kind: "escalate",
+        attempt: i,
+        finishReason: response.finishReason,
+        contentLen: response.rawContent.length,
+        message: `输出被截断（${response.rawContent.length} 字），放大输出预算至 ${budget} 重试（第 ${i} 次升级）`,
+      });
       response = await perform(budget);
     }
 
@@ -642,7 +671,19 @@ export async function chatCompletion(
       contentHead: content.slice(0, 120),
     });
     return { content, promptTokens, completionTokens, finishReason, toolCalls };
-  }, { signal: opts.signal }));  // B93：退避等待可被中止
+  }, {
+    signal: opts.signal,
+    // B93：退避等待可被中止；重试同时透出给调用方打进度（否则 300s 超时 ×4 次重试全程静默）
+    onRetry: opts.onEvent
+      ? (attempt, delayMs, e) =>
+          opts.onEvent!({
+            kind: "retry",
+            attempt,
+            delayMs,
+            message: `请求失败，${delayMs / 1000}s 后重试（第 ${attempt} 次）：${String(e instanceof Error ? e.message : e).slice(0, 120)}`,
+          })
+      : undefined,
+  }));  // B93：退避等待可被中止
 }
 
 /**
@@ -796,16 +837,20 @@ export async function chatJson<T>(
   const requestBudget = { used: 0, max: opts.requestBudget?.max ?? 6 };
   let continueCount = 0;
   let repairCount = 0;
+  let requestCount = 0;
   let accumulated = "";
 
   for (;;) {
     const { content, finishReason } = await chatCompletion(cfg, messages, { ...opts, json: true, requestBudget });
+    requestCount++;
     accumulated += content;
+    opts.onEvent?.({ kind: "response", attempt: requestCount, finishReason, contentLen: content.length, accumulatedLen: accumulated.length });
 
     // 输出因长度上限被截断 → 请求模型从中断处续写
     if (finishReason === "length" && continueCount < maxContinue) {
       continueCount++;
       log.warn("api", "JSON 输出被截断，请求续写", { accumulatedLen: accumulated.length, attempt: continueCount });
+      opts.onEvent?.({ kind: "continue", attempt: continueCount, finishReason, contentLen: content.length, accumulatedLen: accumulated.length });
       messages.push({ role: "assistant", content });
       messages.push({
         role: "user",
@@ -823,6 +868,7 @@ export async function chatJson<T>(
           error: e instanceof Error ? e.message.slice(0, 200) : String(e),
           attempt: repairCount,
         });
+        opts.onEvent?.({ kind: "repair", attempt: repairCount, accumulatedLen: accumulated.length });
         accumulated = "";
         messages.push({ role: "assistant", content });
         messages.push({

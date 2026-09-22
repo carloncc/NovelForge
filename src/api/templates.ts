@@ -236,16 +236,41 @@ export function getTemplate(id: string | undefined): AdapterTemplate | undefined
   return PRESET_TEMPLATES.find((t) => t.id === id);
 }
 
+/** 自定义适配器模板校验结果（#1126：配置页与落盘前统一走这一个校验，避免「alert 后坏值照样保存」） */
+export type CustomTemplateCheck =
+  | { ok: true; template: AdapterTemplate }
+  | { ok: false; error: string };
+
+/**
+ * 解析并校验自定义适配器模板 JSON：
+ * - 语法错误 → 给出可读的解析错误（配置页内联展示，不再 alert 后照样写值）
+ * - 语法正确但缺少 endpoint/requestMap → 同样视为无效（运行期根本用不了）
+ */
+export function checkCustomTemplate(raw: string | undefined): CustomTemplateCheck {
+  const text = (raw ?? "").trim();
+  if (!text) return { ok: false, error: "模板为空" };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ok: false, error: "模板必须是 JSON 对象" };
+  }
+  const template = parsed as AdapterTemplate;
+  if (!template.endpoint || !template.requestMap) {
+    return { ok: false, error: "模板缺少必填字段 endpoint / requestMap" };
+  }
+  return { ok: true, template };
+}
+
 /** 解析配置对应的适配器模板：优先自定义模板，其次预置模板 */
 export function resolveTemplate(cfg: { adapter?: string; extra?: Record<string, unknown> }): AdapterTemplate | undefined {
   const custom = cfg.extra?.customTemplate;
   if (typeof custom === "string" && custom.trim()) {
-    try {
-      const parsed = JSON.parse(custom) as AdapterTemplate;
-      if (parsed && parsed.endpoint && parsed.requestMap) return parsed;
-    } catch {
-      /* 自定义模板解析失败则回退预置 */
-    }
+    const checked = checkCustomTemplate(custom);
+    if (checked.ok) return checked.template;
   }
   const tpl = getTemplate(cfg.adapter);
   if (tpl) return tpl;

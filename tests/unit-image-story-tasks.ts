@@ -96,9 +96,9 @@ const perTotal = buildImageStoryPlan(chapters, cards, { ...base, shotsTotal: 2 }
 assert(perTotal.shotCount === 2, `总量 2 张时应为 2，实际 ${perTotal.shotCount}`);
 assert(perTotal.tasks.filter((t) => t.kind === "threeview").length === 2, "总量上限不应影响三视图（分镜一致性依赖）");
 
-// 6) 物品图开关
+// 6) 物品图开关（#1099）：图片小说渲染与鉴赏室都不展示物品图，开启也不构建（避免静默烧钱）
 const withItems = buildImageStoryPlan(chapters, cards, { ...base, includeItems: true });
-assert(withItems.itemCount === 1, `开启物品图后应为 1，实际 ${withItems.itemCount}`);
+assert(withItems.itemCount === 0, `图片小说不展示物品图：开启也应为 0，实际 ${withItems.itemCount}`);
 
 // 7) 费用预估 = 任务数 × 单价
 assert(Math.abs(plan.estimatedYuan - Math.round(plan.tasks.length * 0.3 * 100) / 100) < 1e-9, "预计费用应为 任务数 × 0.3 元");

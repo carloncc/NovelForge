@@ -193,6 +193,11 @@ const MIME: Record<string, string> = {
   ".ogg": "audio/ogg",
   ".opus": "audio/ogg",
   ".wav": "audio/wav",
+  // #1145：.m4a 必须给浏览器认可的 audio/mp4（audio/m4a 非标准，配合 nosniff 会被拒播）
+  ".m4a": "audio/mp4",
+  ".mp4": "video/mp4",
+  ".webm": "video/webm",
+  ".flac": "audio/flac",
   ".woff": "font/woff",
   ".woff2": "font/woff2",
   ".ttf": "font/ttf",
@@ -202,6 +207,14 @@ const MIME: Record<string, string> = {
   ".xml": "application/xml",
   ".webmanifest": "application/manifest+json",
 };
+
+/** 预览静态资源缓存策略（#1112，与 Rust 预览服务器同口径）：
+ *  html/js/css/json/txt 等入口类强 no-store；固定文件名的立绘/音频等 no-cache（每次重新校验）。 */
+function previewCacheControl(ext: string): string {
+  return [".html", ".htm", ".js", ".mjs", ".css", ".json", ".txt", ".webmanifest"].includes(ext)
+    ? "no-store"
+    : "no-cache, max-age=0, must-revalidate";
+}
 
 function sendJson(res: Connect.ServerResponse, code: number, obj: unknown): void {
   res.statusCode = code;
@@ -613,8 +626,9 @@ async function handlePreviewStatic(req: Connect.IncomingMessage, res: Connect.Se
     }
     const buf = await readFile(full);
     res.statusCode = 200;
-    res.setHeader("Content-Type", MIME[extname(full)] ?? "application/octet-stream");
-    res.setHeader("Cache-Control", "no-cache");
+    const ext = extname(full).toLowerCase();
+    res.setHeader("Content-Type", MIME[ext] ?? "application/octet-stream");
+    res.setHeader("Cache-Control", previewCacheControl(ext));
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.end(buf);
   } catch {

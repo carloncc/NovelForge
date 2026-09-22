@@ -364,6 +364,11 @@ export interface ImageTask {
   /** 差分生成方式（仅表情差分）：expression=优先走 GPT-Image 编辑端点（只改表情、其余保持）；
    *  其他模型/编辑失败时自动回退参考图生图 */
   editVariant?: "expression";
+  /** 脸部局部合成差分（#1086，默认关闭）：true=按 rig.crop 裁脸重绘表情并合成回原图
+   * （身体/alpha 冻结，合成后过 #1084 核验）；缺省/false 走现有整张生成旧路径 */
+  faceComposite?: boolean;
+  /** 脸部合成失败/核验失败时回退整张生成旧路径（默认 false：显式失败记失败项，不静默降级） */
+  faceCompositeFallback?: boolean;
 }
 
 export interface ProjectMeta {

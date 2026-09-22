@@ -2,8 +2,8 @@
 import { computed, ref, watch } from "vue";
 import { save, open } from "@tauri-apps/plugin-dialog";
 import { projectState, pushLog, scheduleSave } from "../stores/project";
-import { tauri, isTauri, downloadZipWeb } from "../utils/tauri";
-import { lintProject, type LintReport } from "../core/lint";
+import { tauri, isTauri, downloadZipWeb, isPathInsideDir } from "../utils/tauri";
+import { lintProject, buildExportOverridePrompt, type LintReport } from "../core/lint";
 import { errMsg } from "../utils/errors";
 import { log } from "../utils/logger";
 import { t } from "../i18n";
@@ -264,9 +264,27 @@ async function packZip(): Promise<void> {
     setMsg(t("导出检查执行失败，已中止打包：请查看日志"), false);
     return;
   }
+  // #1107：检查错误不再硬拦截——素材缺失多为模板/环境回填问题，用户无法在生成页修复。
+  // 允许二次确认后强制导出，并把放弃的错误数留痕（日志面板 + 文件日志）。
   if (report.errors.length) {
-    setMsg(t("存在导出检查错误，请先修复（见上方检查结果）"), false);
-    return;
+    if (!window.confirm(buildExportOverridePrompt(report))) {
+      setMsg(t("存在导出检查错误，已取消打包（见上方检查结果）"), false);
+      return;
+    }
+    log.warn("page", "用户确认忽略导出检查错误继续打包", {
+      dir,
+      errors: report.errors.length,
+      missingAssets: report.summary.missingAssets,
+    });
+    pushLog({
+      step: "导出",
+      message: t("已确认风险：忽略 {n} 个导出检查错误继续打包（缺失素材 {m}）", {
+        n: report.errors.length,
+        m: report.summary.missingAssets,
+      }),
+      level: "warn",
+      at: Date.now(),
+    });
   }
   const base = dir.split(/[\\/]/).filter(Boolean).pop() || "novelforge";
   // UI79：目录名已在 dir 末尾，旧式 `dir + _${base}_web.zip` 会得到 A_A_web.zip；直接拼 _web.zip 即 A_web.zip
@@ -279,15 +297,22 @@ async function packZip(): Promise<void> {
       filters: [{ name: t("ZIP 压缩包"), extensions: ["zip"] }],
     });
     if (!picked) return;
+    // #1116：目标在项目目录内部时拒绝——Rust 先创建 zip 再递归打包，会把正在写入的自身半成品打进包里
+    if (isPathInsideDir(dir, picked)) {
+      setMsg(t("保存位置不能在项目目录内部（否则会把正在写入的 zip 自身打进包里）：请换一个目录"), false);
+      return;
+    }
     target = picked;
   }
 
   packing.value = true;
   try {
-    // 桌面版写文件；网页版在 Worker 中压缩并直接触发浏览器下载（大字节不经日志层）
+    // 桌面版写文件；网页版在 Worker 中流式压缩并直接触发浏览器下载（大字节不经日志层）
     const stats = isTauri()
       ? await tauri.buildZip(dir, target, [".novel2vn"])
-      : await downloadZipWeb(dir, [".novel2vn"], `${base}_web.zip`);
+      : await downloadZipWeb(dir, [".novel2vn"], `${base}_web.zip`, (done, total) => {
+          setMsg(t("正在读取并压缩文件 {done}/{total}…", { done, total }));
+        });
     log.info("page", "打包 zip 完成", { dir, target, fileCount: stats.fileCount, sizeBytes: stats.sizeBytes });
     setMsg(
       t("打包完成：{count} 个文件，{size}MB{downloaded}", {
@@ -336,6 +361,12 @@ async function openExternal(url: string): Promise<void> {
         <span v-if="packing" class="spinner" />
         {{ packing ? t("打包中…") : t("打包网页版 zip") }}
       </button>
+      <button
+        class="btn secondary"
+        :disabled="!projectState.lastResult"
+        :title="!projectState.lastResult ? t('请先在「生成项目」页生成项目') : undefined"
+        @click="goPage('preview')"
+      >{{ t("预览") }}</button>
     </PageHead>
 
     <div class="card" v-if="projectState.lastResult">

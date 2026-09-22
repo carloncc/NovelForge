@@ -119,6 +119,9 @@ fn http_aborts() -> &'static std::sync::Mutex<HashMap<u64, HttpAbortFn>> {
 async fn do_http_request(args: HttpRequestArgs) -> Result<Value, String> {    let target = http_target(&args)?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(args.timeout_secs.clamp(1, 600)))
+        // 连接超时独立封顶 30s：建连/TLS 阶段卡住时不再烧完整次超时（如 300s）才报错，
+        // 慢响应仍享有完整总超时；与 models.rs 的 CONNECT_TIMEOUT_MS 口径一致
+        .connect_timeout(Duration::from_secs(30))
         // 禁止跟随重定向：否则 302/307 可跳到内网/元数据地址完成 SSRF 绕过，
         // 且与 Web 代理（redirect:"manual"）策略不一致
         .redirect(reqwest::redirect::Policy::none())
@@ -831,6 +834,10 @@ fn write_zip_contents(
     let mut file_count = 0u64;
     let mut total_size = 0u64;
 
+    // #1116 纵深防御：目标 zip 自身不得进包（用户把 zip 存在项目目录内时，
+    // 前端虽已拦截，Rust 侧仍需跳过正在写入的半成品；文件名按 canonical 路径比对）
+    let target_canon = std::fs::canonicalize(zip_path).ok();
+
     fn walk(
         dir: &std::path::Path,
         rel: &mut Vec<String>,
@@ -839,6 +846,7 @@ fn write_zip_contents(
         patterns: &[Vec<String>],
         file_count: &mut u64,
         total_size: &mut u64,
+        target_canon: &Option<std::path::PathBuf>,
     ) -> Result<(), String> {
         for entry in std::fs::read_dir(dir).map_err(|e| format!("读取目录失败: {e}"))? {
             let entry = entry.map_err(|e| format!("读取条目失败: {e}"))?;
@@ -860,9 +868,17 @@ fn write_zip_contents(
                 writer
                     .add_directory(zip_name, options)
                     .map_err(|e| format!("写入目录失败: {e}"))?;
-                walk(&path, rel, writer, options, patterns, file_count, total_size)?;
+                walk(&path, rel, writer, options, patterns, file_count, total_size, target_canon)?;
             } else {
                 let zip_name = rel.join("/");
+                if let Some(target) = target_canon {
+                    // 目标 zip 自身：跳过（尤其当用户把它存在源目录内时）
+                    if std::fs::canonicalize(&path).ok().as_ref() == Some(target) {
+                        eprintln!("[novelforge] 跳过打包目标自身: {}", path.display());
+                        rel.pop();
+                        continue;
+                    }
+                }
                 // 流式写入：io::copy 分块拷贝，大视频/配音不再整块读进内存
                 let mut reader = std::fs::File::open(&path).map_err(|e| format!("读取文件失败: {e}"))?;
                 let size = reader.metadata().map(|m| m.len()).unwrap_or(0);
@@ -879,7 +895,7 @@ fn write_zip_contents(
     }
 
     let mut rel = Vec::new();
-    walk(src, &mut rel, &mut writer, options, &patterns, &mut file_count, &mut total_size)?;
+    walk(src, &mut rel, &mut writer, options, &patterns, &mut file_count, &mut total_size, &target_canon)?;
     writer.finish().map_err(|e| format!("zip 收尾失败: {e}"))?;
 
     Ok(serde_json::json!({ "fileCount": file_count, "sizeBytes": total_size }))
@@ -1020,6 +1036,21 @@ mod zip_tests {
         assert!(names.iter().any(|n| n == "index.html"), "根文件丢失: {names:?}");
         assert!(!names.iter().any(|n| n.contains(".novel2vn")), "排除目录被打包: {names:?}");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zip_skips_itself_when_target_inside_source() {
+        // #1116 纵深防御：目标 zip 在源目录内时，打包不得把正在写入的半成品打进包
+        let dir = std::env::temp_dir().join("novelforge_zip_self_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"hello").unwrap();
+        let target = dir.join("out.zip");
+        let res = build_zip_sync(&dir.to_string_lossy(), &target.to_string_lossy(), &[]);
+        assert!(res.is_ok(), "build_zip 失败: {:?}", res.err());
+        let names = read_zip_names(&target);
+        assert_eq!(names, vec!["a.txt".to_string()], "zip 不应包含自身: {names:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

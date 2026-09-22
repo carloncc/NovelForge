@@ -14,7 +14,6 @@ const {
   assetBusy,
   queueRunning,
   rerunChapters,
-  toggleAllRerun,
   toggleChapterRerun,
   imagePlanText,
 } = useGenerateController();

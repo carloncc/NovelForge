@@ -46,6 +46,28 @@ function main(): void {
   const cn = splitChapters(cnNum, "小说");
   assert(cn.length === 1 && cn[0].title === "第十章 结尾", "汉字数字章节识别错误");
 
+  // 9) 首章前正文保留（#1137）：第一章标题前的引子并入第一章开头，不丢弃
+  const preamble = "这是开篇的一段引子。\n\n第一章 开始\n正文一";
+  const pre = splitChapters(preamble, "小说");
+  assert(pre.length === 1 && pre[0].title === "第一章 开始", `引子应并入第一章，实际 ${pre.length} 章`);
+  assert(pre[0].text.includes("引子"), "首章前正文不应丢弃");
+
+  // 10) 长标题（>12 字）可识别为章节标题（#1137）
+  const longTitle = "第一卷 低语、咏唱、祈祷、觉醒吧 1.这是长长的章节标题对白\n正文";
+  const lt = splitChapters(longTitle, "小说");
+  assert(lt.length === 1 && lt[0].title === "第一卷 低语、咏唱、祈祷、觉醒吧 1.这是长长的章节标题对白", "长标题应识别为章节标题");
+
+  // 11) 带序号前缀的标题（#1137）：`1.`/`(1)`/`一、` 剥离后再判定，标题保持原样
+  for (const t of ["1. 第一章 楔子", "(2) 第二章 归途", "一、 第一章 楔子"]) {
+    const r = splitChapters(`${t}\n正文内容`, "小说");
+    assert(r.length === 1 && r[0].title === t, `序号前缀标题应整体识别：${t}`);
+  }
+
+  // 12) 带 、；; 分隔的描述后缀（#1137）
+  const suffixed = "第一章 初见；城门偶遇\n正文";
+  const sf = splitChapters(suffixed, "小说");
+  assert(sf.length === 1 && sf[0].title === "第一章 初见；城门偶遇", "；分隔后缀应识别为章节标题");
+
   console.log("=== 章节切分边界测试通过 ===");
 }
 main();

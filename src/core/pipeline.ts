@@ -1878,18 +1878,49 @@ export class Pipeline {
             if (!script) {
               log({
                 step: "剧本",
-                message: `生成第 ${chapter.index + 1} 章剧本：${chapter.title}${hasFeedback ? "（按你的意见重写）" : chapterForce ? "（全量重写）" : ""}`,
+                message: `生成第 ${chapter.index + 1} 章剧本：${chapter.title}${hasFeedback ? "（按你的意见重写）" : chapterForce ? "（全量重写）" : ""}（正文约 ${(chapter.text || "").length} 字）`,
                 level: "info",
                 at: Date.now(),
               });
               try {
-                script = demo
-                  ? demoScriptAll([chapter], cards!)[0]
-                  : await withTextRetry(
+                // 长调用心跳：单章生成可能持续数分钟（分块多轮 LLM），每 90s 报一次存活，避免看起来卡死
+                const genStart = Date.now();
+                const heartbeat = setInterval(() => {
+                  log({
+                    step: "剧本",
+                    message: `第 ${chapter.index + 1} 章仍在生成中（已等待 ${Math.round((Date.now() - genStart) / 1000)}s，模型输出较长请继续等待）…`,
+                    level: "info",
+                    at: Date.now(),
+                  });
+                }, 90000);
+                try {
+                  script = demo
+                    ? demoScriptAll([chapter], cards!)[0]
+                    : await withTextRetry(
                       () => scriptChapter(input.llm!, chapter, cards!, onUsage, {
                         style: style || undefined,
                         compressNarration: this.options.compressNarration,
                         feedback: this.feedback.script?.[chapter.index],
+                        onLog: (message) => log({ step: "剧本", message, level: "info", at: Date.now() }),
+                        // 长章节会分 N 部分逐段生成（每部分约 1–3 分钟）：逐段打日志，否则看起来像卡死
+                        onPart: ({ part, total, phase, elapsedMs }) => {
+                          if (total <= 1) return;
+                          if (phase === "start" && part === 1) {
+                            log({
+                              step: "剧本",
+                              message: `第 ${chapter.index + 1} 章较长，将分 ${total} 部分逐段生成（请稍候，每部分约 1–3 分钟）…`,
+                              level: "info",
+                              at: Date.now(),
+                            });
+                          } else if (phase === "done") {
+                            log({
+                              step: "剧本",
+                              message: `第 ${chapter.index + 1} 章第 ${part}/${total} 部分完成（${Math.round(elapsedMs / 1000)}s）`,
+                              level: "info",
+                              at: Date.now(),
+                            });
+                          }
+                        },
                       }),
                       {
                         isAborted: () => this.aborted,
@@ -1902,6 +1933,9 @@ export class Pipeline {
                           }),
                       },
                     );
+                } finally {
+                  clearInterval(heartbeat);
+                }
               } catch (e) {
                 this.recordFailure({
                   id: `chapter_${chapter.index + 1}`,
@@ -1984,6 +2018,7 @@ export class Pipeline {
                       () => scriptChapter(input.llm!, chapter, cards!, onUsage, {
                         style: style || undefined,
                         compressNarration: this.options.compressNarration,
+                        onLog: (message) => log({ step: "剧本", message, level: "info", at: Date.now() }),
                         feedback: `保真复核未通过：上一版引语覆盖率 ${Math.round(vr.keptRatio * 100)}%、段落覆盖率 ${Math.round(vr.narrationRatio * 100)}%。请逐段核对原文，把遗漏的对话与关键旁白/心理/环境描写全部补全（每个自然段至少一条 line），不要新增原文没有的台词，不要张冠李戴说话人。`,
                       }),
                       {

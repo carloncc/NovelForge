@@ -177,7 +177,21 @@
 - 项目栏从「嵌套折叠」改为设置内扁平一行（状态标签 + 输出目录输入 + 浏览/加载），少一层折叠
 - 逐章列表的「重跑」链接在鼠标设备上默认隐藏、悬停/键盘聚焦才显示（触屏设备保持可见），20+ 行不再常驻 20+ 个链接
 
+### 修复（ReqFlow 并发批次 2026-09-21：图片小说/配置/导出/导入，4 路并行）
+- 图片小说（#1098–#1104、#1111–#1113、#1132–#1134、#1148）：剧本指纹改用剧本文风（画风只进图像提示词）；物品图在图片小说模式直接不构建（渲染与鉴赏室都不展示，生成即浪费）；图像并发读 API 配置；输出目录跟随主项目（手动目录绑指纹+提示重算）；预览只停自己启动的实例；组装前章节连续性校验与重编号（停用中间章不断链）；多角色分镜全量身份参考与失败保护；trigger 缺失/重复均匀铺开并写回缓存；失败项与日志落盘可恢复；设置写盘去抖+BGM/SE 开关；鉴赏室收录计入分镜；配音暂不支持仅页面明确说明
+- 配置/能力/音色（#1125、#1126、#1129、#1130、#1139、#1135、#1136、#1149、#1131、#1128）：能力冲突一键修复与运行期提示；模板非法 JSON 不落盘回滚；模型文件大小/格式头完整性校验；模型目录改用户可写目录；音色库清空二次确认与空库可读错误；关闭视频推荐位时提示词不产出；CG 上限语义收归 core；能力表/上下文长度按规范化模型 id 匹配；Node 输出目录改环境变量；模型下载已有 HTTPS 白名单与大小上限（经核查）
+- 导出/预览/构建（#1105、#1107、#1116、#1143、#1144、#1114、#1127、#1112、#1145、#1141）：中文标题 Game_key 哈希防串档；lint 错误可豁免继续导出；zip 禁止保存到项目内部（含 Rust 侧 walk 跳过目标自身）；网页版流式压缩与 VFS 批量读取（防 OOM/慢收集）；导出说明 BGM/SE 段落归位；主题哈希类名陈旧警告；预览缓存头（html/js 强 no-store）与 .m4a MIME 修正；figureFraming 取景固定为半身（移除无调用方的 full 参数）
+- 导入/i18n（#1117、#1118、#1137、#1138、#1142）：网页版 ArrayBuffer + GBK/GB18030/BIG5 编码嗅探并提示编码；第二本书写入前确认建独立子目录；本地 splitChapters 同步 AI 分章口径（60 字上限/30 字后缀/序号前缀剥离/首章前正文并入第一章）；多文件同名追加 _2 去重；i18n 全量伪翻译/空值修正 + check-i18n 新增伪翻译与空值门禁（1078 条×4 语言全绿）
+- 测试：新增 unit-image-story-fixpack / unit-config-hardening / unit-export-safety / unit-template-hash / unit-zip-stream / unit-import 扩展 / unit-split-merge 与 unit-chapters 扩展 / unit-sprite-verify / unit-sprite-rig / unit-sprite-composite；全套 **81/81**、cargo 41、tsc --noUnusedLocals、build 全绿
+
+### 新增（表情差分借鉴链：固定底图 + 局部脸部合成 + 像素核验 2026-09-21，ReqFlow #1083–#1087）
+- 差分核验器（#1084）：`src/core/spriteVerify.ts`（允许区椭圆×1.08+羽化；画布尺寸/允许区外 RGBA 逐像素/整幅 alpha 三项校验；差异像素数与 bbox 报告）；表情任务落盘后自动核验，不合格删坏图并记失败项（可单张重生成）
+- 脸部 rig 自动标定（#1085）：`src/core/faceRig.ts`（chatVision 输出归一化 bbox → `[cx,cy,rx,ry]` + 默认肤色采样区；`.novel2vn/face-rig.json` 读写含 base 图指纹；缺部件显式报错或回退整张生成，禁静默降级）；素材页可拖拽椭圆校准编辑器 UI 未做（与生成页重构冲突，待办）
+- 局部脸部重绘与合成（#1086）：`src/core/faceComposite.ts`（裁脸 → 复用编辑模式 `editImageVariant` → dark/max 差分提取、软阈值 (delta-7)/24、羽化、肤色通道中位差对齐、alpha 与允许区外像素冻结 → spriteVerify 核验）；经 `ImageTask.faceComposite` 可选标记接入，**默认关闭**（先跑 2 个表情验证指令遵循度再放量，失败回退旧路径）
+- 附录与许可（#1087）：新建 `THIRD_PARTY_NOTICES.md`（TongjiAI4E/VN_Sprite_Expression_Workflow，MIT，算法与参数参考说明；展示图不在许可范围，未复制）
+
 ### 新增（表情差分走 GPT-Image 编辑模式 2026-09-21）
+
 - 表情差分（非 normal）在 **GPT-Image 系线路**上优先走官方 `POST /v1/images/edits`：以现有立绘为原图，指令只改表情并列出「保持不变清单」（身份/发型/服装/姿势/构图/光影/绿幕底/画风）——姿势与构图不再因重画而漂移，切换表情不跳图
 - **其他模型/线路保持原样**（三视图/普通立绘 + 参考图生图）；编辑端点不可用或调用失败（线路不支持/审核/网络）自动回退原路径，不影响出图
 - 实现：新增 `src/api/imageEdits.ts`（`supportsImageEdits` 判定 GPT-Image 家族 + multipart 拼装 + 经 `runWithImageLimit` 复用图像并发限流）；multipart 通过 `tauri.http` 的 bodyBase64 直发，Tauri 与网页版两条传输无需 Rust/代理改动；`ImageTask.editVariant` 标记表情差分任务

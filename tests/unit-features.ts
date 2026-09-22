@@ -57,10 +57,8 @@ function main(): void {
   assert(out0.includes("changeFigure:none -right"), "章首应清右位立绘");
   // 标题已含「第X章」时不再重复拼接前缀（用户实测：曾显示成「第 1 章 · 第一卷 第一章 …」）
   assert(out0.includes("intro:第1章 -fontColor=rgba(255,255,255,1) -fontSize=large -hold;"), "章首应有章节标题卡（标题已含第X章时不重复前缀）");
-  // 半身取景：立绘就位后套用取景变换；figureFraming=full 时整身显示
+  // 半身取景（#1141：固定行为，figureFraming 死参数已移除）：立绘就位后必须套用取景变换
   assert(out0.includes('setTransform:{"scale":{"x":1.75,"y":1.75},"position":{"x":0,"y":350}} -target=fig-left'), "立绘应套用半身取景");
-  const outFull = renderChapter(chapter(0), { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets, figureFraming: "full" }, 2);
-  assert(!outFull.includes('"scale":{"x":1.75'), "figureFraming=full 时不应套用取景缩放");
 
   // 1) 登场资料卡：首次出场插入旁白资料（立绘可见），之后不再重复
   const seen = new Set<string>();

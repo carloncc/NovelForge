@@ -4,7 +4,7 @@ import { tauri } from "../utils/tauri";
 import { errMsg } from "../utils/errors";
 import { cacheDirFor } from "./cache";
 import { sceneVocalKey, sceneVocalKeyPart, splitLineForSpeech } from "./render";
-import { ttsConfigById, voiceLibraryFor, voiceProfileById } from "../stores/config";
+import { ttsConfigById, requireVoiceLibrary, voiceLibraryFor, voiceProfileById } from "../stores/config";
 import { pickVoiceForGender, voiceGenderOf } from "./minimaxVoices";
 import { log as logger } from "../utils/logger";
 import { readAssetMap, updateAssetMap } from "./assetMap";
@@ -166,8 +166,10 @@ export function buildVoiceJobs(  cfg: ApiConfig,
   characters: CharacterCard[],
   chapterIndexes?: Set<number>,
 ): VoiceJob[] {
-  const library = voiceLibraryFor(cfg);
-  const fallbackVoice = library[0] || "default";
+  // #1139：音色库为空时直接抛可读错误（各 TTS 服务均无 "default" 音色）；
+  // 禁止再回退假音色逐句 400 失败重试（长篇=数百次无效请求 + 日志刷屏）。
+  const library = requireVoiceLibrary(cfg);
+  const fallbackVoice = library[0];
   const charById = new Map(characters.map((c) => [c.id, c]));
   const voiceName = (charId: string): { voice: string; ttsConfigId?: string; cloned: boolean } => {
     const char = charById.get(charId);
@@ -302,7 +304,12 @@ export async function runVoiceJob(
   }
   if (isAborted?.()) return null;
   const library = voiceLibraryFor(jobConfig);
-  const fallbackVoice = library[0] || "default";
+  // #1139：空库直接跳过并给出可读提示，不发起任何合成请求（更不回退假音色 "default" 重试）。
+  if (!library.length) {
+    log({ step: "配音", message: "音色库为空，已跳过配音：请先在「API 配置 > TTS 配音 > 音色列表」中填写至少一个可用音色", level: "warn", at: Date.now() });
+    return null;
+  }
+  const fallbackVoice = library[0];
   if (!force) {
     const cached = await vocalHit(cacheDir, job.file);
     if (cached) return cached;

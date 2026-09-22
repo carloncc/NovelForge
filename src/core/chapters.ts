@@ -3,14 +3,26 @@ import { tauri } from "../utils/tauri";
 import { basename, basenameWithoutExt } from "../utils/path";
 import { log } from "../utils/logger";
 
-const CHAPTER_RE =
-  /^\s*(第[零〇一二三四五六七八九十百千万两\d]+[章节回卷部集幕篇](?:[\s·：:－—-][^。！？!?；;\n]{1,12})?|(?:序章|序言|楔子|尾声|终章|番外|后记|前言|引子)(?:[\s·：:－—-][^。！？!?；;\n]{1,12})?)\s*$/;
+/** 行首序号前缀（#1137）：`1.`/`001、`/`(1)`/`一、` 等网文编号剥离后再匹配标题本体 */
+const NUM_PREFIX =
+  /^\s*(?:\d{1,4}\s*[.、．:：)）\]]|\d{1,4}\s+|[(（\[]\s*\d{1,4}\s*[)）\]]|[一二三四五六七八九十]+\s*[、.．])\s*/;
+
+/** 章节锚点：编号章 / 序章-终章标记 / 裸序号（`22.标题`）/ 英文标记 */
+const CHAPTER_ANCHOR =
+  /^(?:第\s*[0-9零〇一二三四五六七八九十百千万两]+\s*[章回节话篇部幕卷]|序章|序言|楔子|尾声|终章|番外|后记|前言|引子|[0-9零〇一二三四五六七八九十百千万两]+\s*[.、．)）]\s*\S)/;
+const CHAPTER_EN_ANCHOR = /^(Chapter|CHAPTER|Episode|episode|Prologue|Epilogue|Act)\b/i;
 
 function isChapterTitle(line: string): boolean {
   const trimmed = line.trim();
-  if (trimmed.length > 40 || trimmed.length < 2) return false;
-  if (CHAPTER_RE.test(trimmed)) return true;
-  if (/^(Chapter|CHAPTER|Episode|episode|Prologue|Epilogue|Act)\s*\d*.*$/i.test(trimmed) && trimmed.length <= 40) return true;
+  if (trimmed.length > 60 || trimmed.length < 2) return false;
+  // 含句末标点的是正文句子，不是标题（旧实现只看后缀是相同效果；这里收紧到整行，
+  // 长标题最多含 、，；等分隔，不含 。！？!?）
+  if (/[。！？!?]/.test(trimmed)) return false;
+  let core = trimmed;
+  const prefix = core.match(NUM_PREFIX);
+  if (prefix) core = core.slice(prefix[0].length).trim();
+  if (CHAPTER_ANCHOR.test(core)) return true;
+  if (CHAPTER_EN_ANCHOR.test(core)) return true;
   return false;
 }
 
@@ -33,13 +45,23 @@ export function splitChapters(fullText: string, baseTitle: string): ChapterInfo[
   const chapters: { title: string; lines: string[] }[] = [];
   let current: { title: string; lines: string[] } = { title: "第一章", lines: [] };
   let anyChapter = false;
+  // 首章标题之前的正文（引子/前言碎片）：暂存，碰到第一个标题时并入该章开头
+  const preamble: string[] = [];
 
   for (const raw of lines) {
     const line = raw.trimEnd();
     if (isChapterTitle(line)) {
       current = { title: line.trim(), lines: [] };
+      // 首章前的正文（引子/前言碎片）是第一个章节的一部分：并入本章开头而非丢弃，
+      // 否则第一章永远从标题行开始、引子无声消失（#1137）
+      if (preamble.length) {
+        current.lines.push(...preamble);
+        preamble.length = 0;
+      }
       chapters.push(current);
       anyChapter = true;
+    } else if (!anyChapter) {
+      preamble.push(raw);
     } else {
       current.lines.push(raw);
     }

@@ -7,6 +7,7 @@ import AssetPreview from "../components/AssetPreview.vue";
 import { projectState } from "../stores/project";
 import {
   imageStoryState,
+  imageStoryDirForeign,
   imageStoryEstimate,
   imageStoryShots,
   loadImageStoryState,
@@ -15,11 +16,13 @@ import {
   retryFailedImages,
   regenerateShot,
   startImageStoryPreview,
+  stopImageStoryPreview,
   exportImageStoryZip,
   setImageStoryDir,
+  followMainProjectDir,
   goImport,
 } from "../stores/imageStory";
-import { tauri, isTauri } from "../utils/tauri";
+import { isTauri } from "../utils/tauri";
 import { errMsg } from "../utils/errors";
 
 const preview = ref<{ path: string; label: string } | null>(null);
@@ -47,7 +50,10 @@ onMounted(() => {
   void loadImageStoryState();
 });
 onBeforeUnmount(() => {
-  void tauri.stopPreviewServer().catch(() => undefined);
+  // #1102：预览服务器是全局单例，只停自己启动的预览，避免把其他页面的预览一起停掉
+  if (imageStoryState.previewRunning) {
+    void stopImageStoryPreview();
+  }
 });
 </script>
 
@@ -58,6 +64,7 @@ onBeforeUnmount(() => {
         {{ imageStoryState.stopping ? t("正在停止…") : t("停止") }}
       </button>
     </PageHead>
+    <p class="hint" style="margin: 8px 2px">{{ t("图片小说模式暂不支持配音（如需人声请使用立绘模式）。") }}</p>
 
     <div v-if="!projectState.novel" class="card empty-next">
       <p class="hint">{{ t("还没有小说：导入小说（或加载示例小说）后即可生成图片版。") }}</p>
@@ -84,8 +91,12 @@ onBeforeUnmount(() => {
             @change="setImageStoryDir(($event.target as HTMLInputElement).value)"
           />
           <button v-if="isTauri()" class="link-btn" :disabled="busy" @click="pickDir">{{ t("选择目录") }}</button>
+          <button class="link-btn" :disabled="busy" @click="followMainProjectDir">{{ t("按当前作品重算目录") }}</button>
         </div>
         <p class="hint mt-2">{{ t("独立输出目录：与立绘版产物互不覆盖；缓存与状态各自独立。") }}</p>
+        <p v-if="imageStoryDirForeign" class="hint mt-2" style="color: var(--warn)">
+          {{ t("当前图片版目录属于其他作品：继续生成会与旧书产物混在一起。如需为当前作品新建目录，请点「按当前作品重算目录」。") }}
+        </p>
       </div>
 
       <!-- 计划与选项 -->
@@ -93,11 +104,17 @@ onBeforeUnmount(() => {
         <div class="card-head">
           <h3>{{ t("张数与费用") }}</h3>
           <div class="card-actions">
-            <span class="hint">
+            <span v-if="imageStoryEstimate.exact" class="hint">
               {{ t("预计最多 {n} 张图片 ≈ {yuan} 元（命中缓存不重复计费）", { n: imageStoryEstimate.total, yuan: imageStoryEstimate.yuan.toFixed(1) }) }}
+            </span>
+            <span v-else class="hint">
+              {{ t("粗估 ≈ {n} 张图片 ≈ {yuan} 元（命中缓存不重复计费）", { n: imageStoryEstimate.total, yuan: imageStoryEstimate.yuan.toFixed(1) }) }}
             </span>
           </div>
         </div>
+        <p v-if="imageStoryEstimate.unbounded" class="hint mt-2">
+          {{ t("当前不限上限，实际张数以剧本产出为准（上值为按每场景 2 张的粗估）。") }}
+        </p>
         <div class="opt-grid">
           <label class="opt-item">
             <span>{{ t("每场景张数（0=不限）") }}</span>
@@ -115,6 +132,10 @@ onBeforeUnmount(() => {
             <span>{{ t("统一画风") }}</span>
             <input type="text" class="grow" v-model="imageStoryState.options.imageStyle" :placeholder="t('例：unified Japanese anime style, cel shading, clean line art')" />
           </label>
+          <label class="opt-item" :title="t('只影响台词/旁白的写作风格，不影响画面；改画风不会让剧本重写')">
+            <span>{{ t("剧本文风（留空用默认；改画风不会重写剧本）") }}</span>
+            <input type="text" class="grow" v-model="imageStoryState.scriptStyle" :placeholder="t('例：冷峻简洁的短句对白')" />
+          </label>
         </div>
         <details class="mt-2">
           <summary class="hint" style="cursor: pointer">{{ t("高级设置") }}</summary>
@@ -126,8 +147,15 @@ onBeforeUnmount(() => {
             <label class="opt-item" :title="t('使用独立图片识别 API 核对生成图，不合格自动重生成 1 次（会增加费用与耗时）')">
               <input type="checkbox" v-model="imageStoryState.options.imageSelfCheck" /> {{ t("图像自检（多模态核对，不合格自动重生成）") }}
             </label>
+            <label class="opt-item" :title="t('图片小说模式不展示物品图：渲染端只出文字卡、鉴赏室也不收录，生成即浪费费用，故已禁用')">
+              <input type="checkbox" v-model="imageStoryState.options.includeItems" disabled /> {{ t("生成物品图（默认关闭）") }}
+              <span class="hint">{{ t("图片小说模式不展示物品图，已自动跳过（开启也不会生成）") }}</span>
+            </label>
             <label class="opt-item">
-              <input type="checkbox" v-model="imageStoryState.options.includeItems" /> {{ t("生成物品图（默认关闭）") }}
+              <input type="checkbox" v-model="imageStoryState.useBgm" /> {{ t("背景音乐（BGM）") }}
+            </label>
+            <label class="opt-item">
+              <input type="checkbox" v-model="imageStoryState.useSe" /> {{ t("环境音效（SE）") }}
             </label>
             <label class="opt-item" :title="t('先生成一张全项目画风基准图，背景/CG 以其为参考图，强制所有图片画风统一（推荐开启）')">
               <input type="checkbox" v-model="imageStoryState.options.styleAnchor" /> {{ t("风格锚点（背景/CG 统一画风）") }}
@@ -181,7 +209,16 @@ onBeforeUnmount(() => {
         <div class="card-head">
           <h3>{{ t("分镜结果") }}</h3>
           <div class="card-actions">
+            <span v-if="imageStoryState.previewRunning" class="tag ok">{{ t("预览已启动") }}</span>
             <button class="btn secondary small" :disabled="busy" @click="startImageStoryPreview">{{ t("预览") }}</button>
+            <button
+              v-if="imageStoryState.previewRunning"
+              class="btn secondary small"
+              :disabled="busy"
+              @click="stopImageStoryPreview"
+            >
+              {{ t("停止预览") }}
+            </button>
             <button class="btn secondary small" :disabled="busy || imageStoryState.zipBusy" @click="exportImageStoryZip">
               <span v-if="imageStoryState.zipBusy" class="spinner" /> {{ imageStoryState.zipBusy ? t("打包中…") : t("导出 zip") }}
             </button>
@@ -191,7 +228,6 @@ onBeforeUnmount(() => {
           <div class="stage-row-label" style="margin-bottom: 6px">
             <b>{{ group.title || `${t("第")}${group.chapter + 1}${t("章")}` }}</b>
             <span class="faint small">{{ group.shots.length }} {{ t("张") }}</span>
-            <span v-if="imageStoryState.previewUrl" class="tag ok">{{ t("预览已启动") }}</span>
           </div>
           <div class="shot-grid">
             <div v-for="s in group.shots" :key="s.id" class="shot-cell">

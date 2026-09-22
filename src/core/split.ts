@@ -604,6 +604,15 @@ function fallbackSplit(blocks: string[], fullText: string, maxChapterChars: numb
   return chapters;
 }
 
+/** 无 LLM 时的分章标题判定（#1137）：长度上限 60；分隔符后描述放宽到 30 字并允许 ，、；；
+ *  允许行首序号前缀（`1.`/`001、`/`(1)`/`一、`等）后再匹配标题，`1. 第一章 标题`类网文格式可识别。 */
+const FALLBACK_NUM_PREFIX =
+  "^(?:\\s*(?:\\d{1,4}\\s*[.、．:：)）\\]]|\\d{1,4}\\s+|[(（\\[]\\s*\\d{1,4}\\s*[)）\\]]|[一二三四五六七八九十]+\\s*[、.．])\\s*)";
+const FALLBACK_CHAPTER_RE = new RegExp(
+  `^\\s*(第[零〇一二三四五六七八九十百千万两\\d]+[章节回卷部集幕篇](?:[\\s·：:－—-][^。！？!?\\n]{1,30})?|(?:序章|序言|楔子|尾声|终章|番外|后记|前言|引子)(?:[\\s·：:－—-][^。！？!?\\n]{1,30})?)\\s*$`,
+);
+const FALLBACK_EN_RE = /^(Chapter|CHAPTER|Episode|episode|Prologue|Epilogue|Act)\s*\d*.*$/i;
+
 /**
  * 无 LLM 时的分章回退：基于章节标题的正则规则切分。
  * 兼容多文件合并导入（未切章）的情况，保证 demo 模式也能分章。
@@ -617,15 +626,15 @@ export function splitChaptersForFallback(fullText: string): ChapterInfo[] {
 
   const isChapterTitle = (line: string): boolean => {
     const trimmed = line.trim();
-    if (trimmed.length > 40 || trimmed.length < 2) return false;
-    if (
-      /^\s*(第[零〇一二三四五六七八九十百千万两\d]+[章节回卷部集幕篇](?:[\s·：:－—-][^。！？!?；;\n]{1,12})?|(?:序章|序言|楔子|尾声|终章|番外|后记|前言|引子)(?:[\s·：:－—-][^。！？!?；;\n]{1,12})?)\s*$/.test(
-        trimmed,
-      )
-    ) {
+    if (trimmed.length > 60 || trimmed.length < 2) return false;
+    // 行首序号前缀（`1.`/`001、`/`一、`等）剥离后再匹配：网文常见 `1. 第一章 标题` 格式
+    const unnumbered = trimmed.replace(new RegExp(FALLBACK_NUM_PREFIX), "");
+    const body = unnumbered.length >= 2 ? unnumbered : trimmed;
+    if (FALLBACK_CHAPTER_RE.test(body)) {
       return true;
     }
-    return /^(Chapter|CHAPTER|Episode|episode|Prologue|Epilogue|Act)\s*\d*.*$/i.test(trimmed);
+    if (FALLBACK_EN_RE.test(trimmed)) return true;
+    return body !== trimmed && FALLBACK_EN_RE.test(body);
   };
 
   for (const raw of lines) {

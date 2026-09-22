@@ -12,7 +12,7 @@ import type {
   SceneJSON,
   Shot,
 } from "./types";
-import { chatJson } from "../api/openaiCompatible";
+import { chatJson, type LlmProgressEvent } from "../api/openaiCompatible";
 import { estimateCharsPerToken, outputTokensForText } from "../api/providers";
 import { splitNovelForAgent } from "./textSplit";
 import { log as logger } from "../utils/logger";
@@ -167,6 +167,63 @@ export interface ScriptChapterOptions {
   mode?: "sprite" | "imageOnly";
   /** 图片小说：每场景分镜张数目标（0/缺省=不限，按剧情需要；仅图片小说模式生效） */
   shotsPerScene?: number;
+  /** 分块进度回调（长章节分 N 部分生成时逐段上报；调用方可据此打日志/进度，避免长调用期间无输出） */
+  onPart?: (info: { part: number; total: number; phase: "start" | "done"; elapsedMs: number }) => void;
+  /** 请求级日志回调（续写/修复/重试/预算升级等模型请求事件；调用方接到后打面向用户的日志） */
+  onLog?: (message: string) => void;
+  /** 视频推荐位开关（#1135）：false=提示词不再要求 videoPoints（省 token、不挤占台词篇幅）；
+   *  缺省 undefined=保持原行为（要求 1-3 个），避免已上线调用方行为突变 */
+  useVideoPoints?: boolean;
+  /** 每章视频推荐点数上限（#1135：0/缺省=不限；>0 时注入提示词并在映射侧按整章配额裁剪） */
+  videoPointsPerChapter?: number;
+  /** 每章 CG 数上限（#1136：0/缺省=不限即提示词默认 3 个；>0 时覆盖规则 5 的数量并参与映射裁剪。
+   *  只改 core 侧语义与注释，不碰设置页 UI） */
+  cgMax?: number;
+}
+
+/** CG 每章默认上限（#1136）：设置页 0=不限制时仍受提示词默认 3 个约束（与既有行为一致） */
+export const SCRIPT_CG_DEFAULT_MAX = 3;
+
+/** 解析 CG 整章配额（#1136，纯函数供单测）：>0 用用户上限，否则回退默认 3 */
+export function resolveCgMax(cgMax?: number): number {
+  return cgMax && cgMax > 0 ? Math.floor(cgMax) : SCRIPT_CG_DEFAULT_MAX;
+}
+
+/** 视频推荐位提示词规则（#1135，纯函数供单测）：
+ *  关闭时明确要求不输出 videoPoints（而不是生成后再清空，白花 token）；限数时注入整章上限 */
+export function videoPointsPromptRule(useVideoPoints?: boolean, limit?: number): string {
+  if (useVideoPoints === false) {
+    return "【本次已关闭视频推荐位（覆盖上文规则 6）】：不要输出 videoPoints 字段，不要为视频推荐位花费任何篇幅，把篇幅留给台词与旁白保真。";
+  }
+  if (limit && limit > 0) {
+    return `【本章视频推荐位上限（覆盖上文规则 6 的数量）】：本章 videoPoints 总数不超过 ${Math.floor(limit)} 个，优先保留最具动感的名场面。`;
+  }
+  return "";
+}
+
+/** CG 上限提示词规则（#1136，纯函数供单测）：用户设上限时覆盖规则 5 的数量 */
+export function cgPromptRule(cgMax?: number): string {
+  if (cgMax && cgMax > 0) {
+    return `【本章 CG 上限（覆盖上文规则 5 的数量）】：本章 cg 总数不超过 ${Math.floor(cgMax)} 个（每个场景最多 1 个），按画面张力排序，宁缺毋滥。`;
+  }
+  return "";
+}
+
+/** 组装剧本系统提示（#1135/#1136 条件注入，纯函数供单测）：
+ *  三个开关全缺省时与旧提示词逐字一致（已上线调用方行为不变）。 */
+export function buildScriptSystemPrompt(opts: {
+  imageOnly: boolean;
+  useVideoPoints?: boolean;
+  videoPointsPerChapter?: number;
+  cgMax?: number;
+}): string {
+  const base = opts.imageOnly ? `${SYSTEM_PROMPT}\n${IMAGE_ONLY_RULES}` : SYSTEM_PROMPT;
+  const extra: string[] = [];
+  const videoRule = videoPointsPromptRule(opts.useVideoPoints, opts.videoPointsPerChapter);
+  if (videoRule) extra.push(videoRule);
+  const cgRule = cgPromptRule(opts.cgMax);
+  if (cgRule) extra.push(cgRule);
+  return extra.length ? `${base}\n${extra.join("\n")}` : base;
 }
 
 /** 旁白处理策略文案（#793/#801，纯函数供单测）：
@@ -242,7 +299,7 @@ function mapScriptLine(l: ScriptModel["scenes"][number]["lines"][number], cards:
   };
 }
 
-/** 剧本场景映射上下文（跨分块共享：场景 id 去重与 CG 配额按整章累计） */
+/** 剧本场景映射上下文（跨分块共享：场景 id 去重与 CG/视频位配额按整章累计） */
 interface ScriptSceneContext {
   chapter: ChapterInfo;
   cards: ExtractionResult;
@@ -250,13 +307,25 @@ interface ScriptSceneContext {
   shotsPerScene?: number;
   resolveSceneId: (s: ScriptModel["scenes"][number], fallbackIndex: number) => string;
   cgCount: { value: number };
+  /** 整章视频位配额累计（#1135：上限按整章计，达上限后后续场景不再出） */
+  videoCount: { value: number };
+  /** 视频推荐位开关透传（#1135）：false=映射侧直接丢弃，不写残条 */
+  useVideoPoints?: boolean;
+  /** 整章视频位上限透传（#1135：0/缺省=不限） */
+  videoPointsPerChapter?: number;
+  /** 整章 CG 上限透传（#1136：0/缺省=默认 3） */
+  cgMax?: number;
 }
 
 /** 把一次模型回执映射为场景数组（含分支/CG/物品/视频位/分镜清洗与配额） */
 function mapScriptScenes(model: ScriptModel, ctx: ScriptSceneContext): SceneJSON[] {
   // 分支/CG 配额：与 prompt 规则一致（#795/#798）。超出上限的只告警并放弃多余项，
   // 不做静默截断——静默丢剧情比丢 CG 更难察觉。
-  const CG_PER_CHAPTER_MAX = 3;
+  // #1136：CG 上限取用户设置（cgMax>0）否则默认 3；#1135：视频位关闭时映射侧直接清空。
+  const CG_PER_CHAPTER_MAX = resolveCgMax(ctx.cgMax);
+  const VIDEO_PER_CHAPTER_MAX = ctx.videoPointsPerChapter && ctx.videoPointsPerChapter > 0
+    ? Math.floor(ctx.videoPointsPerChapter)
+    : 0;
   const CHOICES_PER_SCENE_MAX = 4;
   const CHOICE_LINES_SOFT_MAX = 12;
   return (model.scenes || []).map((s, i) => {
@@ -360,21 +429,73 @@ function mapScriptScenes(model: ScriptModel, ctx: ScriptSceneContext): SceneJSON
       itemEvents,
       // 过滤缺 title/videoPrompt 的残条：dataValidation 会校验必填字段，
       // 写出残条会导致整章剧本缓存下次加载被判损坏（丢掉整章比丢一个视频位更糟）
-      videoPoints: (s.videoPoints || [])
-        .filter((vp) => vp && typeof vp.title === "string" && vp.title.trim() && typeof vp.videoPrompt === "string" && vp.videoPrompt.trim())
-        .map((vp, k) => ({
-          id: vp.id || `vp_${s.id || i}_${k}`,
-          title: vp.title,
-          description: vp.description || "",
-          videoPrompt: vp.videoPrompt,
-          durationSecs: vp.durationSecs || 5,
-        })),
+      // #1135：关闭视频推荐位时直接清空（提示词侧已不要求，映射侧兜底）；
+      // 设上限时按整章配额裁剪（达上限后后续场景不再出），而不是按场景 slice。
+      videoPoints: (() => {
+        if (ctx.useVideoPoints === false) return [];
+        const cleaned = (s.videoPoints || [])
+          .filter((vp) => vp && typeof vp.title === "string" && vp.title.trim() && typeof vp.videoPrompt === "string" && vp.videoPrompt.trim())
+          .map((vp, k) => ({
+            id: vp.id || `vp_${s.id || i}_${k}`,
+            title: vp.title,
+            description: vp.description || "",
+            videoPrompt: vp.videoPrompt,
+            durationSecs: vp.durationSecs || 5,
+          }));
+        if (!VIDEO_PER_CHAPTER_MAX) return cleaned;
+        const remain = VIDEO_PER_CHAPTER_MAX - ctx.videoCount.value;
+        if (remain <= 0) {
+          if (cleaned.length) {
+            logger.warn("script", `视频推荐位超过每章 ${VIDEO_PER_CHAPTER_MAX} 个上限，已丢弃后续场景的多余推荐位`, { scene: s.id || i });
+          }
+          return [];
+        }
+        const kept = cleaned.slice(0, remain);
+        if (cleaned.length > kept.length) {
+          logger.warn("script", `视频推荐位超过每章 ${VIDEO_PER_CHAPTER_MAX} 个上限，已丢弃多余推荐位`, { scene: s.id || i });
+        }
+        ctx.videoCount.value += kept.length;
+        return kept;
+      })(),
       lines,
       figures: [],
       choices: choices.length ? choices : undefined,
       ...(shots && shots.length ? { shots } : {}),
     };
   });
+}
+
+/** 异常文本提取（chatCompletion 抛的是 {status, message} 裸对象、Tauri 侧抛的是字符串，均非 Error） */
+function failureText(e: unknown): string {
+  if (typeof e === "string") return e;
+  if (e instanceof Error) return e.message;
+  try {
+    const o = e as { status?: unknown; message?: unknown };
+    return `status=${String(o.status ?? "?")} ${typeof o.message === "string" ? o.message : JSON.stringify(e).slice(0, 300)}`;
+  } catch {
+    return "未知错误";
+  }
+}
+
+/** 降级拆分（纯函数，供单测）：按段落对半切；尾部不足 2000 字的碎片并入前一块
+ *  （避免单独发一次几乎无正文的请求，且保证无损覆盖：join 还原原文）。 */
+export function splitForDegrade(text: string): string[] {
+  const raw = splitNovelForAgent(text, Math.ceil(text.length / 2)).filter((h) => h.length > 0);
+  const out: string[] = [];
+  for (const h of raw) {
+    if (h.trim().length < 2000 && out.length) out[out.length - 1] += h;
+    else out.push(h);
+  }
+  return out;
+}
+
+/** 服务端过载/超时类失败（纯函数，供单测）：429/5xx、请求总超时（reqwest 文案为 error sending request）等。
+ *  此类失败等量重试注定再次失败，调用方应降级（拆分/换通道）而非硬扛；鉴权/参数/审查类返回 false。 */
+export function isServerClassFailure(e: unknown): boolean {
+  const status = typeof e === "object" && e !== null ? (e as { status?: unknown }).status : undefined;
+  if (status === 429 || status === 500 || status === 502 || status === 503 || status === 504) return true;
+  // 纯文本匹配必须带边界/上下文（\b429\b、HTTP 503），避免 "1500 tokens" 这类数字误伤
+  return /\b429\b|\b50[0-4]\b|HTTP (429|50[0-4])|status.?(429|50[0-4])|timed out|timeout|error sending request|socket|econnreset|econnaborted|reset by peer|overload|capacity/i.test(failureText(e));
 }
 
 export async function scriptChapter(
@@ -404,7 +525,14 @@ export async function scriptChapter(
   // 剧本输出与分块（#800 落地 + 忠实全文回归修复）：忠实模式下长章输出极易被截断，
   // 「scenes 为空」正是截断/JSON 修复失败的典型表现——先按「输出预算可承载的正文体量」把章节切块，
   // 逐块生成后合并场景（场景 id 跨块去重）；空 scenes 带明确反馈重试一次，仍失败才进失败项。
-  const systemPrompt = imageOnly ? `${SYSTEM_PROMPT}\n${IMAGE_ONLY_RULES}` : SYSTEM_PROMPT;
+  // #1135/#1136：视频推荐位开关与 CG/视频位上限按开关条件注入系统提示（关闭不再下发规则 6，
+  // 而不是生成后再清空，白花 token 并挤占台词篇幅）；三开关全缺省时与旧提示词逐字一致。
+  const systemPrompt = buildScriptSystemPrompt({
+    imageOnly,
+    useVideoPoints: opts.useVideoPoints,
+    videoPointsPerChapter: opts.videoPointsPerChapter,
+    cgMax: opts.cgMax,
+  });
   const parts = planScriptChunks(cfg, chapter, systemPrompt, extra, cards);
   const resolveSceneId = makeSceneIdResolver(cards, chapter.index);
   const mapCtx: ScriptSceneContext = {
@@ -414,38 +542,94 @@ export async function scriptChapter(
     shotsPerScene: opts.shotsPerScene,
     resolveSceneId,
     cgCount: { value: 0 },
+    videoCount: { value: 0 },
+    useVideoPoints: opts.useVideoPoints,
+    videoPointsPerChapter: opts.videoPointsPerChapter,
+    cgMax: opts.cgMax,
   };
 
   const scenes: SceneJSON[] = [];
   let title = chapter.title;
   for (let i = 0; i < parts.length; i++) {
-    const partNote = parts.length > 1
-      ? `\n\n【本章分 ${parts.length} 部分生成】这是第 ${i + 1}/${parts.length} 部分：只输出这部分正文对应的场景与台词；不要在本部分结尾写章节收束、不要写 end；不要把其它部分的内容补进来。`
-      : "";
-    const user = buildScriptUser(chapter, cards, extra, parts[i], partNote);
-    const maxTokens = outputTokensForText(cfg, `${systemPrompt}\n${user}`);
-    let model = await chatJson<ScriptModel>(cfg, systemPrompt, user, { maxTokens, onUsage, timeoutSecs: 300 });
-    let partScenes = mapScriptScenes(model, mapCtx);
-    if (!partScenes.length) {
-      logger.warn("script", `第 ${chapter.index + 1} 章${parts.length > 1 ? ` 第 ${i + 1}/${parts.length} 部分` : ""}未产出场景，带提示重试一次`, {});
-      model = await chatJson<ScriptModel>(
-        cfg,
-        systemPrompt,
-        `${user}\n\n注意：上一次回复没有 scenes 数组或 scenes 为空。请输出严格 JSON，且 scenes 至少包含本部分正文的第一个场景（含完整的 lines 台词）。`,
-        { maxTokens, onUsage, timeoutSecs: 300 },
-      );
-      partScenes = mapScriptScenes(model, mapCtx);
+    const partStart = Date.now();
+    opts.onPart?.({ part: i + 1, total: parts.length, phase: "start", elapsedMs: 0 });
+    const partTag = parts.length > 1 ? `第 ${i + 1}/${parts.length} 部分` : "";
+    const noteFor = (label: string, total: number): string =>
+      total > 1
+        ? `\n\n【本章分 ${total} 部分生成】这是${label}：只输出这部分正文对应的场景与台词；不要在本部分结尾写章节收束、不要写 end；不要把其它部分的内容补进来。`
+        : "";
+    // 请求级事件翻译成分块上下文日志：续写/修复/重试/预算升级全部可见（否则单请求 300s 超时 ×N 次重试全程静默）
+    const llmEventFor = (tag: string) => (e: LlmProgressEvent): void => {
+      if (!opts.onLog) return;
+      const where = `第 ${chapter.index + 1} 章${tag}`;
+      if (e.kind === "response") {
+        opts.onLog(`${where}模型返回（${e.contentLen ?? 0} 字${e.finishReason ? `，finish=${e.finishReason}` : ""}，累计 ${e.accumulatedLen ?? 0} 字）`);
+      } else if (e.kind === "continue") {
+        opts.onLog(`${where}输出被截断，请求续写（第 ${e.attempt} 次，已累积 ${e.accumulatedLen ?? 0} 字）…`);
+      } else if (e.kind === "repair") {
+        opts.onLog(`${where}JSON 解析失败，请求模型修复（第 ${e.attempt} 次）…`);
+      } else {
+        const base = e.message ?? "放大输出预算重试";
+        // 过载与超时给不同的排查方向：前者等后端恢复/换通道，后者多为单次请求过大、可拆小
+        const hint = e.kind === "retry" && /429|50[234]|overload|capacity|rate.?limit|busy/i.test(base)
+          ? "（模型后端过载/限流：已自动延长等待重试；若持续失败请换模型/通道，或稍后再试）"
+          : e.kind === "retry" && /timed out|timeout|error sending request/i.test(base)
+            ? "（单次请求 300s 未返回：本章输出过大或后端变慢；持续失败会自动拆小重试，也可开「压缩旁白」减小输出）"
+            : "";
+        opts.onLog(`${where}${base}${hint}…`);
+      }
+    };
+    // 单个子块生成（含空结果带提示重试一次；无场景即抛错，由外层决定是否降级拆分）
+    const genOnePart = async (bodyText: string, note: string, tag: string): Promise<{ model: ScriptModel; scenes: SceneJSON[] }> => {
+      const user = buildScriptUser(chapter, cards, extra, bodyText, note);
+      const maxTokens = outputTokensForText(cfg, `${systemPrompt}\n${user}`);
+      const llmEvent = llmEventFor(tag);
+      let model = await chatJson<ScriptModel>(cfg, systemPrompt, user, { maxTokens, onUsage, timeoutSecs: 300, onEvent: llmEvent });
+      let subScenes = mapScriptScenes(model, mapCtx);
+      if (!subScenes.length) {
+        logger.warn("script", `第 ${chapter.index + 1} 章${tag}未产出场景，带提示重试一次`, {});
+        opts.onLog?.(`第 ${chapter.index + 1} 章${tag}未产出场景，带提示重试一次…`);
+        model = await chatJson<ScriptModel>(
+          cfg,
+          systemPrompt,
+          `${user}\n\n注意：上一次回复没有 scenes 数组或 scenes 为空。请输出严格 JSON，且 scenes 至少包含本部分正文的第一个场景（含完整的 lines 台词）。`,
+          { maxTokens, onUsage, timeoutSecs: 300, onEvent: llmEvent },
+        );
+        subScenes = mapScriptScenes(model, mapCtx);
+      }
+      if (!subScenes.length) {
+        throw new Error(
+          `第 ${chapter.index + 1} 章剧本未产出任何场景${tag ? `（${tag}）` : ""}：模型返回无 scenes（常见于输出被截断或 JSON 修复失败）。本章未写入缓存，请直接重试；若反复失败可开启「压缩旁白」或改用输出上限更高的模型`,
+        );
+      }
+      return { model, scenes: subScenes };
+    };
+
+    let firstModel: ScriptModel | null = null;
+    try {
+      const r = await genOnePart(parts[i], noteFor(`第 ${i + 1}/${parts.length} 部分`, parts.length), partTag);
+      firstModel = r.model;
+      scenes.push(...r.scenes);
+    } catch (e) {
+      // 自适应降级：服务端过载/超时 + 文本还够大 → 按段落对半拆成小块分别生成
+      // （小请求更容易在超时前完成；鉴权/参数/审查/空结果类错误直接抛出，不拆）
+      const halves = parts[i].length > 8000 ? splitForDegrade(parts[i]) : [];
+      if (!isServerClassFailure(e) || halves.length < 2) throw e;
+      const reason = /429/.test(failureText(e)) ? "后端限流" : "后端过载/超时";
+      opts.onLog?.(`第 ${chapter.index + 1} 章${partTag}请求过大（${reason}），已拆成 ${halves.length} 块分别生成…`);
+      logger.warn("script", `第 ${chapter.index + 1} 章${partTag}服务端失败，降级拆分重试`, { error: failureText(e).slice(0, 200) });
+      for (let h = 0; h < halves.length; h++) {
+        const subTag = `${partTag ? `${partTag}之` : ""}第 ${h + 1}/${halves.length} 块`;
+        const r = await genOnePart(halves[h], noteFor(subTag, halves.length), subTag);
+        if (!firstModel) firstModel = r.model;
+        scenes.push(...r.scenes);
+      }
     }
-    if (!partScenes.length) {
-      throw new Error(
-        `第 ${chapter.index + 1} 章剧本未产出任何场景${parts.length > 1 ? `（第 ${i + 1}/${parts.length} 部分）` : ""}：模型返回无 scenes（常见于输出被截断或 JSON 修复失败）。本章未写入缓存，请直接重试；若反复失败可开启「压缩旁白」或改用输出上限更高的模型`,
-      );
-    }
-    if (parts.length > 1 && i === 0) {
-      const partTitle = (model as { title?: unknown }).title;
+    if (parts.length > 1 && i === 0 && firstModel) {
+      const partTitle = (firstModel as { title?: unknown }).title;
       if (typeof partTitle === "string" && partTitle.trim()) title = partTitle.trim();
     }
-    scenes.push(...partScenes);
+    opts.onPart?.({ part: i + 1, total: parts.length, phase: "done", elapsedMs: Date.now() - partStart });
   }
 
   return {

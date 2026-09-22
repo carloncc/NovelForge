@@ -105,6 +105,7 @@
           <button class="btn" id="figNext" data-i18n="c-next">下一张</button>
           <button class="btn" id="figFit" data-i18n="c-fit">复位</button>
         </div>
+        <p id="actionNote" style="display:none; font-size:12px; color:var(--dim); margin:4px 0 0" data-i18n="t-action-note">动作立绘不含服装：当前为默认服装动作</p>
       </div>
     </div>
   </div>
@@ -161,7 +162,7 @@
       "c-prev": "上一张", "c-next": "下一张", "c-fit": "复位", "a-none": "无动作", empty: "暂无内容", voice: "音色", desc: "简介", cloth: "服装",
       "c-default": "默认服装", "e-normal": "默认", "e-happy": "开心", "e-sad": "悲伤", "e-angry": "愤怒", "e-surprised": "惊讶",
       ch: "第 {n} 章", other: "其他", all: "全部",
-      collected: "收录：{chars} 角色 · {cgs} CG · {bgs} 背景 · {bgms} 音乐",
+      collected: "收录：{chars} 角色 · {cgs} CG · {bgs} 背景 · {shots} 分镜 · {bgms} 音乐",
       "nf-figure": "该角色尚未生成立绘，生成后回到本页即可鉴赏", "nf-costume": "该服装立绘尚未生成（可在图像阶段补齐）",
       "nf-action": "该动作立绘尚未生成（可在图像阶段补齐）", "nf-emotion": "该表情差分尚未生成（可在图像阶段补齐）",
       "nf-file": "图片文件不存在，可能未生成或已被删除", "bad-combo": "该组合不存在（服装差分只有默认表情）" },
@@ -170,7 +171,7 @@
       "c-prev": "上一張", "c-next": "下一張", "c-fit": "復位", "a-none": "無動作", empty: "暫無內容", voice: "音色", desc: "簡介", cloth: "服裝",
       "c-default": "預設服裝", "e-normal": "預設", "e-happy": "開心", "e-sad": "悲傷", "e-angry": "憤怒", "e-surprised": "驚訝",
       ch: "第 {n} 章", other: "其他", all: "全部",
-      collected: "收錄：{chars} 角色 · {cgs} CG · {bgs} 背景 · {bgms} 音樂",
+      collected: "收錄：{chars} 角色 · {cgs} CG · {bgs} 背景 · {shots} 分鏡 · {bgms} 音樂",
       "nf-figure": "該角色尚未生成立繪，生成後回到本頁即可鑑賞", "nf-costume": "該服裝立繪尚未生成（可在圖像階段補齊）",
       "nf-action": "該動作立繪尚未生成（可在圖像階段補齊）", "nf-emotion": "該表情差分尚未生成（可在圖像階段補齊）",
       "nf-file": "圖片檔案不存在，可能未生成或已被刪除", "bad-combo": "該組合不存在（服裝差分只有預設表情）" },
@@ -179,7 +180,7 @@
       "c-prev": "Previous", "c-next": "Next", "c-fit": "Reset", "a-none": "No pose", empty: "Nothing here yet", voice: "Voice", desc: "About", cloth: "Outfit",
       "c-default": "Default outfit", "e-normal": "Normal", "e-happy": "Happy", "e-sad": "Sad", "e-angry": "Angry", "e-surprised": "Surprised",
       ch: "Ch. {n}", other: "Other", all: "All",
-      collected: "Collected: {chars} chars · {cgs} CG · {bgs} backgrounds · {bgms} tracks",
+      collected: "Collected: {chars} chars · {cgs} CG · {bgs} backgrounds · {shots} storyboards · {bgms} tracks",
       "nf-figure": "This character has no sprite yet. Generate images to see it here.", "nf-costume": "This costume sprite has not been generated yet.",
       "nf-action": "This pose sprite has not been generated yet.", "nf-emotion": "This expression variant has not been generated yet.",
       "nf-file": "Image file is missing (not generated or deleted).", "bad-combo": "This combination does not exist (costume variants only have the default expression)." },
@@ -188,7 +189,7 @@
       "c-prev": "前へ", "c-next": "次へ", "c-fit": "リセット", "a-none": "ポーズなし", empty: "まだ何もありません", voice: "ボイス", desc: "紹介", cloth: "衣装",
       "c-default": "デフォルト衣装", "e-normal": "通常", "e-happy": "笑顔", "e-sad": "悲しい", "e-angry": "怒り", "e-surprised": "驚き",
       ch: "第 {n} 章", other: "その他", all: "全て",
-      collected: "収録：キャラ {chars} · CG {cgs} · 背景 {bgs} · 音楽 {bgms}",
+      collected: "収録：キャラ {chars} · CG {cgs} · 背景 {bgs} · 絵コンテ {shots} · 音楽 {bgms}",
       "nf-figure": "このキャラクターの立ち絵はまだありません", "nf-costume": "この衣装の立ち絵はまだ生成されていません",
       "nf-action": "このポーズの立ち絵はまだ生成されていません", "nf-emotion": "この表情差分はまだ生成されていません",
       "nf-file": "画像ファイルが存在しません（未生成または削除済み）", "bad-combo": "この組み合わせは存在しません（衣装差分はデフォルト表情のみ）" },
@@ -197,7 +198,7 @@
       "c-prev": "이전", "c-next": "다음", "c-fit": "초기화", "a-none": "포즈 없음", empty: "아직 내용이 없습니다", voice: "음성", desc: "소개", cloth: "의상",
       "c-default": "기본 의상", "e-normal": "기본", "e-happy": "기쁨", "e-sad": "슬픔", "e-angry": "분노", "e-surprised": "놀람",
       ch: "제 {n} 장", other: "기타", all: "전체",
-      collected: "수록: 캐릭터 {chars} · CG {cgs} · 배경 {bgs} · 음악 {bgms}",
+      collected: "수록: 캐릭터 {chars} · CG {cgs} · 배경 {bgs} · 콘티 {shots} · 음악 {bgms}",
       "nf-figure": "이 캐릭터의 스프라이트가 아직 없습니다", "nf-costume": "이 의상 스프라이트가 아직 생성되지 않았습니다",
       "nf-action": "이 포즈 스프라이트가 아직 생성되지 않았습니다", "nf-emotion": "이 표정 차분이 아직 생성되지 않았습니다",
       "nf-file": "이미지 파일이 없습니다(미생성 또는 삭제됨)", "bad-combo": "존재하지 않는 조합입니다(의상 차분은 기본 표정만 지원)" }
@@ -312,14 +313,25 @@
     loadFig(v.file);
     if (v.action) {
       selAction.value = v.action;
-      selCostume.value = "";
+      // 动作立绘不含服装（生成侧口径）：保留用户的服装选择但禁用下拉并给说明，
+      // 不再静默清空——此前用户以为"选择没生效/界面抽风"（#1151）
+      selCostume.disabled = true;
       selEmotion.value = "normal";
+      selEmotion.disabled = true;
     } else {
       selAction.value = "";
+      selCostume.disabled = false;
       selCostume.value = v.costume || "";
       selEmotion.value = v.emotion || "normal";
+      selEmotion.disabled = !!selCostume.value;
     }
-    selEmotion.disabled = !!selCostume.value;
+    updateActionNote();
+  }
+  /** 动作+服装组合的明确说明（UI105 口径的动作侧对称：动作期间服装不可用直接明示） */
+  function updateActionNote() {
+    var show = !!selAction.value && !!selCostume.value;
+    var el = document.getElementById("actionNote");
+    if (el) el.style.display = show ? "" : "none";
   }
   function populateChar(c) {
     selCostume.innerHTML = "";
@@ -353,7 +365,10 @@
     var action = selAction.value;
     var costume = selCostume.value;
     var emotion = selEmotion.value || "normal";
+    // 动作期间服装不可用：直接禁用下拉（保留用户选择），不静默清空（#1151）
+    selCostume.disabled = !!action;
     selEmotion.disabled = !!costume;
+    updateActionNote();
     // UI105：服装差分只有 normal 姿态（换装期间表情差分暂停），选中服装时回退默认表情
     if (costume && emotion !== "normal") {
       selEmotion.value = "normal";
@@ -387,8 +402,8 @@
   document.getElementById("figFit").addEventListener("click", function () { zoom.value = 100; applyZoom(); });
 
   /* ---- 画廊（CG / 背景共用：按章节分组 + IntersectionObserver 懒加载 + 灯箱切换/缩放）---- */
-  var galleryFilters = { cg: "all", bg: "all" };
-  var galleryLists = { cg: [], bg: [] };
+  var galleryFilters = { cg: "all", bg: "all", shot: "all" };
+  var galleryLists = { cg: [], bg: [], shot: [] };
   var lbKind = "cg";
   var lbIndex = -1;
   var lbZoom = 1;
@@ -481,7 +496,7 @@
     document.getElementById("lbImg").style.transform = "scale(" + v + ")";
   }
 
-  /* ---- 收集度：已收录角色 / CG / 背景 / 音乐数量 ---- */
+  /* ---- 收集度：已收录角色 / CG / 背景 / 分镜 / 音乐数量 ---- */
   function renderStats() {
     var el = document.getElementById("stats");
     if (!el) return;
@@ -489,6 +504,7 @@
       chars: D.characters.length,
       cgs: D.cgs.length,
       bgs: D.bgs.length,
+      shots: (D.shots || []).length,
       bgms: D.bgms.length,
     });
   }

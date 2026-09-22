@@ -3,7 +3,10 @@
 //! - 断点续传（.part 文件 + Range 头）
 //! - 连接失败重试（指数退避，12 次封顶，可重试状态码 408/429/5xx）
 //! - md5 完整性校验（失败重下，3 轮）
-//! 模型文件保存在程序目录（resource_dir）models/ 下，经 model:// 自定义协议供前端 fetch。
+//! 模型文件保存在**用户可写目录**（app_data_dir/models，回退 app_config_dir）下，
+//! 经 model:// 自定义协议供前端 fetch；resource_dir/models 只作为旧版本迁移来源与只读查找路径。
+//! #1130：AppImage/deb/macOS .app 等安装形态下 resource_dir 只读，模型目录必须落在可写位置，
+//! 否则下载必然以「Permission denied」失败；不可写时通过 ModelStatus.writable 明确告知前端。
 
 use once_cell::sync::OnceCell;
 use serde::Serialize;
@@ -23,7 +26,35 @@ const MAX_RESUME_ATTEMPTS: u32 = 20;
 /// 单个文件下载的总时长上限（含所有续传轮次）
 const MAX_DOWNLOAD_DURATION: Duration = Duration::from_secs(30 * 60);
 
+/// #1128：下载来源白名单——前端只应传 rembg 官方 release，重定向目标（GitHub CDN）同样在列，
+/// 避免 webview 内任意脚本把该命令当 SSRF/任意落盘通道用
+const ALLOWED_DOWNLOAD_HOSTS: &[&str] = &[
+    "github.com",
+    "objects.githubusercontent.com",
+    "github-releases.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+];
+/// github.com 上只放行 rembg release 的下载路径（其余路径一律拒绝）
+const REMBG_RELEASE_PATH_PREFIX: &str = "/danielgatis/rembg/releases/download/";
+/// 表外文件（未来新增模型）的统一大小上限：与前端 sizeMB 上限对齐（300MB）+10% 余量
+const MAX_UNKNOWN_MODEL_BYTES: u64 = 330 * 1024 * 1024;
+/// 可信模型的最小体积：小于此值必然不是模型（截断/占位文件）
+const MIN_MODEL_BYTES: u64 = 1024 * 1024;
+
+/// 内置模型登记表：文件名 → (期望大小 MB, 官方 md5)。
+/// 与前端 src/core/cutout/models.ts 保持一致；新增模型时两边都要改（#1128c：md5 不再由调用方说了算）。
+const KNOWN_MODELS: &[(&str, u64, &str)] = &[
+    ("isnet-anime.onnx", 168, "6f184e756bb3bd901c8849220a83e38e"),
+    ("isnet-general-use.onnx", 170, "fc16ebd8b0c10d971d3513d564d01e29"),
+    ("BiRefNet-general-bb_swin_v1_tiny-epoch_232.onnx", 214, "4fab47adc4ff364be1713e97b7e66334"),
+    ("u2netp.onnx", 5, "8e83ca70e441ab06c318d82300c84806"),
+];
+
 static MODELS_DIR: OnceCell<PathBuf> = OnceCell::new();
+/// 只读内置模型目录（resource_dir/models）：旧版本模型所在地，仅用于迁移与查找兜底
+static BUNDLED_MODELS_DIR: OnceCell<Option<PathBuf>> = OnceCell::new();
+/// 当前模型目录是否可写：false 时下载必然失败，前端据此给出「改用便携版/手动放置」提示
+static MODELS_DIR_WRITABLE: AtomicBool = AtomicBool::new(false);
 
 #[derive(Default)]
 struct InstallState {
@@ -57,57 +88,152 @@ pub struct ModelStatus {
     pub total: u64,
     pub error: Option<String>,
     pub installed: bool,
+    /// 安装判定依据（#1129）：missing / ok / corrupt，corrupt 时 installed=false 且带 integrityReason
+    pub integrity: String,
+    pub integrity_reason: Option<String>,
+    /// 当前实际使用的模型目录（#1130：不再是 resource_dir，UI 直接显示这个值）
+    pub dir: Option<String>,
+    /// 目录是否可写：false 表示下载必然失败，需提示用户改用便携版/手动放置
+    pub writable: bool,
 }
 
-/// 初始化模型目录（程序目录/models），首次启动 setup 时调用
-pub fn init_models_dir<R: tauri::Runtime>(app: &impl Manager<R>) -> Result<PathBuf, String> {
-    let dir = app
-        .path()
-        .resource_dir()
-        .map_err(|e| format!("获取程序目录失败: {e}"))?
-        .join("models");
-    fs::create_dir_all(&dir).map_err(|e| format!("创建模型目录失败: {e}"))?;
-    migrate_old_models_dir(app, &dir);
-    let _ = MODELS_DIR.set(dir.clone());
-    Ok(dir)
+/// 模型文件完整性判定结果
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Integrity {
+    Ok,
+    Missing,
+    Corrupt,
 }
 
-/// 历史版本把模型放在应用配置目录（%APPDATA%）models/。新目录为空时把旧文件搬过去，
-/// 避免老用户已安装的模型失效（跨盘移动失败则退化为复制后删除）。
-fn migrate_old_models_dir<R: tauri::Runtime>(app: &impl Manager<R>, new_dir: &Path) {
-    let empty = fs::read_dir(new_dir)
-        .map(|mut it| it.next().is_none())
-        .unwrap_or(true);
-    if !empty {
-        return;
-    }
-    let Ok(old_dir) = app.path().app_config_dir().map(|d| d.join("models")) else {
-        return;
-    };
-    if !old_dir.is_dir() {
-        return;
-    }
-    let entries: Vec<_> = match fs::read_dir(&old_dir) {
-        Ok(it) => it.filter_map(|e| e.ok()).map(|e| e.path()).collect(),
-        Err(_) => return,
-    };
-    if entries.is_empty() {
-        return;
-    }
-    let mut copied = Vec::new();
-    for entry in &entries {
-        let Some(name) = entry.file_name() else { continue };
-        if fs::copy(entry, new_dir.join(&name)).is_ok() {
-            copied.push(entry.clone());
+impl Integrity {
+    fn as_str(self) -> &'static str {
+        match self {
+            Integrity::Ok => "ok",
+            Integrity::Missing => "missing",
+            Integrity::Corrupt => "corrupt",
         }
     }
-    if copied.len() == entries.len() {
-        let _ = fs::remove_dir_all(&old_dir);
-        println!("[novelforge] 已把旧模型目录迁移到: {}", new_dir.display());
-    } else {
-        eprintln!("[novelforge] 警告: 旧模型迁移不完整，请手动处理 {}", old_dir.display());
+}
+
+struct IntegrityReport {
+    kind: Integrity,
+    reason: Option<String>,
+}
+
+fn corrupt(reason: impl Into<String>) -> IntegrityReport {
+    IntegrityReport { kind: Integrity::Corrupt, reason: Some(reason.into()) }
+}
+
+/// 初始化模型目录（用户可写位置），首次启动 setup 时调用；后续调用直接复用已选定的目录。
+pub fn init_models_dir<R: tauri::Runtime>(app: &impl Manager<R>) -> Result<PathBuf, String> {
+    if let Some(dir) = MODELS_DIR.get() {
+        return Ok(dir.clone());
+    }
+    // 内置（只读）目录：旧版本模型放在这里，仅作为迁移来源与查找兜底
+    let bundled = app.path().resource_dir().ok().map(|d| d.join("models"));
+    let _ = BUNDLED_MODELS_DIR.set(bundled.clone());
+
+    // #1130：优先用户可写目录。app_data_dir（Linux ~/.local/share、Windows %APPDATA%）→
+    // app_config_dir（同为用户目录）→ resource_dir（只读兜底，UI 会提示不可写）。
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(dir) = app.path().app_data_dir() {
+        candidates.push(dir.join("models"));
+    }
+    if let Ok(dir) = app.path().app_config_dir() {
+        let config_models = dir.join("models");
+        if !candidates.contains(&config_models) {
+            candidates.push(config_models);
+        }
+    }
+    if let Some(dir) = bundled.clone() {
+        if !candidates.contains(&dir) {
+            candidates.push(dir);
+        }
+    }
+
+    let mut failures: Vec<String> = Vec::new();
+    let last = candidates.len().saturating_sub(1);
+    for (index, candidate) in candidates.iter().enumerate() {
+        let is_last = index == last;
+        match inspect_models_dir(candidate) {
+            Ok(true) => return Ok(select_models_dir(candidate.clone(), true, &candidates)),
+            Ok(false) if is_last => {
+                // 全部候选都不可写：退回只读目录，至少状态查询与「手动放置模型」仍可用
+                return Ok(select_models_dir(candidate.clone(), false, &candidates));
+            }
+            Ok(false) => failures.push(format!("{}：不可写", candidate.display())),
+            Err(message) => failures.push(format!("{}：{message}", candidate.display())),
+        }
+    }
+    Err(format!("无法准备模型目录（{}）", failures.join("；")))
+}
+
+fn select_models_dir(dir: PathBuf, writable: bool, sources: &[PathBuf]) -> PathBuf {
+    migrate_legacy_models(&dir, sources, writable);
+    MODELS_DIR_WRITABLE.store(writable, Ordering::Relaxed);
+    let _ = MODELS_DIR.set(dir.clone());
+    if !writable {
+        eprintln!(
+            "[novelforge] 警告: 模型目录不可写（{}）：AI 抠图模型将无法下载，请改用便携版/绿色版，或手动下载模型放入该目录",
+            dir.display()
+        );
+    }
+    MODELS_DIR.get().cloned().unwrap_or(dir)
+}
+
+/// 创建目录并真的写一次探测文件确认可写（resource_dir 下 create_dir_all 可能"成功"但写入必失败）。
+/// 返回 Ok(true)=可写，Ok(false)=目录存在但不可写，Err=目录无法创建。
+fn inspect_models_dir(dir: &Path) -> Result<bool, String> {
+    fs::create_dir_all(dir).map_err(|e| format!("创建目录失败: {e}"))?;
+    if !dir.is_dir() {
+        return Err("路径不是目录".to_string());
+    }
+    let probe = dir.join(".novelforge-write-test");
+    match fs::write(&probe, b"ok") {
+        Ok(()) => {
+            let _ = fs::remove_file(&probe);
+            Ok(true)
+        }
+        Err(_) => Ok(false),
     }
 }
+
+/// 历史版本把模型放在 resource_dir/models 或应用配置目录 models/：
+/// 新目录里缺哪个文件就从旧目录补哪个（跨盘失败退化为复制失败，只告警不阻断）。
+fn migrate_legacy_models(target: &Path, sources: &[PathBuf], writable: bool) {
+    if !writable {
+        return;
+    }
+    for source in sources {
+        if source == target || !source.is_dir() {
+            continue;
+        }
+        let entries: Vec<_> = match fs::read_dir(source) {
+            Ok(it) => it.filter_map(|e| e.ok()).map(|e| e.path()).collect(),
+            Err(_) => continue,
+        };
+        for entry in entries {
+            let Some(name) = entry.file_name() else { continue };
+            let Some(name_str) = name.to_str() else { continue };
+            // 只迁移合法模型文件名（跳过 .part / 探测文件等）
+            if safe_model_filename(name_str).is_err() {
+                continue;
+            }
+            let destination = target.join(&name);
+            if destination.exists() {
+                continue;
+            }
+            if fs::copy(&entry, &destination).is_ok() {
+                println!("[novelforge] 已把旧模型 {} 迁移到 {}", entry.display(), destination.display());
+                // 迁移成功后清掉旧副本，避免同一模型占两份磁盘（只读目录删除失败则保留）
+                let _ = fs::remove_file(&entry);
+            } else {
+                eprintln!("[novelforge] 警告: 旧模型迁移失败，已保留原文件 {}", entry.display());
+            }
+        }
+    }
+}
+
 
 pub fn models_dir() -> Option<&'static PathBuf> {
     MODELS_DIR.get()
@@ -135,7 +261,149 @@ fn model_part_file(dir: &Path, filename: &str) -> PathBuf {
 }
 
 fn installed(dir: &Path, filename: &str) -> bool {
-    model_file(dir, filename).exists()
+    model_integrity(dir, filename).kind == Integrity::Ok
+}
+
+/// #1129：不再「文件存在即已安装」——损坏/截断/被替换/占位文件会被判 corrupt，
+/// 避免 UI 显示「已安装」而运行期 onnxruntime 加载失败后降级色度键、错误难定位。
+/// 只做便宜的大小 + 文件头校验（md5 校验在下载落位时已完成；状态查询里算 md5 代价过高）。
+fn model_integrity(dir: &Path, filename: &str) -> IntegrityReport {
+    let path = model_file(dir, filename);
+    let Ok(metadata) = fs::metadata(&path) else {
+        return IntegrityReport { kind: Integrity::Missing, reason: None };
+    };
+    if !metadata.is_file() {
+        return corrupt("模型路径不是文件");
+    }
+    let size = metadata.len();
+    if size < MIN_MODEL_BYTES {
+        return corrupt(format!("文件过小（{} KB），疑似截断或占位文件", size / 1024));
+    }
+    if let Some((size_mb, _)) = known_model(filename) {
+        let expected = size_mb.saturating_mul(1024 * 1024);
+        // 允许 10% 误差（前端 sizeMB 为约数）；明显偏小即判不完整
+        if size.saturating_mul(10) < expected.saturating_mul(9) {
+            return corrupt(format!(
+                "文件不完整（{:.0} MB，期望约 {} MB）",
+                size as f64 / 1048576.0,
+                size_mb
+            ));
+        }
+    }
+    let mut head = [0u8; 16];
+    match read_file_head(&path, &mut head) {
+        Ok(filled) => {
+            let bytes = &head[..filled];
+            if bytes.is_empty() || bytes.iter().all(|b| *b == 0) {
+                return corrupt("文件头全零，疑似损坏或占位文件");
+            }
+            if looks_like_text(bytes) {
+                return corrupt("文件内容像文本/网页而不是模型（可能是错误页被当成模型保存）");
+            }
+            // ONNX 是 protobuf 序列化的 ModelProto：首字段 ir_version（varint，tag = 0x08）
+            if filename.ends_with(".onnx") && bytes[0] != 0x08 {
+                return corrupt(format!(
+                    "文件头不是有效的 ONNX 模型（首字节 0x{:02x}）",
+                    bytes[0]
+                ));
+            }
+        }
+        Err(error) => return corrupt(format!("读取文件头失败: {error}")),
+    }
+    IntegrityReport { kind: Integrity::Ok, reason: None }
+}
+
+fn read_file_head(path: &Path, buffer: &mut [u8]) -> Result<usize, String> {
+    let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match file.read(&mut buffer[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(filled)
+}
+
+/// 文本/HTML 探测：全为可打印 ASCII 或空白 → 不可能是模型二进制
+fn looks_like_text(bytes: &[u8]) -> bool {
+    bytes.iter().all(|b| {
+        *b == b'\n' || *b == b'\r' || *b == b'\t' || (0x20..=0x7e).contains(b)
+    })
+}
+
+fn known_model(filename: &str) -> Option<(u64, &'static str)> {
+    KNOWN_MODELS
+        .iter()
+        .find(|(name, _, _)| *name == filename)
+        .map(|(_, size_mb, md5)| (*size_mb, *md5))
+}
+
+/// #1128b：单文件下载大小上限。登记表内按「期望大小 ×1.2 + 32MB」留余量，表外统一 330MB
+fn max_bytes_for(filename: &str) -> u64 {
+    match known_model(filename) {
+        Some((size_mb, _)) => {
+            size_mb
+                .saturating_mul(1024 * 1024)
+                .saturating_mul(12)
+                / 10
+                + 32 * 1024 * 1024
+        }
+        None => MAX_UNKNOWN_MODEL_BYTES,
+    }
+}
+
+/// #1128a：下载地址白名单——仅 HTTPS，主机必须在允许列表内；
+/// github.com 还要求路径以 rembg 官方 release 前缀开头（其他主机是 GitHub CDN 重定向目标）
+fn validate_download_url(url: &str) -> Result<reqwest::Url, String> {
+    let parsed = reqwest::Url::parse(url.trim()).map_err(|e| format!("下载地址无效: {e}"))?;
+    if parsed.scheme() != "https" {
+        return Err("下载地址必须使用 HTTPS（模型仅允许从 rembg 官方 release 下载）".to_string());
+    }
+    let host = parsed.host_str().unwrap_or_default().trim_end_matches('.').to_ascii_lowercase();
+    if !ALLOWED_DOWNLOAD_HOSTS.contains(&host.as_str()) {
+        return Err(format!(
+            "下载主机 {host} 不在允许列表内（仅允许 GitHub 官方 release/CDN 域名）"
+        ));
+    }
+    if host == "github.com" && !parsed.path().starts_with(REMBG_RELEASE_PATH_PREFIX) {
+        return Err(format!(
+            "github.com 仅允许下载 rembg 官方 release（路径需以 {REMBG_RELEASE_PATH_PREFIX} 开头）"
+        ));
+    }
+    Ok(parsed)
+}
+
+/// 重定向目标同样要过白名单（GitHub release 会 302 到 CDN，不能一刀切禁跟随）
+fn download_host_allowed(url: &reqwest::Url) -> bool {
+    if url.scheme() != "https" {
+        return false;
+    }
+    let host = url.host_str().unwrap_or_default().trim_end_matches('.').to_ascii_lowercase();
+    ALLOWED_DOWNLOAD_HOSTS.contains(&host.as_str())
+}
+
+/// #1128c：md5 以 Rust 内置表为准——登记表内的文件忽略调用方传值（仅做一致性校验），
+/// 表外文件必须提供 32 位十六进制 md5，避免「校验值也可被调用方指定」
+fn resolve_download_md5(filename: &str, provided: &str) -> Result<String, String> {
+    let provided = provided.trim().to_ascii_lowercase();
+    match known_model(filename) {
+        Some((_, expected)) => {
+            if !provided.is_empty() && provided != expected {
+                return Err(format!(
+                    "模型 {filename} 的校验值与内置登记表不一致，已拒绝下载"
+                ));
+            }
+            Ok(expected.to_string())
+        }
+        None => {
+            if provided.len() != 32 || !provided.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err("未登记的模型必须提供 32 位 MD5 校验值".to_string());
+            }
+            Ok(provided)
+        }
+    }
 }
 
 fn set_install_state(model_id: &str, filename: &str, state: &str, error: Option<String>) {
@@ -148,6 +416,7 @@ fn set_install_state(model_id: &str, filename: &str, state: &str, error: Option<
 
 fn status_for(model_id: &str, filename: &str) -> ModelStatus {
     let dir = models_dir().cloned().unwrap_or_default();
+    let integrity = model_integrity(&dir, filename);
     let guard = INSTALL.lock().unwrap_or_else(|e| e.into_inner());
     let active = guard.model_id.as_deref() == Some(model_id);
     ModelStatus {
@@ -156,9 +425,14 @@ fn status_for(model_id: &str, filename: &str) -> ModelStatus {
         bytes: if active { guard.bytes } else { 0 },
         total: if active { guard.total } else { 0 },
         error: if active { guard.error.clone() } else { None },
-        installed: installed(&dir, filename),
+        installed: integrity.kind == Integrity::Ok,
+        integrity: integrity.kind.as_str().to_string(),
+        integrity_reason: integrity.reason,
+        dir: models_dir().map(|d| d.display().to_string()),
+        writable: MODELS_DIR_WRITABLE.load(Ordering::Relaxed),
     }
 }
+
 
 fn sleep_ms(ms: u64) {
     std::thread::sleep(std::time::Duration::from_millis(ms));
@@ -170,6 +444,14 @@ async fn connect_with_retry(url: &str, headers: Vec<(String, String)>) -> Result
     for attempt in 1..=MAX_CONNECT_ATTEMPTS {
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_millis(CONNECT_TIMEOUT_MS))
+            // #1128a：重定向目标也要过白名单，避免下载源 302 到内网/任意主机
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() > 5 || !download_host_allowed(attempt.url()) {
+                    attempt.stop()
+                } else {
+                    attempt.follow()
+                }
+            }))
             .build()
             .map_err(|e| format!("HTTP 客户端创建失败: {e}"))?;
         let mut req = client.get(url);
@@ -178,9 +460,13 @@ async fn connect_with_retry(url: &str, headers: Vec<(String, String)>) -> Result
         }
         match req.send().await {
             Ok(response) => {
-                if RETRYABLE_STATUS.contains(&response.status().as_u16()) {
-                    last_error = Some(format!("HTTP {}", response.status().as_u16()));
-                    eprintln!("[model-download] 收到可重试状态 HTTP {}，第 {attempt}/{MAX_CONNECT_ATTEMPTS} 次", response.status().as_u16());
+                let status = response.status().as_u16();
+                if RETRYABLE_STATUS.contains(&status) {
+                    last_error = Some(format!("HTTP {status}"));
+                    eprintln!("[model-download] 收到可重试状态 HTTP {status}，第 {attempt}/{MAX_CONNECT_ATTEMPTS} 次");
+                } else if (300..400).contains(&status) {
+                    // 重定向策略只放行白名单主机：走到这里说明跳到了未授权地址
+                    return Err("下载地址被重定向到未授权的地址（仅允许 GitHub 官方域名），已拒绝".to_string());
                 } else {
                     return Ok(response);
                 }
@@ -197,13 +483,14 @@ async fn connect_with_retry(url: &str, headers: Vec<(String, String)>) -> Result
     Err(last_error.unwrap_or_else(|| "无法连接下载源".to_string()))
 }
 
-/// 下载一个文件到 part（断点续传；连接中断自动续传，但轮数与总时长有上限且可取消）
+/// 下载一个文件到 part（断点续传；连接中断自动续传，但轮数、总时长与总字节数都有上限且可取消）
 async fn download_to_part(
     dir: &Path,
     filename: &str,
     url: &str,
     model_id: &str,
     cancel: &AtomicBool,
+    max_bytes: u64,
 ) -> Result<(), String> {
     let part = model_part_file(dir, filename);
     let started = Instant::now();
@@ -243,6 +530,14 @@ async fn download_to_part(
             return Err(format!("下载失败：HTTP {status}"));
         }
         let total = offset + response.content_length().unwrap_or(0);
+        // #1128b：先看声明大小，超限直接拒绝（避免拉完才发现白花流量/占满磁盘）
+        if total > max_bytes {
+            return Err(format!(
+                "模型文件超过大小上限（声明 {} MB，上限 {} MB），已拒绝下载",
+                total / 1048576,
+                max_bytes / 1048576
+            ));
+        }
         let mut file = OpenOptions::new().create(true).append(true).open(&part)
             .map_err(|e| format!("打开下载文件失败: {e}"))?;
         let mut stream = response.bytes_stream();
@@ -255,8 +550,16 @@ async fn download_to_part(
             }
             match chunk {
                 Ok(bytes) => {
-                    file.write_all(&bytes).map_err(|e| format!("写入下载文件失败: {e}"))?;
                     downloaded += bytes.len() as u64;
+                    // #1128b：真实写入量也要设上限（服务端可能不报 Content-Length）
+                    if downloaded > max_bytes {
+                        let _ = fs::remove_file(&part);
+                        return Err(format!(
+                            "模型文件超过大小上限（{} MB），下载已中止",
+                            max_bytes / 1048576
+                        ));
+                    }
+                    file.write_all(&bytes).map_err(|e| format!("写入下载文件失败: {e}"))?;
                     // 仅当全局状态槽仍属于本模型时才回写进度：并发的另一个模型下载接管状态后，
                     // 旧任务的进度会污染新模型的 UI（B116 跨模型污染）
                     let mut guard = INSTALL.lock().unwrap_or_else(|e| e.into_inner());
@@ -424,11 +727,12 @@ async fn download_model(
     md5: &str,
     model_id: &str,
     cancel: &AtomicBool,
+    max_bytes: u64,
 ) -> Result<(), String> {
     let destination = model_file(dir, filename);
     let part = model_part_file(dir, filename);
     for round in 1..=3u32 {
-        download_to_part(dir, filename, url, model_id, cancel).await?;
+        download_to_part(dir, filename, url, model_id, cancel, max_bytes).await?;
         println!("[model-download] 第 {round} 轮下载完成，正在校验完整性…");
         let digest = file_md5(&part)?;
         if md5.is_empty() || digest == md5 {
@@ -452,9 +756,20 @@ pub async fn model_download_start(
 ) -> Result<ModelStatus, String> {
     let dir = init_models_dir(&app)?;
     let safe = safe_model_filename(&filename)?;
+    // #1128：入口加固——URL 主机白名单（仅 HTTPS + GitHub/rembg release 路径）、
+    // md5 以内置登记表为准、单文件大小上限，避免该命令被当成 SSRF/任意落盘通道
+    let url = validate_download_url(&url)?.to_string();
+    let md5 = resolve_download_md5(&safe, &md5)?;
+    let max_bytes = max_bytes_for(&safe);
     if installed(&dir, &safe) {
         set_install_state(&model_id, &safe, "done", None);
         return Ok(status_for(&model_id, &safe));
+    }
+    if !MODELS_DIR_WRITABLE.load(Ordering::Relaxed) {
+        return Err(format!(
+            "模型目录不可写（{}）：请改用便携版/绿色版，或手动下载模型后放入该目录",
+            dir.display()
+        ));
     }
     // 「检查是否已在下载 + 标记下载中」必须放在同一持锁临界区：
     // 否则两个并发调用都能通过检查，对同一模型启动两次下载（双倍流量/互相覆盖 .part）
@@ -495,6 +810,7 @@ pub async fn model_download_start(
             &spawn_md5,
             &spawn_model_id,
             &spawn_cancel,
+            max_bytes,
         )
         .await;
         let mut guard = INSTALL.lock().unwrap_or_else(|e| e.into_inner());
@@ -588,10 +904,17 @@ pub async fn model_remove(model_id: String, filename: String) -> Result<(), Stri
 /// 供 model:// 自定义协议读取模型文件（返回文件字节；失败返回 None）。
 /// B123：自定义协议要求一次性返回完整 body，无法流式；模型文件通常几十 MB，
 /// 这里维持全量读入（协议层无 Range 支持）。若将来引入超大模型，需改用分块协议。
+/// #1130：先查用户可写目录，再回退只读内置目录（安装包自带模型 / 尚未迁移的场景）。
 pub fn read_model_file(filename: &str) -> Option<Vec<u8>> {
-    let dir = models_dir()?;
     let safe = safe_model_filename(filename).ok()?;
-    let path = model_file(dir, &safe);
+    if let Some(dir) = models_dir() {
+        let path = model_file(dir, &safe);
+        if path.is_file() {
+            return fs::read(path).ok();
+        }
+    }
+    let bundled = BUNDLED_MODELS_DIR.get()?.as_ref()?;
+    let path = model_file(bundled, &safe);
     if !path.is_file() {
         return None;
     }
@@ -600,7 +923,29 @@ pub fn read_model_file(filename: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{md5_hex, Md5};
+    use super::{
+        max_bytes_for, md5_hex, model_integrity, resolve_download_md5, validate_download_url,
+        Integrity, Md5, MAX_UNKNOWN_MODEL_BYTES,
+    };
+    use std::fs;
+    use std::path::PathBuf;
+
+    /// 每个测试独立的临时目录（避免并行测试互相踩）
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("novelforge-models-test-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_model(dir: &PathBuf, filename: &str, size: usize, first_byte: u8) -> PathBuf {
+        let path = dir.join(filename);
+        let mut bytes = vec![0u8; size];
+        bytes[0] = first_byte;
+        bytes[1] = 0x07;
+        fs::write(&path, &bytes).unwrap();
+        path
+    }
 
     #[test]
     fn md5_streaming_matches_one_shot() {
@@ -628,5 +973,96 @@ mod tests {
             md5_hex(multi_block.as_bytes()),
             "57edf4a22be3c955ac49da2e2107b67a"
         );
+    }
+
+    #[test]
+    fn download_url_must_be_https_allowlisted_and_rembg_release() {
+        // 官方 release 地址与 CDN 重定向目标都放行
+        assert!(validate_download_url(
+            "https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2netp.onnx"
+        )
+        .is_ok());
+        assert!(validate_download_url("https://objects.githubusercontent.com/github-production-release-asset/1/x?X-Amz=1").is_ok());
+
+        for rejected in [
+            // 非 HTTPS / 其他协议
+            "http://github.com/danielgatis/rembg/releases/download/v0.0.0/u2netp.onnx",
+            "ftp://github.com/danielgatis/rembg/releases/download/v0.0.0/u2netp.onnx",
+            "file:///etc/passwd",
+            // 白名单外主机（含内网/元数据地址）
+            "https://evil.example.com/u2netp.onnx",
+            "https://169.254.169.254/latest/meta-data",
+            "https://raw.githubusercontent.com/danielgatis/rembg/main/u2netp.onnx",
+            // 同主机但非 rembg release 路径
+            "https://github.com/danielgatis/rembg/archive/refs/heads/main.zip",
+            // 伪造成 github.com 子域（host 不是 github.com）
+            "https://github.com.evil.example/u2netp.onnx",
+        ] {
+            assert!(validate_download_url(rejected).is_err(), "应拒绝下载地址: {rejected}");
+        }
+    }
+
+    #[test]
+    fn download_md5_comes_from_builtin_table_for_known_models() {
+        // 登记表内的模型：调用方不传 / 传对 → 用内置值；传错 → 拒绝
+        assert_eq!(
+            resolve_download_md5("u2netp.onnx", "").unwrap(),
+            "8e83ca70e441ab06c318d82300c84806"
+        );
+        assert_eq!(
+            resolve_download_md5("u2netp.onnx", "8E83CA70E441AB06C318D82300C84806").unwrap(),
+            "8e83ca70e441ab06c318d82300c84806"
+        );
+        assert!(resolve_download_md5("u2netp.onnx", "00000000000000000000000000000000").is_err());
+        // 表外文件：必须给出 32 位十六进制校验值
+        assert_eq!(
+            resolve_download_md5("future-model.onnx", "0123456789abcdef0123456789abcdef").unwrap(),
+            "0123456789abcdef0123456789abcdef"
+        );
+        assert!(resolve_download_md5("future-model.onnx", "").is_err());
+        assert!(resolve_download_md5("future-model.onnx", "deadbeef").is_err());
+        assert!(resolve_download_md5("future-model.onnx", "zz23456789abcdef0123456789abcdef").is_err());
+    }
+
+    #[test]
+    fn download_size_limit_matches_registry() {
+        // 登记表内：期望大小 ×1.2 + 32MB（5MB 的 u2netp 上限约 38MB）
+        assert_eq!(max_bytes_for("u2netp.onnx"), 5 * 1024 * 1024 * 12 / 10 + 32 * 1024 * 1024);
+        // 表外：统一 330MB
+        assert_eq!(max_bytes_for("future-model.onnx"), MAX_UNKNOWN_MODEL_BYTES);
+    }
+
+    #[test]
+    fn integrity_rejects_missing_truncated_and_broken_models() {
+        let dir = temp_dir("integrity");
+        // 缺失
+        assert_eq!(model_integrity(&dir, "u2netp.onnx").kind, Integrity::Missing);
+
+        // 截断（大小远小于登记值）
+        write_model(&dir, "u2netp.onnx", 1024 * 1024, 0x08);
+        let truncated = model_integrity(&dir, "u2netp.onnx");
+        assert_eq!(truncated.kind, Integrity::Corrupt);
+        assert!(truncated.reason.unwrap().contains("不完整"));
+
+        // 占位文件（全零）
+        write_model(&dir, "u2netp.onnx", 8 * 1024 * 1024, 0x00);
+        assert_eq!(model_integrity(&dir, "u2netp.onnx").kind, Integrity::Corrupt);
+
+        // 错误页被当成模型保存（文本/HTML）
+        let html = dir.join("u2netp.onnx");
+        let mut text = vec![b' '; 8 * 1024 * 1024];
+        text[..15].copy_from_slice(b"<html><body>404");
+        fs::write(&html, &text).unwrap();
+        assert_eq!(model_integrity(&dir, "u2netp.onnx").kind, Integrity::Corrupt);
+
+        // 大小达标但文件头不是 ONNX
+        write_model(&dir, "u2netp.onnx", 6 * 1024 * 1024, 0x77);
+        assert_eq!(model_integrity(&dir, "u2netp.onnx").kind, Integrity::Corrupt);
+
+        // 正常（ONNX ModelProto 首字节 0x08）
+        write_model(&dir, "u2netp.onnx", 6 * 1024 * 1024, 0x08);
+        assert_eq!(model_integrity(&dir, "u2netp.onnx").kind, Integrity::Ok);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

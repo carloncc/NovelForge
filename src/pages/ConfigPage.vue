@@ -17,7 +17,8 @@ import { errMsg } from "../utils/errors";
 import { log } from "../utils/logger";
 import { currentLang, t } from "../i18n";
 import PageHead from "../components/PageHead.vue";
-import { knownImageModelCapabilities } from "../api/providers";
+import { knownImageModelCapabilities, isImageCapabilityConflict } from "../api/providers";
+import { checkCustomTemplate } from "../api/templates";
 import { resolveContextLength, inputCharBudget } from "../api/providers";
 import { DEFAULT_CONCURRENCY_BY_CHANNEL, type CutoutMode } from "../stores/configMigration";
 import type { ApiConfig, ChannelKey, ImageModelCapabilities } from "../core/types";
@@ -47,8 +48,21 @@ const cutoutStatusText = computed(() => {
     return t("正在下载模型「{name}」… {progress}", { name: model.label, progress });
   }
   if (status.state === "error") return t("模型「{name}」下载失败：{error}", { name: model.label, error: status.error ?? "" });
+  // #1129：文件存在但大小/文件头校验不过时判 corrupt（不再显示「已安装」误导），给出重下入口
+  if (status.integrity === "corrupt") {
+    return t("模型「{name}」校验失败（{reason}），请重新下载", { name: model.label, reason: status.integrity_reason ?? "" });
+  }
   if (status.installed) return t("模型「{name}」（{size} MB）已安装，可直接用于 AI 抠图", { name: model.label, size: model.sizeMB });
   return t("模型「{name}」（{size} MB）未安装，手动下载后可启用 AI 抠图", { name: model.label, size: model.sizeMB });
+});
+
+/** 模型目录不可写提示（#1130：AppImage/deb/安装版 resource_dir 只读时下载必然失败） */
+const cutoutWritableHint = computed(() => {
+  const status = cutoutStatus.value;
+  if (status && status.writable === false) {
+    return t("模型目录不可写（{dir}）：AI 抠图模型无法下载，请改用便携版/绿色版，或手动下载模型后放入该目录", { dir: status.dir ?? cutoutModelDir.value });
+  }
+  return "";
 });
 
 const cutoutStatusClass = computed(() => {
@@ -63,6 +77,8 @@ const cutoutStatusClass = computed(() => {
 async function refreshCutoutStatus(): Promise<void> {
   const status = await cutoutModelStatus(currentCutoutModel.value);
   cutoutStatus.value = status;
+  // #1130：目录以后端返回的实际可写目录为准（不再写死 resource_dir/models）
+  if (status.dir) cutoutModelDir.value = status.dir;
   if (status.state === "downloading") scheduleCutoutPoll();
   else stopCutoutPoll();
 }
@@ -124,7 +140,8 @@ watch(
 
 onMounted(async () => {
   await refreshCutoutStatus();
-  if (isTauri()) {
+  // 兜底：状态查询失败时才用 resourceDir 占位，正常由 refreshCutoutStatus 按后端实际目录回填
+  if (!cutoutModelDir.value && isTauri()) {
     cutoutModelDir.value = `${(await tauri.resourceDir().catch(() => ""))}/models`;
   }
 });
@@ -219,8 +236,50 @@ function toggleCustom(key: string): void {
   customOpen.value[key] = !customOpen.value[key];
 }
 
-function showTemplateError(): void {
-  globalThis.alert(t("模板 JSON 格式错误"));
+/** 自定义模板内联错误（#1126）：字段旁常驻展示，不再 alert 后照样写坏值 */
+const templateError = ref<Record<string, string>>({});
+
+/** 自定义模板输入处理（#1126）：先校验再写入；非法 JSON 不写入配置（回滚显示旧值），
+ *  坏值因此落不了盘，运行期不会再因模板解析失败而难定位 */
+function onCustomTemplateChange(cfg: ApiConfig, e: Event): void {
+  const el = e.target as HTMLTextAreaElement;
+  const v = el.value.trim();
+  if (!v) {
+    cfg.extra!.customTemplate = undefined;
+    templateError.value[cfg.id] = "";
+    return;
+  }
+  const checked = checkCustomTemplate(v);
+  if (checked.ok) {
+    cfg.extra!.customTemplate = v;
+    templateError.value[cfg.id] = "";
+  } else {
+    templateError.value[cfg.id] = checked.error;
+    // 回滚显示：把输入框恢复为上次合法值（或空），坏值只留在错误提示里
+    el.value = (cfg.extra!.customTemplate as string | undefined) ?? "";
+  }
+}
+
+/** 音色库输入处理（#1139）：清空需二次确认（清空后配音将不可用，无假回退） */
+function onVoiceLibraryChange(cfg: ApiConfig, e: Event): void {
+  const el = e.target as HTMLTextAreaElement;
+  const list = el.value.split("\n").map((s: string) => s.trim()).filter(Boolean);
+  if (!list.length) {
+    const old = Array.isArray(cfg.extra!.voiceLibrary) ? [...(cfg.extra!.voiceLibrary as string[])] : [];
+    if (old.length && !window.confirm(t("清空音色库后配音将不可用（各 TTS 服务均无名为 default 的音色）。确定要清空吗？"))) {
+      el.value = old.join("\n");
+      return;
+    }
+    // 允许清空：显式 [] 以用户为准，配音阶段会直接报可读错误而不是逐句 400 重试
+    cfg.extra!.voiceLibrary = [];
+    return;
+  }
+  cfg.extra!.voiceLibrary = list;
+}
+
+/** 音色库是否被清空（#1139）：显式 [] 才算空，undefined 回退默认表不算空 */
+function isVoiceLibraryCleared(cfg: ApiConfig): boolean {
+  return Array.isArray(cfg.extra?.voiceLibrary) && (cfg.extra!.voiceLibrary as string[]).length === 0;
 }
 
 async function runTest(kind: ChannelKey, cfg: ApiConfig): Promise<void> {
@@ -309,8 +368,16 @@ function setImageCapability<K extends keyof ImageModelCapabilities>(
 }
 
 function imageCapabilityConflict(cfg: ApiConfig): boolean {
-  const capabilities = editableImageCapabilities(cfg);
-  return capabilities.maxReferenceImages > 0 && !capabilities.supportsImageEdit;
+  return isImageCapabilityConflict(editableImageCapabilities(cfg));
+}
+
+/** #1125 一键修复：冲突时二选一（自动启用图生图 / 参考图数置 0），修完即与运行期口径一致 */
+function fixImageCapabilityEnableEdit(cfg: ApiConfig): void {
+  setImageCapability(cfg, "supportsImageEdit", true);
+}
+
+function fixImageCapabilityZeroRef(cfg: ApiConfig): void {
+  setImageCapability(cfg, "maxReferenceImages", 0);
 }
 
 /** 模型下拉可选项：仅来自自动拉取的 /models 列表（按通道过滤），不内置默认模型 */
@@ -571,16 +638,13 @@ watch(
               <textarea
                 :value="(cfg.extra!.voiceLibrary as string[] | undefined)?.join('\n') ?? ''"
                 rows="4"
-                @change="
-                  (e: any) => {
-                    const list = (e.target as HTMLTextAreaElement).value.split('\n').map((s: string) => s.trim()).filter(Boolean);
-                    // 允许清空：此前空值被忽略，音色库只能增不能减
-                    cfg.extra!.voiceLibrary = list;
-                  }
-                "
+                @change="(e: any) => onVoiceLibraryChange(cfg, e)"
                 placeholder="female-tianmei&#10;male-qn-qingse&#10;female-chengshu"
               />
             </label>
+            <div v-if="isVoiceLibraryCleared(cfg)" class="notice danger mt-2">
+              {{ t("音色库为空：配音将不可用（各 TTS 服务均无名为 default 的音色）。请至少填写一个可用音色，或从 MiniMax 获取。") }}
+            </div>
             <div v-if="cfg.adapter === 'minimax-tts' || /minimaxi?\.com/i.test(cfg.baseUrl)" class="row mt-2">
               <button class="btn secondary small" :disabled="voiceFetching === cfg.id || !cfg.apiKey" @click="fetchVoicesFor(cfg)">
                 {{ voiceFetching === cfg.id ? t("获取中…") : t("从 MiniMax 获取音色") }}
@@ -678,6 +742,9 @@ watch(
             <div v-if="knownImageModelCapabilities(cfg.model)" class="notice mt-2">
               {{ t("已知模型能力：最多") }} {{ knownImageModelCapabilities(cfg.model)!.maxReferenceImages }} {{ t("张参考图，编码") }} {{ knownImageModelCapabilities(cfg.model)!.referenceEncoding }}
             </div>
+            <div v-else-if="cfg.model?.trim()" class="notice mt-2">
+              {{ t("未识别该模型能力，请点一次「测试连接」自动探测（否则参考图/图生图将不可用）。") }}
+            </div>
             <div v-else class="cfg-row mt-2">
               <label class="field">
                 <span>{{ t("参考图数量（0–3）") }}</span>
@@ -705,7 +772,11 @@ watch(
               <label class="check"><input type="checkbox" :checked="editableImageCapabilities(cfg).supportsSeed" @change="(e: any) => setImageCapability(cfg, 'supportsSeed', (e.target as HTMLInputElement).checked)" /> {{ t("固定 seed") }}</label>
             </div>
             <div v-if="!knownImageModelCapabilities(cfg.model) && imageCapabilityConflict(cfg)" class="notice danger">
-              {{ t("参考图数量大于 0 时必须启用图生图。") }}
+              {{ t("参考图数量大于 0 时必须启用图生图，否则保存后运行期将批量失败（REFERENCE_UNSUPPORTED）。") }}
+              <div class="row mt-2">
+                <button class="btn secondary small" @click="fixImageCapabilityEnableEdit(cfg)">{{ t("一键修复：启用图生图") }}</button>
+                <button class="btn ghost small" @click="fixImageCapabilityZeroRef(cfg)">{{ t("参考图数置 0") }}</button>
+              </div>
             </div>
           </details>
           <details v-if="customOpen[ch.key + ':' + cfg.id]" class="cfg-details">
@@ -724,17 +795,12 @@ watch(
   "requestMap": { "model": "$model", "prompt": "$prompt" },
   "response": { "path": "data", "encoding": "base64" }
 }'
-                @change="
-                  (e: any) => {
-                    const v = (e.target as HTMLTextAreaElement).value.trim();
-                    cfg.extra!.customTemplate = v || undefined;
-                    if (v) {
-                      try { JSON.parse(v); } catch { showTemplateError(); }
-                    }
-                  }
-                "
+                @change="(e: any) => onCustomTemplateChange(cfg, e)"
               />
             </label>
+            <div v-if="templateError[cfg.id]" class="notice danger mt-2">
+              {{ t("模板 JSON 无效：") }}{{ templateError[cfg.id] }}{{ t("（坏值未写入配置，请修正后失焦重试）") }}
+            </div>
           </details>
         </div>
 
@@ -785,6 +851,9 @@ watch(
       </div>
       <div class="cfg-row">
         <span class="cutout-status" :class="cutoutStatusClass">{{ cutoutStatusText }}</span>
+      </div>
+      <div v-if="cutoutWritableHint" class="cfg-row">
+        <span class="notice danger">{{ cutoutWritableHint }}</span>
       </div>
       <div class="cfg-row">
         <button class="btn secondary small" :disabled="cutoutBusy || cutoutStatus?.installed || cutoutMode !== 'ai'" @click="downloadCurrentModel">

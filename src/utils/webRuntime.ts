@@ -354,6 +354,9 @@ export async function webStartPreviewServer(root: string): Promise<{ url: string
 /** 已压缩的媒体/字体文件：直接 store，不再浪费 CPU 二次压缩（大项目能快一个数量级） */
 const ZIP_MEDIA_RE = /\.(png|jpe?g|webp|gif|mp4|webm|mp3|ogg|opus|wav|flac|m4a|ttf|otf|woff2?)$/i;
 
+/** 流式打包时从 VFS 分批读取的批大小：越小内存峰值越低，越大事务开销越小 */
+const ZIP_READ_BATCH = 8;
+
 /** 在专用 Worker 中压缩（浏览器）；Node（单测）无 Worker 时回退同步压缩 */
 function zipEntries(entries: Record<string, [Uint8Array, { level: 0 | 6 }]>): Promise<Uint8Array> {
   if (typeof Worker === "undefined") {
@@ -380,11 +383,320 @@ function zipEntries(entries: Record<string, [Uint8Array, { level: 0 | 6 }]>): Pr
   });
 }
 
+/** 无法创建流式 zip Worker（旧内核/CSP/非浏览器环境）时抛出：调用方回退到整包压缩 */
+class ZipStreamUnavailable extends Error {}
+
+/**
+ * 流式 ZIP Worker 主体（#1143）：以函数源码注入 Blob Worker，无打包器依赖。
+ * 逐文件压缩：媒体/字体直存、文本用 CompressionStream('deflate-raw')（不支持时退化为直存）；
+ * 压缩结果分块回传主线程（Transferable），Worker 内不保留整包字节，
+ * 内存峰值 ≈ 单个文件 + 已压缩输出（旧实现是「全部原始字节 + 结构化克隆 + 压缩结果」三份叠加）。
+ * 注意：本函数必须自包含（不引用模块作用域的任何变量），因为它以 toString() 注入 Worker。
+ * 导出仅供单测用假 scope 驱动（生产路径只通过 toString() 注入）。
+ */
+export function zipStreamScope(scope: {
+  onmessage: ((ev: { data: unknown }) => void) | null;
+  postMessage: (message: unknown, transfer?: unknown[]) => void;
+}): void {
+  const encoder = new TextEncoder();
+  const u16 = (buf: Uint8Array, off: number, v: number): void => {
+    buf[off] = v & 0xff;
+    buf[off + 1] = (v >>> 8) & 0xff;
+  };
+  const u32 = (buf: Uint8Array, off: number, v: number): void => {
+    buf[off] = v & 0xff;
+    buf[off + 1] = (v >>> 8) & 0xff;
+    buf[off + 2] = (v >>> 16) & 0xff;
+    buf[off + 3] = (v >>> 24) & 0xff;
+  };
+  let crcTable: Uint32Array | null = null;
+  const crc32 = (bytes: Uint8Array): number => {
+    if (!crcTable) {
+      crcTable = new Uint32Array(256);
+      for (let n = 0; n < 256; n++) {
+        let c = n;
+        for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+        crcTable[n] = c >>> 0;
+      }
+    }
+    let c = 0xffffffff;
+    for (let i = 0; i < bytes.length; i++) c = crcTable[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  };
+  /** 分块回传；只转移独占 buffer（压缩流分块可能是大 buffer 的视图，需先拷贝） */
+  const emit = (bytes: Uint8Array): void => {
+    if (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength) {
+      scope.postMessage({ type: "chunk", data: bytes }, [bytes.buffer]);
+    } else {
+      const copy = bytes.slice();
+      scope.postMessage({ type: "chunk", data: copy }, [copy.buffer]);
+    }
+  };
+  interface Entry {
+    name: Uint8Array;
+    method: number;
+    crc: number;
+    comp: number;
+    uncomp: number;
+    offset: number;
+  }
+  const entries: Entry[] = [];
+  let offset = 0;
+  const MAX32 = 0xffffffff;
+
+  const addFile = async (path: string, data: Uint8Array, store: boolean): Promise<void> => {
+    if (entries.length >= 65535) throw new Error("文件数超过 ZIP（非 zip64）上限 65535");
+    if (data.byteLength > MAX32) throw new Error(`单个文件超过 ZIP 4GB 上限：${path}`);
+    const name = encoder.encode(path);
+    if (name.length > 65535) throw new Error(`文件名过长：${path}`);
+    const canDeflate = !store && typeof CompressionStream !== "undefined";
+    const method = canDeflate ? 8 : 0;
+    const crc = crc32(data);
+    const localOffset = offset;
+    // 本地文件头：bit3 = 数据描述符（压缩后尺寸未知），bit11 = UTF-8 名称
+    const header = new Uint8Array(30 + name.length);
+    u32(header, 0, 0x04034b50);
+    u16(header, 4, 20);
+    u16(header, 6, 0x0808);
+    u16(header, 8, method);
+    u16(header, 10, 0);
+    u16(header, 12, 0x0021); // 1980-01-01：0 日期会被部分解压工具判为非法
+    u32(header, 14, 0);
+    u32(header, 18, 0);
+    u32(header, 22, 0);
+    u16(header, 26, name.length);
+    u16(header, 28, 0);
+    header.set(name, 30);
+    offset += header.length;
+    emit(header);
+
+    let comp = data.byteLength;
+    if (method === 8) {
+      comp = 0;
+      const stream = new CompressionStream("deflate-raw");
+      const writer = stream.writable.getWriter();
+      const reader = stream.readable.getReader();
+      const pump = (async () => {
+        await writer.write(data);
+        await writer.close();
+      })();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        comp += value.byteLength;
+        emit(value);
+      }
+      await pump;
+    } else if (data.byteLength > 0) {
+      emit(data); // 转移文件字节，Worker 不保留副本
+    }
+    offset += comp;
+    // 数据描述符：签名 + crc + 压缩尺寸 + 原始尺寸
+    const dd = new Uint8Array(16);
+    u32(dd, 0, 0x08074b50);
+    u32(dd, 4, crc);
+    u32(dd, 8, comp);
+    u32(dd, 12, data.byteLength);
+    offset += dd.length;
+    emit(dd);
+    if (offset > MAX32) throw new Error("项目超过 ZIP（非 zip64）4GB 上限");
+    entries.push({ name, method, crc, comp, uncomp: data.byteLength, offset: localOffset });
+  };
+
+  const finish = (): void => {
+    const cdOffset = offset;
+    let cdSize = 0;
+    for (const e of entries) {
+      const rec = new Uint8Array(46 + e.name.length);
+      u32(rec, 0, 0x02014b50);
+      u16(rec, 4, 20);
+      u16(rec, 6, 20);
+      u16(rec, 8, 0x0808);
+      u16(rec, 10, e.method);
+      u16(rec, 12, 0);
+      u16(rec, 14, 0x0021);
+      u32(rec, 16, e.crc);
+      u32(rec, 20, e.comp);
+      u32(rec, 24, e.uncomp);
+      u16(rec, 28, e.name.length);
+      u16(rec, 30, 0);
+      u16(rec, 32, 0);
+      u16(rec, 34, 0);
+      u16(rec, 36, 0);
+      u32(rec, 38, 0);
+      u32(rec, 42, e.offset);
+      rec.set(e.name, 46);
+      emit(rec);
+      cdSize += rec.length;
+    }
+    offset += cdSize;
+    const eocd = new Uint8Array(22);
+    u32(eocd, 0, 0x06054b50);
+    u16(eocd, 4, 0);
+    u16(eocd, 6, 0);
+    u16(eocd, 8, entries.length);
+    u16(eocd, 10, entries.length);
+    u32(eocd, 12, cdSize);
+    u32(eocd, 16, cdOffset);
+    u16(eocd, 20, 0);
+    offset += eocd.length;
+    emit(eocd);
+    scope.postMessage({ type: "done", fileCount: entries.length, sizeBytes: offset });
+  };
+
+  let queue: Promise<void> = Promise.resolve();
+  scope.onmessage = (ev: { data: unknown }): void => {
+    const msg = ev.data as { type?: string; path?: string; store?: boolean; data?: ArrayBuffer };
+    queue = queue.then(async () => {
+      try {
+        if (msg.type === "add" && msg.path && msg.data) {
+          await addFile(msg.path, new Uint8Array(msg.data), msg.store === true);
+          scope.postMessage({ type: "added", path: msg.path });
+        } else if (msg.type === "end") {
+          finish();
+        }
+      } catch (error) {
+        scope.postMessage({ type: "error", message: error instanceof Error ? error.message : String(error) });
+      }
+    });
+  };
+}
+
+interface ZipStreamResult {
+  fileCount: number;
+  sizeBytes: number;
+  chunks: Uint8Array[];
+}
+
+interface ZipStreamClient {
+  add(path: string, data: ArrayBuffer, store: boolean): Promise<void>;
+  finish(): Promise<ZipStreamResult>;
+  dispose(): void;
+}
+
+function canStreamZip(): boolean {
+  return typeof Worker !== "undefined" && typeof Blob !== "undefined" && typeof URL !== "undefined" && typeof URL.createObjectURL === "function";
+}
+
+/** 创建流式 zip Worker 客户端（逐文件 add → 回传压缩分块；失败时抛 ZipStreamUnavailable） */
+function createZipStreamClient(): ZipStreamClient {
+  let url = "";
+  let worker: Worker;
+  try {
+    url = URL.createObjectURL(new Blob([`(${zipStreamScope.toString()})(self);`], { type: "text/javascript" }));
+    worker = new Worker(url);
+  } catch (error) {
+    if (url) URL.revokeObjectURL(url);
+    throw new ZipStreamUnavailable(errMsg(error));
+  }
+  const chunks: Uint8Array[] = [];
+  let resolveAdd: (() => void) | null = null;
+  let rejectAdd: ((e: Error) => void) | null = null;
+  let resolveDone: ((r: ZipStreamResult) => void) | null = null;
+  let rejectDone: ((e: Error) => void) | null = null;
+  const settleError = (e: Error): void => {
+    rejectAdd?.(e);
+    rejectDone?.(e);
+    resolveAdd = null;
+    rejectAdd = null;
+    resolveDone = null;
+    rejectDone = null;
+  };
+  worker.onmessage = (ev: MessageEvent<{ type?: string; data?: ArrayBuffer; message?: string; fileCount?: number; sizeBytes?: number }>) => {
+    const msg = ev.data ?? {};
+    if (msg.type === "chunk" && msg.data) {
+      chunks.push(new Uint8Array(msg.data));
+      return;
+    }
+    if (msg.type === "added") {
+      const r = resolveAdd;
+      resolveAdd = null;
+      rejectAdd = null;
+      r?.();
+      return;
+    }
+    if (msg.type === "done") {
+      const r = resolveDone;
+      resolveDone = null;
+      rejectDone = null;
+      r?.({ fileCount: msg.fileCount ?? 0, sizeBytes: msg.sizeBytes ?? 0, chunks });
+      return;
+    }
+    if (msg.type === "error") settleError(new Error(msg.message || t("zip worker 执行失败")));
+  };
+  worker.onerror = (e) => settleError(new Error(e.message || t("zip worker 执行失败")));
+  return {
+    add: (path, data, store) =>
+      new Promise<void>((resolve, reject) => {
+        resolveAdd = resolve;
+        rejectAdd = reject;
+        worker.postMessage({ type: "add", path, store, data }, [data]);
+      }),
+    finish: () =>
+      new Promise<ZipStreamResult>((resolve, reject) => {
+        resolveDone = resolve;
+        rejectDone = reject;
+        worker.postMessage({ type: "end" });
+      }),
+    dispose: () => {
+      worker.terminate();
+      if (url) URL.revokeObjectURL(url);
+    },
+  };
+}
+
+/** 一次性事务列出 + 每批一次事务读取 → 逐文件喂给流式 Worker（#1143/#1144） */
+async function streamZipFromVfs(
+  sourceDir: string,
+  exclude: string[],
+  onProgress?: (done: number, total: number) => void,
+): Promise<ZipStreamResult> {
+  const client = createZipStreamClient();
+  try {
+    await vfs.vfsCollectFilesBatched(
+      sourceDir,
+      exclude,
+      async (files, progress) => {
+        for (const f of files) {
+          await client.add(f.path, f.data, ZIP_MEDIA_RE.test(f.path));
+        }
+        onProgress?.(progress.done, progress.total);
+      },
+      ZIP_READ_BATCH,
+    );
+    return await client.finish();
+  } finally {
+    client.dispose();
+  }
+}
+
+function concatChunks(chunks: Uint8Array[]): Uint8Array {
+  let size = 0;
+  for (const c of chunks) size += c.byteLength;
+  const out = new Uint8Array(size);
+  let off = 0;
+  for (const c of chunks) {
+    out.set(c, off);
+    off += c.byteLength;
+  }
+  return out;
+}
+
 export async function webBuildZip(
   sourceDir: string,
   _zipPath: string,
   exclude: string[],
+  onProgress?: (done: number, total: number) => void,
 ): Promise<{ fileCount: number; sizeBytes: number; data: Uint8Array }> {
+  if (canStreamZip()) {
+    try {
+      const { fileCount, sizeBytes, chunks } = await streamZipFromVfs(sourceDir, exclude, onProgress);
+      return { fileCount, sizeBytes, data: concatChunks(chunks) };
+    } catch (e) {
+      if (!(e instanceof ZipStreamUnavailable)) throw e;
+      log.warn("webRuntime", "流式 zip Worker 不可用，回退整包压缩", { error: errMsg(e) });
+    }
+  }
   const files = await vfs.vfsCollectFiles(sourceDir, exclude);
   const entries: Record<string, [Uint8Array, { level: 0 | 6 }]> = {};
   for (const f of files) {
@@ -394,13 +706,25 @@ export async function webBuildZip(
   return { fileCount: files.length, sizeBytes: zipData.byteLength, data: zipData };
 }
 
-/** 网页版导出：压缩后直接触发浏览器下载（应用层调用，字节不经日志包装） */
+/** 网页版导出：压缩后直接触发浏览器下载（应用层调用，字节不经日志包装）。
+ *  流式路径把压缩分块直接交给 Blob 下载，不再拼成一份连续 Uint8Array（#1143）。 */
 export async function webDownloadZip(
   sourceDir: string,
   exclude: string[],
   downloadName: string,
+  onProgress?: (done: number, total: number) => void,
 ): Promise<{ fileCount: number; sizeBytes: number }> {
-  const { fileCount, sizeBytes, data } = await webBuildZip(sourceDir, "", exclude);
+  if (canStreamZip()) {
+    try {
+      const { fileCount, sizeBytes, chunks } = await streamZipFromVfs(sourceDir, exclude, onProgress);
+      vfs.vfsDownloadChunks(chunks, downloadName, "application/zip");
+      return { fileCount, sizeBytes };
+    } catch (e) {
+      if (!(e instanceof ZipStreamUnavailable)) throw e;
+      log.warn("webRuntime", "流式 zip Worker 不可用，回退整包压缩", { error: errMsg(e) });
+    }
+  }
+  const { fileCount, sizeBytes, data } = await webBuildZip(sourceDir, "", exclude, onProgress);
   vfs.vfsDownloadBytes(data, downloadName, "application/zip");
   return { fileCount, sizeBytes };
 }

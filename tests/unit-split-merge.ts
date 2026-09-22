@@ -1,4 +1,4 @@
-import { mergeTinyChapters, protectSpecialBlocks, protectNumberedBlocks, MIN_CHAPTER_CHARS } from "../src/core/split";
+import { mergeTinyChapters, protectSpecialBlocks, protectNumberedBlocks, MIN_CHAPTER_CHARS, splitChaptersForFallback } from "../src/core/split";
 import type { ChapterInfo } from "../src/core/types";
 
 function assert(cond: boolean, msg: string): void {
@@ -105,6 +105,39 @@ function main(): void {
     assert(discard.has(4), "普通杂项应保留在丢弃集");
     assert(marks.some((m) => m.blockIndex === 2 && m.raw.startsWith("22.")), "救回的块应就地立章");
     for (let i = 1; i < marks.length; i++) assert(marks[i].blockIndex > marks[i - 1].blockIndex, "marks 应保持有序");
+  }
+
+  // #1137：首章前正文（前言/引子）不得丢弃，并入第一章开头
+  {
+    const text = "前言：这是一段引子，交代背景。\n\n第一章 初入江湖\n正文开始。\n\n第二章 再会\n继续。";
+    const chapters = splitChaptersForFallback(text);
+    assert(chapters.length === 2, `应切出 2 章，实际 ${chapters.length}`);
+    assert(chapters[0].text.includes("前言：这是一段引子"), "首章前正文应并入第一章");
+    assert(chapters[0].text.includes("正文开始"), "第一章正文应保留");
+  }
+
+  // #1137：长标题（分隔符后 15 字、含 ，）应识别为标题
+  {
+    const text = "第一章 出发\n正文。\n\n第十二章 少年自远方来，风尘仆仆归故里\n继续。";
+    const chapters = splitChaptersForFallback(text);
+    assert(chapters.length === 2, `长标题应识别，实际 ${chapters.length} 章`);
+    assert(chapters[1].title.includes("第十二章"), `第二章标题应为长标题，实际 ${chapters[1].title}`);
+  }
+
+  // #1137：行首序号前缀（`1.`/`001 `）后接标题应识别；纯序号正文行不应误判
+  {
+    const text = "1. 第一章 标题\n正文开始。\n\n001 第二章 标题\n继续。\n\n1. 苹果很好吃\n买水果。";
+    const chapters = splitChaptersForFallback(text);
+    assert(chapters.length === 2, `序号前缀标题应识别，实际 ${chapters.length} 章`);
+    assert(chapters[0].title === "1. 第一章 标题", `标题原文应保留，实际 ${chapters[0].title}`);
+    assert(chapters[1].text.includes("苹果很好吃"), "序号正文行应留在章内，不另起章");
+  }
+
+  // #1137：英文标题（`Chapter 1 …`）应识别
+  {
+    const text = "Chapter 1 The Beginning\nBody text.\n\nChapter 2 The Journey\nMore body.";
+    const chapters = splitChaptersForFallback(text);
+    assert(chapters.length === 2, `英文标题应识别，实际 ${chapters.length} 章`);
   }
 
   console.log("=== split merge tests passed ===");

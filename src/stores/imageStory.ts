@@ -14,6 +14,7 @@ import type {
 } from "../core/types";
 import { t } from "../i18n";
 import { activeConfig, voiceLibraryFor } from "./config";
+import { concurrencyFor } from "./configMigration";
 import { setActiveAbortSignal } from "../api/abort";
 import { projectState } from "./project";
 import { goPage } from "./nav";
@@ -26,7 +27,16 @@ import { scriptCacheFileName, scriptFingerprint, titleHash } from "../core/cache
 import { scriptChapter } from "../core/script";
 import { extractFromNovelChunked } from "../core/extractAgent";
 import { translateChapter } from "../core/translate";
-import { buildImageStoryPlan, runImageStoryTasks, IMAGE_YUAN_EACH } from "../core/imageStory";
+import {
+  buildImageStoryPlan,
+  deriveImageStoryDir,
+  estimateImageStoryPlan,
+  normalizeShotTriggers,
+  planChapterContinuity,
+  resolveImageStoryDirOnLoad,
+  runImageStoryTasks,
+} from "../core/imageStory";
+import { shotCharacterIdsOf } from "../core/images";
 import { assembleProject, gameKeyFor } from "../core/project";
 import { inferWebgalLanguage } from "../core/render";
 import { resolveTemplateDir } from "../utils/template";
@@ -42,6 +52,16 @@ export interface ImageStoryFailedItem {
 export interface ImageStoryState {
   outputDir: string;
   options: ImageStoryOptions;
+  /** 剧本/台词文风（#1098）：与图像画风 imageStyle 分离，只进剧本指纹与剧本提示词 */
+  scriptStyle: string;
+  /** 目录自动跟随主项目（#1101）：手动选择目录后置 false */
+  dirAuto: boolean;
+  /** 当前目录绑定的主项目指纹（#1101）：与当前主项目不一致时提示「目录属于其他作品」 */
+  dirProjectKey: string;
+  /** 组装：BGM 开关（#1104） */
+  useBgm: boolean;
+  /** 组装：环境音效（SE）开关（#1104） */
+  useSe: boolean;
   cards: ExtractionResult | null;
   chapters: ChapterScript[];
   assets: AssetMap;
@@ -55,6 +75,8 @@ export interface ImageStoryState {
   failed: ImageStoryFailedItem[];
   lastError: string;
   previewUrl: string;
+  /** 预览服务器是否由本页启动且仍在运行（#1102：停止后不再显示「预览已启动」） */
+  previewRunning: boolean;
   zipBusy: boolean;
   lastZipPath: string;
   loaded: boolean;
@@ -75,6 +97,11 @@ const DEFAULT_OPTIONS: ImageStoryOptions = {
 export const imageStoryState = reactive<ImageStoryState>({
   outputDir: "",
   options: { ...DEFAULT_OPTIONS },
+  scriptStyle: "",
+  dirAuto: true,
+  dirProjectKey: "",
+  useBgm: true,
+  useSe: true,
   cards: null,
   chapters: [],
   assets: emptyAssetMap(),
@@ -88,33 +115,167 @@ export const imageStoryState = reactive<ImageStoryState>({
   failed: [],
   lastError: "",
   previewUrl: "",
+  previewRunning: false,
   zipBusy: false,
   lastZipPath: "",
   loaded: false,
 });
 
-/** 输出的图片小说输出目录：默认与主项目同级的 `<书名>-图片版/`，可手动改 */
-export function defaultImageStoryDir(): string {
+/** 主项目指纹（#1101）：目录归属判定用；不含小说正文，避免切章就误判换作品 */
+function mainProjectKey(): string {
   const main = (projectState.outputDir || "").replace(/[\\/]+$/, "");
-  const title = projectState.novel?.fileName?.replace(/\.txt$/i, "") || t("未命名作品");
-  if (!main) return `${title}-图片版`;
-  const parent = main.includes("/") || main.includes("\\") ? main.replace(/[\\/][^\\/]*$/, "") : "";
-  return `${parent ? `${parent}/` : ""}${title}-图片版`;
+  const title = projectState.novel?.fileName ?? "";
+  if (!main && !title) return "";
+  return titleHash(`${main}|${title}`);
 }
 
+/** 输出的图片小说输出目录：默认与主项目同级的 `<书名>-图片版/`，可手动改 */
+export function defaultImageStoryDir(): string {
+  const title = projectState.novel?.fileName?.replace(/\.txt$/i, "") || t("未命名作品");
+  return deriveImageStoryDir(projectState.outputDir || "", title);
+}
+
+/** 当前目录是否属于其他作品（手动指定的目录 + 主项目已切换） */
+export const imageStoryDirForeign = computed(
+  () => !imageStoryState.dirAuto && !!imageStoryState.dirProjectKey && imageStoryState.dirProjectKey !== mainProjectKey(),
+);
+
 function pushLog(step: string, message: string, level: PipelineEvent["level"] = "info"): void {
-  imageStoryState.logs.push({ step, message, level, at: Date.now() });
+  const ev: PipelineEvent = { step, message, level, at: Date.now() };
+  imageStoryState.logs.push(ev);
   if (imageStoryState.logs.length > 500) imageStoryState.logs.splice(0, imageStoryState.logs.length - 500);
+  // #1148：日志同步写入 <图片版目录>/.novel2vn/image-story.log（JSONL），关掉应用后可恢复
+  diskLogEvents.push(ev);
+  if (diskLogEvents.length > LOG_FILE_LIMIT) diskLogEvents.splice(0, diskLogEvents.length - LOG_FILE_LIMIT);
+  scheduleLogFlush();
 }
 
 const META_FILE = (dir: string): string => `${dir}/.novel2vn/image-story.json`;
 const CACHE_ROOT = (dir: string): string => `${dir}/.novel2vn/cache`;
+const LOG_FILE = (dir: string): string => `${dir}/.novel2vn/image-story.log`;
+const FAILED_FILE = (dir: string): string => `${dir}/.novel2vn/image-story-failed.json`;
+
+interface ImageStoryMeta {
+  version?: number;
+  options?: Partial<ImageStoryOptions>;
+  scriptStyle?: string;
+  useBgm?: boolean;
+  useSe?: boolean;
+  dirAuto?: boolean;
+  projectKey?: string;
+}
+
+/* ---- 运行日志落盘（#1148：关掉应用即丢 → 落盘到图片版目录 .novel2vn 下并可恢复） ---- */
+
+const LOG_FILE_LIMIT = 2000;
+const DISPLAY_LOG_LIMIT = 500;
+let diskLogEvents: PipelineEvent[] = [];
+let logWriteChain: Promise<void> = Promise.resolve();
+let logFlushTimer: ReturnType<typeof setTimeout> | undefined;
+
+function scheduleLogFlush(): void {
+  if (logFlushTimer !== undefined) return;
+  logFlushTimer = setTimeout(() => {
+    logFlushTimer = undefined;
+    void flushLogFile();
+  }, 800);
+}
+
+async function flushLogFile(): Promise<void> {
+  const dir = imageStoryState.outputDir;
+  if (!dir || !diskLogEvents.length) return;
+  const payload = diskLogEvents.map((ev) => JSON.stringify(ev)).join("\n");
+  logWriteChain = logWriteChain
+    .then(() => tauri.mkdirAll(`${dir}/.novel2vn`))
+    .then(() => tauri.writeTextFile(LOG_FILE(dir), payload))
+    .catch((e) => logger.warn("imageStory", "图片小说运行日志落盘失败", { error: errMsg(e).slice(0, 160) }));
+  await logWriteChain;
+}
+
+async function readLogFile(dir: string): Promise<PipelineEvent[]> {
+  const out: PipelineEvent[] = [];
+  try {
+    const { text } = await tauri.readTextFile(LOG_FILE(dir));
+    for (const line of text.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const ev = JSON.parse(trimmed) as PipelineEvent;
+        if (ev && typeof ev.message === "string") out.push({ step: ev.step ?? "运行", message: ev.message, level: ev.level ?? "info", at: ev.at ?? Date.now() });
+      } catch {
+        /* 跳过损坏行 */
+      }
+    }
+  } catch {
+    /* 首次运行没有日志文件 */
+  }
+  return out.slice(-LOG_FILE_LIMIT);
+}
+
+/** 恢复日志：本次会话已有内存日志时以内存为准（避免半落盘把本次运行截断） */
+async function syncLogsFromDisk(dir: string): Promise<void> {
+  if (!diskLogEvents.length) diskLogEvents = await readLogFile(dir);
+  imageStoryState.logs = diskLogEvents.slice(-DISPLAY_LOG_LIMIT);
+}
+
+/* ---- 失败项落盘（#1148） ---- */
+
+let failedWriteChain: Promise<void> = Promise.resolve();
+let failedFlushTimer: ReturnType<typeof setTimeout> | undefined;
+
+async function persistFailedItems(): Promise<void> {
+  const dir = imageStoryState.outputDir;
+  if (!dir) return;
+  const payload = JSON.stringify(imageStoryState.failed, null, 2);
+  failedWriteChain = failedWriteChain
+    .then(() => tauri.mkdirAll(`${dir}/.novel2vn`))
+    .then(() => tauri.writeTextFile(FAILED_FILE(dir), payload))
+    .catch((e) => logger.warn("imageStory", "图片小说失败项落盘失败", { error: errMsg(e).slice(0, 160) }));
+  await failedWriteChain;
+}
+
+async function readFailedFile(dir: string): Promise<ImageStoryFailedItem[]> {
+  try {
+    const { text } = await tauri.readTextFile(FAILED_FILE(dir));
+    const parsed = JSON.parse(text) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (f): f is ImageStoryFailedItem =>
+        !!f && typeof f === "object" && typeof (f as ImageStoryFailedItem).key === "string" && typeof (f as ImageStoryFailedItem).message === "string",
+    );
+  } catch {
+    return [];
+  }
+}
+
+function scheduleFailedPersist(): void {
+  if (failedFlushTimer !== undefined) return;
+  failedFlushTimer = setTimeout(() => {
+    failedFlushTimer = undefined;
+    void persistFailedItems();
+  }, 600);
+}
+
+let persistTimer: ReturnType<typeof setTimeout> | undefined;
 
 let saveChain: Promise<void> = Promise.resolve();
 function persist(): void {
   const dir = imageStoryState.outputDir;
   if (!dir) return;
-  const payload = JSON.stringify({ version: 1, outputDir: dir, options: imageStoryState.options }, null, 2);
+  const payload = JSON.stringify(
+    {
+      version: 2,
+      outputDir: dir,
+      options: imageStoryState.options,
+      scriptStyle: imageStoryState.scriptStyle,
+      useBgm: imageStoryState.useBgm,
+      useSe: imageStoryState.useSe,
+      dirAuto: imageStoryState.dirAuto,
+      projectKey: imageStoryState.dirProjectKey,
+    },
+    null,
+    2,
+  );
   saveChain = saveChain
     .then(() => tauri.mkdirAll(`${dir}/.novel2vn`))
     .then(() => tauri.writeTextFile(META_FILE(dir), payload))
@@ -125,32 +286,55 @@ function persist(): void {
 export async function loadImageStoryState(): Promise<void> {
   if (imageStoryState.loaded) return;
   imageStoryState.loaded = true;
-  // 候选目录：上次保存的（主项目同级扫描过深，这里只认自身记录）
-  let dir = "";
+  let remembered = "";
   try {
-    const raw = localStorage.getItem("novelforge:image-story-dir");
-    if (raw) dir = raw;
+    remembered = localStorage.getItem("novelforge:image-story-dir") ?? "";
   } catch {
     /* 忽略 */
   }
-  if (!dir) dir = defaultImageStoryDir();
-  imageStoryState.outputDir = dir;
-  try {
-    const { text } = await tauri.readTextFile(META_FILE(dir));
-    const parsed = JSON.parse(text) as { options?: Partial<ImageStoryOptions> };
-    imageStoryState.options = { ...DEFAULT_OPTIONS, ...(parsed.options ?? {}) };
-  } catch {
-    /* 首次使用：默认选项 */
+  const rememberedMeta = remembered ? await readMeta(remembered) : null;
+  // #1101：自动跟随的目录按当前主项目重算（换作品不残留旧书目录）；手动指定的目录保留但标记归属
+  const decision = resolveImageStoryDirOnLoad({
+    rememberedDir: remembered,
+    rememberedAuto: rememberedMeta?.dirAuto !== false,
+    derivedDir: defaultImageStoryDir(),
+  });
+  const meta = decision.dir === remembered ? rememberedMeta : await readMeta(decision.dir);
+  imageStoryState.outputDir = decision.dir;
+  applyMeta(meta);
+  imageStoryState.dirAuto = meta?.dirAuto !== undefined ? meta.dirAuto !== false : decision.auto;
+  imageStoryState.dirProjectKey = imageStoryState.dirAuto ? mainProjectKey() : (meta?.projectKey ?? "");
+  if (decision.followed && remembered && decision.dir !== remembered) {
+    pushLog("项目", `主项目已切换：图片版目录已跟随为 ${decision.dir}（原目录 ${remembered}）`);
   }
   try {
-    localStorage.setItem("novelforge:image-story-dir", dir);
+    localStorage.setItem("novelforge:image-story-dir", decision.dir);
   } catch {
     /* 忽略 */
   }
   await refreshFromDisk();
 }
 
-/** 从磁盘恢复卡片/剧本/图片映射（换目录或生成结束后调用） */
+async function readMeta(dir: string): Promise<ImageStoryMeta | null> {
+  try {
+    const { text } = await tauri.readTextFile(META_FILE(dir));
+    return JSON.parse(text) as ImageStoryMeta;
+  } catch {
+    return null;
+  }
+}
+
+function applyMeta(meta: ImageStoryMeta | null): void {
+  const includeItems = meta?.options?.includeItems === true;
+  // #1099：图片小说模式不展示物品图（渲染端跳过、鉴赏室不收录），开关强制关闭，避免付费后看不到
+  imageStoryState.options = { ...DEFAULT_OPTIONS, ...(meta?.options ?? {}), includeItems: false };
+  imageStoryState.scriptStyle = typeof meta?.scriptStyle === "string" ? meta.scriptStyle : "";
+  imageStoryState.useBgm = meta?.useBgm !== false;
+  imageStoryState.useSe = meta?.useSe !== false;
+  if (includeItems) pushLog("物品图", t("图片小说模式不展示物品图，已关闭「生成物品图」开关（避免付费后游戏内看不到）"), "warn");
+}
+
+/** 从磁盘恢复卡片/剧本/图片映射/日志/失败项（换目录或生成结束后调用） */
 export async function refreshFromDisk(): Promise<void> {
   const dir = imageStoryState.outputDir;
   if (!dir) return;
@@ -167,26 +351,70 @@ export async function refreshFromDisk(): Promise<void> {
     imageStoryState.assets = emptyAssetMap();
   }
   imageStoryState.chapters = await readCachedChapters();
+  imageStoryState.failed = await readFailedFile(dir);
+  await syncLogsFromDisk(dir);
   refreshPlan();
 }
 
-export function setImageStoryDir(dir: string): void {
-  imageStoryState.outputDir = dir;
+export function setImageStoryDir(dir: string, opts: { manual?: boolean } = {}): void {
+  const next = (dir || "").trim();
+  if (!next) return;
+  if (opts.manual !== false) {
+    // 手动指定：不再自动跟随，并把目录绑定到当前主项目（之后换作品会提示「目录属于其他作品」）
+    imageStoryState.dirAuto = false;
+    imageStoryState.dirProjectKey = mainProjectKey();
+  }
+  if (next === imageStoryState.outputDir) return;
+  imageStoryState.outputDir = next;
+  // 目录变了：旧预览地址不再对应当前产物，日志缓冲也属于旧目录
+  imageStoryState.previewUrl = "";
+  imageStoryState.previewRunning = false;
+  diskLogEvents = [];
   try {
-    localStorage.setItem("novelforge:image-story-dir", dir);
+    localStorage.setItem("novelforge:image-story-dir", next);
   } catch {
     /* 忽略 */
   }
+  void persist();
   void refreshFromDisk();
 }
 
+/** 按当前作品重算目录（#1101）：页面「按当前作品重算目录」按钮与主项目切换时自动跟随共用 */
+export function followMainProjectDir(): void {
+  imageStoryState.dirAuto = true;
+  imageStoryState.dirProjectKey = mainProjectKey();
+  setImageStoryDir(defaultImageStoryDir(), { manual: false });
+}
+
 watch(
-  () => JSON.stringify(imageStoryState.options),
+  () => JSON.stringify([imageStoryState.options, imageStoryState.scriptStyle, imageStoryState.useBgm, imageStoryState.useSe]),
   () => {
-    persist();
     refreshPlan();
+    // #1103：每键入即写盘 → 防抖 500ms，连续调参只落盘一次
+    if (persistTimer !== undefined) clearTimeout(persistTimer);
+    persistTimer = setTimeout(() => {
+      persistTimer = undefined;
+      persist();
+    }, 500);
   },
 );
+
+watch(
+  () => JSON.stringify(imageStoryState.failed),
+  () => scheduleFailedPersist(),
+);
+
+// #1101：主项目切换时，自动跟随的目录立刻重算；手动目录保持不动（由页面提示「属于其他作品」）
+watch(mainProjectKey, (key) => {
+  if (!imageStoryState.loaded) return;
+  if (!imageStoryState.dirAuto) return;
+  imageStoryState.dirProjectKey = key;
+  const next = defaultImageStoryDir();
+  if (next && next !== imageStoryState.outputDir) {
+    pushLog("项目", `主项目已切换：图片版目录跟随为 ${next}`);
+    setImageStoryDir(next, { manual: false });
+  }
+});
 
 /* ==================== 计划与费用 ==================== */
 
@@ -210,28 +438,48 @@ function refreshPlan(): void {
   };
 }
 
-/** 预估：尚无剧本时按「章节数 × 4 场景 × 每场景张数（默认 2）」粗估，供生成前提示 */
+/** 预估：尚无剧本时按「章节数 × 4 场景 × 每场景张数（默认 2）」粗估，供生成前提示（#1103：不限张数时文案须说明是粗估） */
 export const imageStoryEstimate = computed(() => {
   const plan = imageStoryState.plan;
   if (plan) {
-    return { total: plan.total, yuan: plan.yuan, exact: true as const };
+    return { total: plan.total, yuan: plan.yuan, exact: true, unbounded: false };
   }
-  const chapters = enabledChapters.value.length;
-  const perScene = imageStoryState.options.shotsPerScene > 0 ? imageStoryState.options.shotsPerScene : 2;
-  const perChapter = imageStoryState.options.shotsPerChapter > 0 ? imageStoryState.options.shotsPerChapter : 0;
-  const shots = perChapter > 0 ? Math.min(chapters * perChapter, chapters * 4 * perScene) : chapters * 4 * perScene;
-  const total = shots + (imageStoryState.cards?.characters.length ?? 0);
-  return { total, yuan: Math.round(total * IMAGE_YUAN_EACH * 100) / 100, exact: false as const };
+  return estimateImageStoryPlan(
+    enabledChapters.value.length,
+    imageStoryState.options,
+    imageStoryState.cards?.characters.length ?? 0,
+  );
 });
 
 /* ==================== 读取/缓存 ==================== */
 
+/** 剧本缓存指纹（#1098）：只用「剧本文风」scriptStyle——图像画风 imageStyle 只进图像提示词，不进剧本指纹 */
 const scriptFp = (): string =>
   scriptFingerprint({
-    style: imageStoryState.options.imageStyle,
+    style: imageStoryState.scriptStyle,
     compressNarration: false,
     visualMode: "imageOnly",
   });
+
+/** #1134：分镜触发行号兜底（缺失/重复/非递增 → 按剧情均匀铺开）；有修正时写回缓存，保证游戏内演出与缓存一致 */
+async function repairShotTriggers(script: ChapterScript, cacheFile: string): Promise<ChapterScript> {
+  const { chapters, repairs } = normalizeShotTriggers([script]);
+  if (!repairs.length) return script;
+  const fixed = chapters[0];
+  for (const r of repairs) {
+    pushLog(
+      "剧本",
+      `第 ${fixed.chapter + 1} 章场景 ${r.sceneId}：${r.before.length} 张分镜的触发行号缺失/重复/非递增，已按剧情均匀铺开（${r.before.join("/")} → ${r.after.join("/")}）`,
+      "warn",
+    );
+  }
+  try {
+    await tauri.writeTextFile(cacheFile, JSON.stringify(fixed, null, 2));
+  } catch {
+    /* 写回失败不影响本次运行 */
+  }
+  return fixed;
+}
 
 async function readCachedChapters(): Promise<ChapterScript[]> {
   const dir = imageStoryState.outputDir;
@@ -246,7 +494,7 @@ async function readCachedChapters(): Promise<ChapterScript[]> {
     try {
       const { text } = await tauri.readTextFile(file);
       const script = parseChapterScript(JSON.parse(text));
-      out.push(script);
+      out.push(await repairShotTriggers(script, file));
     } catch {
       /* 未生成 */
     }
@@ -360,7 +608,7 @@ async function runScriptStage(llm: NonNullable<ReturnType<typeof activeConfig>>,
     const file = scriptCacheFileName(cacheDir, false, ch.index, eff.title, eff.text, fp);
     try {
       const { text } = await tauri.readTextFile(file);
-      out.push(parseChapterScript(JSON.parse(text)));
+      out.push(await repairShotTriggers(parseChapterScript(JSON.parse(text)), file));
       pushLog("剧本", `第 ${ch.index + 1} 章分镜剧本命中缓存`);
       continue;
     } catch {
@@ -373,10 +621,19 @@ async function runScriptStage(llm: NonNullable<ReturnType<typeof activeConfig>>,
         shotsPerScene: imageStoryState.options.shotsPerScene,
         compressNarration: false,
         style: imageStoryState.options.imageStyle || undefined,
+        onLog: (message) => pushLog("剧本", message),
+        onPart: ({ part, total, phase, elapsedMs }) => {
+          if (total <= 1) return;
+          if (phase === "start" && part === 1) {
+            pushLog("剧本", `第 ${ch.index + 1} 章较长，将分 ${total} 部分逐段生成（每部分约 1–3 分钟）…`);
+          } else if (phase === "done") {
+            pushLog("剧本", `第 ${ch.index + 1} 章第 ${part}/${total} 部分完成（${Math.round(elapsedMs / 1000)}s）`);
+          }
+        },
       });
       await tauri.mkdirAll(cacheDir);
       await tauri.writeTextFile(file, JSON.stringify(script, null, 2));
-      out.push(script);
+      out.push(await repairShotTriggers(script, file));
       const shots = script.scenes.reduce((n, s) => n + (s.shots?.length ?? 0), 0);
       pushLog("剧本", `第 ${ch.index + 1} 章完成：${script.scenes.length} 场景 / ${shots} 分镜`, "success");
     } catch (e) {
@@ -395,13 +652,17 @@ async function runImageStage(cards: ExtractionResult, chapters: ChapterScript[])
     pushLog("图片", "未配置图像 API，跳过图片生成（可在「API 配置」页配置）", "warn");
     return;
   }
+  // #1099：物品图在图片小说模式不参与演出也不进鉴赏室，开关已被强制关闭；历史配置残留时明确告警
+  if (imageStoryState.options.includeItems) pushLog("图片", "「生成物品图」在图片小说模式不生效，已跳过物品图生成", "warn");
   const plan = buildImageStoryPlan(chapters, cards, imageStoryState.options);
   if (!plan.tasks.length) {
     pushLog("图片", "没有可生成的分镜任务（请先完成剧本，或提高张数上限）", "warn");
     return;
   }
+  // #1100：图像并发取该 API 配置（与立绘版/重生成同口径），不再硬编码 3
+  const concurrency = concurrencyFor(imageCfg, "image");
   imageStoryState.plan = { shots: plan.shotCount, threeviews: plan.threeviewCount, items: plan.itemCount, total: plan.tasks.length, yuan: plan.estimatedYuan };
-  pushLog("图片", `开始生成图片：分镜 ${plan.shotCount} 张 / 三视图 ${plan.threeviewCount} 张 / 物品 ${plan.itemCount} 张（预计最多 ¥${plan.estimatedYuan}，命中缓存不重复计费）`);
+  pushLog("图片", `开始生成图片：分镜 ${plan.shotCount} 张 / 三视图 ${plan.threeviewCount} 张（预计最多 ¥${plan.estimatedYuan}，命中缓存不重复计费；并发 ${concurrency}，取自该图像 API 配置）`);
   const assets = await readAssetMap(dir);
   await backupAssetMap(dir).catch(() => null);
   let done = 0;
@@ -410,7 +671,7 @@ async function runImageStage(cards: ExtractionResult, chapters: ChapterScript[])
     tasks: plan.tasks,
     cacheRoot: CACHE_ROOT(dir),
     outputDir: dir,
-    concurrency: 3,
+    concurrency,
     isAborted: () => abortFlag,
     log: (ev) => pushLog(ev.step || "图片", ev.message, ev.level),
     verifyCfg: imageStoryState.options.imageSelfCheck ? activeConfig("vision") : undefined,
@@ -439,35 +700,74 @@ async function runImageStage(cards: ExtractionResult, chapters: ChapterScript[])
   pushLog("图片", `图片完成：产出 ${result.produced} 张，失败 ${result.failed} 张`, result.failed ? "warn" : "success");
 }
 
-async function runAssembleStage(cards: ExtractionResult, chapters: ChapterScript[]): Promise<void> {
+async function runAssembleStage(cards: ExtractionResult, chapters: ChapterScript[]): Promise<boolean> {
   const dir = imageStoryState.outputDir;
   imageStoryState.stage = "组装";
+  // #1111/#1132：组装前校验「本次剧本覆盖全部启用章节」——缺章会让场景链断裂
+  // （chN 末尾 changeScene:chN+1.txt 指向不存在的文件，开局/中途黑屏卡住），因此直接阻断组装。
+  const continuity = planChapterContinuity(chapters, enabledChapters.value.map((c) => c.index));
+  if (!continuity.ok) {
+    const labels = continuity.missing.map((i) => `第 ${i + 1} 章`).join("、");
+    const msg = `组装已中止：缺少 ${continuity.missing.length} 个启用章节的分镜剧本（${labels}）。缺章会让游戏场景链断裂（chN 指向不存在的 chN+1），请先「重试失败项」补齐剧本，或关闭这些章节后再组装。`;
+    pushLog("组装", msg, "error");
+    imageStoryState.lastError = msg;
+    for (const i of continuity.missing) {
+      imageStoryState.failed.push({
+        key: `script_ch${i + 1}`,
+        label: `第 ${i + 1} 章剧本`,
+        message: "分镜剧本缺失：已阻止组装（避免产物断链）",
+      });
+    }
+    await persistFailedItems();
+    return false;
+  }
+  // #1132：按启用顺序重编号为 ch1..chN（与主链路 pipeline 同口径），停用中间章不再留下空洞
+  const ordered = continuity.renumbered;
+  if (continuity.present.some((c, i) => c !== i)) {
+    pushLog("组装", `章节已按启用顺序重编号：ch1..ch${ordered.length}（停用章不留空洞，原始章号 ${continuity.present.map((c) => c + 1).join("/")}）`);
+  }
   const templateDir = await resolveTemplateDir();
   const assets = await readAssetMap(dir);
   const title = (projectState.novel?.fileName ?? "图片小说").replace(/\.txt$/i, "");
-  const sample = chapters
+  const sample = ordered
     .slice(0, 3)
     .map((c) => `${c.title} ${c.scenes.map((s) => s.location).join(" ")}`)
     .join(" ");
+  // #1104：模板缺少内置 SE（game/vocal 无 wav）时降级为不输出 playEffect，避免成品 404 静默无声
+  let useSe = imageStoryState.useSe;
+  if (useSe) {
+    const seDir = `${templateDir}/game/vocal`;
+    const entries = await tauri.listDir(seDir).catch(() => []);
+    const hasSe = entries.some((e) => !e.isDir && e.name.toLowerCase().endsWith(".wav"));
+    if (!hasSe) {
+      useSe = false;
+      pushLog("组装", `模板缺少内置环境音效（${seDir} 无 wav 文件）：已自动关闭环境音效，避免产物播放 404 静默无声`, "warn");
+    }
+  }
   await tauri.mkdirAll(`${dir}/.novel2vn`);
   await assembleProject({
     outputDir: dir,
     title,
     gameKey: gameKeyFor(title),
     templateDir,
-    chapters,
+    chapters: ordered,
     cards,
     assets,
     mode: "imageOnly",
     introCard: false,
     figureEmotions: false,
     figureActions: false,
-    useBgm: true,
-    useSe: true,
+    useBgm: imageStoryState.useBgm,
+    useSe,
     language: inferWebgalLanguage(sample || title),
     log: (message) => pushLog("组装", message),
   });
-  pushLog("组装", "组装完成（可预览或导出 zip）", "success");
+  pushLog(
+    "组装",
+    `组装完成：${ordered.length} 章（ch1..ch${ordered.length}）${imageStoryState.useBgm ? "" : "，未启用 BGM"}${useSe ? "" : "，未启用环境音效"}（可预览或导出 zip）`,
+    "success",
+  );
+  return true;
 }
 
 /** 一键运行：提取 → 分镜剧本 → 图片 → 组装（复用缓存，只补缺失） */
@@ -490,7 +790,8 @@ export async function runImageStory(): Promise<void> {
   imageStoryState.failed = [];
   imageStoryState.produced = 0;
   imageStoryState.lastError = "";
-  imageStoryState.logs = [];
+  // #1148：日志不再整段清空——运行日志落盘并可恢复，这里只插入分节标记（历史仍在 .novel2vn/image-story.log）
+  pushLog("运行", `—— 新一轮运行（输出目录：${imageStoryState.outputDir}）——`);
   try {
     await ensureOutputDir();
     imageStoryState.stage = "提取";
@@ -501,8 +802,11 @@ export async function runImageStory(): Promise<void> {
     imageStoryState.chapters = chapters;
     refreshPlan();
     if (!abortFlag && chapters.length) await runImageStage(cards, chapters);
-    if (!abortFlag && chapters.length) await runAssembleStage(cards, chapters);
+    let assembled = false;
+    if (!abortFlag && chapters.length) assembled = await runAssembleStage(cards, chapters);
     if (abortFlag) pushLog("运行", "已停止（已完成的产物与缓存保留）", "warn");
+    else if (!chapters.length) pushLog("运行", "没有生成任何章节的分镜剧本：已跳过组装（见上方失败项）", "warn");
+    else if (!assembled) pushLog("运行", `运行结束：分镜剧本 ${chapters.length} 章，图片产出 ${imageStoryState.produced} 张；组装未完成（缺章，见上方错误）`, "warn");
     else pushLog("运行", `全部完成：分镜剧本 ${chapters.length} 章，图片产出 ${imageStoryState.produced} 张`, "success");
     await refreshFromDisk();
   } catch (e) {
@@ -515,6 +819,9 @@ export async function runImageStory(): Promise<void> {
     imageStoryState.progress = null;
     endAbortableRun();
     persist();
+    // #1148：运行结束把失败项与日志强制落盘（防抖窗口内的改动也不丢）
+    await persistFailedItems();
+    await flushLogFile();
   }
 }
 
@@ -546,6 +853,8 @@ export async function retryFailedImages(): Promise<void> {
   } finally {
     imageStoryState.running = false;
     endAbortableRun();
+    await persistFailedItems();
+    await flushLogFile();
   }
 }
 
@@ -564,8 +873,10 @@ export async function regenerateShot(taskId: string): Promise<void> {
   const figureBase: Record<string, string> = {};
   for (const [id, path] of Object.entries(assets.figure)) figureBase[id] = path;
   // 依赖的三视图缺失时不单张重生成（避免静默降级为纯文生图导致人物不一致）
-  if (task.characterId && !figureBase[`${task.characterId}_threeview`]) {
-    pushLog("图片", `角色 ${task.characterId} 的三视图缺失：请先重跑图片阶段补齐三视图后再重生成该分镜`, "error");
+  // #1133：多人分镜对每个出场角色都校验，不再只看第一个角色
+  const missingChars = shotCharacterIdsOf(task).filter((id) => !figureBase[`${id}_threeview`]);
+  if (missingChars.length) {
+    pushLog("图片", `角色 ${missingChars.join("、")} 的三视图缺失：请先重跑图片阶段补齐三视图后再重生成该分镜`, "error");
     return;
   }
   imageStoryState.running = true;
@@ -579,6 +890,8 @@ export async function regenerateShot(taskId: string): Promise<void> {
       concurrency: 1,
       isAborted: () => abortFlag,
       force: true,
+      // 单张重生成不跑三视图任务：把已生成的三视图作为预置参考传入（#1133 多身份参考同样受益）
+      figureBase,
       log: (ev) => pushLog(ev.step || "图片", ev.message, ev.level),
       verifyCfg: imageStoryState.options.imageSelfCheck ? activeConfig("vision") : undefined,
       onTaskDone: (t2, path) => {
@@ -588,12 +901,15 @@ export async function regenerateShot(taskId: string): Promise<void> {
       },
       onTaskFailed: (t2, message) => {
         pushLog("图片", `${t2.usage || t2.id} 重生成失败：${message.slice(0, 160)}`, "error");
+        imageStoryState.failed.push({ key: t2.id, label: t2.usage || t2.fileName, message });
       },
     });
     await refreshFromDisk();
   } finally {
     imageStoryState.running = false;
     endAbortableRun();
+    await persistFailedItems();
+    await flushLogFile();
   }
 }
 
@@ -606,10 +922,24 @@ export async function startImageStoryPreview(): Promise<void> {
     await tauri.stopPreviewServer().catch(() => undefined);
     const res = await tauri.startPreviewServer(dir);
     imageStoryState.previewUrl = res.url;
+    imageStoryState.previewRunning = true;
     pushLog("预览", `预览已启动：${res.url}`, "success");
   } catch (e) {
+    imageStoryState.previewRunning = false;
     pushLog("预览", `预览启动失败：${errMsg(e).slice(0, 160)}`, "error");
   }
+}
+
+/** 停止共享预览服务器并复位状态（#1102）：停服后不再显示「预览已启动」，避免状态与实际不符 */
+export async function stopImageStoryPreview(): Promise<void> {
+  try {
+    await tauri.stopPreviewServer();
+    pushLog("预览", "预览已停止");
+  } catch (e) {
+    pushLog("预览", `停止预览失败：${errMsg(e).slice(0, 160)}`, "warn");
+  }
+  imageStoryState.previewUrl = "";
+  imageStoryState.previewRunning = false;
 }
 
 export async function exportImageStoryZip(): Promise<void> {

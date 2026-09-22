@@ -27,8 +27,6 @@ export interface RenderOptions {
   useSe?: boolean;
   /** 视觉模式（#810）：sprite=立绘版（默认）；imageOnly=图片小说——跳过 changeFigure 全家族，按 shot.triggerLineIndex 淡入切换全屏图 */
   mode?: "sprite" | "imageOnly";
-  /** 立绘取景：bust=游戏内半身取景（默认，配合全身素材）；full=按原图整身显示 */
-  figureFraming?: "bust" | "full";
 }
 
 export function sanitizeId(id: string): string {
@@ -128,7 +126,8 @@ const ENTRANCES = ["enter-from-left", "enter-from-right", "enter-from-bottom"];
 
 /** 全身立绘 → 游戏内半身取景：素材按 head-to-feet 生成，舞台用「放大 + 下移」取到头像~大腿的构图
  *（近似旧版 thighs-up 立绘观感）。数值按「1920×1080 舞台 + 1024² 立绘 contain 到高度」几何推算：
- *  原图高 1080 居中 → 放大 1.75 = 1890，再下移 350 → 可见顶部约 57%（头到腿）。 */
+ *  原图高 1080 居中 → 放大 1.75 = 1890，再下移 350 → 可见顶部约 57%（头到腿）。
+ *  #1141：取景为固定行为（原先的 figureFraming 参数无任何调用方，'full' 分支是死代码，已移除）。 */
 const FIGURE_FRAMING = '{"scale":{"x":1.75,"y":1.75},"position":{"x":0,"y":350}}';
 /** 高潮句推近：在半身取景基础上再放大一档（取到头~腰），结束后回到 FIGURE_FRAMING */
 const FIGURE_FRAMING_ZOOM = '{"scale":{"x":1.96,"y":1.96},"position":{"x":0,"y":518}}';
@@ -481,10 +480,10 @@ export function renderChapter(
             out.push(`changeFigure:${getBaseName(displayFile)} -${slot} -next;`);
           }
           // 半身取景：立绘就位后立即套用取景变换（duration=0 与入场动画不叠加）
-          if (opts.figureFraming !== "full") out.push(`setTransform:${FIGURE_FRAMING} -target=fig-${slot} -duration=0 -next;`);
+          out.push(`setTransform:${FIGURE_FRAMING} -target=fig-${slot} -duration=0 -next;`);
         } else if (figureChanged) {
           out.push(`changeFigure:${getBaseName(displayFile)} -${slot} -next;`);
-          if (opts.figureFraming !== "full") out.push(`setTransform:${FIGURE_FRAMING} -target=fig-${slot} -duration=0 -next;`);
+          out.push(`setTransform:${FIGURE_FRAMING} -target=fig-${slot} -duration=0 -next;`);
         }
         lastFigureFile.set(effCharId, displayFile);
       }
@@ -497,8 +496,8 @@ export function renderChapter(
       if (useActions && isDramatic(line.text)) {
         if (slot) {
           out.push(`setTransform:{"blur":5} -target=bg-main -duration=700 -next;`);
-          out.push(`setTransform:${opts.figureFraming === "full" ? '{"scale":{"x":1.22,"y":1.22},"position":{"x":0,"y":0}}' : FIGURE_FRAMING_ZOOM} -target=fig-${slot} -duration=1500 -next;`);
-          out.push(`setTransform:${opts.figureFraming === "full" ? '{"scale":{"x":1,"y":1}}' : FIGURE_FRAMING} -target=fig-${slot} -duration=800 -next;`);
+          out.push(`setTransform:${FIGURE_FRAMING_ZOOM} -target=fig-${slot} -duration=1500 -next;`);
+          out.push(`setTransform:${FIGURE_FRAMING} -target=fig-${slot} -duration=800 -next;`);
           out.push(`setTransform:{"blur":0} -target=bg-main -duration=800 -next;`);
         }
       }
@@ -672,7 +671,7 @@ export function renderChapter(
       // 原样恢复 CG 前的立绘（无入场动画；状态同步回填，后续台词按原表情/服装继续）
       for (const b of cgBefore) {
         out.push(`changeFigure:${getBaseName(b.file)} -${b.slot} -next;`);
-        if (opts.figureFraming !== "full") out.push(`setTransform:${FIGURE_FRAMING} -target=fig-${b.slot} -duration=0 -next;`);
+        out.push(`setTransform:${FIGURE_FRAMING} -target=fig-${b.slot} -duration=0 -next;`);
         stageSlot.set(b.id, b.slot);
         lastFigureFile.set(b.id, b.file);
         stageOrder.push(b.id);

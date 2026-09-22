@@ -75,12 +75,29 @@ export function voiceLibraryFor(cfg: ApiConfig | undefined): string[] {
   const lib = cfg?.extra?.voiceLibrary;
   if (Array.isArray(lib)) {
     // 显式列表（含被用户清空成 []）以用户为准，不再回填 17 个默认音色（此前清空无效）；
-    // 清空后配音会自动回退 "default"（runVoiceJob 的 fallbackVoice 逻辑）
+    // #1139：清空后配音不可用（各 TTS 服务均无名为 "default" 的音色），调用方须先校验
+    // 空库并提示用户补充音色，禁止再静默回退字面量 "default" 逐句失败重试。
     return Array.from(new Set((lib as string[]).map((v) => String(v)).filter(Boolean)));
   }
   // 未设置过（undefined）：默认音色 + 适配器模板音色
   const tplVoices = cfg?.adapter ? (getTemplate(cfg.adapter)?.voices ?? []) : [];
   return Array.from(new Set([...DEFAULT_VOICE_LIBRARY, ...tplVoices]));
+}
+
+/** 音色库为空时的可读错误（#1139）：配音阶段直接抛它，而不是逐句请求假音色 "default" */
+export const VOICE_LIBRARY_EMPTY_MESSAGE =
+  "音色库为空：配音不可用，请先在「API 配置 > TTS 配音 > 音色列表」中填写至少一个可用音色（每行一个）。";
+
+/** 音色库是否为空（显式清空的 [] 才算空；undefined 回退默认表，不算空） */
+export function isVoiceLibraryEmpty(cfg: ApiConfig | undefined): boolean {
+  return voiceLibraryFor(cfg).length === 0;
+}
+
+/** 取出可用音色库：为空时抛可读错误（#1139），调用方据此阻止配音阶段 */
+export function requireVoiceLibrary(cfg: ApiConfig | undefined): string[] {
+  const lib = voiceLibraryFor(cfg);
+  if (!lib.length) throw new Error(VOICE_LIBRARY_EMPTY_MESSAGE);
+  return lib;
 }
 
 /** 应用服务商模板：填入 base_url / model / adapter / 音色库 */
