@@ -281,6 +281,12 @@ export interface ChatOptions {
    */
   signal?: AbortSignal;
   /**
+   * 超时重试配额（默认与 withRetry 的 retries 一致）：单次请求总超时后最多再等量重试几次。
+   * 剧本等大输出场景传 0——第一次超时即抛，由上层按段落拆小后重试（小请求才 fit 得进超时），
+   * 而不是把同一个巨型请求烧 N×300s 注定失败。
+   */
+  timeoutRetries?: number;
+  /**
    * 模型请求进度事件（可选）：chatJson/chatCompletion 在「请求重试、预算升级、收到响应、
    * 截断续写、JSON 修复」时触发。调用方可据此打面向用户的进度日志，避免长调用期间无输出。
    * 不传则行为与旧版完全一致。
@@ -423,10 +429,14 @@ function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
  */
 export async function withRetry<T>(
   fn: () => Promise<T>,
-  opts?: { retries?: number; delayFor?: (attempt: number) => number; signal?: AbortSignal; onRetry?: (attempt: number, delayMs: number, err: unknown) => void },
+  opts?: { retries?: number; delayFor?: (attempt: number) => number; signal?: AbortSignal; onRetry?: (attempt: number, delayMs: number, err: unknown) => void; timeoutRetries?: number },
 ): Promise<T> {
   const retries = opts?.retries ?? 4;
   const delayFor = opts?.delayFor ?? retryDelayFor;
+  // 超时单独配额（默认与 retries 一致）：300s 总超时后等量重试注定再次超时，
+  // 配额耗尽直接抛出由上层降级（拆分/换通道），不再烧 N×300s 硬扛
+  const timeoutCap = opts?.timeoutRetries ?? retries;
+  let timeoutCount = 0;
   for (let attempt = 0; ; attempt++) {
     if (opts?.signal?.aborted) throw new Error("已中止");
     try {
@@ -444,6 +454,12 @@ export async function withRetry<T>(
         throw e;
       }
       if (attempt >= retries) throw e;
+      // 超时类失败单独计数：配额内走正常退避，配额耗尽直接抛出（上层据此拆分降级）
+      const timeoutMsg = String(e instanceof Error ? e.message : e);
+      if (/timed out|timeout|error sending request/i.test(timeoutMsg)) {
+        timeoutCount++;
+        if (timeoutCount > timeoutCap) throw e;
+      }
       // 后端过载/限流（429/502/503/504）：1s/10s 的退避等于轰炸已过载的后端，延长 6 倍
       // （约 6s/60s/120s/180s）给服务端恢复时间；普通网络错误保持原退避
       const overloaded = status === 429 || status === 502 || status === 503 || status === 504;
@@ -610,31 +626,25 @@ export async function chatCompletion(
   // 文本请求全局限流：并发 1（串行），避免多章节剧本同时发大请求打爆网关
   return llmLimiterFor(cfg).run(() => withRetry(async () => {
     let response = await perform(escalation[0]);
-    // 升级重试：
-    //   ① content 为空且 finishReason=length → 预算被思考耗尽
-    //   ② JSON 模式下解析失败且 finishReason=length → 残 JSON 也算截断
-    //   满足任一即放大 max_tokens 再试（已给足预算时首轮即最大，跳过放大）
+    // 升级重试（仅 content 为空且 finishReason=length → 预算被推理思考耗尽时放大）：
+    // 截断但非空的响应（含残缺 JSON）直接返回，由 chatJson 的续写循环分段取回——
+    // 若在这里放大预算重发，慢后端上更大的单次输出更注定超时（第 2 章 300s 事件复盘）。
+    // （已给足预算时首轮即最大，跳过放大）
     for (let i = 1; i < escalation.length; i++) {
       const budget = escalation[i];
       if (seenBudgets.has(budget)) break;
       seenBudgets.add(budget);
-      const truncated = response.finishReason === "length";
-      const empty = !response.rawContent.trim();
-      const brokenJson = truncated && opts.json && !canParseJson(response.rawContent);
-      if (!truncated || (!empty && !brokenJson)) break;
-      log.warn("api", "输出被截断（content 为空或 JSON 不完整），放大 max_tokens 重试", {
+      if (!shouldEscalateBudget(response.finishReason, response.rawContent)) break;
+      log.warn("api", "输出为空且被截断（预算被思考耗尽），放大 max_tokens 重试", {
         budget,
         reasoningLen: response.reasoning.length,
-        rawLen: response.rawContent.length,
-        empty,
-        brokenJson,
       });
       opts.onEvent?.({
         kind: "escalate",
         attempt: i,
         finishReason: response.finishReason,
         contentLen: response.rawContent.length,
-        message: `输出被截断（${response.rawContent.length} 字），放大输出预算至 ${budget} 重试（第 ${i} 次升级）`,
+        message: `首轮输出为空（预算被思考耗尽），放大输出预算至 ${budget} 重试（第 ${i} 次升级）`,
       });
       response = await perform(budget);
     }
@@ -673,6 +683,7 @@ export async function chatCompletion(
     return { content, promptTokens, completionTokens, finishReason, toolCalls };
   }, {
     signal: opts.signal,
+    timeoutRetries: opts.timeoutRetries,
     // B93：退避等待可被中止；重试同时透出给调用方打进度（否则 300s 超时 ×4 次重试全程静默）
     onRetry: opts.onEvent
       ? (attempt, delayMs, e) =>
@@ -748,24 +759,11 @@ export function extractJson(text: string): unknown {
   throw new Error("无法从响应中提取合法 JSON");
 }
 
-/** 轻量 JSON 可解析性探测（用于截断重试判断） */
-function canParseJson(text: string): boolean {
-  const cleaned = text.replace(/```json|```/g, "").trim();
-  if (!cleaned) return false;
-  try {
-    JSON.parse(cleaned);
-    return true;
-  } catch {
-    /* fallthrough */
-  }
-  const first = sliceFirstJsonObject(cleaned);
-  if (!first) return false;
-  try {
-    JSON.parse(first);
-    return true;
-  } catch {
-    return false;
-  }
+/** 预算升级判定（纯函数，供单测）：仅「被截断且内容为空」时升级
+ *  （推理模型的思考耗尽了输出预算、答案一个字没出，加大预算才有意义）；
+ *  截断但有内容的响应一律不升级——由续写循环分段取回，又小又快。 */
+export function shouldEscalateBudget(finishReason: string | undefined, rawContent: string): boolean {
+  return finishReason === "length" && !rawContent.trim();
 }
 
 /**

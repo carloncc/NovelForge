@@ -582,9 +582,13 @@ export async function scriptChapter(
     // 单个子块生成（含空结果带提示重试一次；无场景即抛错，由外层决定是否降级拆分）
     const genOnePart = async (bodyText: string, note: string, tag: string): Promise<{ model: ScriptModel; scenes: SceneJSON[] }> => {
       const user = buildScriptUser(chapter, cards, extra, bodyText, note);
-      const maxTokens = outputTokensForText(cfg, `${systemPrompt}\n${user}`);
+      // 单次输出预算 8K：慢后端上小响应才 fit 得进 300s（30 tok/s 下约 270s），
+      // 超出部分由续写循环分段取回（第 1 章 197KB 即靠续写拼出）；续写轮次放宽到 5 轮覆盖整块
+      const maxTokens = outputTokensForText(cfg, `${systemPrompt}\n${user}`, 8192);
       const llmEvent = llmEventFor(tag);
-      let model = await chatJson<ScriptModel>(cfg, systemPrompt, user, { maxTokens, onUsage, timeoutSecs: 300, onEvent: llmEvent });
+      // 超时零容忍盲重试：第一次 300s 超时即抛，外层按段落拆小后重试（小请求才 fit 得进超时）
+      const chatOpts = { maxTokens, onUsage, timeoutSecs: 300, onEvent: llmEvent, timeoutRetries: 0, maxContinue: 5 };
+      let model = await chatJson<ScriptModel>(cfg, systemPrompt, user, chatOpts);
       let subScenes = mapScriptScenes(model, mapCtx);
       if (!subScenes.length) {
         logger.warn("script", `第 ${chapter.index + 1} 章${tag}未产出场景，带提示重试一次`, {});
@@ -593,7 +597,7 @@ export async function scriptChapter(
           cfg,
           systemPrompt,
           `${user}\n\n注意：上一次回复没有 scenes 数组或 scenes 为空。请输出严格 JSON，且 scenes 至少包含本部分正文的第一个场景（含完整的 lines 台词）。`,
-          { maxTokens, onUsage, timeoutSecs: 300, onEvent: llmEvent },
+          chatOpts,
         );
         subScenes = mapScriptScenes(model, mapCtx);
       }
