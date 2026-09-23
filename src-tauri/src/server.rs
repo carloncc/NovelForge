@@ -14,11 +14,27 @@ pub struct ServerHandle {
     stop_flag: Arc<AtomicUsize>,
     thread: Mutex<Option<thread::JoinHandle<()>>>,
     port: u16,
+    /// 已校验的预览根（canonical）：#1329 回滚重启旧实例用
+    root: PathBuf,
+    /// 每实例随机 token：随启动响应返回，供前端后续做严格鉴权时携带
+    token: String,
 }
+
+/// #1294：每请求 thread::spawn 无上限 → 请求洪水打爆线程；并发处理数封顶，超限回 503。
+const MAX_PREVIEW_REQUEST_THREADS: usize = 64;
+static ACTIVE_PREVIEW_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 
 impl ServerHandle {
     pub fn port(&self) -> u16 {
         self.port
+    }
+    /// #1329 回滚用：旧实例的已校验根
+    pub fn preview_root(&self) -> &Path {
+        &self.root
+    }
+    /// 启动时生成的随机 token（随 start_preview_server 响应返回前端）
+    pub fn preview_token(&self) -> &str {
+        &self.token
     }
     pub fn stop(&self) {
         self.stop_flag.store(1, Ordering::Relaxed);
@@ -41,22 +57,139 @@ impl ServerHandle {
     }
 }
 
+/// #1294 + #1329：先校验根再绑定端口。旧顺序（先绑定、后 canonicalize）有两个坏处：
+/// 目录无效时调用方已付出绑定代价，且 commands 侧“先停旧实例”后才发现根无效；
+/// 现在目录无效直接返回，旧预览不受影响。
 pub fn start(root: &str) -> Result<ServerHandle, String> {
+    let canon = validate_preview_root(root)?;
     let server = Server::http("127.0.0.1:17892")
         .map_err(|e| format!("启动预览服务器失败（端口 17892 被占用？）: {e}"))?;
-    start_with_server(root, server)
+    start_with_server(canon.to_string_lossy().as_ref(), server)
+}
+
+/// 预览根校验：必须存在、是目录、且含 index.html（即已生成的项目输出目录）。
+/// 把 Documents 等任意目录变成 http 分享的口子在此堵住。
+pub fn validate_preview_root(root: &str) -> Result<PathBuf, String> {
+    let canon = PathBuf::from(root)
+        .canonicalize()
+        .map_err(|e| format!("目录无效: {e}"))?;
+    if !canon.is_dir() {
+        return Err("预览根不是有效目录".to_string());
+    }
+    if !canon.join("index.html").is_file() {
+        return Err("目录不是有效的预览输出（缺少 index.html），已拒绝分享".to_string());
+    }
+    Ok(canon)
+}
+
+/// 每实例随机 token（128 bit）：优先 OS 随机源，失败退化为时间+进程+计数哈希
+/// （退化路径仅保证唯一性、不保证不可预测，日志中明确标记）。
+fn generate_preview_token() -> String {
+    let mut bytes = [0u8; 16];
+    match getrandom::getrandom(&mut bytes) {
+        Ok(()) => bytes.iter().map(|b| format!("{b:02x}")).collect(),
+        Err(error) => {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            static COUNTER: AtomicUsize = AtomicUsize::new(0);
+            let mut hasher = DefaultHasher::new();
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+                .hash(&mut hasher);
+            std::process::id().hash(&mut hasher);
+            COUNTER.fetch_add(1, Ordering::Relaxed).hash(&mut hasher);
+            thread::current().id().hash(&mut hasher);
+            let h1 = hasher.finish();
+            let h2 = h1.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            eprintln!("[novelforge] 警告: 预览 token 随机源不可用（{error}），已退化为弱 token");
+            format!("{h1:016x}{h2:016x}")
+        }
+    }
+}
+
+fn request_header_value(request: &tiny_http::Request, name: &str) -> Option<String> {
+    request
+        .headers()
+        .iter()
+        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name))
+        .map(|h| h.value.as_str().to_string())
+}
+
+/// #1294 DNS rebinding 防护：Host 必须指向本机预览端口。
+/// 无 Host 头（HTTP/1.0 兼容/测试直连）时放行——重绑攻击必然携带攻击者 Host。
+fn preview_host_allowed(host: Option<&str>, port: u16) -> bool {
+    let Some(raw) = host else {
+        return true;
+    };
+    let h = raw.trim().trim_end_matches('.').to_ascii_lowercase();
+    // 拆 host:port（IPv6 形如 [::1]:port）
+    let (name, req_port) = if let Some(stripped) = h.strip_prefix('[') {
+        let Some(end) = stripped.find(']') else {
+            return false;
+        };
+        let name = &stripped[..end];
+        let rest = &stripped[end + 1..];
+        let req_port = rest.strip_prefix(':').and_then(|p| p.parse::<u16>().ok());
+        (name.to_string(), req_port)
+    } else if let Some((name, port_str)) = h.rsplit_once(':') {
+        // 127.0.0.1:17892 / localhost:17892；无端口时整体即主机名
+        match port_str.parse::<u16>() {
+            Ok(p) => (name.to_string(), Some(p)),
+            Err(_) => (h.clone(), None),
+        }
+    } else {
+        (h.clone(), None)
+    };
+    if name != "127.0.0.1" && name != "localhost" && name != "::1" {
+        return false;
+    }
+    // 带端口时必须与本实例端口一致（测试直连常省略端口，此时放行）
+    if let Some(p) = req_port {
+        return p == port;
+    }
+    true
+}
+
+/// 跨站读防护：请求携带 Origin/Referer 时必须同源（本机预览端口），否则 403。
+/// 预览 iframe 内的同源子资源天然满足；攻击者页面 fetch 会带上 evil Origin 而被拦。
+/// 缺失时放行（顶层导航/无 Referer 的首跳不受影响）。
+fn preview_origin_allowed(value: Option<&str>, port: u16) -> bool {
+    let Some(raw) = value else {
+        return true;
+    };
+    let v = raw.trim().to_ascii_lowercase();
+    v.starts_with(&format!("http://127.0.0.1:{port}"))
+        || v.starts_with(&format!("http://localhost:{port}"))
+        || v.starts_with(&format!("http://[::1]:{port}"))
+}
+
+/// #1294：.novel2vn 工程目录（含原文与成本）与点文件一律不对外提供。
+fn is_preview_blocked(root: &Path, candidate: &Path) -> bool {
+    if let Ok(rel) = candidate.strip_prefix(root) {
+        if rel
+            .components()
+            .any(|c| c.as_os_str() == ".novel2vn")
+        {
+            return true;
+        }
+    }
+    candidate
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with('.'))
 }
 
 /// 在已绑定的 Server 上启动预览服务（测试用 127.0.0.1:0 拿临时端口，避免与开发环境端口冲突）
 fn start_with_server(root: &str, server: Server) -> Result<ServerHandle, String> {
-    let root = PathBuf::from(root)
-        .canonicalize()
-        .map_err(|e| format!("目录无效: {e}"))?;
+    let root = validate_preview_root(root)?;
     let port = server
         .server_addr()
         .to_ip()
         .map(|addr| addr.port())
         .unwrap_or(17892);
+    let token = generate_preview_token();
     let server = Arc::new(server);
     let stop_flag = Arc::new(AtomicUsize::new(0));
 
@@ -67,10 +200,21 @@ fn start_with_server(root: &str, server: Server) -> Result<ServerHandle, String>
         while flag.load(Ordering::Relaxed) == 0 {
             match srv.recv_timeout(Duration::from_millis(200)) {
                 Ok(Some(request)) => {
+                    // #1294 并发封顶：超限直接 503，不再无上限 thread::spawn
+                    if ACTIVE_PREVIEW_REQUESTS.load(Ordering::Relaxed) >= MAX_PREVIEW_REQUEST_THREADS {
+                        let response = tiny_http::Response::from_data(b"busy".to_vec())
+                            .with_status_code(503);
+                        let _ = request.respond(response);
+                        continue;
+                    }
+                    ACTIVE_PREVIEW_REQUESTS.fetch_add(1, Ordering::Relaxed);
                     // 每请求独立线程：浏览器会并发加载页面/音频/图片资源，串行处理时
                     // 单个慢响应（大文件传输/慢客户端）会阻塞后续所有请求，预览"卡住"。
                     let r = r.clone();
-                    thread::spawn(move || handle_request(&r, request));
+                    thread::spawn(move || {
+                        handle_request(&r, request, port);
+                        ACTIVE_PREVIEW_REQUESTS.fetch_sub(1, Ordering::Relaxed);
+                    });
                 }
                 Ok(None) => continue,
                 Err(_) => break,
@@ -83,10 +227,22 @@ fn start_with_server(root: &str, server: Server) -> Result<ServerHandle, String>
         stop_flag,
         thread: Mutex::new(Some(thread)),
         port,
+        root,
+        token,
     })
 }
 
-fn handle_request(root: &Path, request: tiny_http::Request) {
+fn handle_request(root: &Path, request: tiny_http::Request, port: u16) {
+    // #1294：Host/Origin/Referer 校验（DNS rebinding 与跨站读防护）
+    if !preview_host_allowed(request_header_value(&request, "Host").as_deref(), port)
+        || !preview_origin_allowed(request_header_value(&request, "Origin").as_deref(), port)
+        || !preview_origin_allowed(request_header_value(&request, "Referer").as_deref(), port)
+    {
+        let response =
+            tiny_http::Response::from_data(b"forbidden".to_vec()).with_status_code(403);
+        let _ = request.respond(response);
+        return;
+    }
     let url = request.url().to_string();
     let range_header: Option<String> = request
         .headers()
@@ -116,6 +272,11 @@ fn handle_request(root: &Path, request: tiny_http::Request) {
 
     let Some(candidate) = safe_file_path(root, Path::new(&rel)) else {
         respond_error(request, 404, b"404 not found");
+        return;
+    };
+    // #1294：.novel2vn 工程目录与点文件不对外
+    if is_preview_blocked(root, &candidate) {
+        respond_error(request, 404, b"not found");
         return;
     };
     let mut file = match std::fs::File::open(&candidate) {
@@ -362,7 +523,7 @@ struct _MutexGuardGuard(Mutex<()>);
 
 #[cfg(test)]
 mod tests {
-    use super::{cache_control_for, content_type_for, http_date, parse_range, safe_file_path, start_with_server};
+    use super::{cache_control_for, content_type_for, generate_preview_token, http_date, is_preview_blocked, parse_range, preview_host_allowed, preview_origin_allowed, safe_file_path, start_with_server, validate_preview_root};
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpStream;
@@ -433,6 +594,8 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let payload: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
         fs::write(root.join("data.bin"), &payload).unwrap();
+        // 预览根校验要求输出目录含 index.html（#1294）：测试根同样补齐
+        fs::write(root.join("index.html"), "<html></html>").unwrap();
 
         // 用 127.0.0.1:0 绑定临时端口，避免占用固定预览端口导致测试互相干扰
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
@@ -499,5 +662,92 @@ mod tests {
 
         handle.stop();
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// #1294：预览根必须是含 index.html 的已生成输出目录；任意目录一律拒绝
+    #[test]
+    fn preview_root_requires_generated_output() {
+        assert!(validate_preview_root("/definitely/not/here-novelforge").is_err());
+        let dir = std::env::temp_dir().join(format!("novelforge-preview-root-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // 空目录（无 index.html）→ 拒绝分享
+        assert!(validate_preview_root(dir.to_str().unwrap()).is_err());
+        fs::write(dir.join("index.html"), "<html></html>").unwrap();
+        assert!(validate_preview_root(dir.to_str().unwrap()).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1294：Host/Origin 校验——重绑与跨站读被拦，同源与无头直连放行
+    #[test]
+    fn preview_host_and_origin_checks() {
+        assert!(preview_host_allowed(Some("127.0.0.1:17892"), 17892));
+        assert!(preview_host_allowed(Some("127.0.0.1"), 17892));
+        assert!(preview_host_allowed(Some("localhost:17892"), 17892));
+        assert!(preview_host_allowed(None, 17892));
+        assert!(!preview_host_allowed(Some("evil.com"), 17892));
+        assert!(!preview_host_allowed(Some("127.0.0.1:9999"), 17892));
+        assert!(!preview_host_allowed(Some("attacker.example:17892"), 17892));
+        assert!(preview_origin_allowed(None, 17892));
+        assert!(preview_origin_allowed(Some("http://127.0.0.1:17892/game/scene/1.txt"), 17892));
+        assert!(!preview_origin_allowed(Some("http://evil.com/"), 17892));
+        assert!(!preview_origin_allowed(Some("http://127.0.0.1:9999/x"), 17892));
+    }
+
+    /// #1294：.novel2vn 与点文件不对外
+    #[test]
+    fn preview_blocks_project_state_and_dotfiles() {
+        let root = std::env::temp_dir().join(format!("novelforge-preview-block-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".novel2vn")).unwrap();
+        fs::write(root.join("index.html"), "<html></html>").unwrap();
+        fs::write(root.join(".novel2vn/project_state.json"), "secret").unwrap();
+        fs::write(root.join(".hidden"), "secret").unwrap();
+        let canon = root.canonicalize().unwrap();
+        let secret = canon.join(".novel2vn/project_state.json").canonicalize().unwrap();
+        assert!(is_preview_blocked(&canon, &secret));
+        let hidden = canon.join(".hidden").canonicalize().unwrap();
+        assert!(is_preview_blocked(&canon, &hidden));
+        let index = canon.join("index.html").canonicalize().unwrap();
+        assert!(!is_preview_blocked(&canon, &index));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// #1294 集成：.novel2vn 经 HTTP 应 404，index.html 仍可访问
+    #[test]
+    fn preview_http_hides_project_state() {
+        let root = std::env::temp_dir().join(format!("novelforge-preview-hide-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".novel2vn")).unwrap();
+        fs::write(root.join("index.html"), "<html></html>").unwrap();
+        fs::write(root.join(".novel2vn/project_state.json"), "secret").unwrap();
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let handle = start_with_server(root.to_str().unwrap(), server).unwrap();
+        let get = |path: &str| -> String {
+            let mut stream = TcpStream::connect(("127.0.0.1", handle.port())).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream
+                .write_all(format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").as_bytes())
+                .unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).unwrap();
+            String::from_utf8_lossy(&response).to_string()
+        };
+        assert!(get("/index.html").starts_with("HTTP/1.1 200"), "index.html 应可访问");
+        assert!(get("/.novel2vn/project_state.json").starts_with("HTTP/1.1 404"), ".novel2vn 不得对外");
+
+        handle.stop();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// #1294：每实例 token 唯一且为 32 位十六进制
+    #[test]
+    fn preview_tokens_are_unique_hex() {
+        let a = generate_preview_token();
+        let b = generate_preview_token();
+        assert_eq!(a.len(), 32);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
     }
 }

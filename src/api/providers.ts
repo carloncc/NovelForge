@@ -491,17 +491,29 @@ export function parseModelList(payload: unknown, providerId: ProviderId): Discov
   const list = Array.isArray(root.data) ? root.data : Array.isArray(root.models) ? root.models : undefined;
   if (!list) throw new Error("模型接口缺少 data 或 models 数组");
 
-  const models = list.map((entry) => {
-    if (typeof entry === "string") return { id: entry, capabilities: classifyModelCapabilities({ id: entry }, providerId) };
-    if (!entry || typeof entry !== "object") throw new Error("模型列表包含无效条目");
+  const models: DiscoveredModel[] = [];
+  for (const entry of list) {
+    // 1317：一坏条即全抛。改为坏条过滤（warn 后跳过），空列表才抛。
+    if (typeof entry === "string") {
+      models.push({ id: entry, capabilities: classifyModelCapabilities({ id: entry }, providerId) });
+      continue;
+    }
+    if (!entry || typeof entry !== "object") {
+      console.warn(`[providers] 跳过无效模型条目：${String(entry).slice(0, 80)}`);
+      continue;
+    }
     const record = entry as Record<string, unknown>;
     const id = record.id ?? record.name;
-    if (typeof id !== "string" || !id.trim()) throw new Error("模型条目缺少有效 id");
+    if (typeof id !== "string" || !id.trim()) {
+      console.warn("[providers] 跳过缺少有效 id 的模型条目");
+      continue;
+    }
     const contextLength = extractContextLength(record);
     const model: DiscoveredModel = { id: id.trim(), capabilities: classifyModelCapabilities(record, providerId) };
     if (contextLength) model.contextLength = contextLength;
-    return model;
-  });
+    models.push(model);
+  }
+  if (!models.length) throw new Error("模型列表无有效条目");
   return models.filter((model, index) => models.findIndex((candidate) => candidate.id === model.id) === index);
 }
 

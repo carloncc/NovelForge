@@ -40,6 +40,14 @@ function main(): void {
     assert(r.merged === 0 && r.chapters.length === 2, "楔子属于主线章节，不应并入第一章");
   }
 
+  // 机械回退标题「第N部分」不算真章节：短尾章应并入前一章（修复 295 字残段独立成章）
+  {
+    const r = mergeTinyChapters([ch(0, "第1部分", 20000), ch(1, "第2部分", 20000), ch(2, "第3部分", 295)]);
+    assert(r.merged === 1 && r.chapters.length === 2, `机械碎章应合并，实际 merged=${r.merged} len=${r.chapters.length}`);
+    assert(r.chapters[1].title === "第2部分", "应保留前一章标题");
+    assert(r.chapters[1].text.length === 20295 + 2, `295 字残段应并入前一章，实际 ${r.chapters[1].text.length}`);
+  }
+
   // 中部碎章（插图）并入前一章
   {
     const r = mergeTinyChapters([ch(0, "第一章", 20000), ch(1, "插图", 1096), ch(2, "第二章", 20000)]);

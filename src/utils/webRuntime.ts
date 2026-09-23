@@ -988,7 +988,9 @@ export async function webCutoutImage(dataB64: string, threshold = 40): Promise<{
     }
     ctx.putImageData(imageData, 0, 0);
     return { dataB64: canvas.toDataURL("image/png").split(",")[1] ?? dataB64, method: "chroma" };
-  } catch {
-    return { dataB64, method: "chroma" };
+  } catch (e) {
+    // #1309：异常不再伪装成 {method:"chroma"} 成功返回（调用方会当处理过写盘）。
+    // 直接抛出，调用方走既有的"抠图失败，保留原图"显式回退（含日志），不静默产出假成功。
+    throw e instanceof Error ? e : new Error(`浏览器端抠图失败：${String(e).slice(0, 160)}`);
   }
 }

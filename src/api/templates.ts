@@ -245,7 +245,13 @@ export type CustomTemplateCheck =
  * 解析并校验自定义适配器模板 JSON：
  * - 语法错误 → 给出可读的解析错误（配置页内联展示，不再 alert 后照样写值）
  * - 语法正确但缺少 endpoint/requestMap → 同样视为无效（运行期根本用不了）
+ * - #1317：顶层键白名单——未知键直接拒绝，避免拼写错误/注入字段静默进入请求管线
  */
+const TEMPLATE_TOP_KEYS = new Set([
+  "id", "name", "capability", "mode", "endpoint", "method", "headers",
+  "contentType", "auth", "requestMap", "response", "poll", "voices",
+  "rawResponse", "description",
+]);
 export function checkCustomTemplate(raw: string | undefined): CustomTemplateCheck {
   const text = (raw ?? "").trim();
   if (!text) return { ok: false, error: "模板为空" };
@@ -257,6 +263,10 @@ export function checkCustomTemplate(raw: string | undefined): CustomTemplateChec
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     return { ok: false, error: "模板必须是 JSON 对象" };
+  }
+  const unknownKeys = Object.keys(parsed as Record<string, unknown>).filter((k) => !TEMPLATE_TOP_KEYS.has(k));
+  if (unknownKeys.length) {
+    return { ok: false, error: `模板含未知顶层字段（拼写错误？）：${unknownKeys.slice(0, 5).join("、")}` };
   }
   const template = parsed as AdapterTemplate;
   if (!template.endpoint || !template.requestMap) {

@@ -15,22 +15,30 @@ const {
   queueRunning,
   rerunChapters,
   toggleChapterRerun,
+  toggleAllRerun,
   imagePlanText,
 } = useGenerateController();
 
 const stageCount = computed(() => STAGE_ORDER.filter((s) => selectedStages.value[s]).length);
 
-const chapterSummary = computed(() =>
-  rerunChapters.value === null ? t("全书") : `${t("已勾选")} ${rerunChapters.value.length} ${t("章")}`,
-);
+/** 停用章不参与生成：计数只看启用章，避免「已勾选 12 章」实际只跑 10 章 */
+function isChapterEnabled(index: number): boolean {
+  return projectState.novel?.chapters.find((c) => c.index === index)?.enabled !== false;
+}
+const chapterSummary = computed(() => {
+  if (rerunChapters.value === null) return t("全书");
+  const n = rerunChapters.value.filter(isChapterEnabled).length;
+  return `${t("已勾选")} ${n} ${t("章")}`;
+});
 
-/** 主按钮下方的范围说明：避免按钮写着「整书」实际只跑勾选章节 */
+/** 主按钮下方的范围说明：避免按钮写着「整书」实际只跑勾选章节；停用章不计入 */
 const scopeHint = computed(() => {
   const scope = rerunChapters.value === null
     ? t("全书")
-    : `${t("已勾选")} ${rerunChapters.value.length} ${t("章")}`;
+    : `${t("已勾选")} ${rerunChapters.value.filter(isChapterEnabled).length} ${t("章")}`;
   return `${t("阶段")} ${stageCount.value}/${STAGE_ORDER.length} · ${scope}`;
 });
+const rangeBusy = computed(() => busy.value || !!assetBusy.value || queueRunning.value);
 </script>
 
 <template>
@@ -72,18 +80,28 @@ const scopeHint = computed(() => {
         <div class="card-head mt-4">
           <h3>{{ t("章节范围") }}</h3>
           <div class="card-actions">
+            <button class="btn ghost small" :disabled="rangeBusy" @click="toggleAllRerun(true)">{{ t("全选") }}</button>
+            <button class="btn ghost small" :disabled="rangeBusy" @click="toggleAllRerun(false)">{{ t("全不选") }}</button>
             <span class="hint">{{ chapterSummary }}</span>
           </div>
         </div>
         <p class="hint mb-3">{{ t("未勾选章节复用已有缓存；只勾选部分章节时，配音阶段仅生成这些章节的台词（适合分章节批量配音，避免一次性撞限流）。无缓存则跳过") }}</p>
         <div class="opt-grid chapter-grid">
-          <label v-for="(ch, i) in projectState.novel.chapters" :key="i" class="opt-item">
+          <label
+            v-for="(ch, i) in projectState.novel.chapters"
+            :key="i"
+            class="opt-item"
+            :class="{ 'is-off': ch.enabled === false }"
+            :title="ch.enabled === false ? t('该章节已停用，不参与生成') : ch.title"
+          >
             <input
               type="checkbox"
               :checked="rerunChapters === null || rerunChapters.includes(ch.index)"
+              :disabled="ch.enabled === false || rangeBusy"
               @change="toggleChapterRerun(ch.index, ($event.target as HTMLInputElement).checked)"
             />
             <span class="text-ellipsis" :title="ch.title">{{ ch.title }}</span>
+            <span v-if="ch.enabled === false" class="tag">{{ t("已停用") }}</span>
           </label>
         </div>
       </template>
@@ -93,3 +111,9 @@ const scopeHint = computed(() => {
       <button class="btn small" @click="goPage('import')">{{ t("去导入小说") }}</button>
     </div>
 </template>
+
+<style scoped>
+.chapter-grid .opt-item.is-off {
+  opacity: 0.6;
+}
+</style>

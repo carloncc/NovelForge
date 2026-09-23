@@ -2,8 +2,9 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type { ChapterInfo } from "../../core/types";
 import type { ChapterLight } from "../../composables/useChapterStatus";
-import { emptyChapterLight, isChapterContentComplete } from "../../composables/useChapterStatus";
+import { emptyChapterLight } from "../../composables/useChapterStatus";
 import { t } from "../../i18n";
+import { goPage } from "../../stores/nav";
 import { useGenerateController } from "../../stores/generate";
 
 const props = defineProps<{
@@ -30,7 +31,6 @@ const emit = defineEmits<{
   regen: [novelIndex: number];
   /** 只重跑该章的某一部分（剧本 / 图像 / 配音），其余内容复用缓存 */
   regenPart: [novelIndex: number, part: "script" | "image" | "voice"];
-  toggle: [novelIndex: number];
   select: [novelIndex: number, checked: boolean];
   runSelected: [];
   runQueue: [];
@@ -43,14 +43,14 @@ const emit = defineEmits<{
 }>();
 
 // 工具栏「重跑选中」要对多章依次 await，emit 无法等待，因此这里直接调 store（页面拥有同一单例）
-const { runChapterFullRegen, runChapterPartRegen } = useGenerateController();
+const { runChapterFullRegen, runChapterPartRegen, setNovelChaptersEnabled } = useGenerateController();
 
 const lightOf = (idx: number): ChapterLight => props.lights[idx] ?? emptyChapterLight();
 
-/** 章节显示名：标题已带「第X章」前缀时不再重复拼接（此前会显示成「第1章 第一章 黄昏的城门」） */
+/** 章节显示名：标题已带「第X章」前缀时不再重复拼接（宽正则与游戏内标题卡对齐：章回节话篇部幕卷） */
 function titleOf(c: ChapterInfo): string {
   const base = (c.title ?? "").trim() || t("未命名");
-  return /^第\s*[0-9一二三四五六七八九十百千零〇两]+\s*[章回节]/.test(base)
+  return /^第\s*[0-9一二三四五六七八九十百千零〇两]+\s*[章回节话篇部幕卷]/.test(base)
     ? base
     : `${t("第")}${c.index + 1}${t("章")} ${base}`;
 }
@@ -160,24 +160,76 @@ const menuFeedback = computed(() => {
 function onMenuFeedback(value: string): void {
   for (const i of props.selected) emit("updateFeedback", i, value);
 }
+/** 本地批量忙标志：store busy 经多层透传有延迟，双击间隙会开第二轮计费运行；同步置位并参与 disabled */
+const batchBusy = ref(false);
+const menuBusy = computed(() => locked.value || batchBusy.value);
+/** 选中章标题速查（含停用章）：聚合确认文案用，不再虚报范围 */
+const chapterByIndex = computed(() => {
+  const m = new Map<number, ChapterInfo>();
+  for (const c of [...props.chapters, ...props.disabledChapters]) m.set(c.index, c);
+  return m;
+});
+function nameList(idxs: number[]): string {
+  return idxs.map((i) => `第${i + 1}章「${chapterByIndex.value.get(i)?.title ?? ""}」`).join("、");
+}
 async function regenSelectedPart(part: "script" | "image" | "voice"): Promise<void> {
+  if (batchBusy.value || locked.value) return;
+  const idxs = selectedEnabled.value;
+  if (!idxs.length) return;
+  // #1334：一次聚合确认（取消则整批不执行），循环内跳过逐章确认——此前取消第 1 章仍继续弹第 2 章
+  const label = part === "script" ? "剧本" : part === "image" ? "图像" : "配音";
+  const scopeNote =
+    part === "script"
+      ? `（${idxs.some((i) => (props.feedback[i] ?? "").trim()) ? "含已填意见的章节按意见重写，" : ""}其余强制重写；背景/CG 按新剧本重画，不含配音）`
+      : part === "image"
+        ? "（剧本、配音不动）"
+        : "（剧本、图像不动）";
+  if (!window.confirm(`将重跑第${idxs.map((i) => i + 1).join("、")}章的${label}${scopeNote}。取消则整批不执行，继续吗？`)) return;
+  batchBusy.value = true;
   closeMenu();
-  for (const i of selectedEnabled.value) await runChapterPartRegen(i, part);
+  try {
+    for (const i of idxs) await runChapterPartRegen(i, part, { skipConfirm: true });
+  } finally {
+    batchBusy.value = false;
+  }
 }
 async function regenSelectedFull(): Promise<void> {
+  if (batchBusy.value || locked.value) return;
+  const idxs = selectedEnabled.value;
+  if (!idxs.length) return;
+  // #1334：同上，一次聚合确认；各章「全量」勾选照常分别生效（行为不变，只收敛确认）
+  const forced = idxs.filter((i) => props.force[i]);
+  const forceNote = forced.length === idxs.length
+    ? "（全部勾选「全量」：各章剧本重写＋背景/CG 重画）"
+    : forced.length
+      ? `（其中第${forced.map((i) => i + 1).join("、")}章勾选「全量」：剧本重写＋背景/CG 重画；其余只补缺失）`
+      : "（只补缺失）";
+  if (!window.confirm(`将全量重跑 ${idxs.length} 章（${nameList(idxs)}）${forceNote}，scene 变化后配音需重配。取消则整批不执行，继续吗？`)) return;
+  batchBusy.value = true;
   closeMenu();
-  for (const i of selectedEnabled.value) {
-    emit("updateForce", i, true);
-    try {
-      await runChapterFullRegen(i);
-    } finally {
-      emit("updateForce", i, false);
+  try {
+    for (const i of idxs) {
+      emit("updateForce", i, true);
+      try {
+        await runChapterFullRegen(i, { skipConfirm: true });
+      } finally {
+        emit("updateForce", i, false);
+      }
     }
+  } finally {
+    batchBusy.value = false;
   }
 }
 function toggleSelected(): void {
   closeMenu();
-  for (const i of props.selected) emit("toggle", i);
+  // #1335：混选统一为一个目标态（全停用/全启用），一次确认——不再逐章 toggle 把已停用章反向启用
+  const rows = selectedRows.value;
+  if (!rows.length) return;
+  const enable = rows.every((r) => r.isDisabled);
+  setNovelChaptersEnabled(
+    rows.map((r) => r.chapter.index),
+    enable,
+  );
 }
 </script>
 
@@ -186,13 +238,19 @@ function toggleSelected(): void {
     <div class="card-head">
       <h3>{{ t("逐章生成") }}</h3>
       <div class="card-actions">
-        <!-- 分章状态只读：非「已核对」口径时把下一步指向「生成设置」页 -->
+        <!-- 分章状态只读 + 可点入口：触屏/不熟悉导航的用户可直接跳到生成设置页核对 -->
         <span
           class="tag"
           :class="splitOk ? 'ok' : 'warn'"
           :title="splitOk ? undefined : t('到「生成设置」里重新分章或标记已核对')"
         >{{ splitMetaText }}</span>
         <span v-if="splitConfirmed" class="tag ok">{{ t("已核对") }}</span>
+        <button
+          v-if="!splitConfirmed"
+          class="btn ghost small"
+          :title="t('到生成设置页核对分章')"
+          @click="goPage('settings')"
+        >{{ t("去核对") }}</button>
       </div>
     </div>
 
@@ -232,17 +290,17 @@ function toggleSelected(): void {
             type="text"
             :value="menuFeedback"
             :placeholder="t('意见（可选）：本章节奏太慢…')"
-            :disabled="locked"
+            :disabled="menuBusy"
             @input="onMenuFeedback(($event.target as HTMLInputElement).value)"
           />
           <div class="wb-menu-row">
-            <button class="btn small" role="menuitem" :disabled="locked" @click="regenSelectedPart('script')">{{ t("重跑剧本") }}</button>
-            <button class="btn small" role="menuitem" :disabled="locked" @click="regenSelectedPart('image')">{{ t("重跑图像") }}</button>
-            <button class="btn small" role="menuitem" :disabled="locked" @click="regenSelectedPart('voice')">{{ t("重跑配音") }}</button>
+            <button class="btn small" role="menuitem" :disabled="menuBusy" @click="regenSelectedPart('script')">{{ t("重跑剧本") }}</button>
+            <button class="btn small" role="menuitem" :disabled="menuBusy" @click="regenSelectedPart('image')">{{ t("重跑图像") }}</button>
+            <button class="btn small" role="menuitem" :disabled="menuBusy" @click="regenSelectedPart('voice')">{{ t("重跑配音") }}</button>
           </div>
           <div class="wb-menu-row">
-            <button class="btn small" role="menuitem" :disabled="locked" @click="regenSelectedFull">{{ t("全量重跑") }}</button>
-            <button class="btn small" role="menuitem" :disabled="locked" @click="toggleSelected">{{ toggleLabel }}</button>
+            <button class="btn small" role="menuitem" :disabled="menuBusy" @click="regenSelectedFull">{{ t("全量重跑") }}</button>
+            <button class="btn small" role="menuitem" :disabled="menuBusy" @click="toggleSelected">{{ toggleLabel }}</button>
           </div>
         </div>
       </div>
@@ -266,7 +324,7 @@ function toggleSelected(): void {
         v-for="row in rows"
         :key="row.chapter.index"
         class="stage-row"
-        :class="{ 'is-done': !row.isDisabled && isChapterContentComplete(lightOf(row.chapter.index)), 'is-off': row.isDisabled }"
+        :class="{ 'is-done': !row.isDisabled && row.chip.cls === 'ok', 'is-off': row.isDisabled }"
       >
         <label class="wb-check" :title="t('加入「生成选中」批量队列')">
           <input

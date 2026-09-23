@@ -5,7 +5,7 @@ import { projectState, addMaterial, removeMaterial, restoreProject } from "../st
 import { upsertProject, removeProjectEntry, readDirNovelIdentity, decideNovelImport, suggestProjectSubdirName } from "../stores/projects";
 import { configState, addRecentOutputDir, removeRecentOutputDir } from "../stores/config";
 import { importNovelFile, importNovelFiles } from "../core/chapters";
-import { tauri, isTauri } from "../utils/tauri";
+import { tauri, isTauri, blessParentDir } from "../utils/tauri";
 import { vfsWriteTextFile, vfsWriteFileBase64, vfsListDir, decodeNovelBytes, uniqueImportPath } from "../utils/vfsWeb";
 import { DEMO_NOVEL } from "../core/demoNovel";
 import type { MaterialAsset, NovelDoc } from "../core/types";
@@ -13,6 +13,7 @@ import { splitChapters } from "../core/chapters";
 import { errMsg } from "../utils/errors";
 import { fileToBase64 } from "../utils/file";
 import { log } from "../utils/logger";
+import { classifyMaterial } from "../utils/materials";
 import { currentLang, t } from "../i18n";
 import PageHead from "../components/PageHead.vue";
 import LazyThumb from "../components/LazyThumb.vue";
@@ -30,6 +31,7 @@ function guardRunning(action: string): boolean {
 
 /** 移除素材引用（只删引用关系，不删磁盘文件），二次确认防点错 */
 function confirmRemoveMaterial(path: string, name: string): void {
+  if (!guardRunning(t("移除素材"))) return;
   if (!window.confirm(t("从素材库移除「{name}」？只删除引用关系，磁盘文件保留。", { name }))) return;
   removeMaterial(path);
 }
@@ -72,9 +74,11 @@ async function pickNovel(): Promise<void> {
     if (!picked) return;
     const paths = (Array.isArray(picked) ? picked : [picked]).filter((p): p is string => typeof p === "string");
     if (!paths.length) return;
+    // #1292：登记选中文件所在目录（用户经系统对话框明示授权），否则后续读取被白名单拒绝
+    for (const p of paths) await blessParentDir(p);
     if (projectState.novel && !window.confirm(t("将覆盖当前已导入的「{name}」。继续吗？", { name: projectState.novel.fileName }))) return;
     const doc = paths.length > 1 ? await importNovelFiles(paths) : await importNovelFile(paths[0]);
-    await guardNovelDir(doc);
+    if (!(await guardNovelDir(doc))) return;
     projectState.novel = doc;
     log.info("page", "导入小说成功", { fileCount: paths.length, chapters: doc.chapters.length, charCount: doc.fullText.length });
   } catch (e) {
@@ -119,7 +123,7 @@ async function onNovelFile(e: Event): Promise<void> {
     if (detected.some((e) => e !== "UTF-8")) {
       notice.value = t("检测到文件编码为 {encoding}，已自动转换", { encoding: doc.encoding });
     }
-    await guardNovelDir(doc);
+    if (!(await guardNovelDir(doc))) return;
     projectState.novel = doc;
     log.info("page", "导入小说成功", { fileCount: vPaths.length, chapters: doc.chapters.length, charCount: doc.fullText.length, encoding: doc.encoding });
   } catch (err) {
@@ -139,12 +143,13 @@ async function loadDemo(): Promise<void> {
     fullText: DEMO_NOVEL,
     chapters: splitChapters(DEMO_NOVEL, "星陨之城的守夜人"),
   };
-  await guardNovelDir(doc);
+  if (!(await guardNovelDir(doc))) return;
   projectState.novel = doc;
   log.info("page", "加载示例小说", { chapters: doc.chapters.length, charCount: doc.fullText.length });
 }
 
 async function pickMaterials(): Promise<void> {
+  if (!guardRunning(t("导入素材"))) return;
   if (!isTauri()) {
     materialInput.value?.click();
     return;
@@ -154,8 +159,17 @@ async function pickMaterials(): Promise<void> {
     filters: [{ name: t("图片"), extensions: ["png", "jpg", "jpeg", "webp"] }],
   });
   if (!paths) return;
+  // #1292：登记选中文件所在目录（同导入小说）
   for (const p of Array.isArray(paths) ? paths : [paths]) {
-    await addMaterialAsset(p);
+    if (typeof p === "string") await blessParentDir(p);
+  }
+  importing.value = true;
+  try {
+    for (const p of Array.isArray(paths) ? paths : [paths]) {
+      await addMaterialAsset(p);
+    }
+  } finally {
+    importing.value = false;
   }
 }
 
@@ -164,6 +178,7 @@ async function onMaterialFiles(e: Event): Promise<void> {
   const files = input.files ? [...input.files] : [];
   input.value = "";
   if (!files.length) return;
+  if (!guardRunning(t("导入素材"))) return;
   error.value = "";
   importing.value = true;
   try {
@@ -185,11 +200,8 @@ async function onMaterialFiles(e: Event): Promise<void> {
   }
 }
 
-function classifyMaterial(name: string): MaterialAsset["kind"] {
-  if (/人|角色|char|figure|hero/.test(name)) return "character";
-  if (/物|item|道具|sword|weapon|jade/.test(name)) return "item";
-  return "background";
-}
+/** 素材自动分类见 src/utils/materials.ts（纯函数，#1288/#1367）：
+ *  <script setup> 内不允许 export，函数体必须在外部模块，页面只 import。 */
 
 /** 本地素材 mime 判定：与 Web 路径的 file.type 对齐（之前 webp 会被错标成 png） */
 function materialMime(name: string): string {
@@ -215,10 +227,36 @@ async function addMaterialAsset(p: string): Promise<void> {
   }
 }
 
-function updateChapterTitle(i: number, title: string): void {
+function updateChapterTitle(i: number, title: string, e?: Event): void {
+  // #1366：运行中改章名会改掉项目身份 titleSig 与快照指纹，与章节启停守卫保持一致
+  if (!guardRunning(t("修改章节标题"))) {
+    const input = e?.target as HTMLInputElement | undefined;
+    if (input) input.value = projectState.novel?.chapters[i].title ?? input.value;
+    return;
+  }
   if (projectState.novel) {
     projectState.novel.chapters[i].title = title;
   }
+}
+
+/** 素材类型/映射在运行中同样与管线读素材并发：统一走守卫并回滚 DOM */
+function onMaterialKindChange(m: MaterialAsset, e: Event): void {
+  const sel = e.target as HTMLSelectElement;
+  if (!guardRunning(t("修改素材类型"))) {
+    sel.value = m.kind;
+    return;
+  }
+  m.kind = sel.value as MaterialAsset["kind"];
+}
+
+function onMaterialMapToChange(m: MaterialAsset, e: Event): void {
+  const input = e.target as HTMLInputElement;
+  if (!guardRunning(t("修改素材映射"))) {
+    input.value = m.extra?.mapTo ?? "";
+    return;
+  }
+  if (!m.extra) m.extra = {};
+  m.extra.mapTo = input.value.trim() || undefined;
 }
 
 function toggleChapter(i: number, e?: Event): void {
@@ -295,27 +333,35 @@ async function newProject(): Promise<void> {
 /** 导入保护：新小说与当前目录快照不是同一本时，建议独立目录防串味。
  *  确定=自动建「小说名」子目录并切换；取消=留在当前目录（会覆盖旧缓存）。
  *  #1118：网页版同样执行（VFS 快照 + VFS 建目录），默认 /app/exports 下每本书一个子目录。 */
-async function guardNovelDir(doc: { fileName: string; chapters: { title: string }[] }): Promise<void> {
+async function guardNovelDir(doc: { fileName: string; chapters: { title: string }[] }): Promise<boolean> {
   const dir = projectState.outputDir;
-  if (!dir) return;
+  if (!dir) return true;
   const snap = await readDirNovelIdentity(dir);
   const decision = decideNovelImport(snap, { fileName: doc.fileName, titleSig: doc.chapters.map((c) => c.title).join("|") });
-  if (decision !== "different") return;
+  if (decision !== "different") return true;
+  // #1364：decideNovelImport 已改为同文件名即判 same（titleSig 含 AI 分章后标题，同书重导必然不一致）。
+  // 这里保留同名覆盖确认作双保险（换文件重名的极端情况），不再建子目录。
+  if (snap && snap.fileName === doc.fileName) {
+    return window.confirm(
+      t("重新导入「{name}」将覆盖当前分章/改名结果（含 AI 分章标题与章节启停）。\n\n点「确定」继续覆盖，点「取消」中止导入。", { name: doc.fileName }),
+    );
+  }
   if (!window.confirm(
     t("当前输出目录属于「{oldName}」的项目，继续导入会覆盖它的缓存。\n\n点「确定」为「{newName}」新建独立项目目录，点「取消」留在当前目录（覆盖旧缓存）。", { oldName: snap?.fileName ?? "", newName: doc.fileName }),
-  )) return;
+  )) return true;
   const target = `${dir.replace(/[\\/]+$/, "")}/${suggestProjectSubdirName(doc.fileName)}`;
   await tauri.mkdirAll(target);
   await restoreProject(target);
   configState.outputDir = target;
   addRecentOutputDir(target);
   upsertProject(target, { fileName: doc.fileName, title: doc.chapters[0]?.title ?? "" });
+  return true;
 }
 </script>
 
 <template>
   <div class="inner">
-    <PageHead :title="t('导入小说')" :sub="t('选择 txt 小说文件（可多选，自动合并；导入时不分章，生成时由 AI 分章）；可导入自定义素材（AI 优先使用）')">
+    <PageHead :title="t('导入小说')" :sub="t('选择 txt 小说文件（可多选，自动合并；单文件按标题规则初切，多文件合并为单章，生成时由 AI 重新分章）；可导入自定义素材（AI 优先使用）')">
       <button class="btn secondary" @click="loadDemo">{{ t("加载示例") }}</button>
       <button class="btn" :disabled="importing" @click="pickNovel">
         <span v-if="importing" class="spinner" />
@@ -344,7 +390,7 @@ async function guardNovelDir(doc: { fileName: string; chapters: { title: string 
 
     <div class="card" v-if="projectState.novel">
       <div class="card-head">
-        <h3>{{ t("章节（导入时不切章；生成时由 AI 分章，可在生成页查看/勾选重跑）") }}</h3>
+        <h3>{{ t("章节（单文件按标题规则初切，多文件合并为单章；生成时由 AI 重新分章，可在生成页查看/勾选重跑）") }}</h3>
       </div>
       <div class="tbl-wrap">
         <table class="tbl">
@@ -366,7 +412,7 @@ async function guardNovelDir(doc: { fileName: string; chapters: { title: string 
                   type="text"
                   :value="ch.title"
                   class="title-input"
-                  @change="(e: any) => updateChapterTitle(i, (e.target as HTMLInputElement).value)"
+                  @change="(e: any) => updateChapterTitle(i, (e.target as HTMLInputElement).value, e)"
                 />
               </td>
               <td>{{ fmtNumber(ch.charCount) }}</td>
@@ -386,7 +432,7 @@ async function guardNovelDir(doc: { fileName: string; chapters: { title: string 
         </div>
       </div>
       <p class="hint mb-4">
-        {{ t("人物参考图 / 物品图 / 背景图。文件名含「人/角色/char」归人物、「物/item/剑」归物品、其余归背景。") }}
+        {{ t("人物参考图 / 物品图 / 背景图。文件名含「人/角色/char/figure/hero」归人物、「物/item/道具/剑/sword/weapon/jade」归物品、其余归背景（英文大小写不限）。") }}
         {{ t("管线优先使用你的素材，缺失才由 AI 生成；可在下方手动改类型与映射。") }}
       </p>
       <div v-if="projectState.materials.length" class="mat-grid">
@@ -399,7 +445,7 @@ async function guardNovelDir(doc: { fileName: string; chapters: { title: string 
             <LazyThumb :path="m.path" :alt="m.name" />
           </div>
           <div class="mat-row">
-            <select :value="m.kind" @change="(e: any) => (m.kind = (e.target as HTMLSelectElement).value as any)" style="flex: 1">
+            <select :value="m.kind" @change="(e: any) => onMaterialKindChange(m, e)" style="flex: 1">
               <option value="character">{{ t("人物") }}</option>
               <option value="item">{{ t("物品") }}</option>
               <option value="background">{{ t("背景") }}</option>
@@ -409,12 +455,7 @@ async function guardNovelDir(doc: { fileName: string; chapters: { title: string 
               :value="m.extra?.mapTo ?? ''"
               style="flex: 1.4"
               :placeholder="t('映射到（角色/物品 id）')"
-              @change="
-                (e: any) => {
-                  if (!m.extra) m.extra = {};
-                  m.extra.mapTo = (e.target as HTMLInputElement).value.trim() || undefined;
-                }
-              "
+              @change="(e: any) => onMaterialMapToChange(m, e)"
             />
           </div>
         </div>

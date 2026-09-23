@@ -16,6 +16,28 @@ function onSkipCacheChange(e: Event): void {
   }
   projectState.options.skipCache = input.checked;
 }
+
+/** #1362：number 输入 min=0 拦不住手动键入的负数；负数会被下游 >0 判定吞成「不限制」/回退默认种子，与显示值不一致。
+ *  change 时钳到 >=0，与下游语义（0 = 不限制/自动派生）对齐。纯函数逻辑见 tests/unit-audit-u2-budget-clamp.ts */
+function clampNonNegativeInt(raw: unknown): number {
+  const n = typeof raw === "string" ? Number(raw.trim()) : Number(raw);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.floor(n));
+}
+
+function onBudgetChange(key: "cgPerChapter" | "imageBudgetPerChapter" | "videoPointsPerChapter", e: Event): void {
+  const el = e.target as HTMLInputElement;
+  const clamped = clampNonNegativeInt(el.value);
+  projectState.options[key] = clamped;
+  if (el.value.trim() !== String(clamped)) el.value = String(clamped);
+}
+
+function onSeedChange(e: Event): void {
+  const el = e.target as HTMLInputElement;
+  const clamped = clampNonNegativeInt(el.value);
+  projectState.options.imageSeed = clamped;
+  if (el.value.trim() !== String(clamped)) el.value = String(clamped);
+}
 </script>
 
 <template>
@@ -39,17 +61,17 @@ function onSkipCacheChange(e: Event): void {
           </span>
         </label>
         <label class="opt-item opt-stack">
-          <input type="checkbox" v-model="projectState.options.useBgm" />
+          <input type="checkbox" :checked="projectState.options.useBgm !== false" @change="(e: any) => { projectState.options.useBgm = (e.target as HTMLInputElement).checked; }" />
           <span class="opt-text">
             {{ t("BGM 匹配") }}
-            <span class="hint">{{ t("扫描项目 bgm 文件夹匹配场景音乐") }}</span>
+            <span class="hint">{{ t("扫描项目 bgm 文件夹匹配场景音乐（留空/缺省按开启处理）") }}</span>
           </span>
         </label>
         <label class="opt-item opt-stack">
-          <input type="checkbox" v-model="projectState.options.useSe" />
+          <input type="checkbox" :checked="projectState.options.useSe !== false" @change="(e: any) => { projectState.options.useSe = (e.target as HTMLInputElement).checked; }" />
           <span class="opt-text">
             {{ t("环境音效（SE）") }}
-            <span class="hint">{{ t("按场景氛围播放内置雨/雷/风等音效") }}</span>
+            <span class="hint">{{ t("按场景氛围播放内置雨/雷/风等音效（留空/缺省按开启处理）") }}</span>
           </span>
         </label>
       </div>
@@ -86,7 +108,7 @@ function onSkipCacheChange(e: Event): void {
       <div class="field-grid mt-3">
         <label class="field">
           <span>{{ t("固定种子（0 = 按标题自动派生）") }}</span>
-          <input type="number" min="0" placeholder="0" v-model.number="projectState.options.imageSeed" />
+          <input type="number" min="0" placeholder="0" :value="projectState.options.imageSeed" @change="onSeedChange" />
           <span class="hint">{{ t("同一种子下画风与角色更稳定一致") }}</span>
         </label>
       </div>
@@ -100,18 +122,18 @@ function onSkipCacheChange(e: Event): void {
       <div class="field-grid">
         <label class="field">
           <span>{{ t("每章 CG 数上限（0 = 不限制）") }}</span>
-          <input type="number" min="0" placeholder="0" v-model.number="projectState.options.cgPerChapter" />
+          <input type="number" min="0" placeholder="0" :value="projectState.options.cgPerChapter" @change="(e) => onBudgetChange('cgPerChapter', e)" />
           <span class="hint">{{ t("超出上限的 CG 直接跳过") }}</span>
         </label>
         <label class="field">
-          <span>{{ t("每章图像数上限（0 = 不限制）") }}</span>
-          <input type="number" min="0" placeholder="0" v-model.number="projectState.options.imageBudgetPerChapter" />
-          <span class="hint">{{ t("本章立绘/背景/CG 合计数") }}</span>
+          <span>{{ t("每章背景数上限（0 = 不限制）") }}</span>
+          <input type="number" min="0" placeholder="0" :value="projectState.options.imageBudgetPerChapter" @change="(e) => onBudgetChange('imageBudgetPerChapter', e)" />
+          <span class="hint">{{ t("仅限制背景图；立绘/物品不受限，CG 用上方单独上限") }}</span>
         </label>
         <label class="field">
-          <span>{{ t("视频推荐点数上限（0 = 不限制）") }}</span>
-          <input type="number" min="0" placeholder="0" v-model.number="projectState.options.videoPointsPerChapter" />
-          <span class="hint">{{ t("超出后本章不再出视频推荐位") }}</span>
+          <span>{{ t("每场景视频推荐点数上限（0 = 不限制）") }}</span>
+          <input type="number" min="0" placeholder="0" :value="projectState.options.videoPointsPerChapter" @change="(e) => onBudgetChange('videoPointsPerChapter', e)" />
+          <span class="hint">{{ t("每个场景最多保留该数量，多场景合计可能超出；0 = 不限制") }}</span>
         </label>
       </div>
     </div>

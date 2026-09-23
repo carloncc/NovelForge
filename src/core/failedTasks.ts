@@ -13,10 +13,12 @@ export function failedTasksFile(outputDir: string): string {
 }
 
 /** 失败项身份：图像按用途类别区分（bg/cg/figure/item）——背景与 CG 共用 scene.id，
- * 只按 id 匹配会把「同名不同用途」的失败/成功互相抵消。 */
+ * 只按 id 匹配会把「同名不同用途」的失败/成功互相抵消。
+ * #1311：类别判定只读 message 首段中文前缀，文案改动即错位——此处仅做尽力归类（默认 figure），
+ * 去重键错位的最坏后果是多保留一条失败项（宁可多试一次，不静默丢失败）。 */
 export function failedTaskIdentity(f: FailedTask): string {
   if (f.kind !== "image") return `${f.kind}:${f.id}`;
-  const usage = (f.message.split("：")[0] || "").trim();
+  const usage = ((f.message ?? "").split("：")[0] || "").trim();
   let cat = "figure";
   if (usage.startsWith("背景")) cat = "bg";
   else if (usage.startsWith("CG")) cat = "cg";
@@ -34,7 +36,11 @@ export async function readFailedTasks(outputDir: string): Promise<FailedTask[]> 
     return parsed.filter(
       (f): f is FailedTask =>
         !!f && typeof f === "object" && typeof (f as FailedTask).id === "string" && typeof (f as FailedTask).step === "string",
-    );
+    ).map((f) => (
+      // #1311：手改/损坏的 failed.json 可能缺 message（identity 内 .split 即崩整个读取）。
+      // 缺失按空串补齐（归类默认 figure），损坏条目仍可见、可重试，不整盘作废。
+      typeof f.message === "string" ? f : { ...f, message: "" }
+    ));
   } catch {
     return [];
   }

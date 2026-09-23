@@ -166,17 +166,24 @@ function motionFor(emotion?: string): string | null {
 }
 
 /** 旁白/剧情中有明显动作或冲击感 → 触发舞台镜头震动 */
-/** 环境音效匹配：按场景氛围/时间/地点关键词输出 SE（playEffect），无匹配返回 null */
-function detectSe(scene: SceneJSON): string | null {
-  const hay = `${scene.location} ${scene.atmosphere ?? ""} ${scene.time ?? ""}`;
+/** 环境音效匹配：按场景氛围/时间/地点关键词输出 SE（playEffect），无匹配返回 null。
+ *  #1328：单字关键词（剑/门/风/夜/接近）误配专名（剑宗/门派/风铃/夜晚/接近真相），
+ *  故动作类只认多字词（拔剑/敲门/风声…），tension 只看 atmosphere 的阴森/紧张词，
+ *  时间/地点里的「夜」单独出现不再触发。 */
+export function detectSe(scene: SceneJSON): string | null {
+  const loc = scene.location || "";
+  const atm = scene.atmosphere ?? "";
+  const time = scene.time ?? "";
+  const hay = `${loc} ${atm} ${time}`;
   if (/雨|下雨|大雨|雷雨|暴雨|骤雨/.test(hay)) return "rain";
   if (/雷|闪电|轰鸣/.test(hay)) return "thunder";
-  if (/风|风声|呼啸|寒风/.test(hay)) return "wind";
+  if (/风声|呼啸|寒风|大风|狂风/.test(hay)) return "wind";
   if (/战斗|打斗|激战|厮杀|搏斗|混战|战场|交锋/.test(hay)) return "battle";
-  if (/剑|拔刀|挥剑|武器|刀光|兵刃/.test(hay)) return "sword";
-  if (/门|敲门|推门|叩门|门环/.test(hay)) return "door";
-  if (/脚步|脚步声|走廊|巷|小巷|逼近|接近/.test(hay)) return "step";
-  if (/夜|深夜|阴森|阴冷|紧张|危险|追杀|逃亡|悬念|寂静/.test(hay)) return "tension";
+  if (/拔刀|挥剑|拔剑|剑光|剑气|舞剑|仗剑|武器|刀光|兵刃/.test(hay)) return "sword";
+  if (/敲门|推门|叩门|门环|开门|关门/.test(hay)) return "door";
+  if (/脚步|脚步声|走廊|巷|小巷|逼近/.test(hay)) return "step";
+  // tension 只看氛围词（地点/时间专名不触发）；「夜」需与阴森/紧张等词共现才算
+  if (/阴森|阴冷|紧张|危险|追杀|逃亡|悬念|寂静|恐怖/.test(atm)) return "tension";
   return null;
 }
 
@@ -623,14 +630,31 @@ export function renderChapter(
       }
     };
     // 触发点 ≤ 0 的分镜在第一句之前就切换
-    if (imageOnly) emitDueShots(0);
+    // #1369：图片小说场景必须以自己的首张分镜开场——首分镜触发点 >0 时此前整场沿用上一场景画面。
+    // 场景开始即淡入首图（后续分镜按触发点正常切换；首图触发点 ≤0 时走原有 emitDueShots(0)）。
+    // 全无分镜的场景仍保留上一张图（images.ts 有意不产出黑屏，见 #809 注释）。
+    if (imageOnly) {
+      if (shotList.length && shotList[0].shot.triggerLineIndex > 0) {
+        const { shot, file } = shotList[shotCursor++];
+        out.push(`changeBg:${getBaseName(file)} -duration=400 -ease=easeInOut -next;`);
+        out.push(`unlockCg:${getBaseName(file)} -name=${esc(shot.note || scene.location || "分镜")};`);
+      } else {
+        emitDueShots(0);
+      }
+    }
     // 环境音效（SE）：按场景氛围匹配播放（用户可用同名文件覆盖内置音效）
     // useSe === false（新项目默认）时完全不输出 playEffect；undefined 兼容旧项目仍按氛围输出
     const se = opts.useSe === false ? null : detectSe(scene);
-    if (se && se !== lastSe) {
-      lastSe = se;
-      const seVolume = opts.seVolume ?? 35;
-      out.push(`playEffect:se_${se}.wav -volume=${seVolume} -next;`);
+    if (se) {
+      if (se !== lastSe) {
+        lastSe = se;
+        const seVolume = opts.seVolume ?? 35;
+        out.push(`playEffect:se_${se}.wav -volume=${seVolume} -next;`);
+      }
+    } else {
+      // #1327：无 SE 场景复位 lastSe（与 BGM 的 lastBgm 置 null 对称）。
+      // 否则同章同种氛围第二次出现时 se===lastSe 被跳过而静音（[雨,晴,雨] 的 C 场景无声）。
+      lastSe = null;
     }
 
     // 视频推荐位：有用户放置的视频文件则播放，否则注释占位（不执行）

@@ -7,6 +7,7 @@
  */
 import type { ApiConfig } from "../core/types";
 import { headersFor, runWithImageLimit } from "./openaiCompatible";
+import { activeAbortSignal } from "./abort";
 import { joinApiPath, normalizeBaseUrl } from "./baseUrl";
 import { tauri } from "../utils/tauri";
 import { b64decode, b64encode } from "../utils/base64";
@@ -29,6 +30,15 @@ export interface EditImageVariantRequest {
 
 const CRLF = "\r\n";
 
+/** multipart name/filename 转义（1297）：与 universal.escapeDispositionName 同口径，避免引号/CRLF 注入 part。 */
+function escapeDispositionName(name: string): string {
+  return String(name ?? "")
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/[\r\n]+/g, "_")
+    .slice(0, 200);
+}
+
 function textBytes(text: string): Uint8Array {
   return new TextEncoder().encode(text);
 }
@@ -44,12 +54,15 @@ export function buildEditMultipart(
   file: { name: string; filename: string; mime: string; bytes: Uint8Array },
 ): Uint8Array {
   const parts: Uint8Array[] = [];
-  for (const [name, value] of Object.entries(fields)) {
+  for (const [rawName, value] of Object.entries(fields)) {
+    const name = escapeDispositionName(rawName);
     parts.push(textBytes(`--${boundary}${CRLF}Content-Disposition: form-data; name="${name}"${CRLF}${CRLF}${value}${CRLF}`));
   }
+  const safeFileName = escapeDispositionName(file.name);
+  const safeFilename = escapeDispositionName(file.filename);
   parts.push(
     textBytes(
-      `--${boundary}${CRLF}Content-Disposition: form-data; name="${file.name}"; filename="${file.filename}"${CRLF}Content-Type: ${file.mime}${CRLF}${CRLF}`,
+      `--${boundary}${CRLF}Content-Disposition: form-data; name="${safeFileName}"; filename="${safeFilename}"${CRLF}Content-Type: ${file.mime}${CRLF}${CRLF}`,
     ),
   );
   parts.push(file.bytes);
@@ -68,6 +81,7 @@ export function buildEditMultipart(
 export async function editImageVariant(
   cfg: ApiConfig,
   req: EditImageVariantRequest,
+  opts?: { signal?: AbortSignal },
 ): Promise<{ dataB64: string; mime: string }> {
   const base = normalizeBaseUrl(cfg.baseUrl, (cfg.extra?.pathPrefix as string) || undefined);
   const url = joinApiPath(base, "/images/edits");
@@ -91,7 +105,7 @@ export async function editImageVariant(
       headers: { ...headersFor(cfg), "Content-Type": `multipart/form-data; boundary=${boundary}` },
       bodyBase64: b64encode(body),
       timeoutSecs: 300,
-    }),
+    }, opts?.signal ?? activeAbortSignal()),
   );
   const text = new TextDecoder().decode(b64decode(res.bodyBase64));
   let parsed: { data?: { b64_json?: string }[]; error?: { message?: string } } = {};

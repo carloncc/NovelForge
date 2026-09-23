@@ -190,6 +190,13 @@ export async function flushPendingProjectSave(): Promise<boolean> {
 }
 
 export async function restoreProject(outputDir: string): Promise<void> {
+  // #1292：先登记项目目录进桌面端文件白名单——用户工程可位于任意盘符（D 盘等），
+  // 不登记则后续读写一律被拒，项目打不开。登记失败不阻断（读到明确拒绝再报）。
+  try {
+    await tauri.blessProjectDir(outputDir);
+  } catch {
+    /* 登记失败不阻断，后续文件命令会给出明确拒绝 */
+  }
   // 恢复期间挂起自动保存：否则恢复完成前的 800ms 防抖会把"空状态"写回磁盘（大项目恢复 >800ms 必现，
   // 项目状态文件被静默清空）。
   suspendProjectSave(true);
@@ -215,6 +222,12 @@ export async function restoreProject(outputDir: string): Promise<void> {
     projectState.novel = r.novel;
     projectState.materials = r.materials;
     projectState.options = { ...DEFAULT_OPTIONS, ...(r.options ?? {}) };
+    // #1109 根治：useSe 是可选字段，旧存档/预设套用可能留下显式 undefined——界面 falsy 显示"关"、
+    // 引擎 !==false 判"开"，预设还误判为省钱档。加载时归一化为显式布尔，与引擎语义对齐。
+    if (projectState.options.useSe === undefined) projectState.options.useSe = true;
+    if ((projectState.options as { useBgm?: unknown }).useBgm === undefined) {
+      (projectState.options as { useBgm?: boolean }).useBgm = true;
+    }
     projectState.lastResult = null;
     // 卡片以磁盘上的工作副本为准（与 pipeline.loadCards 同源）：project_state.json 里的
     // cards 只是上次保存时的快照，生成结束后不一定落盘过，重启后可能与 cards.json 不一致。
@@ -356,6 +369,19 @@ watch(
   { deep: false },
 );
 
+// #1320：切换项目时重载该项目的导出界面语言（默认 zh_CN，不碰翻译目标）
+// 注意：loadExportUiLanguage 定义在文件后部，此处不 immediate，改由定义后显式初载，避免 TDZ
+watch(
+  () => projectState.outputDir,
+  () => {
+    try {
+      loadExportUiLanguage();
+    } catch {
+      /* 定义前触发时忽略，初载由底部显式调用 */
+    }
+  },
+);
+
 export function clearLogs(): void {
   projectState.logs = [];
   for (const k of Object.keys(stageLastLevels) as StageKey[]) stageLastLevels[k] = undefined;
@@ -421,4 +447,91 @@ export function addMaterial(mat: MaterialAsset): void {
 
 export function removeMaterial(path: string): void {
   projectState.materials = projectState.materials.filter((m) => m.path !== path);
+}
+
+/* ==================== #1320 导出语言 vs 翻译目标语言（store 侧写入口径） ==================== */
+
+/**
+ * #1320：同一字段两种语义导致静默覆盖——设置页 options.language=“翻译目标（空=不翻译）”，
+ * 导出页“界面语言”此前用 `(o.language)||"zh_CN"` 回填并无条件写回，把空语言写成 zh_CN，
+ * 下次生成静默激活整书翻译（计费）。
+ *
+ * store 侧修复（UI 侧由他人负责迁移到 setExportUiLanguage）：
+ * - 翻译目标：空字符串必须保持空语义（不触发翻译），永不回退 zh_CN；
+ * - 导出界面语言：独立状态 exportSettings.uiLanguage（zh_CN/zh_TW/en/ja/ko），不再复用 options.language；
+ * - 导出保存写入口径：仅当用户真的改动翻译目标（touched）才写，否则保持原值。
+ */
+
+export const EXPORT_UI_LANGUAGES = ["zh_CN", "zh_TW", "en", "ja", "ko"] as const;
+export type ExportUiLanguage = (typeof EXPORT_UI_LANGUAGES)[number];
+
+/** 纯函数：界面语言归一化（无空语义，非法/空一律回退 zh_CN） */
+export function normalizeExportUiLanguage(v: unknown): ExportUiLanguage {
+  const s = typeof v === "string" ? v.trim() : "";
+  return (EXPORT_UI_LANGUAGES as readonly string[]).includes(s) ? (s as ExportUiLanguage) : "zh_CN";
+}
+
+/** 纯函数：翻译目标归一化（保持空语义，永不回退 zh_CN） */
+export function coerceTranslationLanguage(v: unknown): string {
+  return typeof v === "string" ? v : "";
+}
+
+/**
+ * 纯函数：导出保存是否应更新翻译目标。
+ * - touched=false（用户没动该下拉）：保持 current；
+ * - touched=true：写入 coerce 后的 incoming（即使 "" 也照写，保持“不翻译”语义）。
+ */
+export function resolveTranslationLanguageUpdate(current: string, incoming: unknown, touched: boolean): string {
+  if (!touched) return current;
+  if (typeof incoming !== "string") return current;
+  return incoming;
+}
+
+/** 导出界面语言（独立于翻译目标；按项目目录持久化到 localStorage，不进管线指纹） */
+export const exportSettings = reactive<{ uiLanguage: ExportUiLanguage }>({ uiLanguage: "zh_CN" });
+
+function exportUiKey(): string {
+  return `novelforge:exportUi:${projectState.outputDir || "default"}`;
+}
+
+export function loadExportUiLanguage(): void {
+  try {
+    const raw = localStorage.getItem(exportUiKey());
+    if (raw === null) {
+      // 老项目迁移：此前界面语言与翻译目标共用 options.language，非空即沿用，保证旧项目行为不变；
+      // 之后两字段独立演进（界面语言改下拉，翻译目标改设置页）。
+      const legacy = (projectState.options.uiLanguage || projectState.options.language || "").trim();
+      exportSettings.uiLanguage = normalizeExportUiLanguage(legacy || "zh_CN");
+      return;
+    }
+    exportSettings.uiLanguage = normalizeExportUiLanguage(raw);
+  } catch {
+    exportSettings.uiLanguage = "zh_CN";
+  }
+}
+
+export function setExportUiLanguage(v: unknown): ExportUiLanguage {
+  const next = normalizeExportUiLanguage(v);
+  exportSettings.uiLanguage = next;
+  try {
+    localStorage.setItem(exportUiKey(), next);
+  } catch {
+    /* 忽略 */
+  }
+  return next;
+}
+
+/** 翻译目标写入口（保持空语义；UI 侧设置页/导出页统一走这里，不再 `|| "zh_CN"`） */
+export function setTranslationLanguage(v: unknown): string {
+  const next = coerceTranslationLanguage(v);
+  projectState.options.language = next;
+  scheduleSave();
+  return next;
+}
+
+// #1320 初载（对应顶部 watch 的非 immediate 设计）：模块初始化完成后按当前项目载入一次
+try {
+  loadExportUiLanguage();
+} catch {
+  /* 忽略 */
 }

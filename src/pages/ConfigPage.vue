@@ -577,9 +577,9 @@ watch(
 
           <details class="cfg-details">
             <summary>{{ t("高级参数") }}</summary>
-            <div v-if="ch.key === 'llm' || ch.key === 'image' || ch.key === 'tts'" class="cfg-row mt-2">
-              <label class="field cfg-narrow mb-0" :title="t('该 API 批量生成任务同时执行的请求数。每个 API 独立配置，互不影响。')">
-                <span>{{ t("并发数（该 API 批量生成）") }}</span>
+            <div v-if="ch.key === 'llm' || ch.key === 'vision' || ch.key === 'image' || ch.key === 'tts'" class="cfg-row mt-2">
+              <label class="field cfg-narrow mb-0" :title="ch.key === 'vision' ? t('图片识别与生成自检批量任务同时执行的请求数。每个 API 独立配置，互不影响。') : t('该 API 批量生成任务同时执行的请求数。每个 API 独立配置，互不影响。')">
+                <span>{{ ch.key === 'vision' ? t("并发数（图片识别与生成自检）") : t("并发数（该 API 批量生成）") }}</span>
                 <input
                   type="number"
                   min="1"
@@ -591,13 +591,13 @@ watch(
             </div>
             <div v-if="ch.key === 'llm' || ch.key === 'vision'" class="cfg-row">
               <label class="field grow-2">
-                <span>{{ t("上下文长度 token（留空 = 自动探测，留空时填默认 128000）") }}</span>
+                <span>{{ t("上下文长度 token（留空 = 自动探测，探测失败时回退 128000）") }}</span>
                 <input
                   type="number"
                   min="1024"
                   step="1024"
                   :value="(cfg.extra!.contextLength as number | string | undefined) ?? ''"
-                  :placeholder="t('例如 128000；自动探测到时会显示当前值')"
+                  :placeholder="t('例如 128000')"
                   @change="
                     (e: any) => {
                       const v = (e.target as HTMLInputElement).value.trim();
@@ -612,6 +612,7 @@ watch(
                   <code>{{ fmtNumber(resolveContextLength(cfg)) }}</code>
                   <span class="cfg-context-budget">{{ t("输入预算") }}：{{ fmtNumber(inputCharBudget(cfg)) }} {{ t("字符") }}</span>
                 </div>
+                <span class="hint">{{ t("留空时自动探测（/models），探测不到回退 128000；手动填写优先") }}</span>
               </label>
             </div>
           </details>

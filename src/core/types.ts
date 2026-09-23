@@ -532,8 +532,12 @@ export interface GenerationOptions {
   compressNarration?: boolean;
   /** 提取卡片使用 Agent 模式（多步自主扫描 + 工具调用），长小说更稳、可逐步补全 */
   extractAgent?: boolean;
-  /** 目标语言（如 en/ja），把小说翻译成该语言后再生成；空 = 使用原文 */
+  /** 目标语言（如 en/ja），把小说翻译成该语言后再生成；空 = 使用原文。
+   *  注意：这只是翻译开关。游戏界面语言见 uiLanguage（#1320），两者不再共用字段。 */
   language?: string;
+  /** 游戏界面语言（导出页「界面语言」下拉写入；zh_CN/zh_TW/en/ja）。
+   *  缺省时跟随翻译目标（非空），再缺省按原文推断——与旧单字段行为一致。 */
+  uiLanguage?: string;
   /** AI 分章碎章合并阈值（默认 3000 字；0 = 不合并，特殊小章独立成章） */
   splitMinChapterChars?: number;
   /** AI 分章保留特殊章节（后记/番外/特典/插图等不被当杂项丢弃） */
@@ -579,5 +583,5 @@ export interface FailedTask {
 export interface ExportSettings {
   title: string;
   gameKey: string;
-  language: "zh_CN" | "zh_TW" | "en" | "ja";
+  language: "zh_CN" | "zh_TW" | "en" | "ja" | "ko";
 }

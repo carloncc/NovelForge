@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { nextTick } from "vue";
 import { t } from "../../../i18n";
 import { isTauri } from "../../../utils/tauri";
 import { sanitizeId } from "../../../core/render";
@@ -25,6 +26,13 @@ function gotoScriptRegen(): void {
   if (busy.value || assetBusy.value || queueRunning.value) return;
   if (!window.confirm(t("视频推荐位是「剧本」阶段的一部分：重新生成需要重跑剧本阶段（有 LLM 时计费）。\n\n注意：已缓存章节默认复用缓存、不会覆盖推荐位；如需强制重生成，请在「剧本」行勾选「全量」或填写意见后再点「重新生成」。\n\n现在切到「单阶段重跑」吗？"))) return;
   runMode.value = "stage";
+  void nextTick(() => {
+    try {
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    } catch {
+      /* 忽略 */
+    }
+  });
 }
 </script>
 
@@ -33,7 +41,7 @@ function gotoScriptRegen(): void {
   <div class="card" v-if="videoPoints.length">
     <div class="card-head">
       <h3>{{ t("AI 推荐的视频演出位（{n} 个）", { n: videoPoints.length }) }}</h3>
-      <div class="card-actions"><button class="btn secondary small" @click="checkVideos">{{ t("刷新状态") }}</button><button class="btn ghost small" :disabled="busy || !!assetBusy || queueRunning" :title="t('视频推荐位随剧本阶段生成：这里引导到单阶段重跑（默认复用缓存，需覆盖请勾全量）')" @click="gotoScriptRegen">{{ t("重新生成推荐位…") }}</button></div>
+      <div class="card-actions"><button class="btn secondary small" :disabled="busy || !!assetBusy || queueRunning" :title="t('刷新视频目录状态')" @click="checkVideos">{{ t("刷新状态") }}</button><button class="btn ghost small" :disabled="busy || !!assetBusy || queueRunning" :title="t('视频推荐位随剧本阶段生成：这里引导到单阶段重跑（默认复用缓存，需覆盖请勾全量）')" @click="gotoScriptRegen">{{ t("重新生成推荐位…") }}</button></div>
     </div>
     <p class="hint mb-4">{{ t("提示词粘贴到即梦/可灵生成 mp4，用「导入视频」或手动放入") }} <code>game/video/video_&lt;id&gt;.mp4</code> {{ t("，刷新后自动启用，零 API 费用。") }}</p>
     <div v-for="vp in videoPoints" :key="vp.id" style="border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px 14px; margin-bottom: 10px">

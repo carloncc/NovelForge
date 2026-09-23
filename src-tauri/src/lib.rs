@@ -47,13 +47,59 @@ pub fn ensure_embedded_template(app: &tauri::App) -> Result<std::path::PathBuf, 
 }
 
 /// 鉴赏室页面随模板一起分发：内嵌副本存在时补写到模板目录，老安装 / 老模板升级后缺失也会补齐。
+/// #1375：只在缺失时写入会导致升级永不生效（新画廊 tab 等功能出不来）。改为版本戳比对：
+/// 内嵌模板带 `template vN` 戳（见 src/gameExtra/appreciation.html 头部）；目标缺失或戳不一致
+/// （老版本无戳/版本落后/用户手改）一律先备份旧文件（.bak）再覆盖并打日志，保证升级可达且可回滚。
 fn ensure_appreciation_file(target: &std::path::Path) {
     let dest = target.join("appreciation.html");
-    if dest.exists() {
+    let outdated = match std::fs::read_to_string(&dest) {
+        Err(_) => true,
+        Ok(existing) => template_stamp(&existing) != template_stamp(APPRECIATION_HTML),
+    };
+    if (!outdated) {
         return;
+    }
+    if dest.exists() {
+        let backup = dest.with_extension("html.bak");
+        if std::fs::write(&backup, std::fs::read(&dest).unwrap_or_default()).is_ok() {
+            eprintln!("[novelforge] 鉴赏室模板已备份: {}", backup.display());
+        }
     }
     if let Err(error) = std::fs::write(&dest, APPRECIATION_HTML) {
         eprintln!("[novelforge] 警告: 写入鉴赏室页面失败: {error}");
+    } else {
+        eprintln!("[novelforge] 鉴赏室模板已升级/补齐");
+    }
+}
+
+/// 提取模板版本戳 `template vN`（无戳的老文件返回空串，必判为过期）。
+fn template_stamp(text: &str) -> &str {
+    match text.find("template v") {
+        None => "",
+        Some(i) => {
+            let rest = &text[i + "template v".len()..];
+            let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+            &rest[..end]
+        }
+    }
+}
+
+#[cfg(test)]
+mod template_version_tests {
+    use super::template_stamp;
+
+    #[test]
+    fn stamp_detects_version_and_missing() {
+        assert_eq!(template_stamp("<!-- NovelForge appreciation template v3 -->"), "3");
+        assert_eq!(template_stamp("<html>no stamp</html>"), "");
+    }
+
+    #[test]
+    fn stamp_differs_across_versions() {
+        assert_ne!(
+            template_stamp("<!-- template v2 -->"),
+            template_stamp("<!-- template v3 -->")
+        );
     }
 }
 
@@ -94,6 +140,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::http_request,
             commands::cancel_http_request,
+            commands::bless_project_dir,
             commands::read_text_file,
             commands::write_text_file,
             commands::read_file_base64,

@@ -13,6 +13,7 @@
     "prepare:template": "node scripts/fetch-webgal-template.mjs",
     "check:template": "node scripts/check-template.mjs",
     "check:i18n": "node scripts/check-i18n.mjs",
+    "typecheck:tests": "vue-tsc -p tsconfig.tests.json --noEmit",
     "download:model": "tsx scripts/download-cutout-model.mjs",
     "postinstall": "node scripts/copy-ort-assets.mjs"
   },

@@ -76,13 +76,16 @@ export async function readDirNovelIdentity(outputDir: string): Promise<DirNovelI
 
 export type NovelImportDecision = "empty" | "same" | "different";
 
-/** 导入保护（纯函数）：目录里已有别的小说快照时判 different，调用方弹窗分流 */
+/** 导入保护（纯函数）：目录里已有别的小说快照时判 different，调用方弹窗分流。
+ *  #1364：同文件名即判 same——titleSig 含 AI 分章后标题/用户改名，同书重导必然不一致，
+ *  拿它判"不同小说"会把同名再导入推进"新建独立目录"陷阱。同名不同内容（换文件重名）的
+ *  极端情况由调用方覆盖确认兜底，且管线指纹会按正文作废缓存，不会静默串味。 */
 export function decideNovelImport(
   snapshot: DirNovelIdentity | null,
   incoming: { fileName: string; titleSig: string },
 ): NovelImportDecision {
   if (!snapshot) return "empty";
-  if (snapshot.fileName === incoming.fileName && snapshot.titleSig === incoming.titleSig) return "same";
+  if (snapshot.fileName === incoming.fileName) return "same";
   return "different";
 }
 

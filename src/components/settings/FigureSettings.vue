@@ -24,13 +24,13 @@ import { projectState } from "../../stores/project";
           <option value="full">{{ t("完整（默认）") }}</option>
           <option value="core">{{ t("核心（省图）") }}</option>
         </select>
-        <span class="hint">{{ t("核心＝少图省钱；完整＝AI 全量表情＋服装＋动作") }}</span>
+        <span class="hint">{{ t("核心＝少图（仅省服装差分与自定义表情，动作照常）；完整＝全量表情＋服装＋动作") }}</span>
       </label>
       <label class="opt-item opt-stack">
         <input type="checkbox" v-model="projectState.options.figureActions" />
         <span class="opt-text">
           {{ t("人物动作（入场/情绪动作/镜头震动）") }}
-          <span class="hint">{{ t("关闭后人物只做静态演出") }}</span>
+          <span class="hint">{{ t("关闭后人物只做静态演出（仅影响演出动画；动作图由「角色三视图与动作立绘」决定）") }}</span>
         </span>
       </label>
       <label class="opt-item opt-stack">

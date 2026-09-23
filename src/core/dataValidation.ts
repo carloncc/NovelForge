@@ -18,14 +18,30 @@ export function parseChapterScript(input: unknown): ChapterScript {
   if (!Number.isInteger(chapter.chapter) || (chapter.chapter as number) < 0) throw new Error("chapter cache has an invalid chapter number");
   if (typeof chapter.title !== "string") throw new Error("chapter cache has an invalid title");
   if (!Array.isArray(chapter.scenes)) throw new Error("chapter cache has an invalid scene list");
-  for (const sceneInput of chapter.scenes) {
-    const scene = record(sceneInput, "chapter scene");
+  const scenes = chapter.scenes as unknown[];
+  const chapterNo = chapter.chapter;
+  for (let si = 0; si < scenes.length; si++) {
+    const sceneInput = scenes[si];
+    const scene = record(sceneInput, `chapter ${String(chapterNo)} scene #${si}`);
     for (const field of ["id", "location", "atmosphere", "time", "bgPrompt"] as const) {
       if (typeof scene[field] !== "string") throw new Error(`chapter scene has an invalid ${field}`);
     }
     for (const field of ["itemEvents", "lines", "figures"] as const) {
       if (!Array.isArray(scene[field])) throw new Error(`chapter scene has an invalid ${field}`);
     }
+    // #1311：itemEvents 逐项校验并带场景/事件下标定位（此前仅 Array.isArray，坏项万行章无从找）。
+    const lineCount = (scene.lines as unknown[]).length;
+    (scene.itemEvents as unknown[]).forEach((evInput, ei) => {
+      const where = `chapter ${String(chapterNo)} scene #${si} itemEvent #${ei}`;
+      const ev = record(evInput, where);
+      if (!Number.isInteger(ev.triggerIndex) || (ev.triggerIndex as number) < 0 || (ev.triggerIndex as number) > Math.max(0, lineCount - 1)) {
+        throw new Error(`${where} has an invalid triggerIndex`);
+      }
+      if (typeof ev.itemId !== "string" || !ev.itemId.trim()) throw new Error(`${where} has an invalid itemId`);
+      if (!["obtain", "exchange", "show", "key"].includes(ev.action as string)) {
+        throw new Error(`${where} has an invalid action`);
+      }
+    });
     for (const lineInput of scene.lines as unknown[]) {
       assertScriptLine(lineInput, "chapter line");
     }

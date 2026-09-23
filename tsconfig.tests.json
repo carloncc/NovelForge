@@ -1,0 +1,8 @@
+{
+  "extends": "./tsconfig.json",
+  "include": ["tests/unit-*.ts"],
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["vite/client", "node"]
+  }
+}

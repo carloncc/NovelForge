@@ -23,21 +23,23 @@ const { busy, stageStatus, failedCounts, stageFeedback, stageForce, runStageRege
         :force="stageForce"
         :busy="busy"
         @regen="runStageRegen"
+        @update:feedback="(s, v) => (stageFeedback[s] = v)"
+        @update:force="(s, v) => (stageForce[s] = v)"
       />
 
       <div class="opt-grid mt-4">
         <label class="opt-item" :title="t('关闭后恢复旧的严格单阶段：重新生成只跑该阶段，下游需手动依次重跑')">
           <input type="checkbox" v-model="projectState.options.autoCascadeDownstream" :disabled="busy" /> {{ t("跑完自动补齐下游") }}
         </label>
-        <span class="opt-item" :title="t('图像开关在「生成内容」里设置，此处只显示当前状态')">
+        <span class="opt-item" :title="t('图像开关在「生成设置 → 内容」里设置，此处只显示当前状态')">
           <span>{{ t("下游图像") }}：</span>
           <span class="tag" :class="projectState.options.useImage ? 'ok' : 'warn'">{{ projectState.options.useImage ? t("已开启") : t("已关闭") }}</span>
-          <span class="faint small">{{ t("（在「生成内容」中修改）") }}</span>
+          <span class="faint small">{{ t("（在「生成设置 → 内容」中修改）") }}</span>
         </span>
-        <span class="opt-item" :title="t('配音开关在「生成内容」里设置，此处只显示当前状态')">
+        <span class="opt-item" :title="t('配音开关在「生成设置 → 内容」里设置，此处只显示当前状态')">
           <span>{{ t("下游配音") }}：</span>
           <span class="tag" :class="projectState.options.useTts ? 'ok' : 'warn'">{{ projectState.options.useTts ? t("已开启") : t("已关闭") }}</span>
-          <span class="faint small">{{ t("（在「生成内容」中修改）") }}</span>
+          <span class="faint small">{{ t("（在「生成设置 → 内容」中修改）") }}</span>
         </span>
         <span class="opt-item" :title="t('组装是本地操作、不计费；但游戏文件里写死了剧本正文与图片/配音路径，动过剧本或资产就必须重新组装，预览才会更新')">
           <span>{{ t("组装为本地操作（不计费）：关闭「跑完自动补齐下游」后，需手动点「组装」刷新预览") }}</span>

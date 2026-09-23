@@ -61,14 +61,20 @@ export async function cutoutModelExpectedPath(model: CutoutModel): Promise<strin
 /**
  * 下载并等待完成（轮询状态）。onProgress 每轮进度回调（bytes/total 单位字节）。
  * 返回最终状态；下载失败抛错。
+ * #1309：轮询加 30 分钟墙钟上限 + 可选中止——后端卡死时不再无限空转，UI 进度不会转到天荒地老。
  */
 export async function downloadCutoutModelAndWait(
   model: CutoutModel,
   onProgress?: (status: CutoutModelStatus) => void,
+  opts?: { timeoutMs?: number; signal?: AbortSignal },
 ): Promise<CutoutModelStatus> {
   await downloadCutoutModel(model);
+  const deadline = Date.now() + (opts?.timeoutMs ?? 30 * 60_000);
   for (;;) {
+    if (opts?.signal?.aborted) throw new Error("模型下载已取消");
+    if (Date.now() > deadline) throw new Error("模型下载超时（30 分钟无完成）：请检查网络或磁盘空间后重试");
     await new Promise((resolveSleep) => setTimeout(resolveSleep, 1000));
+    if (opts?.signal?.aborted) throw new Error("模型下载已取消");
     const status = await cutoutModelStatus(model);
     onProgress?.(status);
     if (status.installed && status.state === "done") return status;

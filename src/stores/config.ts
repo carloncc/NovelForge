@@ -174,6 +174,10 @@ async function loadPersisted() {
       writeSecrets: (secrets) => tauri.writeApiSecrets(secrets),
     });
     const parsed = loaded.config;
+    // #1308：迁移丢弃/改名不再静默——打日志并在横幅透出（UI 文案均为 t() key）
+    if (loaded.migrationWarnings?.length) {
+      for (const w of loaded.migrationWarnings) log.warn("config", w, {});
+    }
     if (loaded.migrationPending) {
       configPersistenceBlocked = true;
       pendingMigrationContent = serializeConfigFile(parsed);
@@ -227,6 +231,25 @@ function persistedConfigContent(): string {
   });
 }
 
+/**
+ * #1315：有序事务写盘（先密钥后配置）。两步都成功才更新“已落盘”标记；
+ * 任一步失败不更新标记（下次自动保存会重试），并透出横幅。调用方不得在失败后清横幅。
+ */
+async function writeConfigAndSecrets(content: string, secrets: Record<string, string>, secretsSig: string): Promise<boolean> {
+  try {
+    await tauri.writeApiSecrets(secrets);
+    await tauri.writeConfig(content);
+  } catch (error) {
+    configPersistenceError.value = t("配置自动保存失败：{error}", { error: error instanceof Error ? error.message : String(error) });
+    return false;
+  }
+  lastPersistedContent = content;
+  lastPersistedSecrets = secretsSig;
+  // UI81：自动保存恢复正常后清掉上次的失败横幅；迁移/凭据阻塞态由 configPersistenceBlocked 保留
+  if (!configPersistenceBlocked) configPersistenceError.value = "";
+  return true;
+}
+
 function scheduleMigrationRetry(): void {
   if (!pendingMigrationContent || migrationRetryTimer !== undefined) return;
   migrationRetryTimer = window.setTimeout(() => {
@@ -238,11 +261,11 @@ function scheduleMigrationRetry(): void {
 async function retryMigrationPersistence(): Promise<void> {
   const migratedContent = pendingMigrationContent;
   if (!migratedContent) return;
-  try {
-    await tauri.writeApiSecrets(pendingMigrationSecrets);
-    await tauri.writeConfig(migratedContent);
-  } catch (error) {
-    configPersistenceError.value = t("配置迁移仍无法保存：{error}", { error: error instanceof Error ? error.message : String(error) });
+  const migratedSecretsSig = JSON.stringify(pendingMigrationSecrets);
+  const ok = await writeConfigAndSecrets(migratedContent, pendingMigrationSecrets, migratedSecretsSig);
+  // writeConfigAndSecrets 已写横幅；此处只处理重试调度（成功才清 pending）
+  if (!ok) {
+    configPersistenceError.value = t("配置迁移仍无法保存：{error}", { error: configPersistenceError.value || t("未知错误") });
     scheduleMigrationRetry();
     return;
   }
@@ -286,18 +309,7 @@ watch(
       const secrets = configSecrets(configState);
       const secretsSig = JSON.stringify(secrets);
       if (content === lastPersistedContent && secretsSig === lastPersistedSecrets) return;
-      void tauri
-        .writeApiSecrets(secrets)
-        .then(() => tauri.writeConfig(content))
-        .then(() => {
-          lastPersistedContent = content;
-          lastPersistedSecrets = secretsSig;
-          // UI81：自动保存恢复正常后清掉上次的失败横幅；迁移/凭据阻塞态由 configPersistenceBlocked 保留
-          if (!configPersistenceBlocked) configPersistenceError.value = "";
-        })
-        .catch((error) => {
-          configPersistenceError.value = t("配置自动保存失败：{error}", { error: error instanceof Error ? error.message : String(error) });
-        });
+      void writeConfigAndSecrets(content, secrets, secretsSig);
     }, 500) as unknown as number;
   },
   { deep: true },
@@ -344,18 +356,23 @@ export function addConfig(kind: ChannelKey): void {
   preset.active[kind] = cfg.id;
 }
 
-export function removeConfig(kind: ChannelKey, id: string): void {
+export async function removeConfig(kind: ChannelKey, id: string): Promise<boolean> {
   const preset = activePreset();
   const list = preset.channels[kind];
   const idx = list.findIndex((c) => c.id === id);
-  if (idx < 0) return;
-  list.splice(idx, 1);
-  void tauri.writeApiSecrets({ [id]: "" }).catch((error) => {
+  if (idx < 0) return false;
+  // #1315：先 await 删密钥，失败则不改 UI（此前先 splice 再 void 删，失败时 UI 已删但密钥仍在）
+  try {
+    await tauri.writeApiSecrets({ [id]: "" });
+  } catch (error) {
     configPersistenceError.value = t("删除系统凭据失败：{error}", { error: error instanceof Error ? error.message : String(error) });
-  });
+    return false;
+  }
+  list.splice(idx, 1);
   if (preset.active[kind] === id) {
     preset.active[kind] = list[0]?.id ?? "";
   }
+  return true;
 }
 
 export function addPreset(): void {
@@ -364,18 +381,88 @@ export function addPreset(): void {
   configState.activePresetId = preset.id;
 }
 
-export function removePreset(id: string): void {
-  if (configState.presets.length <= 1) return;
+export async function removePreset(id: string): Promise<boolean> {
+  if (configState.presets.length <= 1) return false;
   const idx = configState.presets.findIndex((p) => p.id === id);
-  if (idx < 0) return;
+  if (idx < 0) return false;
   const removedSecrets = Object.fromEntries(
     Object.values(configState.presets[idx].channels).flat().map((config) => [config.id, ""]),
   );
-  configState.presets.splice(idx, 1);
-  void tauri.writeApiSecrets(removedSecrets).catch((error) => {
+  // #1315：同 removeConfig，先落密钥删除再改 UI
+  try {
+    await tauri.writeApiSecrets(removedSecrets);
+  } catch (error) {
     configPersistenceError.value = t("删除系统凭据失败：{error}", { error: error instanceof Error ? error.message : String(error) });
-  });
+    return false;
+  }
+  configState.presets.splice(idx, 1);
   if (configState.activePresetId === id) {
     configState.activePresetId = configState.presets[0].id;
   }
+  return true;
+}
+
+/* ==================== #1333 模型列表拉取策略（store 侧纯函数，UI 侧由 ConfigPage 消费） ==================== */
+
+/** 轻量字符串哈希（djb2，hex），用于签名中的 Key 指纹：不存明文，只记“内容是否变了” */
+export function hashKeyFragment(key: string): string {
+  let h = 5381;
+  for (let i = 0; i < key.length; i++) h = ((h * 33) ^ key.charCodeAt(i)) >>> 0;
+  return h.toString(16);
+}
+
+/**
+ * #1333 签名：纳入 apiKey 实际值指纹（末 4 位 + 长度 + 哈希），K→K 但内容变了也能触发重拉；
+ * 明文 Key 不进签名（避免日志/持久化泄露）。
+ */
+export function modelFetchSignature(cfg: { id: string; baseUrl: string; apiKey?: string; extra?: { pathPrefix?: unknown } }): string {
+  const key = cfg.apiKey ?? "";
+  const tail = key.slice(-4);
+  const fp = key ? `${key.length}:${tail}:${hashKeyFragment(key)}` : "-";
+  const prefix = typeof cfg.extra?.pathPrefix === "string" ? cfg.extra.pathPrefix : "";
+  return `${cfg.id}|${cfg.baseUrl}|${prefix}|${fp}`;
+}
+
+/** 纯函数：签名变化才需重拉 */
+export function shouldRefetchModels(prevSig: string | undefined, nextSig: string): boolean {
+  if (!prevSig) return true;
+  return prevSig !== nextSig;
+}
+
+/**
+ * #1333 合并策略（纯函数）：
+ * - 成功：用新列表整体替换；
+ * - 失败（next 为 undefined）：保留旧列表（不再先清空后失败即丢）；
+ * - 仅当 baseUrl/前缀真正变化且调用方要求时才清空（clearOnEndpointChange）。
+ */
+export function mergeDiscoveredModels(
+  prev: unknown,
+  next: unknown,
+  opts?: { baseUrlChanged?: boolean; clearOnEndpointChange?: boolean },
+): unknown[] {
+  const prevList = Array.isArray(prev) ? prev : [];
+  if (next === undefined) {
+    if (opts?.baseUrlChanged && opts?.clearOnEndpointChange) return [];
+    return prevList;
+  }
+  return Array.isArray(next) ? next : prevList;
+}
+
+/** 纯函数：endpoint（baseUrl/前缀）是否变化——变化才允许清空旧列表 */
+export function isModelEndpointChanged(
+  prev: { baseUrl: string; pathPrefix?: string },
+  next: { baseUrl: string; pathPrefix?: string },
+): boolean {
+  return prev.baseUrl !== next.baseUrl || (prev.pathPrefix ?? "") !== (next.pathPrefix ?? "");
+}
+
+/**
+ * #1333 store 侧写入口径：成功才替换、失败保留旧列表。
+ * 返回最终列表（调用方直接赋给 cfg.extra.discoveredModels）。
+ */
+export function applyDiscoveredModelsSuccess(prev: unknown, models: unknown[]): unknown[] {
+  return mergeDiscoveredModels(prev, models);
+}
+export function applyDiscoveredModelsFailure(prev: unknown, opts?: { baseUrlChanged?: boolean }): unknown[] {
+  return mergeDiscoveredModels(prev, undefined, opts);
 }

@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { save, open } from "@tauri-apps/plugin-dialog";
-import { projectState, pushLog, scheduleSave } from "../stores/project";
-import { tauri, isTauri, downloadZipWeb, isPathInsideDir } from "../utils/tauri";
+import { projectState, pushLog, scheduleSave, exportSettings, setExportUiLanguage, loadExportUiLanguage } from "../stores/project";
+import { tauri, isTauri, downloadZipWeb, isPathInsideDir, blessParentDir } from "../utils/tauri";
 import { lintProject, buildExportOverridePrompt, type LintReport } from "../core/lint";
 import { errMsg } from "../utils/errors";
 import { log } from "../utils/logger";
@@ -15,6 +15,8 @@ import type { ExportSettings } from "../core/types";
 const message = ref("");
 // 通知成败分色：此前成功/失败/进行中统一渲染成绿色，失败信息看起来也像成功
 const messageOk = ref(true);
+// #1348：消息清除 timer id（不清旧 timer 会提前抹掉后一条消息）
+let msgTimer: ReturnType<typeof setTimeout> | null = null;
 const linting = ref(false);
 const packing = ref(false);
 const lintReport = ref<LintReport | null>(null);
@@ -26,17 +28,28 @@ const settings = ref<ExportSettings>({
   language: "zh_CN",
 });
 
-// 从项目选项/最近结果初始化导出设置（含语言；此前语言未初始化会被无条件写回 zh_CN）
+// 从项目选项/最近结果初始化导出设置（含界面语言）。
+// #1320/#1346：settingsInitial 记录回填快照；settingsDirty 为 true 时 watch 不再整体覆盖正在编辑的内容。
+// 界面语言已与翻译目标彻底解耦：下拉绑定独立的 exportSettings.uiLanguage，保存写入
+// options.uiLanguage（组装 Default_Language 用它），永不触碰 options.language（翻译开关，空=不翻译）。
+const settingsInitial = ref({ title: "", gameKey: "", language: "zh_CN" as ExportSettings["language"] });
+const settingsDirty = ref(false);
+function markSettingsDirty(): void {
+  settingsDirty.value = true;
+}
 function initSettings(): void {
+  if (settingsDirty.value) return;
   const meta = projectState.lastResult?.meta;
   const o = projectState.options;
-  settings.value = {
+  loadExportUiLanguage();
+  // 界面语言：独立字段（localStorage 按项目存，缺省从旧 options 迁移，保证老项目行为不变）
+  const uiLang = exportSettings.uiLanguage;
+  settingsInitial.value = {
     title: o.exportTitle ?? meta?.title ?? "",
     gameKey: o.exportGameKey ?? meta?.gameKey ?? "",
-    // UI18：项目 language 为空串（""）时 ?? 不兜底，下拉会因无匹配 option 显示空白；
-    // 用 || 统一落到 zh_CN（导出语言只允许 zh_CN/zh_TW/en/ja，空串本身无意义）
-    language: (o.language as ExportSettings["language"]) || "zh_CN",
+    language: uiLang,
   };
+  settings.value = { ...settingsInitial.value };
 }
 watch(() => projectState.lastResult?.meta.generatedAt, initSettings, { immediate: true });
 
@@ -47,9 +60,14 @@ const { busy: pipelineBusy, assetBusy: genAssetBusy, queueRunning: genQueueRunni
 const runBusy = computed(() => pipelineBusy.value || !!genAssetBusy.value || genQueueRunning.value);
 
 function setMsg(m: string, ok = true): void {
+  // #1348：连续调用时旧 timer 会提前抹掉新消息（成败反馈 0.x 秒消失）：先清旧 timer
+  if (msgTimer !== null) clearTimeout(msgTimer);
   message.value = m;
   messageOk.value = ok;
-  setTimeout(() => (message.value = ""), 4000);
+  msgTimer = setTimeout(() => {
+    msgTimer = null;
+    message.value = "";
+  }, 4000);
 }
 
 async function openFolder(): Promise<void> {
@@ -125,10 +143,17 @@ const titleForm = ref({
   themeFromArtwork: true,
 });
 const bgmOptions = ref<string[]>([]);
+// #1346：标题表单脏标志（任一控件改动即置位；保存成功或切换项目时清除）
+const titleDirty = ref(false);
+function markTitleDirty(): void {
+  titleDirty.value = true;
+}
 
 const fileNameOf = (p: string): string => p.split(/[\\/]/).filter(Boolean).pop() || p;
 
 function initTitleForm(): void {
+  // #1346：与 initSettings 同策略——有未保存改动时不整体覆盖（输出目录切换除外，见 outputDir watch）
+  if (titleDirty.value) return;
   const o = projectState.options;
   titleForm.value = {
     coverMode: o.titleCoverMode ?? "auto",
@@ -163,6 +188,10 @@ async function loadBgmOptions(): Promise<void> {
 watch(
   outputDir,
   (dir) => {
+    // 切项目时旧表单属于旧项目：清除脏标志后回填（页内 generatedAt 更新则不覆盖，见 initSettings/initTitleForm）
+    settingsDirty.value = false;
+    titleDirty.value = false;
+    initSettings();
     initTitleForm();
     void loadBgmOptions();
     // 打开导出页自动检查一次（打包前还会再新鲜检查一次）
@@ -222,10 +251,18 @@ async function saveAndAssemble(): Promise<void> {
   if (f.coverMode === "custom" && !f.coverPath) {
     setMsg(t("已选「自定义封面」但还没有选择图片（将暂时回退到第一章 CG）"), false);
   }
+  // #1347：标题曲下拉是快照——保存前刷新，选中值已不存在则回退自动匹配并明示（此前静默写死文件名，删文件后标题静音）
+  await loadBgmOptions();
+  if (f.bgmFile && f.bgmFile !== "none" && !bgmOptions.value.includes(f.bgmFile)) {
+    setMsg(t("所选标题曲「{file}」已不存在（被删除或移动），已回退为自动匹配", { file: f.bgmFile }), false);
+    f.bgmFile = "";
+  }
   const o = projectState.options;
   o.exportTitle = title;
   o.exportGameKey = key;
-  o.language = settings.value.language;
+  // #1320：界面语言只写独立字段（组装 Default_Language 用它）；翻译目标 options.language 碰都不碰，
+  // 空=不翻译语义永不被导出保存破坏。
+  o.uiLanguage = setExportUiLanguage(settings.value.language);
   o.titleCoverMode = f.coverMode;
   o.titleLogoMode = f.logoMode;
   o.titleBgmFile = f.bgmFile.trim();
@@ -239,6 +276,10 @@ async function saveAndAssemble(): Promise<void> {
   setMsg(t("正在重新组装标题画面…"));
   const ok = await execute({ stages: ["assemble"] });
   if (ok) {
+    // #1346：保存成功后快照与脏标志同步，避免后续 generatedAt 更新把刚保存的值又覆盖一遍
+    settingsInitial.value = { ...settings.value };
+    settingsDirty.value = false;
+    titleDirty.value = false;
     setMsg(t("已保存并重新组装：可点「预览」查看效果"));
     pushLog({ step: "导出", message: t("导出设置与标题画面已保存并重新组装（标题/GameKey/封面/Logo/标题曲/菜单开关/主题取色）"), level: "success", at: Date.now() });
   } else {
@@ -302,6 +343,8 @@ async function packZip(): Promise<void> {
       setMsg(t("保存位置不能在项目目录内部（否则会把正在写入的 zip 自身打进包里）：请换一个目录"), false);
       return;
     }
+    // #1292：登记保存位置所在目录（用户经保存对话框明示授权），否则写 zip 被白名单拒绝
+    await blessParentDir(picked);
     target = picked;
   }
 
@@ -324,7 +367,9 @@ async function packZip(): Promise<void> {
     pushLog({
       step: "导出",
       message: t("已打包网页版 zip：{path}（{count} 文件 / {size}MB）", {
-        path: target,
+        // #1350：Web 端产物是浏览器下载的 `<目录名>_web.zip`，target（VFS 虚拟路径）并不存在；
+        // 日志按端取真实位置，避免用户照日志去路径里找扑空。
+        path: isTauri() ? target : `${base}_web.zip（已下载到浏览器下载目录）`,
         count: stats.fileCount,
         size: (stats.sizeBytes / 1024 / 1024).toFixed(1),
       }),
@@ -400,28 +445,30 @@ async function openExternal(url: string): Promise<void> {
       <div class="field-grid">
         <label class="field">
           <span>{{ t("游戏标题") }}</span>
-          <input type="text" v-model="settings.title" />
+          <input type="text" v-model="settings.title" @input="markSettingsDirty" />
         </label>
         <label class="field">
           <span>{{ t("Game Key（6-10 位字母数字）") }}</span>
-          <input type="text" v-model="settings.gameKey" />
+          <input type="text" v-model="settings.gameKey" @input="markSettingsDirty" />
         </label>
         <label class="field">
           <span>{{ t("界面语言") }}</span>
-          <select v-model="settings.language">
+          <select v-model="settings.language" @change="markSettingsDirty">
             <option value="zh_CN">{{ t("简体中文") }}</option>
             <option value="zh_TW">{{ t("繁體中文") }}</option>
             <option value="en">English</option>
             <option value="ja">{{ t("日本語") }}</option>
+            <option value="ko">한국어</option>
           </select>
         </label>
       </div>
+      <p v-if="settingsDirty" class="hint" style="margin-top: 6px">{{ t("导出设置有未保存的修改：切页或等待生成完成期间可能被重置，点「保存并重新组装」后再离开。") }}</p>
 
       <div class="card-section mt-3">
         <div class="field-grid">
           <label class="field">
             <span>{{ t("封面图") }}</span>
-            <select v-model="titleForm.coverMode">
+            <select v-model="titleForm.coverMode" @change="markTitleDirty">
               <option value="auto">{{ t("自动生成（按主题配色，推荐）") }}</option>
               <option value="none">{{ t("不使用封面") }}</option>
               <option value="custom">{{ t("自定义图片…") }}</option>
@@ -436,7 +483,7 @@ async function openExternal(url: string): Promise<void> {
           </label>
           <label class="field">
             <span>{{ t("标题 Logo") }}</span>
-            <select v-model="titleForm.logoMode">
+            <select v-model="titleForm.logoMode" @change="markTitleDirty">
               <option value="auto">{{ t("自动生成文字 Logo（推荐）") }}</option>
               <option value="none">{{ t("不显示 Logo") }}</option>
               <option value="custom">{{ t("自定义图片…") }}</option>
@@ -451,7 +498,7 @@ async function openExternal(url: string): Promise<void> {
           </label>
           <label class="field">
             <span>{{ t("标题音乐") }}</span>
-            <select v-model="titleForm.bgmFile">
+            <select v-model="titleForm.bgmFile" @change="markTitleDirty">
               <option value="">{{ t("自动匹配（推荐）") }}</option>
               <option value="none">{{ t("不播放") }}</option>
               <option v-for="b in bgmOptions" :key="b" :value="b">{{ b }}</option>
@@ -459,10 +506,10 @@ async function openExternal(url: string): Promise<void> {
           </label>
         </div>
         <div class="mt-3" style="display: flex; flex-wrap: wrap; gap: 14px">
-          <label class="check"><input type="checkbox" v-model="titleForm.enableContinue" /> {{ t("显示「继续游戏」") }}</label>
-          <label class="check"><input type="checkbox" v-model="titleForm.enableFlowchart" /> {{ t("显示「流程图」") }}</label>
-          <label class="check"><input type="checkbox" v-model="titleForm.enableAppreciation" /> {{ t("显示「鉴赏室」") }}</label>
-          <label class="check"><input type="checkbox" v-model="titleForm.themeFromArtwork" /> {{ t("主题色随画风") }}</label>
+          <label class="check"><input type="checkbox" v-model="titleForm.enableContinue" @change="markTitleDirty" /> {{ t("显示「继续游戏」") }}</label>
+          <label class="check"><input type="checkbox" v-model="titleForm.enableFlowchart" @change="markTitleDirty" /> {{ t("显示「流程图」") }}</label>
+          <label class="check"><input type="checkbox" v-model="titleForm.enableAppreciation" @change="markTitleDirty" /> {{ t("显示「鉴赏室」") }}</label>
+          <label class="check"><input type="checkbox" v-model="titleForm.themeFromArtwork" @change="markTitleDirty" /> {{ t("主题色随画风") }}</label>
         </div>
       </div>
       <p class="hint" style="margin-top: 6px">

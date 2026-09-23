@@ -21,7 +21,14 @@ import {
 } from "./providers";
 export { ReferenceImageError } from "./providers";
 import { zlibSync } from "fflate";
-import { log } from "../utils/logger";
+import { log, redactUrl } from "../utils/logger";
+
+/** HTTP 状态错误（1317）：禁止 throw 裸对象，统一挂 status 的 Error（保栈）。 */
+function httpStatusError(status: number, message: string): Error {
+  const e = new Error(message);
+  (e as { status?: number }).status = status;
+  return e;
+}
 
 /**
  * 全局图像请求并发上限：任务层并发再高（如 30），实际同时发往图片 API 的请求数也受此限制。
@@ -129,7 +136,8 @@ export function disposeLimiters(): void {
   const base = normalizeBaseUrl(cfg.baseUrl, cfg.extra?.pathPrefix as string | undefined);
   // joinApiPath：base 带 query 时把 /models 拼进 pathname 而不是 query（B109）
   const url = joinApiPath(base, "/models");
-  log.info("api", "拉取模型列表", { url, kind, model: cfg.model, apiKey: maskKey(cfg.apiKey) });
+  // 1295：URL 可能含 ?key=（Gemini 风格），落盘前经 redactUrl（logger 侧亦会二次脱敏）。
+  log.info("api", "拉取模型列表", { url: redactUrl(url), kind, model: cfg.model, apiKey: maskKey(cfg.apiKey) });
   const response = await tauri.http({
     method: "GET",
     url,
@@ -141,7 +149,7 @@ export function disposeLimiters(): void {
   }, activeAbortSignal());
   if (response.status >= 400) {
     const raw = utf8FromB64(response.bodyBase64).slice(0, 400);
-    log.error("api", "拉取模型列表失败", { url, status: response.status, raw });
+    log.error("api", "拉取模型列表失败", { url: redactUrl(url), status: response.status, raw });
     throw new Error(`模型列表接口返回 ${response.status}${raw ? `：${raw}` : ""}`);
   }
   // JSON 解析失败必须给出可读错误（B107）：中转站/网关会返回 HTML 错误页，
@@ -151,7 +159,7 @@ export function disposeLimiters(): void {
     payload = JSON.parse(utf8FromB64(response.bodyBase64));
   } catch {
     const head = utf8FromB64(response.bodyBase64).slice(0, 120);
-    log.error("api", "模型列表响应不是合法 JSON", { url, head });
+    log.error("api", "模型列表响应不是合法 JSON", { url: redactUrl(url), head });
     throw new Error(`模型列表响应不是合法 JSON：${head}`);
   }
   const provider = providerIdForConfig(cfg);
@@ -261,6 +269,9 @@ export interface ChatOptions {
   onUsage?: (promptTokens: number, completionTokens: number) => void;
   /** JSON 输出被截断时最多续写次数（默认 3） */
   maxContinue?: number;
+  /** 续写进度下限（字符）：从第 2 次续写起，本轮新增内容低于此值视为模型停滞
+   *  （挤牙膏式输出），停止续写走解析/修复，避免无限续写小片段烧钱；默认 0=不检查 */
+  minContinueProgress?: number;
   /** JSON 解析失败时最多修复重试次数（默认 2） */
   maxRepair?: number;
   /** OpenAI 兼容 function calling：提供后请求体带上 tools/tool_choice，响应可返回 toolCalls */
@@ -502,7 +513,7 @@ export async function chatCompletion(
     body.tool_choice = opts.toolChoice ?? "auto";
   }
   log.info("api", "LLM 请求发出", {
-    url,
+    url: redactUrl(url),
     model: cfg.model,
     modelJson: JSON.stringify(cfg.model),
     baseUrl: cfg.baseUrl,
@@ -516,9 +527,19 @@ export async function chatCompletion(
     bodyJson: JSON.stringify(body).slice(0, 400),
   });
 
-  // 推理型模型（deepseek 系列）会先消耗大量 token 在 reasoning_content 思考上。
-  // 当 content 为空且 finish_reason=length 时，说明预算被思考耗尽、答案未输出，需放大预算重试。
-  // 这里把 HTTP 调用做成可带独立 tokenBudget 的闭包，逐级放大。
+  // 预算策略（不针对任何特定模型/厂商）：
+  // 调用方给的 maxTokens 是"期望正文"的预算。思考型模型会把思维链也算进 max_tokens，
+  // 一旦思考量超过该预算，就会 content 为空 + finish_reason=length。此时按模型实际报告的思考量
+  // （reasoning_tokens，缺失则按 reasoning 文本估算）把预算补成「思考量 + 正文预算」重发，
+  // 而不是固定小步放大（固定步长在重思考模型上永远追不上思考量）。
+  const contentBudget = opts.maxTokens ?? 8000;
+  const MAX_OUTPUT_TOKENS = 128_000;
+  const MAX_ESCALATIONS = 3;
+  // 单次请求超时按预算缩放：预算越大、生成越久，超时相应放宽（上限 30 分钟）
+  const baseTimeout = opts.timeoutSecs ?? 180;
+  const timeoutFor = (budget: number): number =>
+    Math.min(1_800, Math.max(baseTimeout, Math.round((baseTimeout * budget) / Math.max(1, contentBudget))));
+
   const perform = async (tokenBudget: number) => {
     // B93：中止检查放在预算计数之前——已中止不消耗调用预算，也不再发出付费请求
     if (opts.signal?.aborted) throw new Error("已中止");
@@ -540,15 +561,15 @@ export async function chatCompletion(
       url,
       headers: headersFor(cfg),
       body: JSON.stringify(requestBody),
-      timeoutSecs: opts.timeoutSecs ?? 180,
+      timeoutSecs: timeoutFor(tokenBudget),
     }, opts.signal ?? activeAbortSignal());
     const text = b64ToUtf8(res.bodyBase64);
     if (res.status >= 500 || res.status === 429) {
-      log.warn("api", `chatCompletion HTTP ${res.status}`, { url, raw: text.slice(0, 600) });
-      throw { status: res.status, message: `HTTP ${res.status}` };
+      log.warn("api", `chatCompletion HTTP ${res.status}`, { url: redactUrl(url), raw: text.slice(0, 600) });
+      throw httpStatusError(res.status, `HTTP ${res.status}`);
     }
     if (res.status >= 400) {
-      log.error("api", `LLM HTTP 错误 ${res.status}`, { url, raw: text.slice(0, 1000) });
+      log.error("api", `LLM HTTP 错误 ${res.status}`, { url: redactUrl(url), raw: text.slice(0, 1000) });
       let message = text.slice(0, 300);
       try {
         const parsed = JSON.parse(text) as { error?: { message?: unknown } };
@@ -567,7 +588,7 @@ export async function chatCompletion(
     }
 
     log.info("api", "LLM 响应返回", {
-      url,
+      url: redactUrl(url),
       status: res.status,
       bodyLen: text.length,
       body: text.slice(0, 600),
@@ -584,69 +605,86 @@ export async function chatCompletion(
       log.error("api", "chatCompletion 厂商返回业务错误", { providerError });
       throw new Error(`LLM 返回错误: ${providerError}`);
     }
-    if (!data.choices || !data.choices.length) {
+    // 1317：choices[0] 未校验（null 即 TypeError→unknown→默认再打 4 次付费）。
+    // 类型守卫 + 结构非法按 400 硬错（classifyError→invalid_param，不重试）。
+    const firstChoice = Array.isArray(data.choices) ? data.choices[0] : undefined;
+    if (!firstChoice || typeof firstChoice !== "object") {
       log.error("api", "chatCompletion 响应缺少 choices", { data: JSON.stringify(data).slice(0, 400) });
-      throw new Error(`LLM 返回错误: ${JSON.stringify(data).slice(0, 400)}`);
+      throw httpStatusError(400, `LLM 响应结构非法（缺少 choices）：${JSON.stringify(data).slice(0, 200)}`);
     }
-    const message = data.choices[0].message ?? {};
+    const choiceMessage = (firstChoice as { message?: unknown }).message;
+    if (choiceMessage !== undefined && (choiceMessage === null || typeof choiceMessage !== "object")) {
+      log.error("api", "chatCompletion 响应 message 非法", { data: JSON.stringify(data).slice(0, 400) });
+      throw httpStatusError(400, `LLM 响应结构非法（message 非对象）：${JSON.stringify(data).slice(0, 200)}`);
+    }
+    const message = (choiceMessage ?? {}) as { content?: unknown; reasoning_content?: unknown; tool_calls?: unknown };
     const rawContent = typeof message.content === "string" ? message.content : "";
     const reasoning = typeof message.reasoning_content === "string" ? message.reasoning_content : "";
     const toolCalls: ToolCall[] | undefined = Array.isArray(message.tool_calls)
-      ? message.tool_calls.filter(
+      ? (message.tool_calls as unknown[]).filter(
           (tc: unknown) =>
             !!tc && (tc as ToolCall).type === "function" && !!(tc as ToolCall).function?.name,
-        )
+        ) as ToolCall[]
       : undefined;
+    const finishReason = (firstChoice as { finish_reason?: unknown }).finish_reason as string | undefined;
     return {
       rawContent,
       reasoning,
       toolCalls,
-      finishReason: data.choices[0].finish_reason as string | undefined,
+      finishReason,
       promptTokens: (data.usage?.prompt_tokens as number | undefined) ?? 0,
       completionTokens: (data.usage?.completion_tokens as number | undefined) ?? 0,
+      // 思考型模型会报告思维链 token 数（OpenAI 兼容字段）：用于把被思考吃掉的预算精确补回来
+      reasoningTokens: (data.usage?.completion_tokens_details?.reasoning_tokens as number | undefined) ?? 0,
     };
   };
 
-  // 基础预算：调用方显式指定则用之，否则给推理型模型一个默认预算（避免思考耗尽）
-  // 升级路径必须严格递增：opts.maxTokens=16000 → [16000, 24000, 32000]，
-  // 修复旧版 [16000, 16000] 去重后只跑一次的 bug
-  // 若调用方已给足预算（≥64K，通常是按模型上下文动态算的），首轮直接用最大预算，
-  // 不再放大（避免超模型 max_tokens 被服务端 400 拒绝）。
-  const baseBudget = opts.maxTokens ?? 8000;
-  const generous = typeof opts.maxTokens === "number" && opts.maxTokens >= 64_000;
-  const escalation = opts.maxTokens
-    ? (generous
-        ? [opts.maxTokens, opts.maxTokens]
-        : Array.from(new Set([opts.maxTokens, opts.maxTokens + 8000, Math.max(opts.maxTokens * 2, 24000)])).sort((a, b) => a - b))
-    : [baseBudget, baseBudget * 2];
-  // 预置首轮预算（B91）：opts.maxTokens 是 generous 时 escalation=[X, X]，
-  // 旧实现升级循环还会用同一个 X 再发一次请求（无意义重复付费）；预置后直接跳过。
-  const seenBudgets = new Set<number>([escalation[0]]);
-
-  // 文本请求全局限流：并发 1（串行），避免多章节剧本同时发大请求打爆网关
-  return llmLimiterFor(cfg).run(() => withRetry(async () => {
-    let response = await perform(escalation[0]);
+  // 1302：升级循环在 withRetry 之外——每次重试重打同一预算（重复计费）的问题由此避免，
+  // 预算记账与实际发出的请求对齐。
+  const retryOpts = {
+    signal: opts.signal,
+    timeoutRetries: opts.timeoutRetries,
+    // B93：退避等待可被中止；重试同时透出给调用方打进度（否则 300s 超时 ×4 次重试全程静默）
+    onRetry: opts.onEvent
+      ? (attempt: number, delayMs: number, e: unknown) =>
+          opts.onEvent!({
+            kind: "retry",
+            attempt,
+            delayMs,
+            message: `请求失败，${delayMs / 1000}s 后重试（第 ${attempt} 次）：${String(e instanceof Error ? e.message : e).slice(0, 120)}`,
+          })
+      : undefined,
+  };
+  // 文本请求限流（按 API 隔离，默认 3、上限 8，见 llmLimiterFor；此前注释误写“并发 1 串行”已纠正）
+  return llmLimiterFor(cfg).run(async () => {
+    const runOnce = (budget: number): Promise<Awaited<ReturnType<typeof perform>>> =>
+      withRetry(() => perform(budget), retryOpts);
+    let budget = contentBudget;
+    let response = await runOnce(budget);
     // 升级重试（仅 content 为空且 finishReason=length → 预算被推理思考耗尽时放大）：
     // 截断但非空的响应（含残缺 JSON）直接返回，由 chatJson 的续写循环分段取回——
     // 若在这里放大预算重发，慢后端上更大的单次输出更注定超时（第 2 章 300s 事件复盘）。
-    // （已给足预算时首轮即最大，跳过放大）
-    for (let i = 1; i < escalation.length; i++) {
-      const budget = escalation[i];
-      if (seenBudgets.has(budget)) break;
-      seenBudgets.add(budget);
+    const seenBudgets = new Set<number>([budget]);
+    for (let i = 1; i <= MAX_ESCALATIONS; i++) {
       if (!shouldEscalateBudget(response.finishReason, response.rawContent)) break;
-      log.warn("api", "输出为空且被截断（预算被思考耗尽），放大 max_tokens 重试", {
-        budget,
+      const next = Math.min(MAX_OUTPUT_TOKENS, nextBudgetAfterThinking(budget, response, contentBudget));
+      if (next <= budget || seenBudgets.has(next)) break;
+      seenBudgets.add(next);
+      log.warn("api", "输出为空且被截断（思考耗尽输出预算），按思考量放大 max_tokens 重试", {
+        from: budget,
+        to: next,
         reasoningLen: response.reasoning.length,
+        reasoningTokens: response.reasoningTokens,
       });
       opts.onEvent?.({
         kind: "escalate",
         attempt: i,
         finishReason: response.finishReason,
         contentLen: response.rawContent.length,
-        message: `首轮输出为空（预算被思考耗尽），放大输出预算至 ${budget} 重试（第 ${i} 次升级）`,
+        message: `首轮输出为空（预算被思考耗尽），放大输出预算至 ${next} 重试（第 ${i} 次升级）`,
       });
-      response = await perform(budget);
+      budget = next;
+      response = await runOnce(budget);
     }
 
     let content = response.rawContent;
@@ -681,20 +719,7 @@ export async function chatCompletion(
       contentHead: content.slice(0, 120),
     });
     return { content, promptTokens, completionTokens, finishReason, toolCalls };
-  }, {
-    signal: opts.signal,
-    timeoutRetries: opts.timeoutRetries,
-    // B93：退避等待可被中止；重试同时透出给调用方打进度（否则 300s 超时 ×4 次重试全程静默）
-    onRetry: opts.onEvent
-      ? (attempt, delayMs, e) =>
-          opts.onEvent!({
-            kind: "retry",
-            attempt,
-            delayMs,
-            message: `请求失败，${delayMs / 1000}s 后重试（第 ${attempt} 次）：${String(e instanceof Error ? e.message : e).slice(0, 120)}`,
-          })
-      : undefined,
-  }));  // B93：退避等待可被中止
+  }); // 限流器内：升级循环已在 withRetry 之外，单次 perform 独立重试（1302）
 }
 
 /**
@@ -767,6 +792,24 @@ export function shouldEscalateBudget(finishReason: string | undefined, rawConten
 }
 
 /**
+ * 思考耗尽预算后下一次该给多大（纯函数，供单测；不针对任何特定模型）：
+ * 至少「本次思考量 + 期望正文预算 + 余量」，让正文真正拿到预算；
+ * 模型未报告 reasoning_tokens 时按 reasoning 文本长度估算；再兜底至少比上次多 8000。
+ */
+export function nextBudgetAfterThinking(
+  prevBudget: number,
+  resp: { reasoningTokens?: number; reasoning?: string },
+  contentBudget: number,
+): number {
+  const reported = typeof resp.reasoningTokens === "number" && resp.reasoningTokens > 0 ? resp.reasoningTokens : 0;
+  // 无 token 统计时按字符估 token（中文约 1.5 字符/token，这里取 2 作保守上限，宁可多留）
+  const estimated = Math.ceil((resp.reasoning ?? "").length / 2);
+  const reasoningUsed = Math.max(reported, estimated);
+  const want = reasoningUsed + Math.max(1, contentBudget) + 1024;
+  return Math.max(prevBudget + 8000, want);
+}
+
+/**
  * 从「思考过程 + JSON 混排」的文本里提取最后一个合法的 JSON。
  * 推理型模型（deepseek 系列）的 reasoning_content 通常是：思考文字 + 末尾一个完整 JSON。
  * 策略：从文本末尾向前找闭合符，再向后做括号平衡扫描定位匹配的开括号，尝试 JSON.parse。
@@ -817,6 +860,20 @@ function extractJsonFromMixed(text: string): string {
   return cleaned;
 }
 
+/** 续写判定（纯函数，供单测）：finish=length 且轮次未超即续写；从第 2 次续写起，
+ *  本轮新增内容低于下限视为模型停滞，停止续写走解析/修复，避免无限续写小片段烧钱。 */
+export function shouldContinueJson(
+  finishReason: string | undefined,
+  continueCount: number,
+  maxContinue: number,
+  newContentLen: number,
+  minProgress: number,
+): boolean {
+  if (finishReason !== "length" || continueCount >= maxContinue) return false;
+  if (minProgress > 0 && continueCount >= 1 && newContentLen < minProgress) return false;
+  return true;
+}
+
 export async function chatJson<T>(
   cfg: ApiConfig,
   system: string,
@@ -844,8 +901,8 @@ export async function chatJson<T>(
     accumulated += content;
     opts.onEvent?.({ kind: "response", attempt: requestCount, finishReason, contentLen: content.length, accumulatedLen: accumulated.length });
 
-    // 输出因长度上限被截断 → 请求模型从中断处续写
-    if (finishReason === "length" && continueCount < maxContinue) {
+    // 输出因长度上限被截断 → 请求模型从中断处续写（生成多少、下轮接着往后补，不设总量天花板）
+    if (shouldContinueJson(finishReason, continueCount, maxContinue, content.length, opts.minContinueProgress ?? 0)) {
       continueCount++;
       log.warn("api", "JSON 输出被截断，请求续写", { accumulatedLen: accumulated.length, attempt: continueCount });
       opts.onEvent?.({ kind: "continue", attempt: continueCount, finishReason, contentLen: content.length, accumulatedLen: accumulated.length });
@@ -855,6 +912,15 @@ export async function chatJson<T>(
         content: "你的上一轮 JSON 输出因长度限制被截断。请只输出缺失的剩余 JSON 部分（严格从中断处继续，不要重复已输出的内容，不要任何解释文字）。",
       });
       continue;
+    }
+    // 停滞可见：仍被截断但新增内容过少（或轮次用尽），不再续写，直接走解析/修复，避免静默烧钱
+    if (finishReason === "length") {
+      log.warn("api", "输出仍被截断但停止续写（新增过少或轮次用尽），转解析", {
+        accumulatedLen: accumulated.length,
+        contentLen: content.length,
+        continueCount,
+      });
+      opts.onEvent?.({ kind: "escalate", attempt: continueCount, message: "输出仍被截断但新增过少，停止续写转解析" });
     }
 
     try {
@@ -944,13 +1010,13 @@ export async function chatVision(
       timeoutSecs: opts.timeoutSecs ?? 120,
     }, opts.signal ?? activeAbortSignal());
     if (res.status >= 500 || res.status === 429) {
-      log.error("api", `chatVision 服务端错误 ${res.status}`, { url: chatUrl, model: cfg.model });
-      throw { status: res.status, message: `HTTP ${res.status}` };
+      log.error("api", `chatVision 服务端错误 ${res.status}`, { url: redactUrl(chatUrl), model: cfg.model });
+      throw httpStatusError(res.status, `HTTP ${res.status}`);
     }
     if (res.status >= 400) {
       const raw = b64ToUtf8(res.bodyBase64);
       log.error("api", `chatVision 失败 ${res.status}`, {
-        url: chatUrl,
+        url: redactUrl(chatUrl),
         model: cfg.model,
         apiKey: maskKey(cfg.apiKey),
         raw: raw.slice(0, 600),
@@ -974,7 +1040,8 @@ export async function chatVision(
       log.error("api", "chatVision 响应缺少 choices", { model: cfg.model, raw: text.slice(0, 500) });
       throw new VisionApiError(`图片识别 API 响应缺少 choices: ${JSON.stringify(data).slice(0, 400)}`, "VISION_RESPONSE_INVALID");
     }
-    const c = data.choices[0].message?.content ?? "";
+    // 1317：choices[0] 可能为 null，?. 守卫避免 TypeError→unknown→无谓重试。
+    const c = (data.choices[0] as { message?: { content?: unknown } } | null | undefined)?.message?.content ?? "";
     const usage = data.usage || {};
     opts.onUsage?.(usage.prompt_tokens ?? 0, usage.completion_tokens ?? 0);
     const reply = typeof c === "string" ? c : JSON.stringify(c);
@@ -1045,7 +1112,7 @@ export async function ttsSpeech(
   cfg: ApiConfig,
   text: string,
   voice: string,
-  _timeoutSecs = 120,
+  timeoutSecs = 120,
   perLine?: { speed?: number; ttsEmotion?: string },
 ): Promise<{ dataB64: string; mime: string }> {
   const tpl = resolveTemplate(cfg) ?? getTemplate("openai-tts")!;
@@ -1060,7 +1127,8 @@ export async function ttsSpeech(
     textHead: text.slice(0, 80),
   });
   try {
-    const r = await unifiedTts(cfg, tpl, { text, voice, speed: perLine?.speed, ttsEmotion: perLine?.ttsEmotion });
+    // 1317：timeoutSecs 此前被忽略（参数名 _timeoutSecs 从未使用），现透传给统一通道。
+    const r = await unifiedTts(cfg, tpl, { text, voice, speed: perLine?.speed, ttsEmotion: perLine?.ttsEmotion }, { timeoutSecs });
     // MiniMax 支持 mp3/wav/flac：mime 按用户配置的输出格式修正，避免扩展名/类型判断错误
     const fmt = ((cfg.extra as Record<string, unknown> | undefined)?.ttsFormat as string | undefined) ?? "";
     const mime = fmt === "wav" ? "audio/wav" : fmt === "flac" ? "audio/flac" : r.mime;
@@ -1214,16 +1282,20 @@ const CONNECTION_TEST_IMAGE_SIZE = "1024x1024";
 
 /** 带参考图的能力探测：用一张纯色小图作为参考图请求图生图，成功说明该模型支持参考图/图生图 */
 async function probeImageEditSupport(cfg: ApiConfig): Promise<{ ok: boolean; detail: string }> {
-  // 探针必须真正把参考图发出去才能判断能力。未知模型此前没有能力值，
-  // routeImageReferences 会在发请求前就把 required 参考图拒掉（REFERENCE_UNSUPPORTED），
-  // 导致"永远探不出支持"。这里临时给一份宽松能力让请求真正发出，finally 还原。
-  const prevCaps = cfg.extra?.imageCapabilities;
+  // 1317：此前就地改共享 cfg.extra 并 finally 还原，并发 generate 会读到伪造能力。
+  // 改为传 cfg 拷贝，探测的宽松能力只在本次探测内生效，不污染共享配置。
   const base = knownImageModelCapabilities(cfg.model) ?? { maxReferenceImages: 0, supportsSeed: false, supportsImageEdit: false, referenceEncoding: "raw-base64" as const };
-  cfg.extra ??= {};
-  cfg.extra.imageCapabilities = { ...base, supportsImageEdit: true, maxReferenceImages: 3 };
+  const probeCfg: ApiConfig = {
+    ...cfg,
+    extra: {
+      ...(cfg.extra ?? {}),
+      imageCapabilities: { ...base, supportsImageEdit: true, maxReferenceImages: 3 },
+      imageCapabilitiesModel: cfg.model,
+    },
+  };
   try {
     const probe = await generateImage(
-      cfg,
+      probeCfg,
       "a simple red square next to the reference image, same style",
       { references: [{ role: "structure", required: true, dataB64: VISION_TEST_PNG_B64, mime: "image/png" }], size: CONNECTION_TEST_IMAGE_SIZE },
     );
@@ -1233,9 +1305,6 @@ async function probeImageEditSupport(cfg: ApiConfig): Promise<{ ok: boolean; det
     return { ok: true, detail: "" };
   } catch (e) {
     return { ok: false, detail: e instanceof Error ? e.message : String(e) };
-  } finally {
-    if (prevCaps === undefined) delete cfg.extra.imageCapabilities;
-    else cfg.extra.imageCapabilities = prevCaps;
   }
 }
 

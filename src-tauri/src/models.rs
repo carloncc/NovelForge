@@ -434,14 +434,34 @@ fn status_for(model_id: &str, filename: &str) -> ModelStatus {
 }
 
 
-fn sleep_ms(ms: u64) {
-    std::thread::sleep(std::time::Duration::from_millis(ms));
+/// #1349：async 内禁用 std::thread::sleep——退避等待改用可取消的异步睡眠，
+/// 每 100ms 检查一次取消标志；返回 true 表示等待期间被取消。
+async fn sleep_cancellable(ms: u64, cancel: &AtomicBool) -> bool {
+    let mut waited = 0u64;
+    while waited < ms {
+        if cancel.load(Ordering::Relaxed) {
+            return true;
+        }
+        let step = (ms - waited).min(100);
+        tokio::time::sleep(Duration::from_millis(step)).await;
+        waited += step;
+    }
+    cancel.load(Ordering::Relaxed)
 }
 
 /// 连接并跟随重定向；可重试状态码 / 连接失败自动重试（指数退避）
-async fn connect_with_retry(url: &str, headers: Vec<(String, String)>) -> Result<reqwest::Response, String> {
+/// #1349：新增 cancel 参数——连接重试全程（12 次 × 退避）均可被取消，
+/// 退避等待不再 std::thread::sleep 占死 tokio worker。
+async fn connect_with_retry(
+    url: &str,
+    headers: Vec<(String, String)>,
+    cancel: &AtomicBool,
+) -> Result<reqwest::Response, String> {
     let mut last_error: Option<String> = None;
     for attempt in 1..=MAX_CONNECT_ATTEMPTS {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("下载已取消".to_string());
+        }
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_millis(CONNECT_TIMEOUT_MS))
             // #1128a：重定向目标也要过白名单，避免下载源 302 到内网/任意主机
@@ -477,7 +497,9 @@ async fn connect_with_retry(url: &str, headers: Vec<(String, String)>) -> Result
             }
         }
         if attempt < MAX_CONNECT_ATTEMPTS {
-            sleep_ms(1000 * u64::from(attempt.min(8)));
+            if sleep_cancellable(1000 * u64::from(attempt.min(8)), cancel).await {
+                return Err("下载已取消".to_string());
+            }
         }
     }
     Err(last_error.unwrap_or_else(|| "无法连接下载源".to_string()))
@@ -513,7 +535,7 @@ async fn download_to_part(
             println!("[model-download] 检测到未完成下载 {} MB，将断点续传…", offset / 1048576);
         }
         let headers = if offset > 0 { vec![("Range".to_string(), format!("bytes={offset}-"))] } else { Vec::new() };
-        let response = connect_with_retry(url, headers).await?;
+        let response = connect_with_retry(url, headers, cancel).await?;
         if cancel.load(Ordering::Relaxed) {
             return Err("下载已取消".to_string());
         }
@@ -581,7 +603,10 @@ async fn download_to_part(
             return Ok(());
         }
         eprintln!("[model-download] 连接中断（第 {attempt} 次），{} 秒后续传…", attempt.min(8));
-        sleep_ms(1000 * u64::from(attempt.min(8)));
+        // #1349：续传等待同样可取消、不再阻塞 tokio worker
+        if sleep_cancellable(1000 * u64::from(attempt.min(8)), cancel).await {
+            return Err("下载已取消".to_string());
+        }
     }
 }
 
@@ -734,7 +759,11 @@ async fn download_model(
     for round in 1..=3u32 {
         download_to_part(dir, filename, url, model_id, cancel, max_bytes).await?;
         println!("[model-download] 第 {round} 轮下载完成，正在校验完整性…");
-        let digest = file_md5(&part)?;
+        // #1349：数百 MB 同步 MD5 挪出 async 运行时（spawn_blocking），避免占死 worker
+        let part_owned = part.clone();
+        let digest = tauri::async_runtime::spawn_blocking(move || file_md5(&part_owned))
+            .await
+            .map_err(|e| format!("校验任务失败: {e}"))??;
         if md5.is_empty() || digest == md5 {
             fs::rename(&part, &destination).map_err(|e| format!("模型文件落位失败: {e}"))?;
             println!("[model-download] {}，模型已就位", if md5.is_empty() { "完整性校验跳过（md5 未设置）" } else { "md5 校验通过" });
@@ -924,11 +953,13 @@ pub fn read_model_file(filename: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        max_bytes_for, md5_hex, model_integrity, resolve_download_md5, validate_download_url,
-        Integrity, Md5, MAX_UNKNOWN_MODEL_BYTES,
+        connect_with_retry, max_bytes_for, md5_hex, model_integrity, resolve_download_md5,
+        sleep_cancellable, validate_download_url, Integrity, Md5, MAX_UNKNOWN_MODEL_BYTES,
     };
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
 
     /// 每个测试独立的临时目录（避免并行测试互相踩）
     fn temp_dir(tag: &str) -> PathBuf {
@@ -1031,9 +1062,9 @@ mod tests {
         // 表外：统一 330MB
         assert_eq!(max_bytes_for("future-model.onnx"), MAX_UNKNOWN_MODEL_BYTES);
     }
-
     #[test]
     fn integrity_rejects_missing_truncated_and_broken_models() {
+
         let dir = temp_dir("integrity");
         // 缺失
         assert_eq!(model_integrity(&dir, "u2netp.onnx").kind, Integrity::Missing);
@@ -1064,5 +1095,35 @@ mod tests {
         assert_eq!(model_integrity(&dir, "u2netp.onnx").kind, Integrity::Ok);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1349：预置取消标志时 connect 阶段立即退出（不发起 12 次重试、不睡退避）
+    #[tokio::test]
+    async fn connect_retry_observes_pre_set_cancel() {
+        let cancel = AtomicBool::new(true);
+        let started = Instant::now();
+        let result =
+            connect_with_retry("https://objects.githubusercontent.com/x", Vec::new(), &cancel)
+                .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("取消"));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "预取消应立即返回，不应进入重试等待"
+        );
+    }
+
+    /// #1349：退避等待期间置位取消应提前返回 true；未取消时睡满返回 false
+    #[tokio::test]
+    async fn cancellable_sleep_wakes_on_cancel() {
+        let cancel = AtomicBool::new(false);
+        assert!(!sleep_cancellable(50, &cancel).await);
+        let cancel = AtomicBool::new(true);
+        assert!(sleep_cancellable(8000, &cancel).await);
+        // 8 秒退避若不可取消会睡满；可取消时应在远小于 8 秒内返回
+        let started = Instant::now();
+        let cancel = AtomicBool::new(true);
+        assert!(sleep_cancellable(8000, &cancel).await);
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

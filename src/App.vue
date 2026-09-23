@@ -64,6 +64,21 @@ onMounted(async () => {
   const logPath = await installLogFileSink();
   log.info("app", "应用启动，日志已落盘", { logPath });
   await configReady;
+  // #1292：启动时登记已知项目目录进桌面端文件白名单（当前 + 历史 + 项目列表）——
+  // 用户工程可位于任意盘符，不登记则读写一律被拒、项目打不开。单个失败不阻断。
+  {
+    const known = new Set<string>();
+    if (configState.outputDir) known.add(configState.outputDir);
+    for (const d of configState.recentOutputDirs ?? []) if (d) known.add(d);
+    for (const p of configState.projects ?? []) if (p?.outputDir) known.add(p.outputDir);
+    for (const d of known) {
+      try {
+        await tauri.blessProjectDir(d);
+      } catch {
+        /* 单个失败不阻断，切换项目时还会再登记 */
+      }
+    }
+  }
   if (configState.outputDir) {
     projectState.outputDir = configState.outputDir;
     // 启动恢复失败必须留痕：以前这里不接异常，状态读不出来时 projectState.novel 会一直是 null，

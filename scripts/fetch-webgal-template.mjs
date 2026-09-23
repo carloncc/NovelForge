@@ -7,13 +7,18 @@
 import { createWriteStream } from "node:fs";
 import { copyFile, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
-import { dirname, join } from "node:path";
+import { createHash } from "node:crypto";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const TARGET = join(ROOT, "src-tauri", "templates", "webgal");
 const VERSION = "4.6.3";
+// #1310：模板 zip 钉 hash（防镜像 compromised 下发恶意包）。
+// 哈希由 WEBGAL_TEMPLATE_SHA256 注入（CI secret/变量）；缺失时只告警不断链，
+// 存在即强制校验，不匹配直接抛错中断构建。
+const EXPECTED_SHA256 = (process.env.WEBGAL_TEMPLATE_SHA256 ?? "").trim().toLowerCase();
 const URLS = [
   `https://github.com/OpenWebGAL/WebGAL/releases/download/${VERSION}/WebGAL-${VERSION}-web.zip`,
   `https://ghfast.top/https://github.com/OpenWebGAL/WebGAL/releases/download/${VERSION}/WebGAL-${VERSION}-web.zip`,
@@ -40,6 +45,37 @@ async function download(url, dest) {
   } finally {
     clearTimeout(timer);
   }
+  await verifyZipHash(dest);
+}
+
+/** #1310：zip 哈希校验（钉 hash，无 hash 时告警） */
+async function verifyZipHash(zipPath) {
+  if (!EXPECTED_SHA256) {
+    console.warn("[novelforge] 警告: 未设置 WEBGAL_TEMPLATE_SHA256，跳过模板 zip 哈希校验（建议在 CI 中钉住）");
+    return;
+  }
+  const hash = createHash("sha256");
+  const data = await readFile(zipPath);
+  hash.update(data);
+  const actual = hash.digest("hex").toLowerCase();
+  if (actual !== EXPECTED_SHA256) {
+    throw new Error(`模板 zip 哈希不匹配：期望 ${EXPECTED_SHA256}，实际 ${actual}（可能镜像被污染，已中断）`);
+  }
+  console.log("模板 zip 哈希校验通过");
+}
+
+/** #1310：路径必须落在项目根内，防止 zip/TARGET 被意外指向系统目录后 rm -rf */
+function assertInsideRoot(p, label) {
+  const abs = resolve(p);
+  const root = resolve(ROOT);
+  if (abs !== root && !abs.startsWith(root + "\\") && !abs.startsWith(root + "/")) {
+    throw new Error(`${label} 越界：${p} 不在项目根内，已拒绝`);
+  }
+}
+
+/** #1310：PowerShell 单引号转义（''），配合 -LiteralPath 避免路径注入 */
+function psQuote(p) {
+  return `'${String(p).replace(/'/g, "''")}'`;
 }
 
 async function exists(p) {
@@ -175,23 +211,25 @@ async function main() {
   if (lastErr) throw lastErr;
 
   console.log("解压中…");
+  assertInsideRoot(TARGET, "模板目标目录");
+  assertInsideRoot(zip, "模板 zip");
   await rm(TARGET, { recursive: true, force: true });
   await mkdir(TARGET, { recursive: true });
   const unzip = spawnSync("unzip", ["-o", zip, "-d", TARGET], { stdio: "ignore" });
   if (unzip.status !== 0) {
-    // Windows runner：尝试 PowerShell Expand-Archive
+    // Windows runner：尝试 PowerShell Expand-Archive（路径走转义后的字面量，不拼 shell）
     const ps = spawnSync(
       "powershell",
-      ["-NoProfile", "-Command", `Expand-Archive -Force -Path '${zip}' -DestinationPath '${TARGET}'`],
+      ["-NoProfile", "-Command", `Expand-Archive -LiteralPath ${psQuote(zip)} -DestinationPath ${psQuote(TARGET)} -Force`],
       { stdio: "ignore" },
     );
     if (ps.status !== 0) {
-      // 通用兜底：python3 / python
+      // 通用兜底：python3 / python（路径走 argv，不拼进 -c 代码字符串）
       let pyOk = false;
       for (const py of ["python3", "python"]) {
         const r = spawnSync(
           py,
-          ["-c", `import zipfile; zipfile.ZipFile(r"${zip}").extractall(r"${TARGET}")`],
+          ["-c", "import sys,zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])", zip, TARGET],
           { stdio: "ignore" },
         );
         if (r.status === 0) {

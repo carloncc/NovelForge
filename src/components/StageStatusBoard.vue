@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref } from "vue";
 import type { StageKey } from "../core/types";
 import { STAGE_LABELS, STAGE_ORDER } from "../core/types";
 import type { StageState } from "../composables/useStageStatus";
@@ -13,7 +13,12 @@ const props = defineProps<{
   busy: boolean;
 }>();
 
-const emit = defineEmits<{ regen: [stage: StageKey] }>();
+/** props 只读：意见/全量经事件回父组件写入（父侧持有 store ref），子组件不再 v-model 直改 prop */
+const emit = defineEmits<{
+  regen: [stage: StageKey];
+  "update:feedback": [stage: StageKey, value: string];
+  "update:force": [stage: StageKey, value: boolean];
+}>();
 
 // 语言切换后标签需实时更新：computed（setup 期一次性 t() 会停留在旧语言）
 const STATE_LABELS = computed<Record<StageState, string>>(() => ({
@@ -36,6 +41,18 @@ const showFeedback = (s: StageKey): boolean =>
 const showForce = (s: StageKey): boolean => s !== "assemble";
 
 const stageOrder = computed(() => STAGE_ORDER);
+
+/** 意见/全量收进按行折叠：每行常驻只剩「意见」开关 + 「重新生成」2 个控件（含 assemble 共 13 + 上游复选框 1 = 14 ≤ 15） */
+const expanded = ref<Partial<Record<StageKey, boolean>>>({});
+function toggleExpanded(s: StageKey): void {
+  expanded.value[s] = !expanded.value[s];
+}
+function hasOptions(s: StageKey): boolean {
+  return showFeedback(s) || showForce(s);
+}
+function hasOpinion(s: StageKey): boolean {
+  return !!(props.feedback[s]?.trim() || props.force[s]);
+}
 </script>
 
 <template>
@@ -55,19 +72,15 @@ const stageOrder = computed(() => STAGE_ORDER);
         <b>{{ t(STAGE_LABELS[s]) }}</b>
         <span class="stage-state-text" :class="statuses[s]">{{ stateText(statuses[s], s) }}</span>
       </div>
-      <!-- 意见与全量行内直出：不再折叠，避免每行多一次点击 -->
-      <input
-        v-if="showFeedback(s)"
-        class="stage-feedback"
-        type="text"
-        v-model="feedback[s]"
+      <!-- 意见与全量收进折叠：常驻每行只剩「意见」开关 + 「重新生成」，避免 19 控件同屏堆叠填错行 -->
+      <button
+        v-if="hasOptions(s)"
+        class="btn ghost small"
         :disabled="busy"
-        :placeholder="s === 'voice' ? t('意见（填了=全书重配，计费）') : t('意见（填了=全量重生成，计费）')"
-      />
-      <label v-if="showForce(s)" class="opt-item mb-0" :title="t('勾选后无视缓存全量重跑该阶段（计费），不需要填意见；执行前会二次确认')">
-        <input type="checkbox" v-model="force[s]" :disabled="busy" />
-        {{ t("全量") }}
-      </label>
+        :aria-expanded="!!expanded[s]"
+        :title="t('展开填写本阶段意见 / 全量开关')"
+        @click="toggleExpanded(s)"
+      >{{ hasOpinion(s) ? t("意见●") : t("意见") }} {{ expanded[s] ? "▾" : "▸" }}</button>
       <button
         class="btn small"
         :disabled="busy"
@@ -78,6 +91,26 @@ const stageOrder = computed(() => STAGE_ORDER);
       >
         {{ t("重新生成") }}
       </button>
+      <div v-if="expanded[s] && hasOptions(s)" style="display: flex; gap: 8px; flex-wrap: wrap; flex-basis: 100%">
+        <input
+          v-if="showFeedback(s)"
+          class="stage-feedback"
+          type="text"
+          :value="feedback[s] ?? ''"
+          :disabled="busy"
+          :placeholder="s === 'voice' ? t('意见（填了=全书重配，计费）') : t('意见（填了=全量重生成，计费）')"
+          @input="emit('update:feedback', s, ($event.target as HTMLInputElement).value)"
+        />
+        <label v-if="showForce(s)" class="opt-item mb-0" :title="t('勾选后无视缓存全量重跑该阶段（计费），不需要填意见；执行前会二次确认')">
+          <input
+            type="checkbox"
+            :checked="!!force[s]"
+            :disabled="busy"
+            @change="emit('update:force', s, ($event.target as HTMLInputElement).checked)"
+          />
+          {{ t("全量") }}
+        </label>
+      </div>
     </div>
   </div>
 </template>

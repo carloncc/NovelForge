@@ -8,7 +8,7 @@ import { upsertProject } from "../stores/projects";
 import { Pipeline, novelFingerprint, joinAppendText, dedupeSceneIdsAcrossChapters } from "../core/pipeline";
 import type { SplitMethod } from "../core/pipeline";
 import { resolveTemplateDir } from "../utils/template";
-import { tauri, isTauri } from "../utils/tauri";
+import { tauri, isTauri, blessParentDir } from "../utils/tauri";
 import { vfsWriteFileBase64 } from "../utils/vfsWeb";
 import { sanitizeId } from "../core/render";
 import { errMsg } from "../utils/errors";
@@ -17,9 +17,9 @@ import { ERROR_CLASS_ICON, ERROR_CLASS_LABEL, classifyError } from "../utils/err
 import { cutoutErrorHint } from "../utils/cutoutErrorHint";
 import { log as logger, dumpLogHistory } from "../utils/logger";
 import { useStageStatus } from "../composables/useStageStatus";
-import { runStatusSync, runStatusSetFailed, registerRunStop } from "./runStatus";
+import { runStatusSync, runStatusSetFailed, registerRunStop, isRunSourceBusy } from "./runStatus";
 import { useChapterStatus, isChapterContentComplete, emptyChapterLight } from "../composables/useChapterStatus";
-import type { AssetMap, FailedTask, ImageTask, PipelineEvent, StageFeedback, StageKey, VideoSuggestion } from "../core/types";
+import type { AssetMap, ChapterInfo, FailedTask, ImageTask, PipelineEvent, StageFeedback, StageKey, VideoSuggestion } from "../core/types";
 import { STAGE_LABELS, STAGE_ORDER } from "../core/types";
 import {
   regenerateCharacterFigures,
@@ -141,6 +141,54 @@ function goFullMode(): void {
 }
 const error = ref("");
 const busy = ref(false);
+/**
+ * #1299：单调运行令牌。execute 守卫后同步置 busy，续点校验令牌是否仍是当前运行，
+ * 旧运行的 finally 不得清掉新运行的 busy（与 queueToken 同思路）。
+ */
+let runSeq = 0;
+let activeRunId = 0;
+/** 纯函数：是否应拒绝一次 execute（供单测，无副作用） */
+export function shouldRejectRun(state: { busy: boolean; assetBusy: string; queueRunning: boolean; fromQueue?: boolean }): boolean {
+  if (state.busy) return true;
+  if (state.assetBusy) return true;
+  if (state.queueRunning && !state.fromQueue) return true;
+  return false;
+}
+/** 纯函数：素材→组装能否原子交接（两锁皆空窗口消除的前提） */
+export function canTransferAssetToRun(state: { busy: boolean; assetBusy: string; queueRunning: boolean }): boolean {
+  if (!state.assetBusy) return false;
+  if (state.busy) return false;
+  if (state.queueRunning) return false;
+  return true;
+}
+/** 纯函数：续点令牌是否过期 */
+export function isStaleRunId(runId: number, activeId: number): boolean {
+  return runId !== activeId;
+}
+/** 同步抢占运行锁：成功即置 busy 并返回令牌，失败返回 null（必须在任何 await 之前调用） */
+function claimRun(fromQueue = false): number | null {
+  if (shouldRejectRun({ busy: busy.value, assetBusy: assetBusy.value, queueRunning: queueRunning.value, fromQueue })) return null;
+  activeRunId = ++runSeq;
+  busy.value = true;
+  return activeRunId;
+}
+/**
+ * #1300：素材→组装原子交接。调用方已持有 assetBusy，同步把锁交接给 busy 后再清 assetBusy，
+ * 中间无“两锁皆空”窗口；失败（已有 busy/queue）则保持原锁并返回 null。
+ */
+function transferAssetToRun(): number | null {
+  if (busy.value || queueRunning.value) return null;
+  if (!assetBusy.value) return null;
+  activeRunId = ++runSeq;
+  busy.value = true;
+  assetBusy.value = "";
+  return activeRunId;
+}
+function releaseRun(runId: number): void {
+  if (runId === activeRunId) {
+    busy.value = false;
+  }
+}
 const pendingResumeStages = ref<StageKey[]>([]);
 /**
  * 待续跑计划的作用域（章节范围）。视觉守门挡下的是「某一次具体运行」，
@@ -381,7 +429,7 @@ const imagePlanSummary = computed(() =>
 
 /** 生成前的图片总账文案：图像关闭 / 未配置 API / 尚无剧本都给出明确说法，不让用户猜 */
 const imagePlanText = computed(() => {
-  if (!projectState.options.useImage) return t("图像已关闭（可在「生成内容」开启）");
+  if (!projectState.options.useImage) return t("图像已关闭（可在「生成设置 → 内容」开启）");
   if (!activeConfig("image")?.apiKey) return t("未配置图像 API，图片不会生成");
   const s = imagePlanSummary.value;
   if (!s.knownChapters) return t("剧本生成后自动计算图片总数");
@@ -424,6 +472,39 @@ function toggleNovelChapter(novelIdx: number): void {
     message: ch.enabled === false
       ? `第 ${novelIdx + 1} 章「${ch.title}」已停用（不再参与生成；注意后续章节编号会前移）`
       : `第 ${novelIdx + 1} 章「${ch.title}」已重新启用`,
+    level: "info",
+    at: Date.now(),
+  });
+}
+
+/** 批量启停（#1335）：混选统一为一个目标态（要么全停用，要么全启用），一次确认——
+ *  不再逐章 toggle（此前混选会把已停用章反向重新启用）+ 不再每章各弹一次确认（取消也停不下来）。 */
+function setNovelChaptersEnabled(indices: number[], enabled: boolean): void {
+  const novel = projectState.novel;
+  if (!novel || !indices.length) return;
+  const byIndex = new Map(novel.chapters.map((c) => [c.index, c]));
+  const targets = indices.map((i) => byIndex.get(i)).filter((c): c is ChapterInfo => !!c && (c.enabled !== false) !== enabled);
+  if (!targets.length) return;
+  const names = targets.map((c) => `第${c.index + 1}章「${c.title}」`).join("、");
+  if (!enabled) {
+    if (!window.confirm(`将停用 ${targets.length} 章（${names}）：后续章节编号前移，已有剧本/配音缓存会按新编号重新对齐（可能触发重配）。取消则整批不执行，继续吗？`)) return;
+  } else {
+    if (!window.confirm(`将重新启用 ${targets.length} 章（${names}）：后续章节编号依次后移，已有配音缓存可能对不上而重配。取消则整批不执行，继续吗？`)) return;
+  }
+  for (const c of targets) c.enabled = enabled;
+  // 停用章不能留在批量选择里（与单章 toggle 同口径）
+  if (!enabled) {
+    const off = new Set(targets.map((c) => c.index));
+    selectedChapters.value = selectedChapters.value.filter((i) => !off.has(i));
+  }
+  scheduleSave();
+  void chapterStatus.refresh();
+  void stageStatus.refresh();
+  pushLog({
+    step: "分章",
+    message: enabled
+      ? `已重新启用 ${targets.length} 章（${names}）`
+      : `已停用 ${targets.length} 章（${names}；不再参与生成，后续章节编号前移）`,
     level: "info",
     at: Date.now(),
   });
@@ -484,6 +565,8 @@ const splitOpinion = ref("");
 const splitConfirmed = ref(false);
 /** 逐章工作台的多选（novel index）。声明在 outputDir watch 之前：immediate 回调会清空它 */
 const selectedChapters = ref<number[]>([]);
+/** 逐章工作台的「含配音」开关。同样声明在 outputDir watch 之前：immediate 回调会重置它 */
+const chapterIncludeVoice = ref(false);
 function splitConfirmKey(): string {
   return `novelforge:splitConfirmed:${projectState.outputDir}`;
 }
@@ -511,6 +594,8 @@ watch(() => projectState.outputDir, () => {
   loadSplitConfirmed();
   // 换项目立即清空逐章选择：旧索引在新项目里指向别的章
   selectedChapters.value = [];
+  // #1121：付费开关不跨项目残留——切项目即关闭含配音，避免对另一本书静默产生 TTS 费用
+  chapterIncludeVoice.value = false;
   void chapterStatus.refresh();
   void loadSplitMeta();
   // 卡片以磁盘 cards.json 为准：重启/切换项目后立刻补齐结构。
@@ -550,6 +635,12 @@ async function previewSplit(): Promise<void> {
   const upgrade = !fb && splitMeta.value?.method === "fallback" && !!activeConfig("llm")?.apiKey;
   // 带意见 = 强制全书 AI 重新分章 + 提取：计费且下游缓存作废，执行前显式确认
   if (fb && !window.confirm("填写了分章意见：本次将强制全书 AI 重新分章（并自动带上提取，有 LLM 时计费）；重分章会使下游剧本/图像/配音缓存按指纹作废重跑。继续吗？")) return;
+  // #1110/#1358：先判忙再打"开始"日志——否则 execute 因忙拒绝后，用户看到"已开始"但实际毫无反应
+  if (busy.value || assetBusy.value || queueRunning.value) {
+    error.value = t("已有任务正在运行，本次分章预览未执行：请等它完成，或先点「停止」再试");
+    pushLog({ step: "分章", message: error.value, level: "warn", at: Date.now() });
+    return;
+  }
   pushLog({
     step: "分章",
     message: `AI 分章预览开始（${fb ? "带意见：强制重切" : upgrade ? "规则回退升级：强制 AI 重切（下游缓存作废）" : "无意见：复用缓存"}）`,
@@ -600,7 +691,6 @@ function confirmSplit(): void {
 const queueRunning = ref(false);
 
 /* ---- 逐章工作台：多选 + 含配音（单章链的灵活入口） ---- */
-const chapterIncludeVoice = ref(false);
 const chapterHasCards = computed(() => (projectState.lastResult?.cards?.characters?.length ?? 0) > 0);
 
 function toggleChapterSelected(idx: number, checked: boolean): void {
@@ -624,7 +714,16 @@ function clearChapterSelection(): void {
 async function runSelectedChapters(): Promise<void> {
   if (busy.value || queueRunning.value) return;
   if (!selectedChapters.value.length) return;
-  await runChapterBatch([...selectedChapters.value]);
+  // #1336：确认框计数按实际执行范围（去停用章），不再虚高；执行侧同口径
+  const novel = projectState.novel;
+  const enabledSet = new Set((novel?.chapters ?? []).filter((c) => c.enabled !== false).map((c) => c.index));
+  const dropped = selectedChapters.value.filter((i) => !enabledSet.has(i));
+  const targets = selectedChapters.value.filter((i) => enabledSet.has(i));
+  if (dropped.length) {
+    pushLog({ step: "单章", message: `已跳过 ${dropped.length} 个停用章节（${dropped.map((i) => `第${i + 1}章`).join("、")}），只生成启用的 ${targets.length} 章`, level: "warn", at: Date.now() });
+  }
+  if (!targets.length) return;
+  await runChapterBatch(targets);
 }
 
 /** 就地补齐前置：没有卡片时先跑 分章＋提取，再让用户继续逐章生成 */
@@ -910,6 +1009,33 @@ void stageStatus.refresh();
 const styleRefSrc = ref("");
 const styleRecognizing = ref(false);
 const styleRefInput = ref<HTMLInputElement | null>(null);
+/**
+ * #1315：风格参考图 base64 常驻内存。识别完成后/取消后调用以释放（纯内存优化，不影响语义）。
+ * 保留 styleRefSrc 供“重新识别”用时由调用方显式保留，默认流程在应用后即清。
+ */
+export function clearStyleRef(): void {
+  styleRefSrc.value = "";
+}
+/** 纯函数：localStorage 分章确认键是否属于当前项目命名空间 */
+export function isSplitConfirmKeyForDir(key: string, outputDir: string): boolean {
+  return key === `novelforge:splitConfirmed:${outputDir}`;
+}
+/** #1315：清理非当前项目的分章确认残留键（per-dir 无上限增长），返回清理数 */
+export function pruneSplitConfirmKeys(currentDir: string): number {
+  try {
+    const prefix = "novelforge:splitConfirmed:";
+    const doomed: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith(prefix) && k !== `${prefix}${currentDir}`) doomed.push(k);
+    }
+    // 上限保护：即使都是历史残留，一次最多清 20 个，避免长阻塞
+    for (const k of doomed.slice(0, 20)) localStorage.removeItem(k);
+    return Math.min(doomed.length, 20);
+  } catch {
+    return 0;
+  }
+}
 
 async function pickStyleRef(): Promise<void> {
   if (!isTauri()) {
@@ -963,6 +1089,8 @@ async function recognizeStyleAndApply(b64: string): Promise<void> {
     }
     projectState.options.imageStyle = style;
     pushLog({ step: "画风", message: `已识别画风并写入「统一画风」：${style.slice(0, 100)}…`, level: "success", at: Date.now() });
+    // #1315：识别结果已落库，释放整图 base64 常驻内存（需重识时重新选择）
+    clearStyleRef();
   } catch (e) {
     pushLog({ step: "画风", message: `识别画风失败：${errMsg(e)}`, level: "error", at: Date.now() });
   } finally {
@@ -1304,9 +1432,8 @@ async function reCutout(mapKey: "figure" | "item", assetKey: string, filePath: s
     if (newPath && newPath !== filePath) {
       pushLog({ step: "素材", message: `抠图完成：${assetKey} → 透明底 PNG`, level: "success", at: Date.now() });
       // 抠图产生了新文件：重新组装，把新图复制进游戏目录（否则预览里还是旧图）。
-      // execute 会在 assetBusy 非空时直接拒绝，必须先让出占用。
-      assetBusy.value = "";
-      const ok = await execute({ stages: ["assemble"] });
+      // #1300：原子交接持锁组装，不再先清 assetBusy 留竞态窗口
+      const ok = await assembleWithAssetHandoff(`抠图「${assetKey}」`);
       if (!ok) {
         pushLog({ step: "素材", message: `抠图完成但重新组装未完成（预览可能仍是旧图）；请稍后手动点「组装」（免费）`, level: "warn", at: Date.now() });
       }
@@ -1457,9 +1584,8 @@ const cgRows = computed(() => {
 });
 
 const charNameOf = computed(() => {
-  const map: Record<string, string> = {};
-  for (const c of projectState.lastResult?.cards.characters ?? []) map[c.id] = c.name;
-  return (id: string) => map[id] || id;
+  const chars = projectState.lastResult?.cards.characters ?? [];
+  return (id: string) => resolveCharDisplayName(chars, id);
 });
 
 const voiceRows = computed(() => {
@@ -1583,18 +1709,16 @@ interface ExecuteOptions {
   append?: { baseFullText: string; tailText: string };
   /** 队列内部调用：允许在 queueRunning 期间执行（否则排队时外部按钮会被全部拦截） */
   fromQueue?: boolean;
+  /** 内部：已持有运行锁（transferAssetToRun 返回），跳过守卫直接执行 */
+  __heldRunId?: number;
 }
 
 async function execute(opts: ExecuteOptions): Promise<boolean> {
   error.value = "";
-  if (busy.value || assetBusy.value || (queueRunning.value && !opts.fromQueue)) {
-    // 明确反馈而不是静默返回：否则调用方可能已经写出了"开始"日志，用户看到的却是按钮毫无反应
-    const busyWhat = queueRunning.value && !opts.fromQueue
-      ? "逐章队列"
-      : assetBusy.value
-        ? `素材重生成（${assetBusy.value}）`
-        : "生成任务";
-    error.value = `已有${busyWhat}正在运行，本次操作未执行：请等它完成，或先点「停止」再试`;
+  // #1319：图片小说运行中拒绝启动第二套付费管线。用来源精确判断（isRunSourceBusy），
+  // 不读 runIsBusy——后者在自己刚结束、watch 未刷新时仍为真，会误拒自己的下一次启动。
+  if (opts.__heldRunId == null && isRunSourceBusy("image")) {
+    error.value = t("图片小说正在运行：请等它结束或先停止，再启动主管线（避免两套付费管线并发）");
     pushLog({ step: "生成", message: error.value, level: "warn", at: Date.now() });
     return false;
   }
@@ -1671,6 +1795,33 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
     });
     return false;
   }
+  // #1299：守卫后同步置 busy（claimRun 内同步置位），中间不再有 await 窗口；
+  // 持锁直通（素材→组装原子交接）跳过二次守卫。
+  // 注意：claimRun 必须在视觉守门分支之后——该分支会递归 execute 跑准备阶段，
+  // 若外层先持锁，内层会被自己的锁拒绝，且外层在 try 之前 return 会泄漏 busy，
+  // 导致此后每次操作都误报「已有生成任务正在运行」。
+  let myRunId: number | null = null;
+  if (opts.__heldRunId !== undefined && opts.__heldRunId !== null) {
+    if (opts.__heldRunId !== activeRunId || !busy.value) {
+      error.value = t("已有生成任务正在运行，本次操作未执行：请等它完成，或先点「停止」再试");
+      return false;
+    }
+    myRunId = opts.__heldRunId;
+  } else {
+    const claimed = claimRun(!!opts.fromQueue);
+    if (claimed === null) {
+      // 明确反馈而不是静默返回：否则调用方可能已经写出了"开始"日志，用户看到的却是按钮毫无反应
+      const busyWhat = queueRunning.value && !opts.fromQueue
+        ? "逐章队列"
+        : assetBusy.value
+          ? `素材重生成（${assetBusy.value}）`
+          : "生成任务";
+      error.value = `已有${busyWhat}正在运行，本次操作未执行：请等它完成，或先点「停止」再试`;
+      pushLog({ step: "生成", message: error.value, level: "warn", at: Date.now() });
+      return false;
+    }
+    myRunId = claimed;
+  }
   const llm = activeConfig("llm");
   const vision = activeConfig("vision");
   const image = activeConfig("image");
@@ -1686,14 +1837,18 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
   if (!projectState.outputDir) {
     projectState.outputDir = await tauri.getDefaultOutputDir().catch(() => "");
   }
+  if (isStaleRunId(myRunId, activeRunId)) return false;
   if (outputDirDraft.value && outputDirDraft.value !== projectState.outputDir) {
     if (!(await flushPendingProjectSave())) {
       error.value = t("当前项目保存失败，已取消切换输出目录");
+      releaseRun(myRunId);
+      projectState.running = false;
       return false;
     }
     projectState.outputDir = outputDirDraft.value;
     configState.outputDir = outputDirDraft.value;
   }
+  if (isStaleRunId(myRunId, activeRunId)) return false;
   if (opts.clearLogsFirst) {
     clearLogs();
   }
@@ -1711,8 +1866,9 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
     });
   }
   // B36：运行开始时重置「最近活跃阶段」——否则置 busy 的瞬间看板会把上一轮的阶段显示成「进行中」
+  // #1299：busy 已在 claimRun 同步置位，此处只置 running 并校验令牌（不再二次置 busy 留窗口）
+  if (isStaleRunId(myRunId, activeRunId)) return false;
   resetActiveStage();
-  busy.value = true;
   projectState.running = true;
   // 本次运行的失败任务从这里重新累计（旧值只用于展示上一轮，不能污染本轮的成功/失败判定）
   lastRunFailedTasks.value = [];
@@ -1731,6 +1887,8 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
   };
   try {
     const templateDir = await resolveTemplateDir();
+    // #1299：续点校验——等待模板目录期间若被新运行取代，直接退出不再建第二条管线
+    if (isStaleRunId(myRunId, activeRunId)) return false;
     // 本次运行实际生效的章节范围：显式传入优先，否则沿用全局勾选。
     // 必须与下面日志用同一个值——否则日志会写「全部」而实际只跑勾选的几章，事后无法对账。
     const effectiveRerunChapters =
@@ -1871,9 +2029,14 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
     return false;
   } finally {
     stopAssetLiveRefresh();
-    busy.value = false;
-    projectState.running = false;
-    pipelineRef.value = null;
+    // #1299：旧运行的 finally 不得清掉新运行的锁（停止后马上重开时旧 finally 会误清）
+    releaseRun(myRunId);
+    if (!isStaleRunId(myRunId, activeRunId)) {
+      projectState.running = false;
+    }
+    // 被取代的旧运行不再刷新看板/落盘，避免覆盖新运行状态
+    if (!isStaleRunId(myRunId, activeRunId)) {
+      pipelineRef.value = null;
     // UI57：此处不清空 activeRunLabels——本次运行的阶段标记（含「跳过」）保留到下一次运行开始，
     // 由 execute 开头的 clearRunLabels() 统一清掉。
     void stageStatus.refresh();
@@ -1882,7 +2045,21 @@ async function execute(opts: ExecuteOptions): Promise<boolean> {
     void persistRunLog();
     // 失败列表以 failed.json 为准刷新：重跑成功的章节/图片/配音立即从页面消失
     void refreshFailedTasks();
+    }
   }
+}
+
+/**
+ * #1300：素材→组装原子交接统一入口。同步把 assetBusy 交接给 busy 后持锁直通
+ * execute（__heldRunId），中间无“两锁皆空”窗口；交接失败返回 false。
+ */
+async function assembleWithAssetHandoff(label: string): Promise<boolean> {
+  const held = transferAssetToRun();
+  if (held === null) {
+    pushLog({ step: "素材", message: `${label}：重新组装未执行（有其它任务正在运行）；请稍后在「单阶段重跑」点「组装」刷新（免费）`, level: "warn", at: Date.now() });
+    return false;
+  }
+  return execute({ stages: ["assemble"], __heldRunId: held });
 }
 
 /** 每次管线运行结束自动落盘一份运行日志（成功失败都存，最多保留 10 份）：
@@ -2291,7 +2468,7 @@ function runStageRegen(stage: StageKey): void {
  *   否则「顺序补全」在中途章节缺剧本时会被组装保护拦下，首章一失败整条队列就停死。
  * @returns 管线是否成功，供队列顺序调用。
  */
-async function runChapterFullRegen(novelIdx: number, opts?: { fromQueueBatch?: boolean }): Promise<boolean> {
+async function runChapterFullRegen(novelIdx: number, opts?: { fromQueueBatch?: boolean; skipConfirm?: boolean }): Promise<boolean> {
   const novel = projectState.novel;
   const ch = novel?.chapters.find((c) => c.index === novelIdx);
   if (!novel || !ch) {
@@ -2321,8 +2498,9 @@ async function runChapterFullRegen(novelIdx: number, opts?: { fromQueueBatch?: b
   const voiceNote = chapterIncludeVoice.value ? "含配音" : "不含配音";
   const fb = scriptChapterFeedback.value[novelIdx]?.trim() ?? "";
   const forceAll = !!chapterForce.value[novelIdx];
-  // 全量单章先确认（影响：整章剧本重写＋该章背景/CG 重画）
-  if (forceAll && !window.confirm(`第 ${novelIdx + 1} 章「${ch.title}」将全量重跑（剧本重写${canFillImages ? "＋该章背景/CG 重画" : ""}，scene 变化后该章配音需重配）。继续吗？`)) return false;
+  // 全量单章先确认（影响：整章剧本重写＋该章背景/CG 重画）。
+  // #1334：批量入口传 skipConfirm（工作台已做一次聚合确认），避免 N 章弹 N 次、取消也停不下来
+  if (forceAll && !opts?.skipConfirm && !window.confirm(`第 ${novelIdx + 1} 章「${ch.title}」将全量重跑（剧本重写${canFillImages ? "＋该章背景/CG 重画" : ""}，scene 变化后该章配音需重配）。继续吗？`)) return false;
   chapterForce.value[novelIdx] = false;
   pushLog({
     step: "单章",
@@ -2425,7 +2603,7 @@ async function runChapterFullRegen(novelIdx: number, opts?: { fromQueueBatch?: b
  * - image：只强制重画本章背景/CG，剧本与配音完全不动（人物/物品是项目级资产，不受影响）。
  * - voice：只强制重配本章台词，剧本与图像不动。
  */
-async function runChapterPartRegen(novelIdx: number, part: "script" | "image" | "voice"): Promise<boolean> {
+async function runChapterPartRegen(novelIdx: number, part: "script" | "image" | "voice", opts?: { skipConfirm?: boolean }): Promise<boolean> {
   const novel = projectState.novel;
   const ch = novel?.chapters.find((c) => c.index === novelIdx);
   if (!novel || !ch) {
@@ -2463,7 +2641,8 @@ async function runChapterPartRegen(novelIdx: number, part: "script" | "image" | 
     : part === "image"
       ? `只重画第 ${novelIdx + 1} 章「${ch.title}」的背景/CG（剧本、配音不动）。继续吗？`
       : `只重配第 ${novelIdx + 1} 章「${ch.title}」的台词配音（剧本、图像不动）。继续吗？`;
-  if (!window.confirm(ask)) return false;
+  // #1334：同全量，批量入口已聚合确认，这里跳过
+  if (!opts?.skipConfirm && !window.confirm(ask)) return false;
 
   const exec: ExecuteOptions = {
     stages: [],
@@ -2571,16 +2750,20 @@ function confirmStageOpinion(stage: StageKey, fb: string, forceAll = false): boo
       );
     }
     case "script": {
+      // #1289：确认文案必须与实际执行范围一致（单阶段重跑继承整书面板勾选），不再写死全书章数
+      const scope = chapterScopeText(rerunChapters.value);
       const n = enabledNovelCount || chapters.length;
       return window.confirm(
-        `「剧本」${how}将重写全书 ${n} 章剧本（旧场景图/配音随之过期需重跑）。继续吗？\n（只改一章：去章节盘点那一章的重新生成，意见填在该章意见框）`,
+        `「剧本」${how}将重写${scope === "全书" ? `全书 ${n} 章` : scope}剧本（旧场景图/配音随之过期需重跑）。继续吗？\n（只改一章：去章节盘点那一章的重新生成，意见填在该章意见框）`,
       );
     }
     case "extract":
       return window.confirm(`「提取」${how}将重新提取全部卡片，并作废下游剧本缓存与人物/物品图（背景/CG/配音文件保留）。继续吗？`);
     case "translate": {
+      // #1289：同剧本，确认文案按实际勾选范围
+      const scope = chapterScopeText(rerunChapters.value);
       const n = enabledNovelCount || chapters.length;
-      return window.confirm(`「翻译」${how}将重翻全书 ${n} 章。继续吗？`);
+      return window.confirm(`「翻译」${how}将重翻${scope === "全书" ? `全书 ${n} 章` : scope}。继续吗？`);
     }
     case "split":
       return window.confirm(`将按${how}重新分章：分章变化会导致下游剧本/图像/配音缓存过期需重跑。继续吗？`);
@@ -2608,7 +2791,12 @@ const appendInput = ref<HTMLInputElement | null>(null);
 
 /** 追加新章节：选一个 txt（第4章…），旧章节/卡片/素材全部保留，只对新增部分分章→生成 */
 async function pickAppendFile(): Promise<void> {
-  if (busy.value || assetBusy.value || queueRunning.value) return;
+  // #1110：忙时静默 return 改为明确反馈（设置页已能显示同源 error）
+  if (busy.value || assetBusy.value || queueRunning.value) {
+    error.value = t("已有任务正在运行，本次追加未执行：请等它完成，或先点「停止」再试");
+    pushLog({ step: "追加", message: error.value, level: "warn", at: Date.now() });
+    return;
+  }
   const novel = projectState.novel;
   if (!novel?.fullText?.trim()) {
     error.value = t("追加需要原文全文：请先在「导入小说」页导入原小说（追加靠原文做前缀校验；仅加载项目目录不够）");
@@ -2624,6 +2812,8 @@ async function pickAppendFile(): Promise<void> {
   }
   const picked = await open({ multiple: false, filters: [{ name: t("文本文件"), extensions: ["txt", "TXT"] }] });
   if (!picked || typeof picked !== "string") return;
+  // #1292：登记选中文件所在目录，否则读取被白名单拒绝
+  await blessParentDir(picked);
   try {
     const { text } = await tauri.readTextFile(picked);
     await runAppend(text, picked);
@@ -2680,22 +2870,32 @@ async function runAppend(tailRaw: string, label: string): Promise<void> {
       at: Date.now(),
     });
   }
+  // #1315：先快照，预写 fullText 再跑管线——中断时两者不再错位；失败回滚快照
+  const prevFullText = novel.fullText;
+  const prevSourcePaths = novel.sourcePaths ? [...novel.sourcePaths] : undefined;
+  const prevSourcePath = novel.sourcePath;
+  novel.fullText = joinAppendText(novel.fullText, tail);
+  if (/^[a-zA-Z]:[\\/]/.test(label) || label.startsWith("/")) {
+    const paths = novel.sourcePaths?.length ? [...novel.sourcePaths] : (novel.sourcePath ? [novel.sourcePath] : []);
+    if (!paths.includes(label)) paths.push(label);
+    novel.sourcePaths = paths;
+  }
+  scheduleSave();
   const ok = await execute({
     stages,
-    append: { baseFullText: novel.fullText, tailText: tail },
+    append: { baseFullText: prevFullText, tailText: tail },
     requireFullScriptCoverage: true,
   });
-  if (ok) {
-    // 更新内存小说：全文拼接；章节由 execute 按本次分章的完整数据（含正文）写入 novel.chapters，
-    // 这里不再从 lastResult.splitChapters 覆盖——B13 后它只剩轻量元数据（无 text），覆盖会丢正文。
-    const newFull = joinAppendText(novel.fullText, tail);
-    novel.fullText = newFull;
-    if (/^[a-zA-Z]:[\\/]/.test(label) || label.startsWith("/")) {
-      const paths = novel.sourcePaths?.length ? [...novel.sourcePaths] : (novel.sourcePath ? [novel.sourcePath] : []);
-      if (!paths.includes(label)) paths.push(label);
-      novel.sourcePaths = paths;
-    }
+  if (!ok) {
+    // 失败/中止回滚预写（管线侧按 baseFullText+tail 重算，内存与管线输入保持一致）
+    novel.fullText = prevFullText;
+    if (prevSourcePaths) novel.sourcePaths = prevSourcePaths;
+    novel.sourcePath = prevSourcePath;
     scheduleSave();
+    pushLog({ step: "追加", message: "增量追加未完成，已回滚全文预写（旧章节不受影响），可处理后重试", level: "warn", at: Date.now() });
+    return;
+  }
+  {
     void chapterStatus.refresh();
     // 追加新角色自动同步视觉守门：对比视觉守门条目，缺失的按当前卡片补建三视图（旧人走老路不受影响）；
     // 同步后视觉守门待确认，去视觉守门页确认批准后再跑图像阶段补新章图
@@ -2837,9 +3037,16 @@ async function afterAssetRegen(label: string, resultsLength: number, stats?: Reg
     level: aborted || failedCount || resultsLength === 0 ? "warn" : "success",
     at: Date.now(),
   });
-  // execute 会在 assetBusy 非空时拒绝执行：先让出占用再组装
-  assetBusy.value = "";
-  const ok = await execute({ stages: ["assemble"] });
+  // #1315：部分失败仍 assemble 会新旧混出——中断/有失败时先确认（默认仍组装，但用户可见风险）
+  if ((aborted || failedCount > 0) && resultsLength > 0) {
+    if (!window.confirm(t("部分素材失败仍要重新组装吗？新旧混出可能导致预览不一致；取消则保留旧预览，可到「失败项」补跑后再组装。"))) {
+      pushLog({ step: "素材", message: `${label}：已取消自动组装（新旧混出风险）；失败项补跑后可手动点「组装」刷新（免费）`, level: "warn", at: Date.now() });
+      await loadAssetMapNow(true);
+      return;
+    }
+  }
+  // #1300：原子交接持锁组装，不再先清 assetBusy 留竞态窗口
+  const ok = await assembleWithAssetHandoff(label);
   if (!ok) {
     pushLog({
       step: "素材",
@@ -2858,7 +3065,7 @@ async function regenImageCtx(): Promise<RegenContext | null> {
   if (!ctx.cfg) {
     pushLog({
       step: "素材",
-      message: t("图像生成未启用或未配置 API，无法重生成图片；请在「API 配置」页配置图像模型并在「生成内容」勾选「图像」"),
+      message: t("图像生成未启用或未配置 API，无法重生成图片；请在「API 配置」页配置图像模型并在「生成设置 → 内容」勾选「图像」"),
       level: "warn",
       at: Date.now(),
     });
@@ -3127,8 +3334,7 @@ async function regenVoice(key: string): Promise<void> {
         at: Date.now(),
       },
     );
-    assetBusy.value = "";
-    await execute({ stages: ["assemble"] });
+    await assembleWithAssetHandoff(`重配单句 ${key}`);
   } catch (e) {
     pushLog({ step: "素材", message: `重新配音失败：${errMsg(e)}`, level: "error", at: Date.now() });
   } finally {
@@ -3167,8 +3373,7 @@ async function regenCharVoice(charId: string): Promise<void> {
       level: aborted || r.failed ? "warn" : "success",
       at: Date.now(),
     });
-    assetBusy.value = "";
-    await execute({ stages: ["assemble"] });
+    await assembleWithAssetHandoff(`重配「${charId}」全部配音`);
   } catch (e) {
     pushLog({ step: "素材", message: `重新配音失败：${errMsg(e)}`, level: "error", at: Date.now() });
   } finally {
@@ -3214,8 +3419,7 @@ async function regenSelectedVoices(): Promise<void> {
     });
     if (okCount) {
       selectedVoice.value = new Set();
-      assetBusy.value = "";
-      await execute({ stages: ["assemble"] });
+      await assembleWithAssetHandoff(`批量重配语音（${okCount} 句）`);
     }
   } catch (e) {
     pushLog({ step: "素材", message: `批量重配语音失败：${errMsg(e)}`, level: "error", at: Date.now() });
@@ -3276,8 +3480,7 @@ async function regenMissingVoices(): Promise<void> {
       });
     }
     if (!r.aborted && r.fixed > 0) {
-      assetBusy.value = "";
-      await execute({ stages: ["assemble"] });
+      await assembleWithAssetHandoff("补全缺失语音");
     }
   } catch (e) {
     pushLog({ step: "素材", message: `补全缺失语音失败：${errMsg(e)}`, level: "error", at: Date.now() });
@@ -3332,8 +3535,7 @@ async function cleanupInvalidAssets(): Promise<void> {
         level: "success",
         at: Date.now(),
       });
-      assetBusy.value = "";
-      await execute({ stages: ["assemble"] });
+      await assembleWithAssetHandoff("清理无效素材");
     }
   } catch (e) {
     pushLog({ step: "素材", message: `清理无效素材失败：${errMsg(e)}`, level: "error", at: Date.now() });
@@ -3644,13 +3846,16 @@ function isTrivialVerifyIssue(issue: SpeakerIssue): boolean {
 }
 
 /** 卡片指纹（剧本缓存键的一部分）：与管线同源，优先用内存卡片，其次读磁盘工作副本。
- *  重新提取导致角色 id 变化时，旧剧本按指纹自动失效（否则渲染人名会退化成内部 id）。 */
+ *  重新提取导致角色 id 变化时，旧剧本按指纹自动失效（否则渲染人名会退化成内部 id）。
+ *  #1146：按当前模式（演示/正式）优先选卡片文件，错配时单章重跑与保真核对不再用错指纹。 */
 async function cardsFpForScript(): Promise<string> {
   const cards = projectState.lastResult?.cards;
   if (cards?.characters?.length) return cardsFingerprint(cards);
   const dir = projectState.outputDir;
   if (!dir) return "";
-  for (const f of ["cards.json", "cards_demo.json"]) {
+  const demoNow = !activeConfig("llm")?.apiKey;
+  const ordered = demoNow ? ["cards_demo.json", "cards.json"] : ["cards.json", "cards_demo.json"];
+  for (const f of ordered) {
     try {
       const { text } = await tauri.readTextFile(`${dir}/.novel2vn/${f}`);
       const parsed = JSON.parse(text) as { characters?: { id: string; name?: string }[] };
@@ -3718,9 +3923,15 @@ function trivialVerifyCount(rep: VerifyReportRow): number {
   return rep.issues.filter((i) => isTrivialVerifyIssue(i) && !rep.ignored.includes(verifyIssueKey(i.sceneIndex, i.lineIndex, i.reason))).length;
 }
 
+/** 纯函数：角色 id→展示名（charNameOf / charNameOfId 统一口径，单测锁定） */
+export function resolveCharDisplayName(characters: Array<{ id: string; name: string }> | undefined, id: string): string {
+  const found = (characters ?? []).find((c) => c.id === id);
+  return found?.name ?? id;
+}
+
 function charNameOfId(id: string): string {
-  const c = projectState.lastResult?.cards.characters.find((x) => x.id === id);
-  return c?.name ?? id;
+  // #1315：收敛到单一 getter（此前 charNameOf computed 与本函数各维护一份映射）
+  return charNameOf.value(id);
 }
 
 /** 该章的「生成时源文本」：启用翻译（options.language）的项目里剧本是按译文生成的，
@@ -3893,8 +4104,13 @@ async function ignoreVerifyIssue(rep: VerifyReportRow, issue: SpeakerIssue & { k
 }
 
 async function copyText(text: string, label: string): Promise<void> {
-  await navigator.clipboard.writeText(text);
-  flashCopied(`${label}已复制`);
+  // #1381：剪贴板写入可能被拒（权限/非安全上下文），失败给明确反馈而不是点击零反馈
+  try {
+    await navigator.clipboard.writeText(text);
+    flashCopied(`${label}已复制`);
+  } catch {
+    flashCopied(`${label}复制失败（浏览器限制了剪贴板权限），请手动复制`, 4000, "err");
+  }
 }
 
 /** 统一提示条计时：多个写入点各起一个 setTimeout 会互相提前清掉彼此的消息 */
@@ -3913,13 +4129,21 @@ async function copyLogs(): Promise<void> {
   const text = projectState.logs
     .map((l) => `[${new Date(l.at).toLocaleTimeString()}] [${l.step}] ${l.message}`)
     .join("\n");
-  await navigator.clipboard.writeText(text);
-  flashCopied(t("日志已复制"));
+  try {
+    await navigator.clipboard.writeText(text);
+    flashCopied(t("日志已复制"));
+  } catch {
+    flashCopied(t("日志复制失败（浏览器限制了剪贴板权限）"), 4000, "err");
+  }
 }
 
 async function saveLogs(): Promise<void> {
   const out = projectState.outputDir;
-  if (!out) return;
+  // #1381：无输出目录静默返回改为明确提示
+  if (!out) {
+    flashCopied(t("没有可保存的输出目录：请先导入小说或加载项目"), 4000, "err");
+    return;
+  }
   const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
   const path = `${out}/.novel2vn/logs/${stamp}.log`;
   const text = [
@@ -3945,16 +4169,36 @@ async function saveLogs(): Promise<void> {
 async function retryFailed(): Promise<void> {
   const failed = failedTasks.value;
   if (!failed.length) return;
+  // #1352：混合失败必须圈全——此前只圈剧本章，范围外的图片/配音失败被静默排除，
+  // 提示却承诺「只重试失败项」。id 口径：剧本 chapter_N（1-based）；图像背景/CG 的 id
+  // 即 scene.id（ch{N}_ 前缀，1-based）；配音 vocal key（ch{N}_ 前缀，0-based，见 sceneVocalKey）。
+  // 立绘/物品/锚点等项目级资产无章节映射，走失败项逐条重试，不进管线范围。
   const chapterIds = new Set<number>();
+  const unmapped: FailedTask[] = [];
   for (const f of failed) {
     if (f.kind === "script" && f.id.startsWith("chapter_")) {
       chapterIds.add(parseInt(f.id.replace("chapter_", ""), 10) - 1);
+    } else if (f.kind === "image") {
+      const m = /^ch(\d+)_/.exec(f.id);
+      if (m) chapterIds.add(parseInt(m[1], 10) - 1);
+      else unmapped.push(f);
+    } else if (f.kind === "tts") {
+      const m = /^ch(\d+)_/.exec(f.id.replace(/^vocal_/, ""));
+      if (m) chapterIds.add(parseInt(m[1], 10));
+      else unmapped.push(f);
+    } else {
+      unmapped.push(f);
     }
   }
-  if (chapterIds.size) {
-    rerunChapters.value = Array.from(chapterIds);
+  const novelLen = projectState.novel?.chapters.length ?? 0;
+  const valid = [...chapterIds].filter((n) => Number.isFinite(n) && n >= 0 && (novelLen <= 0 || n < novelLen));
+  if (valid.length) {
+    rerunChapters.value = valid;
+    const extra = unmapped.length
+      ? `；另有 ${unmapped.length} 项项目级/未映射失败（立绘/物品/锚点等，管线章节范围覆盖不到，请在「失败项」逐条重试）`
+      : "";
     flashCopied(t("已定位失败章节并切到「整书生成」：点开始即可只重试失败项（其余自动复用缓存）"), 4000);
-    pushLog({ step: "失败项", message: `定位重试：失败剧本章节→第 ${Array.from(chapterIds).map((n) => n + 1).join("、")} 章已勾选（其余复用缓存）`, level: "info", at: Date.now() });
+    pushLog({ step: "失败项", message: `定位重试：失败章节→第 ${valid.map((n) => n + 1).join("、")} 章已勾选（剧本/图像/配音失败按 id 映射归并，其余复用缓存）${extra}`, level: "info", at: Date.now() });
   } else {
     // 图片/翻译类失败没有章节映射：清掉可能残留的旧章节范围，否则点开始只会跑旧范围、漏掉真正的失败项
     rerunChapters.value = null;
@@ -4004,8 +4248,7 @@ async function retryFailedTask(f: FailedTask): Promise<void> {
           void mutateFailedTasks(projectState.outputDir, (prev) => prev.filter((x) => !sameTask(x))).catch(() => undefined);
         }
         scheduleSave();
-        assetBusy.value = "";
-        await execute({ stages: ["assemble"] });
+        await assembleWithAssetHandoff(`配音重试 ${key}`);
       }
     } catch (e) {
       pushLog({ step: "素材", message: `配音重试失败：${errMsg(e)}`, level: "error", at: Date.now() });
@@ -4209,6 +4452,7 @@ export const generateStore = {
   enabledNovelChapters,
   disabledNovelChapters,
   toggleNovelChapter,
+  setNovelChaptersEnabled,
   splitMeta,
   loadSplitMeta,
   splitMetaText,
@@ -4236,6 +4480,9 @@ export const generateStore = {
   styleRefSrc,
   styleRecognizing,
   cancelStyleRecognize,
+  clearStyleRef,
+  pruneSplitConfirmKeys,
+  isSplitConfirmKeyForDir,
   styleRefInput,
   fileToBase64,
   pickStyleRef,

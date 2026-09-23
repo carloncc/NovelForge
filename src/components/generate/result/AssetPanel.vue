@@ -70,6 +70,18 @@ const {
  * 生成进行中点单项按钮会走到 regenCtx 被拦，只留一条警告日志，看起来像按钮没反应）。 */
 const regenLocked = computed(() => busy.value || queueRunning.value || !!assetBusy.value);
 
+/** 批量付费动作补二次确认：与配音/清理等批量动作对齐，误点一次可能烧掉十几张图 */
+function confirmRegenAllFigure(id: string, name: string): void {
+  if (regenLocked.value) return;
+  if (!window.confirm(t("将重新生成「{name}」的全部表情（多张付费图）。继续吗？", { name }))) return;
+  regenAllFigure(id);
+}
+function confirmRegenThreeView(id: string, name: string): void {
+  if (regenLocked.value) return;
+  if (!window.confirm(t("将重新生成「{name}」的三视图，并联动重画其立绘/表情/动作/服装（多张付费图）。继续吗？", { name }))) return;
+  regenThreeView(id);
+}
+
 /** assetBusy 存的是内部任务键（batch:3 项 / cutout:xxx / repair-voice…），直接显示会向用户
  * 暴露内部标识；这里只做显示层映射，未知前缀原样显示以便排查。 */
 function assetBusyLabel(raw: string): string {
@@ -146,7 +158,7 @@ watch(assetTab, () => {
         </div>
         <label class="field">
           <span>{{ t("对本区立绘的意见（可选）：") }}</span>
-          <input type="text" v-model="assetFeedback.figure" :placeholder="t('如：让「林澈」眼神更锐利、制服更有质感')" />
+          <input type="text" v-model="assetFeedback.figure" :disabled="regenLocked" :placeholder="t('如：让「林澈」眼神更锐利、制服更有质感')" />
         </label>
         <div v-for="row in figureRows" :key="row.id" class="asset-row">
           <div class="asset-row-head">
@@ -154,8 +166,8 @@ watch(assetTab, () => {
             <span style="color: var(--text-faint); font-size: 11px">{{ row.id }}</span>
             <span v-if="row.hasRef" class="tag ok" :title="t('已在「卡片编辑」中为该角色设置参考图，三视图/动作将基于参考图生成')">{{ t("有参考图") }}</span>
             <span class="asset-file">{{ fileExistsLabel(row.threeView) }}</span>
-            <button class="btn small" :disabled="regenLocked" @click="regenThreeView(row.id)">{{ t("重新生成三视图（联动全部）") }}</button>
-            <button class="btn secondary small" :disabled="regenLocked" @click="regenAllFigure(row.id)">{{ t("重新生成全部表情") }}</button>
+            <button class="btn small" :disabled="regenLocked" @click="confirmRegenThreeView(row.id, row.name)">{{ t("重新生成三视图（联动全部）") }}</button>
+            <button class="btn secondary small" :disabled="regenLocked" @click="confirmRegenAllFigure(row.id, row.name)">{{ t("重新生成全部表情") }}</button>
           </div>
           <div class="asset-thumb-row">
             <div v-if="row.threeView" class="asset-thumb" :title="t('三视图（点击放大；有参考图时将基于参考图生成）')" @click="openPreview(row.threeView, `${row.name} · 三视图`)">
@@ -201,7 +213,7 @@ watch(assetTab, () => {
         <div class="card-head"><h3>{{ t("物品图") }}</h3></div>
         <label class="field">
           <span>{{ t("对本区物品图的意见（可选）：") }}</span>
-          <input type="text" v-model="assetFeedback.item" :placeholder="t('如：物品要更有质感、更有光泽')" />
+          <input type="text" v-model="assetFeedback.item" :disabled="regenLocked" :placeholder="t('如：物品要更有质感、更有光泽')" />
         </label>
         <div v-for="row in itemRows" :key="row.id" class="asset-row">
           <div class="asset-row-head">
@@ -224,7 +236,7 @@ watch(assetTab, () => {
         <div class="card-head"><h3>{{ t("背景图") }}</h3></div>
         <label class="field">
           <span>{{ t("对本区背景图的意见（可选）：") }}</span>
-          <input type="text" v-model="assetFeedback.bg" :placeholder="t('如：画面更通透、更有纵深感')" />
+          <input type="text" v-model="assetFeedback.bg" :disabled="regenLocked" :placeholder="t('如：画面更通透、更有纵深感')" />
         </label>
         <div v-for="row in bgRows" :key="row.sceneId" class="asset-row">
           <div class="asset-row-head">
@@ -247,7 +259,7 @@ watch(assetTab, () => {
         <div class="card-head"><h3>CG</h3></div>
         <label class="field">
           <span>{{ t("对本区 CG 的意见（可选）：") }}</span>
-          <input type="text" v-model="assetFeedback.cg" :placeholder="t('如：构图更有冲击力、光影更戏剧化')" />
+          <input type="text" v-model="assetFeedback.cg" :disabled="regenLocked" :placeholder="t('如：构图更有冲击力、光影更戏剧化')" />
         </label>
         <div v-for="row in cgRows" :key="row.sceneId" class="asset-row">
           <div class="asset-row-head">

@@ -59,8 +59,10 @@ export function estimateImageStoryPlan(
   const perScene = options.shotsPerScene > 0 ? options.shotsPerScene : 2;
   const perChapter = options.shotsPerChapter > 0 ? options.shotsPerChapter : 0;
   let shots = perChapter > 0 ? Math.min(chapters * perChapter, chapters * 4 * perScene) : chapters * 4 * perScene;
+  // #1325/#1371：粗估与执行同口径——总张数上限封顶（buildImageTasks 到量即停，见 images.ts）。
   if (options.shotsTotal > 0) shots = Math.min(shots, options.shotsTotal);
-  const total = shots + Math.max(0, Math.floor(characterCount)) + (options.styleAnchor === false ? 0 : 1);
+  // #1340：imageOnly 下不生成风格锚点（buildImageStoryPlan 强制关闭），粗估也不计入锚点费用。
+  const total = shots + Math.max(0, Math.floor(characterCount));
   return {
     total,
     yuan: Math.round(total * IMAGE_YUAN_EACH * 100) / 100,
@@ -156,7 +158,9 @@ export function buildImageStoryPlan(
     shotsTotal: options.shotsTotal ?? 0,
     includeItems: !!options.includeItems,
     style: options.imageStyle,
-    styleAnchor: options.styleAnchor !== false,
+    // #1340：imageOnly 下风格锚点是死开关（shot 任务既不拼锚点提示词也不挂锚点参考图，
+    // 且 images.ts 的锚点只服务 background/cg）——强制关闭，不生成不计费；页面同步标注。
+    styleAnchor: false,
     threeView: true,
     actions: false,
     figureEmotions: false,

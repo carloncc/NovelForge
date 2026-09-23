@@ -263,6 +263,28 @@ export function applyTool(state: ExtractAgentState, call: AgentToolCall): AgentT
         const id = normalizeEntityId(call.args.id, "c") || `c${state.characters.size + 1}`;
         const existing = state.characters.get(id);
         if (existing) {
+          // 1306：跨 chunk 按 id 合并会串人物（chunk2 复用 id 指不同人即错误融合）。
+          // 同 id 但规范名不一致时视为不同人，不合并：分配新 id 独立建卡并警告。
+          if (normalizeName(existing.name) !== normalizeName(name) && existing.name.trim() && name) {
+            const freshId = `${id}_${state.characters.size + 1}`;
+            const card: CharacterCard = {
+              id: freshId,
+              name,
+              appearance: str(call.args.appearance),
+              clothing: str(call.args.clothing),
+              personality: str(call.args.personality),
+              voiceDesc: str(call.args.voiceDesc),
+              color: str(call.args.color) || defaultColor(state.characters.size),
+              isNpc: call.args.isNpc === true,
+              imagePrompt: "",
+              threeViewPrompt: "",
+              actions: [],
+            };
+            mergeCharacterPatch(card, call.args);
+            state.characters.set(freshId, card);
+            logger.warn("extractAgent", `同 id 指代不同人，已分卡：${id}（${existing.name}）vs 新卡 ${freshId}（${name}）`, {});
+            return ok(`id「${id}」已被「${existing.name}」占用，与「${name}」不是同一人，已独立建卡 ${freshId}`);
+          }
           // 重复 add_character 不整体覆盖：只并入非空字段、数组按 id 并集（见 mergeCharacterPatch）
           mergeCharacterPatch(existing, call.args);
           existing.name = existing.name || name;
@@ -303,6 +325,19 @@ export function applyTool(state: ExtractAgentState, call: AgentToolCall): AgentT
         const id = normalizeEntityId(call.args.id, "s") || `s${state.scenes.size + 1}`;
         const existing = state.scenes.get(id);
         if (existing) {
+          // 1306：同 id 不同地点视为不同场景，独立建卡（与角色同口径）。
+          if (normalizeName(existing.location) !== normalizeName(location) && existing.location.trim()) {
+            const freshId = `${id}_${state.scenes.size + 1}`;
+            state.scenes.set(freshId, {
+              id: freshId,
+              location,
+              atmosphere: str(call.args.atmosphere),
+              time: str(call.args.time),
+              imagePrompt: "",
+            });
+            logger.warn("extractAgent", `同场景 id 指代不同地点，已分卡：${id}（${existing.location}）vs 新卡 ${freshId}（${location}）`, {});
+            return ok(`场景 id「${id}」已被「${existing.location}」占用，与「${location}」不是同一地点，已独立建卡 ${freshId}`);
+          }
           // 已有场景不整体覆盖（旧实现无条件 set，重复调用会用空字段抹掉已有信息）：只补缺字段
           if (!existing.location && location) existing.location = location;
           if (!existing.atmosphere && str(call.args.atmosphere)) existing.atmosphere = str(call.args.atmosphere);
@@ -324,6 +359,19 @@ export function applyTool(state: ExtractAgentState, call: AgentToolCall): AgentT
         const id = normalizeEntityId(call.args.id, "i") || `i${state.items.size + 1}`;
         const existing = state.items.get(id);
         if (existing) {
+          // 1306：同 id 不同物品名视为不同物品，独立建卡。
+          if (normalizeName(existing.name) !== normalizeName(name) && existing.name.trim()) {
+            const freshId = `${id}_${state.items.size + 1}`;
+            state.items.set(freshId, {
+              id: freshId,
+              name,
+              appearance: str(call.args.appearance),
+              note: str(call.args.note),
+              imagePrompt: "",
+            });
+            logger.warn("extractAgent", `同物品 id 指代不同物品，已分卡：${id}（${existing.name}）vs 新卡 ${freshId}（${name}）`, {});
+            return ok(`物品 id「${id}」已被「${existing.name}」占用，与「${name}」不是同一物品，已独立建卡 ${freshId}`);
+          }
           // 已有物品不整体覆盖：只补缺字段，避免重复调用把外观/意义/图形提示清空
           if (!existing.name && name) existing.name = name;
           if (!existing.appearance && str(call.args.appearance)) existing.appearance = str(call.args.appearance);
@@ -927,19 +975,44 @@ export async function extractFromNovelChunked(
   }
   opts.log?.(`小说全文 ${fullText.length} 字超出单次上下文，分 ${chunks.length} 段扫描提取（覆盖全书）…`);
   const state: ExtractAgentState = { characters: new Map(), scenes: new Map(), items: new Map() };
+  // 1306：id→name 注册表带入后续 chunk prompt，避免后段复用 id 指代不同人。
+  const registryText = (): string => {
+    const chars = [...state.characters.values()].map((c) => `${c.id}=${c.name}`).join("、");
+    return chars ? `已收录角色 id（后续段禁止用同一 id 指代不同人；同一人必须沿用原 id）：${chars}。` : "";
+  };
+  const uniqueCharId = (want: string): string => {
+    let id = want;
+    let n = 2;
+    while (state.characters.has(id)) id = `${want}_${n++}`;
+    return id;
+  };
   for (let i = 0; i < chunks.length; i++) {
     if (isAborted()) throw new Error("已中止");
     opts.log?.(`提取第 ${i + 1}/${chunks.length} 段（约${chunks[i].length}字）…`);
-    const part = await extractFromNovel(cfg, chunks[i], title, opts.onUsage, opts.feedback, lib);
+    const segFeedback = [opts.feedback, i > 0 ? registryText() : ""].filter(Boolean).join("\n");
+    const part = await extractFromNovel(cfg, chunks[i], title, opts.onUsage, segFeedback || undefined, lib);
     for (const c of part.characters) {
       const prev = state.characters.get(c.id);
-      if (prev) mergeCharacter(prev, c);
-      else state.characters.set(c.id, c);
+      // 1306：同 id 但规范名不一致 = 不同人，不合并，分配新 id 独立建卡（含警告）。
+      if (prev && normalizeName(prev.name) !== normalizeName(c.name)) {
+        const freshId = uniqueCharId(`${c.id}_${i + 1}`);
+        logger.warn("extractAgent", `分段提取同 id 指代不同人，已分卡：${c.id}（${prev.name}）vs 第${i + 1}段（${c.name}→${freshId}）`, {});
+        state.characters.set(freshId, { ...c, id: freshId });
+      } else if (prev) {
+        mergeCharacter(prev, c);
+      } else state.characters.set(c.id, c);
     }
     for (const s of part.scenes) {
       const prev = state.scenes.get(s.id);
       if (!prev) {
         state.scenes.set(s.id, s);
+      } else if (normalizeName(prev.location) !== normalizeName(s.location)) {
+        // 同 id 不同地点 = 不同场景，独立建卡
+        let freshId = `${s.id}_${i + 1}`;
+        let n = 2;
+        while (state.scenes.has(freshId)) freshId = `${s.id}_${i + 1}_${n++}`;
+        logger.warn("extractAgent", `分段提取同场景 id 指代不同地点，已分卡：${s.id}（${prev.location}）vs 第${i + 1}段（${s.location}→${freshId}）`, {});
+        state.scenes.set(freshId, { ...s, id: freshId });
       } else {
         // 同 id 场景：缺字段补齐（首段优先，后段只填空）
         for (const k of ["location", "atmosphere", "time", "imagePrompt"] as const) {
@@ -951,6 +1024,12 @@ export async function extractFromNovelChunked(
       const prev = state.items.get(it.id);
       if (!prev) {
         state.items.set(it.id, it);
+      } else if (normalizeName(prev.name) !== normalizeName(it.name)) {
+        let freshId = `${it.id}_${i + 1}`;
+        let n = 2;
+        while (state.items.has(freshId)) freshId = `${it.id}_${i + 1}_${n++}`;
+        logger.warn("extractAgent", `分段提取同物品 id 指代不同物品，已分卡：${it.id}（${prev.name}）vs 第${i + 1}段（${it.name}→${freshId}）`, {});
+        state.items.set(freshId, { ...it, id: freshId });
       } else {
         for (const k of ["name", "appearance", "note", "imagePrompt"] as const) {
           if (!prev[k] && it[k]) (prev as unknown as Record<string, unknown>)[k] = it[k];

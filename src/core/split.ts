@@ -1,26 +1,27 @@
 import type { ApiConfig, ChapterInfo } from "./types";
 import { chatJson } from "../api/openaiCompatible";
-import { estimateCharsPerToken, inputCharBudgetForText } from "../api/providers";
+import { estimateCharsPerToken, resolveContextLength, MAX_INPUT_CHUNK_CHARS } from "../api/providers";
 import { log } from "../utils/logger";
 
-/** 剧本阶段的输出上限（token，与 script.ts 一致）：单章原文体量必须让「忠实全文」的剧本产出装得下 */
-const SCRIPT_OUTPUT_TOKENS = 32_768;
-
 /**
- * 单章字数预算（#800）：旧实现固定 40000 字，长章忠实改编需要的输出可达数万 token，
- * 逼近/超过 32k 输出上限，模型被迫压缩省旁白，越长丢得越多。这里按上下文与输出上限自适应：
- * - 输出约束：32768 token × 语种字符/token × 0.8 余量（中文约 1.5 万字，英文可到十万字）
- * - 输入约束：单请求输入预算的一半（给角色卡/场景卡/系统提示留位置）
- * 极端小上下文模型仍保底 6000 字（再小会把章节切得无法阅读）。
+ * 单章字数预算（模型自适应，不设固定字数上限）：单章不再受"单次输出"约束——
+ * 剧本/提取/翻译都支持「分部分顺序生成」，长章会按单次请求预算切成多块逐段产出，
+ * 因此章节体量只由「一次能把多少正文喂进模型上下文」决定，不再写死 30000 上限：
+ * - 输入约束：模型上下文 − 单次输出/系统提示/卡片预留
+ * - 绝对硬顶 MAX_INPUT_CHUNK_CHARS（模型输入物理上限，不是章节字数限制）
+ * - 极端小上下文模型仍保底 6000 字（再小会把章节切得无法阅读）
  */
 export function chapterCharBudget(
   cfg: { model?: string; extra?: Record<string, unknown> } | undefined,
   text: string,
 ): number {
   const cpt = estimateCharsPerToken(text);
-  const outputBound = Math.floor(SCRIPT_OUTPUT_TOKENS * cpt * 0.8);
-  const inputBound = Math.floor(inputCharBudgetForText(cfg, text) * 0.5);
-  return Math.max(6000, Math.min(30_000, outputBound, inputBound));
+  const context = resolveContextLength(cfg);
+  // 单次请求仍需给输出/系统提示/角色卡留余量（顺序生成时每次请求都要这部分）
+  const reservedOutput = 24_000;
+  const feedableTokens = Math.max(2_000, context - reservedOutput);
+  const inputBound = Math.floor(feedableTokens * cpt);
+  return Math.max(6000, Math.min(MAX_INPUT_CHUNK_CHARS, inputBound));
 }
 
 /**
@@ -249,6 +250,9 @@ export function protectSpecialBlocks(
  *  用户实测：编号很短的 22、23 章被误并入第 21 章，章节列表少了 2 章。 */
 const REAL_CHAPTER_TITLE_RE = /^\s*(?:第\s*[0-9零〇一二三四五六七八九十百千万两]+\s*[章回节话篇部幕卷]|\d{1,4}\s*[.、．)）]|序章?|序幕|序言|楔子|引子|终章|尾声|正篇|本篇)/;
 
+/** 机械回退分章的标题（第1部分/第2部分…）：是按字数硬切的产物，不是真章节，允许参与碎章合并 */
+const MECHANICAL_PART_TITLE_RE = /^第\s*\d+\s*部分$/;
+
 /**
  * 编号真章节保护（始终生效，不依赖 keepSpecials）：被 LLM 标成杂项的块，
  * 只要首行是「第X章 / N. / 序章 / 楔子」样式就移出丢弃集并就地立章——
@@ -277,8 +281,10 @@ export function mergeTinyChapters(chapters: ChapterInfo[], minChars = MIN_CHAPTE
   for (let i = 0; i < out.length; i++) {
     if (out.length <= 1) break;
     if (out[i].text.length >= minChars) continue;
-    // 真章节不合并：短是正常的（编号章/序/楔子等），只有附加内容才该并进相邻章
-    if (REAL_CHAPTER_TITLE_RE.test(out[i].title ?? "")) continue;
+    // 真章节不合并：短是正常的（编号章/序/楔子等），只有附加内容才该并进相邻章。
+    // 例外：机械回退标题「第N部分」不算真章节——它是按字数硬切的产物，短尾章应并入相邻章。
+    const title = out[i].title ?? "";
+    if (REAL_CHAPTER_TITLE_RE.test(title) && !MECHANICAL_PART_TITLE_RE.test(title)) continue;
     if (i === 0) {
       out[1].text = `${out[0].text}\n\n${out[1].text}`;
       out[1].charCount = out[1].text.length;
@@ -385,11 +391,23 @@ export async function aiSplitChapters(
   stats?: SplitStats,
   opts?: AiSplitOptions,
 ): Promise<ChapterInfo[]> {
-  const blocks = splitBlocks(fullText);
+  let blocks = splitBlocks(fullText);
+  // 单块（全文无空行分段）时先按单换行重新分块：很多 txt 段落间只有单个换行，
+  // 若直接按空行切会得到 1 块 → 完全跳过 AI 分章、退化成按字数机械硬切（章节名变成"第N部分"）。
   if (blocks.length <= 1) {
-    // 单块仍超长（如全文无空行）→ 按句子硬切分，避免超长章撑爆剧本阶段上下文
+    const lineBlocks = fullText
+      .split(/\n+/)
+      .map((b) => b.replace(/\r/g, "").trim())
+      .filter((b) => b.length > 0);
+    if (lineBlocks.length > 1) {
+      log.info("split", "全文无空行分段，已按单换行重新分块后再交给 AI 分章", { blocks: lineBlocks.length });
+      blocks = lineBlocks;
+    }
+  }
+  if (blocks.length <= 1) {
+    // 单块仍超长（如全文既无空行也无换行）→ 按句子硬切分，避免超长章撑爆剧本阶段上下文
     if (fullText.length > maxChapterChars) {
-      return hardSplitBySentences(fullText, maxChapterChars);
+      return mergeTinyChapters(hardSplitBySentences(fullText, maxChapterChars)).chapters;
     }
     return [{ index: 0, title: "第一章", text: fullText, charCount: fullText.length }];
   }
@@ -446,7 +464,8 @@ export async function aiSplitChapters(
   // 若 LLM 一个章节标题都没识别到 → 回退：按块数均匀切成若干章
   if (!uniqueMarks.length) {
     log.warn("split", "AI 未识别到章节标题，回退为按字数切分", { blockCount: blocks.length });
-    return fallbackSplit(blocks, fullText, maxChapterChars);
+    // 回退也要过碎章合并：否则最后一块过小会独立成章（如 295 字残段），后续剧本阶段会反复空转重试
+    return mergeTinyChapters(fallbackSplit(blocks, fullText, maxChapterChars)).chapters;
   }
   log.info("split", "分章识别结果", {
     chapterCount: uniqueMarks.length,

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { nextTick } from "vue";
 import { currentLang, t } from "../../i18n";
 import { projectState } from "../../stores/project";
 import EditCards from "../EditCards.vue";
@@ -36,6 +37,18 @@ const {
   loadScripts,
   onCardsSaved,
 } = useGenerateController();
+
+/** 空态「去整书生成」必须给反馈：切 runMode 后把任务区滚进视野，否则视口零变化像死按钮 */
+function goEmptyFull(): void {
+  runMode.value = "full";
+  void nextTick(() => {
+    try {
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    } catch {
+      /* 忽略 */
+    }
+  });
+}
 </script>
 
 <template>
@@ -94,7 +107,9 @@ const {
     </div>
 
     <!-- 失败项并入「运行」：出问题时只在一个地方处理；日志已独立为「日志」tab -->
-    <FailedPanel />
+    <div id="failed-anchor" class="fail-anchor">
+      <FailedPanel />
+    </div>
   </div>
 
   <div v-else-if="tab === 'products'">
@@ -109,12 +124,22 @@ const {
     <div v-else class="empty">
       <img src="/src/assets/empty-generate.png" alt="" style="width: 240px; opacity: 0.9; margin-bottom: 12px" />
       <p>{{ t("尚无生成结果，先运行一次生成") }}</p>
-      <button class="btn small" @click="runMode = 'full'">{{ t("去整书生成") }}</button>
+      <button class="btn small" @click="goEmptyFull">{{ t("去整书生成") }}</button>
     </div>
-    <VisualBiblePanel class="mt-4" @approve="resumeAfterVisualApproval" @changed="onVisualBibleChanged" @prepare="prepareVisualBible" />
+    <div id="visual-bible-anchor" class="vb-anchor">
+      <VisualBiblePanel class="mt-4" @approve="resumeAfterVisualApproval" @changed="onVisualBibleChanged" @prepare="prepareVisualBible" />
+    </div>
   </div>
 
   <LogPanel v-else-if="tab === 'log'" />
 
   <p v-if="copiedMsg" :style="{ color: copiedMsgLevel === 'err' ? 'var(--err)' : 'var(--ok)', fontSize: '12px', marginTop: '6px' }">{{ copiedMsg }}</p>
 </template>
+
+<style scoped>
+/* 横幅滚动锚点：顶部留出吸顶进度卡高度，避免被遮住 */
+.fail-anchor,
+.vb-anchor {
+  scroll-margin-top: 200px;
+}
+</style>

@@ -39,7 +39,7 @@ import { errMsg } from "../utils/errors";
 import { classifyError } from "../utils/errorClassifier";
 import { log as logger } from "../utils/logger";
 import { configIsUsable } from "../api/providers";
-import { setActiveAbortSignal } from "../api/abort";
+import { setActiveAbortSignal, registerRunAbort, unregisterRunAbort } from "../api/abort";
 import { concurrencyFor } from "../stores/configMigration";
 import { voiceLibraryFor } from "../stores/config";
 import { setLlmConcurrency } from "../api/openaiCompatible";
@@ -112,7 +112,15 @@ async function withTextRetry<T>(
       // 网络/限流/未知 → 递增退避（首次 1s、二次 10s、之后每次 +10s，封顶 60s）
       const delay = attempt === 0 ? 1000 : Math.min(60_000, attempt * 10_000);
       opts.onRetry?.(attempt + 1, delay, e);
-      await new Promise((r) => setTimeout(r, delay));
+      // 1301：退避此前不可中止（raw setTimeout 睡满）。改分片可中断等待。
+      let remaining = delay;
+      while (remaining > 0) {
+        if (opts.isAborted?.()) throw new Error("已中止");
+        const step = Math.min(250, remaining);
+        await new Promise((r) => setTimeout(r, step));
+        remaining -= step;
+      }
+      if (opts.isAborted?.()) throw new Error("已中止");
     }
   }
 }
@@ -557,13 +565,40 @@ export class Pipeline {
     }
   }
 
+  /** 1305：剧本缓存每次命中跑 shape 校验，畸形按 cache-miss 警告重生成。
+   * 合法 JSON 但缺 scenes 此前直接赋值，applyVideoOptions/ensureUniqueSceneIds 遍历即 TypeError，
+   * 落在生成 try 外 → Promise.all 整体失败且报错不透明。 */
+  private async readCachedScript(file: string): Promise<ChapterScript | null> {
+    const raw = await this.readCachedJson<unknown>(file);
+    if (!raw) return null;
+    try {
+      return parseChapterScript(raw);
+    } catch (e) {
+      logger.warn("pipeline", `剧本缓存结构非法，已按缺失处理（将重生成）：${file}`, {
+        error: errMsg(e).slice(0, 200),
+      });
+      return null;
+    }
+  }
+
   /* ---------- 从磁盘恢复中间产物（供分阶段运行） ---------- */
 
   private async loadCards(): Promise<ExtractionResult | null> {
     const base = `${this.input.outputDir}/.novel2vn`;
     for (const f of ["cards.json", "cards_demo.json"]) {
       const parsed = await this.readCachedJson<ExtractionResult>(`${base}/${f}`);
-      if (parsed && Array.isArray(parsed.characters)) return parsed;
+      // 1305：仅查 characters 数组不够，scenes/items 非数组同样会在下游遍历崩。缺失视为损坏按缺失处理。
+      if (parsed && Array.isArray(parsed.characters)) {
+        if ((parsed as { scenes?: unknown }).scenes !== undefined && !Array.isArray((parsed as { scenes?: unknown }).scenes)) {
+          logger.warn("pipeline", `卡片缓存结构非法（scenes 非数组），已按缺失处理：${base}/${f}`);
+          continue;
+        }
+        if ((parsed as { items?: unknown }).items !== undefined && !Array.isArray((parsed as { items?: unknown }).items)) {
+          logger.warn("pipeline", `卡片缓存结构非法（items 非数组），已按缺失处理：${base}/${f}`);
+          continue;
+        }
+        return parsed;
+      }
     }
     return null;
   }
@@ -1359,10 +1394,14 @@ export class Pipeline {
     };
     await Promise.all(Array.from({ length: Math.min(concurrency, total) }, () => worker()));
     for (const item of results) if (item) out.push(item);
+    // 1311：翻译失败保留原文时此前恒 success 全绿，下游在混合语言上烧钱。失败数>0 改 warn 明示。
+    const translateFailed = this.failedTasks.filter((f) => f.id.startsWith("translate_")).length;
     this.input.log({
       step: "翻译",
-      message: `翻译完成：${out.length} 章 → ${languageName(lang)}`,
-      level: "success",
+      message: translateFailed > 0
+        ? `翻译完成：${out.length} 章 → ${languageName(lang)}（其中 ${translateFailed} 章失败已保留原文混入，后续将中英混杂，请在「失败项」重试补译）`
+        : `翻译完成：${out.length} 章 → ${languageName(lang)}`,
+      level: translateFailed > 0 ? "warn" : "success",
       at: Date.now(),
     });
     return out;
@@ -1414,19 +1453,22 @@ export class Pipeline {
 
   /** 运行入口（#784）：统一管理全局中止信号的生命周期 */
   async run(): Promise<PipelineResult> {
+    // 1301：按 runId 注册，仅持有者可清，避免与图片小说等另一方互相覆盖/清除。
+    const runId = `pipeline_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
     try {
-      return await this.runInner();
+      return await this.runInner(runId);
     } finally {
       // 清除信号：避免「停止过的运行」把之后独立发起的请求（单素材重生成等）也当成已中止
-      setActiveAbortSignal(undefined);
+      unregisterRunAbort(runId, this.abortController.signal);
     }
   }
 
-  private async runInner(): Promise<PipelineResult> {
+  private async runInner(runId?: string): Promise<PipelineResult> {
     const { input } = this;
     // #784：把本次运行的中止信号挂到 API 层——「停止」可立即中断在途请求（Tauri 侧经 cancel_http_request）
     if (this.abortController.signal.aborted) this.abortController = new AbortController();
-    setActiveAbortSignal(this.abortController.signal);
+    if (runId) registerRunAbort(runId, this.abortController.signal);
+    else setActiveAbortSignal(this.abortController.signal);
     this.cacheRoot = `${input.outputDir}/.novel2vn/cache`;
     const runStart = logger.time("pipeline", "管线整体运行");
     // 文本/视觉请求限流跟随各 API 自己的并发配置（各 API 互不影响）
@@ -1817,15 +1859,25 @@ export class Pipeline {
         for (let pos = 0; pos < activeChapters.length; pos++) {
           const chapter = activeChapters[pos];
           if (!rerunSet.has(chapter.index) && !feedbackSet.has(chapter.index)) {
-            const hit = await this.readCachedJson<ChapterScript>(
+            // 1304/1305：命中走同一 post-load 路径（校验 + 后处理 + 成功登记），
+            // 否则 videoPoints 关闭也泄漏、scene-id 未去重、failed.json 旧条目不清。
+            const hit = await this.readCachedScript(
               scriptCacheFileName(cacheDir, demo, chapter.index, chapter.title, chapter.text || "", styleFrag),
             );
             if (hit) {
+              this.applyVideoOptions(hit);
+              ensureUniqueSceneIds(hit);
+              this.succeededTaskIds.add(`chapter_${chapter.index + 1}`);
+              await this.verifyAndPersistScript(chapter, hit, cards!.characters, demo, styleFrag).catch((e) => {
+                logger.warn("pipeline", `第 ${chapter.index + 1} 章核对报告补算失败（不阻断）`, {
+                  error: errMsg(e).slice(0, 200),
+                });
+              });
               scriptResults[pos] = hit;
               reused++;
               continue;
             }
-            // 无缓存：留给 worker（走原 warn 跳过逻辑，组装保护会兜底）
+            // 无缓存/结构非法：留给 worker（走原 warn 跳过逻辑，组装保护会兜底）
           }
           pendingPos.push(pos);
         }
@@ -1855,11 +1907,16 @@ export class Pipeline {
           const chapterForce = forceScriptSet.has(chapter.index);
           let script: ChapterScript | null = null;
           if (!selected && !hasFeedback) {
-            script = await this.readCachedJson<ChapterScript>(cacheFile);
+            script = await this.readCachedScript(cacheFile);
             if (script) {
               log({ step: "剧本", message: `[缓存] 第 ${chapter.index + 1} 章（未勾选重跑，复用）：${chapter.title}`, level: "info", at: Date.now() });
               // 复用也保证核对报告存在（旧版本跑出的剧本可能没有）：有则复用，无则补算落盘
-              await this.verifyAndPersistScript(chapter, script, cards!.characters, demo, styleFrag).catch(() => {});
+              await this.verifyAndPersistScript(chapter, script, cards!.characters, demo, styleFrag).catch((e) => {
+                // 1311：此前 catch 空（连 warn 都无），保真缺失无从查。带章号 warn。
+                logger.warn("pipeline", `第 ${chapter.index + 1} 章核对报告补算失败（不阻断）`, {
+                  error: errMsg(e).slice(0, 200),
+                });
+              });
               this.succeededTaskIds.add(`chapter_${chapter.index + 1}`);
             } else {
               log({
@@ -1873,7 +1930,7 @@ export class Pipeline {
             }
           } else {
             if (!this.options.skipCache && !hasFeedback && !chapterForce && !scriptForce) {
-              script = await this.readCachedJson<ChapterScript>(cacheFile);
+              script = await this.readCachedScript(cacheFile);
             }
             if (!script) {
               log({
@@ -2040,8 +2097,11 @@ export class Pipeline {
                   }
                 }
                 reportVerify(vr);
-              } catch {
-                /* 自检失败不阻断生成 */
+              } catch (e) {
+                // 1311：此前 catch 空（连 warn 都无），保真缺失无从查。带章号 warn，不阻断。
+                logger.warn("pipeline", `第 ${chapter.index + 1} 章保真自检失败（已跳过，不阻断生成）`, {
+                  error: errMsg(e).slice(0, 200),
+                });
               }
                 } else {
               log({
@@ -2050,7 +2110,11 @@ export class Pipeline {
                 level: "info",
                 at: Date.now(),
               });
-              await this.verifyAndPersistScript(chapter, script!, cards!.characters, demo, styleFrag).catch(() => {});
+              await this.verifyAndPersistScript(chapter, script!, cards!.characters, demo, styleFrag).catch((e) => {
+                logger.warn("pipeline", `第 ${chapter.index + 1} 章核对报告补算失败（不阻断）`, {
+                  error: errMsg(e).slice(0, 200),
+                });
+              });
             }
           }
           this.applyVideoOptions(script);
@@ -2421,8 +2485,9 @@ export class Pipeline {
         useBgm: this.options.useBgm,
         useSe: this.options.useSe,
         // UI98：「不翻译（使用原文）」时不要写死 zh_CN，按原文语种推断 Default_Language
-        // （假名→ja、谚文→ko、CJK→zh_CN、拉丁→en），保证游戏界面语言与正文一致
-        language: (this.options.language as WebgalLanguage) || inferWebgalLanguage(workingNovel.fullText),
+        // （假名→ja、谚文→ko、CJK→zh_CN、拉丁→en），保证游戏界面语言与正文一致。
+        // #1320：界面语言优先用独立的 uiLanguage（导出页写入），缺省跟随翻译目标，再缺省推断。
+        language: ((this.options.uiLanguage || this.options.language) as WebgalLanguage) || inferWebgalLanguage(workingNovel.fullText),
         titleCoverMode: this.options.titleCoverMode,
         titleCoverPath: this.options.titleCoverPath,
         titleLogoMode: this.options.titleLogoMode,

@@ -13,12 +13,19 @@ import type {
   Shot,
 } from "./types";
 import { chatJson, type LlmProgressEvent } from "../api/openaiCompatible";
-import { estimateCharsPerToken, outputTokensForText } from "../api/providers";
+import { inputCharBudgetForText, outputTokensForText } from "../api/providers";
 import { splitNovelForAgent } from "./textSplit";
 import { log as logger } from "../utils/logger";
 import { tauri } from "../utils/tauri";
 import { scriptCacheRest } from "./cache";
 import type { ApiConfig } from "./types";
+
+/**
+ * 剧本单次请求的输出 token 上限：慢后端上小响应才 fit 得进 300s 超时（30 tok/s ≈ 270s），
+ * 超出部分由续写循环分段取回。planScriptChunks 必须用同一预算切分章节——
+ * 否则计划按大预算排、请求按小预算发，长章会被整块塞进一次请求而空转（被思考耗尽/截断→重试/超时）。
+ */
+const SCRIPT_PART_OUTPUT_TOKENS = 8192;
 
 interface ScriptModel {
   title: string;
@@ -235,8 +242,10 @@ export function narrationPolicyText(compressNarration?: boolean): string {
     : "旁白处理策略（忠实全文，硬约束）：必须完整保留原文全部旁白与心理/环境/氛围描写，只可合并同义重复句，禁止删减任何带信息量/情绪/伏笔的句子；原文每个自然段至少要产出一条 line（narration 或 dialogue）。";
 }
 
-/** 剧本分块（纯函数，供单测）：按「输出预算 × 语种字符/token × 0.65」估算单块可承载的正文体量，
- *  超长章节按段落边界切块（忠实全文模式下避免整章输出被截断 → scenes 为空）。 */
+/** 剧本分块（纯函数，供单测）：**不按单次输出预算预先切章**——输出长度由 chatJson 的续写循环处理
+ *  （先生成一部分，被长度截断后下一次从中断处继续补，直到整章产出完整）。
+ *  这里只按「一次能把多少正文喂进模型上下文」设上限：只有整章正文超出上下文才分块，
+ *  否则整章一次喂进去、由续写补完（这样长章不会被输出预算切碎成多段独立生成）。 */
 export function planScriptChunks(
   cfg: ApiConfig,
   chapter: ChapterInfo,
@@ -244,9 +253,9 @@ export function planScriptChunks(
   extra: string[],
   cards: ExtractionResult,
 ): string[] {
-  const probeTokens = outputTokensForText(cfg, `${systemPrompt}\n${buildScriptUser(chapter, cards, extra, chapter.text.slice(0, 4000))}`);
-  const cpt = estimateCharsPerToken(chapter.text);
-  const chunkBudget = Math.max(3000, Math.floor(probeTokens * cpt * 0.65));
+  const feedChars = inputCharBudgetForText(cfg, chapter.text);
+  const overhead = systemPrompt.length + buildScriptUser(chapter, cards, extra, "").length;
+  const chunkBudget = Math.max(3000, feedChars - overhead);
   return chapter.text.length <= chunkBudget ? [chapter.text] : splitNovelForAgent(chapter.text, chunkBudget);
 }
 
@@ -582,12 +591,24 @@ export async function scriptChapter(
     // 单个子块生成（含空结果带提示重试一次；无场景即抛错，由外层决定是否降级拆分）
     const genOnePart = async (bodyText: string, note: string, tag: string): Promise<{ model: ScriptModel; scenes: SceneJSON[] }> => {
       const user = buildScriptUser(chapter, cards, extra, bodyText, note);
-      // 单次输出预算 8K：慢后端上小响应才 fit 得进 300s（30 tok/s 下约 270s），
-      // 超出部分由续写循环分段取回（第 1 章 197KB 即靠续写拼出）；续写轮次放宽到 5 轮覆盖整块
-      const maxTokens = outputTokensForText(cfg, `${systemPrompt}\n${user}`, 8192);
+      // 单次输出预算 8K：慢后端上小响应才 fit 得进 300s（30 tok/s 下约 270s）；
+      // 整章正文一次喂进去，输出长度由续写循环「先生成一部分、截断后下一次从中断处接着补」补完，
+      // 不再按输出预算预先切章。续写轮次放宽以覆盖整章（大章可能需要多次续写）。
+      const maxTokens = outputTokensForText(cfg, `${systemPrompt}\n${user}`, SCRIPT_PART_OUTPUT_TOKENS);
       const llmEvent = llmEventFor(tag);
-      // 超时零容忍盲重试：第一次 300s 超时即抛，外层按段落拆小后重试（小请求才 fit 得进超时）
-      const chatOpts = { maxTokens, onUsage, timeoutSecs: 300, onEvent: llmEvent, timeoutRetries: 0, maxContinue: 5 };
+      // 超时零容忍盲重试：第一次 300s 超时即抛，外层按段落拆小后重试（小请求才 fit 得进超时）。
+      // 总量无天花板：单次 8K fit 超时，超出部分由续写循环"生成多少、下轮往后补"（最多 10 轮 +
+      // 停滞保护），请求预算提到 16 覆盖 1 首轮 + 10 续写 + 2 修复 + 升级余量。
+      const chatOpts = {
+        maxTokens,
+        onUsage,
+        timeoutSecs: 300,
+        onEvent: llmEvent,
+        timeoutRetries: 0,
+        maxContinue: 10,
+        minContinueProgress: 500,
+        requestBudget: { used: 0, max: 16 },
+      };
       let model = await chatJson<ScriptModel>(cfg, systemPrompt, user, chatOpts);
       let subScenes = mapScriptScenes(model, mapCtx);
       if (!subScenes.length) {

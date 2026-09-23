@@ -6,6 +6,62 @@ import { log } from "../utils/logger";
 import { classifyError } from "../utils/errorClassifier";
 import { normalizeProviderBaseUrl, customHeadersFor, joinApiPath } from "./baseUrl";
 
+/** HTTP 状态错误（1317）：禁止 throw 裸对象，统一挂 status 的 Error（保栈、可被 classifyError 双信号分类）。 */
+export function httpStatusError(status: number, message: string): Error {
+  const e = new Error(message);
+  (e as { status?: number }).status = status;
+  return e;
+}
+
+/** 结果 URL 安全校验（1297）：仅 https 或与 API 同 host；拦回环/私网/link-local。 */
+function hostOf(url: string): string {
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function isBlockedResultHost(host: string): boolean {
+  const h = host.toLowerCase().replace(/^\[|\]$/g, "");
+  if (!h) return true;
+  if (h === "localhost" || h === "::1" || h === "0.0.0.0") return true;
+  if (h.endsWith(".local") || h.endsWith(".internal") || h.endsWith(".localhost")) return true;
+  // IPv4 私网/回环/link-local
+  const m = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(h);
+  if (m) {
+    const [a, b] = [Number(m[1]), Number(m[2])];
+    if (a === 127 || a === 10) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 0) return true;
+  }
+  // IPv6 回环/link-local/唯一本地
+  if (h === "::1" || h.startsWith("fe80:") || h.startsWith("fec0:") || h.startsWith("fc") || h.startsWith("fd")) return true;
+  return false;
+}
+
+/** 结果文件拉取是否放行：https 公网，或与 API base 同 host（本地模型回源） */
+export function isAllowedResultUrl(resultUrl: string, cfgBaseUrl?: string): boolean {
+  let u: URL;
+  try {
+    u = new URL(resultUrl);
+  } catch {
+    return false;
+  }
+  const host = u.hostname.toLowerCase();
+  if (isBlockedResultHost(host)) {
+    // 同 host 回源例外：本地 Ollama 等把结果放在同机 http://127.0.0.1:11434 下时放行
+    if (cfgBaseUrl && hostOf(cfgBaseUrl) === host) return true;
+    return false;
+  }
+  if (u.protocol === "https:") return true;
+  // http 仅允许同 host（避免明文外链跟随）
+  if (cfgBaseUrl && u.protocol === "http:" && hostOf(cfgBaseUrl) === host) return true;
+  return false;
+}
+
 /* ============ 统一能力模型 ============ */
 
 export type Capability = "image" | "tts";
@@ -105,8 +161,31 @@ export function getByPath(obj: unknown, path: string): unknown {
   return cur;
 }
 
+/** multipart name/filename 转义（1297）：拦引号与 CRLF 注入，统一经此函数。 */
+export function escapeDispositionName(name: string): string {
+  return String(name ?? "")
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/[\r\n]+/g, "_")
+    .slice(0, 200);
+}
+
+/** 模板路径危险段（1297 原型污染）：__proto__/constructor/prototype 一律拒绝。 */
+const DANGEROUS_PATH_SEG = /^(?:__proto__|constructor|prototype)$/i;
+
+function assertSafePathSegment(seg: string, path: string): void {
+  const base = seg.match(/^(\w+)/)?.[1] ?? seg;
+  if (DANGEROUS_PATH_SEG.test(base) || DANGEROUS_PATH_SEG.test(seg)) {
+    throw new Error(`模板路径不合法（原型污染风险）：${path}`);
+  }
+}
+
 export function setByPath(obj: Record<string, unknown>, path: string, value: unknown): void {
   const parts = path.split(".");
+  for (const p of parts) {
+    const m = p.match(/^(\w+)\[(\d+)\]$/);
+    assertSafePathSegment(m?.[1] ?? p, path);
+  }
   let cur = obj;
   for (let i = 0; i < parts.length - 1; i++) {
     const key = parts[i];
@@ -193,8 +272,12 @@ export function buildRequestBody(
 
 /* ============ 结果解码 ============ */
 
-function hexToBase64(hex: string): string {
+export function hexToBase64(hex: string): string {
   const clean = hex.replace(/\s+/g, "");
+  // 1317：非法字符/奇长静默写 0 会把坏音频当成功。改为硬错，由上层按 invalid_param 不重试。
+  if (!/^(?:[0-9a-fA-F]{2})+$/.test(clean) || clean.length === 0) {
+    throw new Error(`结果数据不是合法 hex（疑似模型返回了文本而非音频）：${hex.slice(0, 80)}`);
+  }
   const bytes = new Uint8Array(clean.length / 2);
   for (let i = 0; i < bytes.length; i++) {
     bytes[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
@@ -221,7 +304,10 @@ const RESULT_KEYS = [
 ];
 
 /** 深度智能提取：递归查找常见结果字段（Gemini 的 inlineData.data 等深层结构也能取到） */
+const SMART_PICK_MAX_DEPTH = 8;
 function smartPick(raw: unknown, depth = 0): { value: unknown; mime?: string } | undefined {
+  // 1317：数组分支此前无深度上限，不可信 JSON 可栈溢出。统一封顶。
+  if (depth > SMART_PICK_MAX_DEPTH) return undefined;
   if (Array.isArray(raw)) {
     for (const item of raw) {
       const hit = smartPick(item, depth + 1);
@@ -333,6 +419,10 @@ async function decodeResult(
   }
   if (encoding === "none" || /^https?:\/\//i.test(value)) {
     if (/^https?:\/\//i.test(value)) {
+      // 1297：结果 URL 不再无条件跟随。仅 https 公网或与 API 同 host，且拦私网/回环。
+      if (!isAllowedResultUrl(value, cfg.baseUrl)) {
+        throw new Error(`结果 URL 不被允许（仅 https 公网或与 API 同 host，且拦截私网/回环）：${value.slice(0, 120)}`);
+      }
       const res = await tauri.http({ method: "GET", url: value, timeoutSecs: 120 }, activeAbortSignal());
       // 之前不检查状态码：403/404 的错误 JSON 也会被当成"图片数据"返回（静默产出损坏文件）
       if (res.status < 200 || res.status >= 300) {
@@ -346,6 +436,9 @@ async function decodeResult(
       }
       return { dataB64: res.bodyBase64, mime: res.contentType.split(";")[0] || "application/octet-stream" };
     }
+    // #1309：encoding none 的非 URL 值同样做载荷校验——模型拒答文本（如 MiniMax 的纯文本回复）
+    // 否则会被原样写盘成坏 PNG。data: URL 自描述，跳过不断言。
+    if (!value.startsWith("data:")) assertEncodedPayload(value, mime);
     return { dataB64: value, mime: mime ?? "application/octet-stream" };
   }
   assertEncodedPayload(value, mime);
@@ -436,8 +529,10 @@ export function buildMultipartBody(
 ): { body: string; contentType: string } {
   const boundary = `novelforge-${Math.random().toString(36).slice(2, 12)}`;
   const parts: string[] = [];
-  for (const [name, value] of Object.entries(fields)) {
+  for (const [rawName, value] of Object.entries(fields)) {
     if (value === undefined || value === null) continue;
+    // 1297：name 直接插值可被含引号/CRLF 的模板键破坏分隔。统一转义。
+    const name = escapeDispositionName(rawName);
     parts.push(
       `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${String(value)}\r\n`,
     );
@@ -472,12 +567,15 @@ async function requestWithRetry(
   url: string,
   body: Record<string, unknown>,
   template: AdapterTemplate,
-  options?: { isAborted?: () => boolean; parseJson?: boolean },
+  options?: { isAborted?: () => boolean; parseJson?: boolean; signal?: AbortSignal; timeoutSecs?: number },
 ): Promise<HttpRawResult> {
   let lastErr: unknown;
   const isForm = template.contentType === "form";
+  // 1301：调用方此前从不传 isAborted，停止后仍熬满退避并占限流槽。默认接全局信号。
+  const abortedBySignal = (s?: AbortSignal): boolean => !!s?.aborted || !!activeAbortSignal()?.aborted;
   for (let attempt = 0; attempt <= RETRY_DELAYS.length; attempt++) {
     try {
+      if (abortedBySignal(options?.signal) || options?.isAborted?.()) throw new Error("已中止");
       const headers: Record<string, string> = {
         ...(isForm ? {} : { "Content-Type": "application/json" }),
         ...authHeaders(cfg, template),
@@ -497,8 +595,8 @@ async function requestWithRetry(
         url,
         headers,
         body: payload,
-        timeoutSecs: 300,
-      }, activeAbortSignal());
+        timeoutSecs: options?.timeoutSecs ?? 300,
+      }, options?.signal ?? activeAbortSignal());
       // 只在需要时解码响应体：rawResponse 的成功路径可能是几 MB 的音频/图片字节，
       // 每次都转成字符串（旧 postJson 为解析 JSON 才需要）会白白构造大字符串
       const needRaw = res.status >= 400 || options?.parseJson === true;
@@ -518,7 +616,7 @@ async function requestWithRetry(
         if (routeHint) throw new ReferenceImageError(routeHint, "REFERENCE_UNSUPPORTED");
       }
       if (res.status >= 500 || res.status === 429) {
-        throw { status: res.status, message: `HTTP ${res.status}` };
+        throw httpStatusError(res.status, `HTTP ${res.status}`);
       }
       if (res.status >= 400) {
         let errText = raw.slice(0, 300);
@@ -531,9 +629,7 @@ async function requestWithRetry(
         }
         // 状态码挂到 Error 上：上层 classifyError(e, status) 双信号分类
         // （审查 400 靠文本命中，鉴权/参数靠状态码），不带 status 会退化成纯文本分类。
-        const apiError = new Error(`API 错误 ${res.status}: ${errText}`);
-        (apiError as { status?: number }).status = res.status;
-        throw apiError;
+        throw httpStatusError(res.status, `API 错误 ${res.status}: ${errText}`);
       }
       let json: unknown;
       if (options?.parseJson) {
@@ -555,7 +651,7 @@ async function requestWithRetry(
       if (attempt >= RETRY_DELAYS.length) {
         throw e;
       }
-      await retrySleep(jitterDelay(RETRY_DELAYS[attempt]), options?.isAborted);
+      await retrySleep(jitterDelay(RETRY_DELAYS[attempt]), () => !!options?.isAborted?.() || !!options?.signal?.aborted || !!activeAbortSignal()?.aborted);
     }
   }
   throw lastErr;
@@ -566,8 +662,9 @@ async function postJson(
   url: string,
   body: Record<string, unknown>,
   template: AdapterTemplate,
+  opts?: { signal?: AbortSignal; timeoutSecs?: number },
 ): Promise<{ status: number; json: unknown; raw: string }> {
-  const res = await requestWithRetry(cfg, url, body, template, { parseJson: true });
+  const res = await requestWithRetry(cfg, url, body, template, { parseJson: true, ...opts });
   return { status: res.status, json: res.json, raw: res.raw };
 }
 
@@ -600,7 +697,7 @@ async function getJson(cfg: ApiConfig, url: string, template: AdapterTemplate, i
       }, activeAbortSignal());
       const raw = utf8FromB64(res.bodyBase64);
       if (res.status >= 500 || res.status === 429) {
-        throw { status: res.status, message: `HTTP ${res.status}` };
+        throw httpStatusError(res.status, `HTTP ${res.status}`);
       }
       if (res.status >= 400) {
         let errText = raw.slice(0, 200);
@@ -610,9 +707,7 @@ async function getJson(cfg: ApiConfig, url: string, template: AdapterTemplate, i
         } catch {
           /* 非 JSON */
         }
-        const apiError = new Error(`轮询请求失败 ${res.status}: ${errText}`);
-        (apiError as { status?: number }).status = res.status;
-        throw apiError;
+        throw httpStatusError(res.status, `轮询请求失败 ${res.status}: ${errText}`);
       }
       try {
         return JSON.parse(raw);
@@ -643,6 +738,9 @@ export interface CallContext {
   cfg: ApiConfig;
   template: AdapterTemplate;
   vars: Record<string, unknown>;
+  /** 1301/1317：显式中止信号与超时（ttsSpeech 的 timeoutSecs 此前被忽略，统一透传）。 */
+  signal?: AbortSignal;
+  timeoutSecs?: number;
 }
 
 export function joinUrl(base: string, endpoint: string): string {
@@ -671,7 +769,7 @@ export function isOfficialOpenAIImage(cfg: ApiConfig): boolean {
 }
 
 async function callUnified(ctx: CallContext): Promise<UnifiedResult> {
-  const { cfg, template, vars } = ctx;
+  const { cfg, template, vars, signal, timeoutSecs } = ctx;
   // 与文本/视觉同口径地补协议/应用 pathPrefix；但通用适配器端点自带版本段，不自动补 /v1
   const base = normalizeProviderBaseUrl(cfg.baseUrl, (cfg.extra?.pathPrefix as string) || undefined);
   const url = joinUrl(base, template.endpoint.replace("{model}", String(vars.model ?? "")));
@@ -686,14 +784,14 @@ async function callUnified(ctx: CallContext): Promise<UnifiedResult> {
     if (template.rawResponse) {
       // B90：二进制响应同样走 requestWithRetry（5xx/429/网络错误退避重试 + 类型化错误分类），
       // 不再裸调 tauri.http 导致探测/测试连接一遇抖动就失败
-      const res = await requestWithRetry(cfg, url, body, template);
+      const res = await requestWithRetry(cfg, url, body, template, { signal, timeoutSecs });
       return {
         dataB64: res.bodyBase64,
         // 优先真实响应的 Content-Type：模板写死的 mime（如 audio/mpeg）会把 ogg/opus/wav 结果存成 .mp3
         mime: (res.contentType?.split(";")[0] || template.response?.mime) || "application/octet-stream",
       };
     }
-    const { json } = await postJson(cfg, url, body, template);
+    const { json } = await postJson(cfg, url, body, template, { signal, timeoutSecs });
     const raw = getByPath(json, template.response?.path ?? "");
     if (raw !== undefined && raw !== null && raw !== "") {
       return decodeResult(raw, template, cfg);
@@ -712,7 +810,7 @@ async function callUnified(ctx: CallContext): Promise<UnifiedResult> {
   // async：提交 → 轮询 → 取结果
   if (!template.poll) throw new Error("异步模板缺少 poll 配置");
   const poll = template.poll;
-  const { json: submitJson } = await postJson(cfg, url, body, template);
+  const { json: submitJson } = await postJson(cfg, url, body, template, { signal, timeoutSecs });
   const taskId = getByPath(submitJson, poll.taskIdPath);
   if (!taskId || typeof taskId !== "string") {
     const errMsg = smartErrorText(submitJson);
@@ -723,8 +821,25 @@ async function callUnified(ctx: CallContext): Promise<UnifiedResult> {
 
   const pollUrl = joinUrl(base, poll.endpoint.replace("{taskId}", taskId));
 
+  // 1317：仅 maxPolls 无 wall-clock，状态稍异即空转。加 wall-clock 上限 + 状态归一化 + 可中止等待。
+  const normStatus = (s: unknown): string => String(s ?? "").trim().toLowerCase();
+  const SUCCESS_ALIASES = new Set(["succeeded", "success", "succeed", "done", "completed", "complete", "finished"]);
+  const isPollSuccess = (s: unknown): boolean => {
+    const n = normStatus(s);
+    if (!n) return false;
+    if (n === normStatus(poll.successWhen)) return true;
+    return SUCCESS_ALIASES.has(n) && SUCCESS_ALIASES.has(normStatus(poll.successWhen));
+  };
+  const isPollFailed = (s: unknown): boolean =>
+    !!poll.failedWhen && normStatus(s) === normStatus(poll.failedWhen);
+  // wall-clock：默认封顶 10 分钟，避免 maxPolls×intervalMs 配错导致空转过久
+  const pollDeadline = Date.now() + Math.min(Math.max(poll.maxPolls * poll.intervalMs, 60_000), 10 * 60_000);
+  const pollAborted = (): boolean => !!signal?.aborted || !!activeAbortSignal()?.aborted;
+
   for (let i = 0; i < poll.maxPolls; i++) {
-    await new Promise((r) => setTimeout(r, poll.intervalMs));
+    // 1301：poll sleep 此前无 abort 检查，停止后仍熬满 4×30s。改可中止等待。
+    await retrySleep(poll.intervalMs, pollAborted);
+    if (Date.now() > pollDeadline) throw new Error(`任务轮询超时（wall-clock，已等待超过上限）`);
     let statusJson: unknown;
     if (poll.method === "POST") {
       const pollBody = { ...(poll.requestBody ?? {}) } as Record<string, unknown>;
@@ -733,16 +848,16 @@ async function callUnified(ctx: CallContext): Promise<UnifiedResult> {
           if (v === "{taskId}") pollBody[k] = taskId;
         }
       }
-      statusJson = (await postJson(cfg, pollUrl, pollBody, template)).json;
+      statusJson = (await postJson(cfg, pollUrl, pollBody, template, { signal, timeoutSecs })).json;
     } else {
-      statusJson = await getJson(cfg, pollUrl, template);
+      statusJson = await getJson(cfg, pollUrl, template, pollAborted);
     }
     const status = getByPath(statusJson, poll.statusPath);
-    if (poll.failedWhen && String(status) === poll.failedWhen) {
+    if (isPollFailed(status)) {
       const errMsg = smartErrorText(statusJson);
       throw new Error(errMsg ? `API 错误：${errMsg}` : `任务失败：${JSON.stringify(statusJson).slice(0, 300)}`);
     }
-    if (String(status) === poll.successWhen) {
+    if (isPollSuccess(status)) {
       const results = getByPath(statusJson, poll.resultPath);
       let picked: unknown;
       if (Array.isArray(results)) {
@@ -777,6 +892,7 @@ export async function unifiedImage(
   cfg: ApiConfig,
   template: AdapterTemplate,
   input: UnifiedImageInput,
+  opts?: { signal?: AbortSignal; timeoutSecs?: number },
 ): Promise<UnifiedResult> {
   const references = input.references ?? [];
   // B102：官方 GPT-image/DALL·E 通道无法在 /v1/images/generations 携带参考图（需 /v1/images/edits）。
@@ -793,6 +909,8 @@ export async function unifiedImage(
   return callUnified({
     cfg,
     template,
+    signal: opts?.signal,
+    timeoutSecs: opts?.timeoutSecs,
     vars: {
       prompt: input.prompt,
       negativePrompt: input.negativePrompt,
@@ -822,11 +940,14 @@ export async function unifiedTts(
   cfg: ApiConfig,
   template: AdapterTemplate,
   input: UnifiedTtsInput,
+  opts?: { signal?: AbortSignal; timeoutSecs?: number },
 ): Promise<UnifiedResult> {
   const extra = (cfg.extra ?? {}) as Record<string, unknown>;
   return callUnified({
     cfg,
     template,
+    signal: opts?.signal,
+    timeoutSecs: opts?.timeoutSecs,
     vars: {
       text: input.text,
       model: cfg.model,

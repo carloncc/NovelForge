@@ -48,6 +48,12 @@ export interface AssembleInput {
   log: (msg: string) => void;
 }
 
+/** 场景文件 swap 计划（1303 纯函数，供单测）：只删多余旧文件，不先清空。 */
+export function sceneSwapPlan(existing: string[], wanted: string[]): { toDelete: string[] } {
+  const want = new Set(wanted);
+  return { toDelete: existing.filter((n) => n.endsWith(".txt") && !want.has(n)) };
+}
+
 export async function assembleProject(input: AssembleInput): Promise<{ gameDir: string; meta: ProjectMeta }> {
   const { outputDir, title, gameKey, templateDir } = input;
   const done = log.time("project", `组装项目「${title}」`);
@@ -64,18 +70,8 @@ export async function assembleProject(input: AssembleInput): Promise<{ gameDir: 
   await tauri.mkdirAll(joinPath(normalizedOutputDir, "game/vocal"));
   await tauri.mkdirAll(joinPath(normalizedOutputDir, "game/bgm"));
 
-  // 清理旧场景文件（章节减少后防止残留）
-  try {
-    const sceneDir = joinPath(normalizedOutputDir, "game/scene");
-    const sceneEntries = await tauri.listDir(sceneDir);
-    for (const e of sceneEntries) {
-      if (!e.isDir && e.name.endsWith(".txt")) {
-        await tauri.removePath(e.path).catch(() => {});
-      }
-    }
-  } catch {
-    /* 目录不可用 */
-  }
+  // 1303：不再先删全部场景文件。中途抛错/中止即半成品（旧产物已毁）。
+  // 改为先内存渲染完再 swap（写新 + 只删多余），渲染抛错时旧产物原样保留。
 
   input.log("复制引擎文件…");
   const engineFiles = [
@@ -150,6 +146,8 @@ export async function assembleProject(input: AssembleInput): Promise<{ gameDir: 
     renderStart(chapterCount, title),
   );
 
+  // 1303：先内存渲染全部章节（抛错时还未动磁盘，旧产物保留），再写盘 + 只删多余旧文件。
+  const rendered = new Map<string, string>();
   for (const chapter of input.chapters) {
     const txt = renderChapter(chapter, {
       characters: input.cards.characters,
@@ -163,13 +161,40 @@ export async function assembleProject(input: AssembleInput): Promise<{ gameDir: 
       useSe: input.useSe,
       mode: input.mode,
     }, chapterCount);
-    await tauri.writeTextFile(
-      joinPath(normalizedOutputDir, `game/scene/ch${chapter.chapter + 1}.txt`),
-      txt
+    rendered.set(`ch${chapter.chapter + 1}.txt`, txt);
+  }
+  for (const [name, txt] of rendered) {
+    await tauri.writeTextFile(joinPath(normalizedOutputDir, "game/scene", name), txt);
+  }
+  // 只删多余（章节减少后残留），新集合内的旧文件已被覆盖，无需动。
+  try {
+    const sceneDir = joinPath(normalizedOutputDir, "game/scene");
+    const sceneEntries = await tauri.listDir(sceneDir);
+    const wanted = new Set(["start.txt", ...rendered.keys()]);
+    const { toDelete } = sceneSwapPlan(
+      sceneEntries.filter((e) => !e.isDir).map((e) => e.name),
+      [...wanted],
     );
+    for (const name of toDelete) {
+      const hit = sceneEntries.find((e) => e.name === name);
+      if (hit) await tauri.removePath(hit.path).catch(() => {});
+    }
+  } catch {
+    /* 目录不可用 */
   }
   // 流程图：按实际章节重建节点/连线（模板自带 demo 节点会让流程图与鉴赏跳向不存在的场景）
   await writeFlowchart(normalizedOutputDir, input.chapters, title);
+
+  // #1331：组装时若目录有音乐文件但 bgmMap 为空（全部场景缺少氛围描述且兜底未命中），记一条 warn 而不是静默全哑。
+  if (!Object.keys(bgmMap).length) {
+    try {
+      const bgmEntries = await tauri.listDir(joinPath(normalizedOutputDir, "game/bgm"));
+      const n = bgmEntries.filter((e) => !e.isDir && /\.(mp3|ogg|wav|m4a|opus)$/i.test(e.name)).length;
+      if (n > 0) input.log(`警告：检测到 ${n} 首 BGM 但未能自动分配（场景缺少氛围描述），已按文件名轮换兜底；仍无分配请检查 game/bgm/ 文件格式`);
+    } catch {
+      /* bgm 目录不可读则跳过提示 */
+    }
+  }
 
   // 标题画面：封面/Logo 支持 自动生成 / 不使用 / 自定义图片；标题曲可指定或自动匹配
   const coverMode = input.titleCoverMode ?? "auto";
@@ -187,11 +212,23 @@ export async function assembleProject(input: AssembleInput): Promise<{ gameDir: 
     : null;
   const titleImg = coverMode === "none" ? undefined : (customCover ?? autoArt?.cover ?? pickTitleImage(input.assets));
   const gameLogo = logoMode === "none" ? undefined : (customLogo ?? autoArt?.logo);
-  const titleBgm = input.titleBgmFile === "none"
+  // #1347：自定义标题曲与封面同策略——文件不存在时回退自动匹配并记 warn（此前裸写文件名，删文件后标题静音）。
+  let titleBgm = input.titleBgmFile === "none"
     ? undefined
     : input.titleBgmFile && input.titleBgmFile.trim()
       ? input.titleBgmFile.trim()
       : pickTitleBgm(bgmMap);
+  if (titleBgm) {
+    try {
+      const exists = await tauri.pathExists(joinPath(normalizedOutputDir, "game/bgm", titleBgm));
+      if (!exists) {
+        input.log(`警告：标题曲 ${titleBgm} 在 game/bgm/ 中不存在，已回退自动匹配`);
+        titleBgm = pickTitleBgm(bgmMap);
+      }
+    } catch {
+      /* 存在性检查失败则保持原值，不阻断组装 */
+    }
+  }
 
   await tauri.writeTextFile(
     joinPath(normalizedOutputDir, "game/config.txt"),
@@ -278,10 +315,16 @@ async function writeAppreciation(outputDir: string, input: AssembleInput, bgmMap
   // 场景元数据：CG/背景的 assets key 已是 scene.id（images.ts），
   // 旧实现从 key 解析 `^(\d+)_` 章节号——CG 键改成 scene.id 后分组恒为 1、名称显示文件名（UI94）
   const sceneMeta = new Map<string, { location: string; chapter: number; cgTitle?: string }>();
+  // #1343：分镜短标题映射（shot.id → note），供分镜画廊卡片标题使用
+  const shotNote = new Map<string, string>();
   for (const c of input.chapters) {
     for (const s of c.scenes) {
       if (!sceneMeta.has(s.id)) {
         sceneMeta.set(s.id, { location: s.location, chapter: c.chapter + 1, cgTitle: s.cgEvent?.title });
+      }
+      for (const sh of s.shots ?? []) {
+        const note = (sh.note || "").trim().slice(0, 20);
+        if (sh.id && note && !shotNote.has(sh.id)) shotNote.set(sh.id, note);
       }
     }
   }
@@ -340,7 +383,7 @@ async function writeAppreciation(outputDir: string, input: AssembleInput, bgmMap
       chapter: meta?.chapter ?? 1,
     });
   }
-  cgs.sort((a, b) => a.chapter - b.chapter || a.file.localeCompare(b.file));
+  cgs.sort((a, b) => a.chapter - b.chapter || compareGalleryFile(a.file, b.file));
   // UI95：背景画廊（键为 scene.id，名称用场景地点，按章节筛选）
   const seenBg = new Set<string>();
   const bgs: Array<{ file: string; location: string; name: string; chapter: number }> = [];
@@ -356,7 +399,7 @@ async function writeAppreciation(outputDir: string, input: AssembleInput, bgmMap
       chapter: meta?.chapter ?? 1,
     });
   }
-  bgs.sort((a, b) => a.chapter - b.chapter || a.file.localeCompare(b.file));
+  bgs.sort((a, b) => a.chapter - b.chapter || compareGalleryFile(a.file, b.file));
   // 图片小说分镜画廊（#811）：键为 `<sceneId>_shot<N>`，按章节分组展示
   const seenShot = new Set<string>();
   const shots: Array<{ file: string; name: string; chapter: number }> = [];
@@ -366,13 +409,18 @@ async function writeAppreciation(outputDir: string, input: AssembleInput, bgmMap
     seenShot.add(file);
     const sceneId = key.replace(/_shot\d+$/, "");
     const meta = sceneMeta.get(sceneId) ?? sceneMeta.get(sceneId.replace(/^\d+_/, ""));
+    // #1343：卡片标题优先用 Shot.note（剧本已生成），无 note 时用「地点 · 第N张」兜底；
+    // 此前全部显示地点名，同场景多张分镜完全同名无法区分。
+    const shotIdx = key.match(/_shot(\d+)$/)?.[1];
+    const note = shotNote.get(key);
+    const loc = meta?.location || "";
     shots.push({
       file,
-      name: meta?.location || stripExt(file),
+      name: note || (loc && shotIdx ? `${loc} · 第${shotIdx}张` : loc || stripExt(file)),
       chapter: meta?.chapter ?? 1,
     });
   }
-  shots.sort((a, b) => a.chapter - b.chapter || a.file.localeCompare(b.file));
+  shots.sort((a, b) => a.chapter - b.chapter || compareGalleryFile(a.file, b.file));
   // BGM 鉴赏清单必须用实际 detectBgm 扫到的 bgmMap（input.assets.bgm 恒为空，旧实现导致鉴赏室无 BGM）
   const bgms = [...new Set(Object.values(bgmMap))].map((p) => ({
     file: basename(p),
@@ -386,10 +434,30 @@ async function writeAppreciation(outputDir: string, input: AssembleInput, bgmMap
     // 鉴赏页模板随模板目录分发（与 index.html 平级，浏览器直接打开即可）。
     // 旧实现用 process.cwd()+"/src/gameExtra/appreciation.html"，打包后 cwd 非源码目录导致从未复制。
     const tpl = joinPath(input.templateDir, "appreciation.html");
-    await tauri.copyFile(tpl, joinPath(outputDir, "appreciation.html"));
+    const dest = joinPath(outputDir, "appreciation.html");
+    // #1375：输出目录是构建产物，模板升级必须落盘才生效；但用户可能手改过 dest，
+    // 无脑覆盖会吞掉定制。写入前比对：内容不一致则先备份旧文件（.bak），再覆盖并记日志明示。
+    try {
+      const [tplText, destText] = await Promise.all([
+        tauri.readTextFile(tpl).then((r) => r.text).catch(() => null),
+        tauri.readTextFile(dest).then((r) => r.text).catch(() => null),
+      ]);
+      if (destText !== null && tplText !== null && destText !== tplText) {
+        await tauri.writeTextFile(`${dest}.bak`, destText).catch(() => undefined);
+        input.log("鉴赏页模板已升级：旧 appreciation.html 已备份为 appreciation.html.bak（曾被手动修改过）");
+      }
+    } catch {
+      /* 比对失败不阻断复制 */
+    }
+    await tauri.copyFile(tpl, dest);
   } catch (e) {
     input.log(`鉴赏室资源写入失败（不影响游戏本体）：${errMsg(e).slice(0, 80)}`);
   }
+}
+
+/** 画廊文件名排序（纯函数，便于单测）：#1373 字典序下 s10 排在 s2 前，必须按数字段比较。 */
+export function compareGalleryFile(a: string, b: string): number {
+  return a.localeCompare(b, undefined, { numeric: true });
 }
 
 /** 标题画面图：优先取第一章首张 CG（名场面最适合做标题视觉），否则取首张背景图 */
@@ -665,6 +733,8 @@ html, body, .Title_buttonList { font-family: ${font} !important; }
 }
 /* 可访问性：键盘焦点可见 */
 :focus-visible { outline: 2px solid var(--nf-accent, #8b5cf6); outline-offset: 2px; }
+/* 主题柔色消费（#1355）：文本选中底，避免 --nf-accent-soft 全仓零引用 */
+::selection { background: var(--nf-accent-soft, rgba(139, 92, 246, 0.35)); }
 /* 窄屏：快捷栏只留图标，避免多项文字横向溢出 */
 @media (max-width: 900px) {
   ._button_text_rdjpk_23 { display: none; }
@@ -904,9 +974,11 @@ async function detectBgm(
 
   for (const chapter of chapters) {
     for (const scene of chapter.scenes) {
-      if (!scene.bgm) continue;
-      const desc = scene.bgm;
-      const want = BGM_RULES.findIndex(([, words]) => words.some((w) => desc.includes(w)));
+      // #1331：bgm 为空是合法输出（LLM 允许留空），此前直接 continue 导致
+      // 放进 game/bgm 的文件一个都分配不出去（场景/标题/鉴赏三处同时静音）。
+      // 空描述场景同样走稳定轮换兜底，保证「放了文件就能听到」。
+      const desc = scene.bgm || "";
+      const want = desc ? BGM_RULES.findIndex(([, words]) => words.some((w) => desc.includes(w))) : -1;
       let hit: string | undefined;
       if (want >= 0) {
         // 首选与描述同氛围的文件（多首按场景稳定轮换）
@@ -990,8 +1062,9 @@ export function buildExportGuideText(title: string, outputDir: string): string {
     `本游戏由 NovelForge（AI 视觉小说工坊）生成 · 官网：${brandUrl()}`,
     "",
     "1) 网页版（手机/PC 浏览器即玩，零成本）",
-    "   整个文件夹即完整网页游戏。部署到任意静态托管（GitHub Pages / Vercel / 服务器 / 网盘），",
-    "   或直接用浏览器打开 index.html。手机浏览器同样可玩。",
+    "   整个文件夹即完整网页游戏。推荐部署到任意静态托管（GitHub Pages / Vercel / 服务器 / 网盘）后访问，",
+    "   或在游戏目录执行 `python -m http.server 8080` 后打开 http://localhost:8080/index.html。",
+    "   直接双击 index.html（file://）基本可玩，但字体与离线缓存可能受限（详见 game/HOW_TO_PLAY.txt）。",
     "",
     `2) PC 端 exe`,
     `   下载 WebGAL Terre 编辑器：https://www.openwebgal.com/zh-cn/download/`,

@@ -5,6 +5,9 @@ export interface LintIssue {
   level: "error" | "warning";
   scope: string;
   message: string;
+  /** 结构化分类码（#1311）：创建时由 lintIssueCode 统一判定；下游只读 code，
+   *  不再逐处匹配中文子串（文案一改分类即错位）。老数据缺 code 时回退旧口径。 */
+  code?: "missing-asset" | "fixable";
 }
 
 export interface LintReport {
@@ -30,14 +33,29 @@ export interface LintErrorBreakdown {
   fixable: LintIssue[];
 }
 
+/** 缺失类判定的唯一口径（纯函数，供单测）：scope 前缀 + 固定 message 标记。
+ *  中文子串匹配只收敛在这一个函数里，改文案时单测会立刻指出分类漂移。 */
+export function lintIssueCode(scope: string, message: string): "missing-asset" | "fixable" {
+  if (
+    scope.startsWith("素材") ||
+    message.includes("引用缺失") ||
+    message.includes("配音缺失")
+  ) {
+    return "missing-asset";
+  }
+  return "fixable";
+}
+
 export function classifyLintErrors(errors: LintIssue[]): LintErrorBreakdown {
   const missingAsset: LintIssue[] = [];
   const fixable: LintIssue[] = [];
   for (const issue of errors) {
-    const missing =
-      issue.scope.startsWith("素材") ||
-      issue.message.includes("引用缺失") ||
-      issue.message.includes("配音缺失");
+    // 有结构化码的直接读码；外部构造的老数据（无 code）回退旧口径
+    const missing = issue.code
+      ? issue.code === "missing-asset"
+      : issue.scope.startsWith("素材") ||
+        issue.message.includes("引用缺失") ||
+        issue.message.includes("配音缺失");
     (missing ? missingAsset : fixable).push(issue);
   }
   return { missingAsset, fixable };
@@ -66,8 +84,10 @@ export async function lintProject(outputDir: string): Promise<LintReport> {
     warnings: [],
     summary: { scenes: 0, lines: 0, figures: 0, bgs: 0, vocals: 0, videos: 0, missingAssets: 0 },
   };
-  const err = (scope: string, message: string) => report.errors.push({ level: "error", scope, message });
-  const warn = (scope: string, message: string) => report.warnings.push({ level: "warning", scope, message });
+  const err = (scope: string, message: string) =>
+    report.errors.push({ level: "error", scope, message, code: lintIssueCode(scope, message) });
+  const warn = (scope: string, message: string) =>
+    report.warnings.push({ level: "warning", scope, message, code: lintIssueCode(scope, message) });
 
   const sceneDir = `${outputDir}/game/scene`;
   const startExists = await tauri.pathExists(`${sceneDir}/start.txt`);
@@ -116,6 +136,14 @@ export async function lintProject(outputDir: string): Promise<LintReport> {
     return null;
   };
 
+  // #1345：跳转链第二遍校验用的收集器（第一遍只收集，第二遍统一校验目标存在性）
+  const labelsByFile = new Map<string, Set<string>>();
+  const changeTargets: Array<{ from: string; target: string }> = [];
+  const jumpTargets: Array<{ from: string; target: string }> = [];
+  const chooseTargets: Array<{ from: string; target: string }> = [];
+  const fileHasEnd = new Set<string>();
+  const fileHasChangeScene = new Set<string>();
+
   for (const f of sceneFiles) {
     let { text } = await tauri.readTextFile(f.path);
     text = text.replace(/^\uFEFF/, "");
@@ -137,6 +165,7 @@ export async function lintProject(outputDir: string): Promise<LintReport> {
       if (line.startsWith(";")) continue;
 
       if (END_RE.test(line) || CMD_RE.test(line)) {
+        if (END_RE.test(line)) fileHasEnd.add(f.name);
         if (line.startsWith("label:")) {
           const name = line.slice(6, -1).trim();
           if (labels.has(name)) warn(`语法(${f.name})`, `label 重复：${name}`);
@@ -144,6 +173,21 @@ export async function lintProject(outputDir: string): Promise<LintReport> {
           continue;
         }
         const cmd = line.split(":")[0];
+        // #1345：跳转目标收集（第二遍校验存在性；此前收集了 labels 却从未使用）
+        if (cmd === "changeScene") {
+          fileHasChangeScene.add(f.name);
+          const target = line.slice(cmd.length + 1).split(" ")[0].replace(/;$/, "").trim();
+          if (target) changeTargets.push({ from: f.name, target });
+        } else if (cmd === "jumpLabel") {
+          const target = line.slice(cmd.length + 1).replace(/;$/, "").trim();
+          if (target) jumpTargets.push({ from: f.name, target });
+        } else if (cmd === "choose") {
+          const body = line.slice(cmd.length + 1).replace(/;$/, "");
+          for (const part of body.split("|")) {
+            const target = part.slice(part.lastIndexOf(":") + 1).trim();
+            if (target) chooseTargets.push({ from: f.name, target });
+          }
+        }
         if (cmd === "changeBg") bgRefs++;
         if (cmd === "changeFigure") figureRefs++;
         if (cmd === "playVideo") videoRefs++;
@@ -182,6 +226,7 @@ export async function lintProject(outputDir: string): Promise<LintReport> {
       err(`语法(${f.name})`, `无法解析的语句：${line.slice(0, 60)}`);
     }
 
+    labelsByFile.set(f.name, labels);
     if (lineCount === 0 && f.name !== "start.txt") warn(`结构(${f.name})`, "章节没有任何台词");
     if (/^ch\d+\.txt$/.test(f.name) && !/^ch1\.txt$/.test(f.name) && !text.includes("label:")) {
       warn(`结构(${f.name})`, "章节缺少 label（流程图不可达）");
@@ -192,6 +237,77 @@ export async function lintProject(outputDir: string): Promise<LintReport> {
     report.summary.bgs += bgRefs;
     report.summary.vocals += vocalRefs;
     report.summary.videos += videoRefs;
+  }
+
+  // ---- #1345 第二遍：跳转链校验（此前 changeScene/jumpLabel/choose 目标从未解析，坏包可绿灯通过） ----
+  const sceneNames = new Set(sceneFiles.map((f) => f.name));
+  for (const { from, target } of changeTargets) {
+    if (!sceneNames.has(target)) err(`结构(${from})`, `changeScene 目标缺失：${target}（game/scene/ 中不存在，玩到该章末会断链）`);
+  }
+  const jumpCheck = (from: string, target: string): void => {
+    const labels = labelsByFile.get(from);
+    if (labels && !labels.has(target)) err(`结构(${from})`, `跳转目标缺失：${target}（本文件无该 label，悬空跳转）`);
+  };
+  for (const { from, target } of jumpTargets) jumpCheck(from, target);
+  for (const { from, target } of chooseTargets) jumpCheck(from, target);
+  // start.txt 必须指向已存在的章节文件（此前只查存在不查内容，空 start 会静默放行黑屏包）
+  if (startExists) {
+    const startTargets = changeTargets.filter((t) => t.from === "start.txt").map((t) => t.target);
+    if (!startTargets.length) {
+      err("结构(start.txt)", "start.txt 无 changeScene（引擎打开即黑屏）");
+    } else if (!startTargets.some((t) => sceneNames.has(t))) {
+      err("结构(start.txt)", `start.txt 指向的章节不存在：${startTargets.join("、")}`);
+    }
+  }
+  // flowchart.json 场景节点校验（导出页承诺「流程图可达性」却从未读取）
+  try {
+    const { text: flowText } = await tauri.readTextFile(`${outputDir}/game/flowchart.json`);
+    const flow = JSON.parse(flowText) as { flowcharts?: Array<{ nodes?: Array<{ data?: { sceneName?: string } }> }> };
+    for (const chart of flow.flowcharts ?? []) {
+      for (const node of chart.nodes ?? []) {
+        const sn = node.data?.sceneName;
+        if (sn && sn !== "start.txt" && !sceneNames.has(sn)) {
+          err("结构(flowchart.json)", `流程图节点指向缺失场景：${sn}`);
+        }
+      }
+    }
+  } catch {
+    /* 流程图缺失/不可解析则跳过（组装失败另有日志，不在此误报） */
+  }
+  // 章节链结构：末章应有 end;、非末章应有 changeScene（只告警，避免旧包误拦）
+  const chFiles = sceneFiles
+    .map((f) => f.name)
+    .filter((n) => /^ch\d+\.txt$/.test(n))
+    .sort((a, b) => parseInt(a.slice(2), 10) - parseInt(b.slice(2), 10));
+  if (chFiles.length) {
+    const last = chFiles[chFiles.length - 1];
+    if (!fileHasEnd.has(last)) warn(`结构(${last})`, "末章缺少 end;（通关后可能无法正常结束）");
+    for (const n of chFiles.slice(0, -1)) {
+      if (!fileHasChangeScene.has(n)) warn(`结构(${n})`, "非末章缺少 changeScene（可能断链）");
+    }
+  }
+
+  // ---- #1347：config.txt 资源引用校验（此前 lint 全程不读 config，标题曲/封面/Logo 缺失照样绿灯） ----
+  try {
+    const { text: cfgText } = await tauri.readTextFile(`${outputDir}/game/config.txt`);
+    const cfgVal = (key: string): string | null => {
+      const m = new RegExp(`^${key}:(.*);\\s*$`, "m").exec(cfgText);
+      return m ? m[1].trim() : null;
+    };
+    const titleBgm = cfgVal("Title_bgm");
+    if (titleBgm && !assetFiles.bgm.has(titleBgm.toLowerCase())) {
+      report.summary.missingAssets++;
+      err("素材(config.txt)", `标题曲缺失：${titleBgm}（game/bgm/ 中不存在，标题界面静音）`);
+    }
+    for (const key of ["Title_img", "Game_Logo"] as const) {
+      const v = cfgVal(key);
+      if (v && !assetFiles.background.has(v.toLowerCase())) {
+        report.summary.missingAssets++;
+        err("素材(config.txt)", `${key} 缺失：${v}（game/background/ 中不存在）`);
+      }
+    }
+  } catch {
+    /* config 缺失由组装阶段保证，不在此误报 */
   }
 
   return finish(report);

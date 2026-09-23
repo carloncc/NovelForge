@@ -11,6 +11,7 @@ jobs:
   # 质量门禁：PR / 主分支 / tag 都跑前端与 Rust 单测（构建发布前先过测试）
   test:
     runs-on: ubuntu-22.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -38,12 +39,29 @@ jobs:
 
       - name: Fetch WebGAL engine template
         run: pnpm prepare:template
+        timeout-minutes: 10
+
+      - name: Typecheck (vue-tsc)
+        run: pnpm exec vue-tsc --noEmit
+        timeout-minutes: 10
+
+      # #1310：单测类型门（咨询性：历史单测存在类型腐烂，修完前不阻塞构建；变绿后可去掉 continue-on-error）
+      - name: Typecheck tests (advisory)
+        run: pnpm typecheck:tests
+        timeout-minutes: 10
+        continue-on-error: true
+
+      - name: i18n dictionary check
+        run: pnpm check:i18n
+        timeout-minutes: 5
 
       - name: Frontend unit tests
         run: pnpm test
+        timeout-minutes: 15
 
       - name: Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
+        timeout-minutes: 15
 
   build:
     # 仅在 tag 推送或手动触发时构建发布（PR 只跑 test job，避免误发布）

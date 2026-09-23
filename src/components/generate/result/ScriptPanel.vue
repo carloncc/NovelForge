@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref } from "vue";
 import { t } from "../../../i18n";
 import { projectState } from "../../../stores/project";
-import { tauri } from "../../../utils/tauri";
+import { isTauri, tauri } from "../../../utils/tauri";
 import { SCRIPT_MIN_KEPT_RATIO, SCRIPT_MIN_NARRATION_RATIO } from "../../../core/script";
 import { useGenerateController } from "../../../stores/generate";
 
@@ -32,16 +32,26 @@ const {
 /** 只列启用章节：停用章不参与生成，列出来点了也只会报"已停用" */
 const enabledChapters = computed(() => projectState.novel?.chapters.filter((c) => c.enabled !== false) ?? []);
 
-/** 章节显示名：标题已带「第X章」前缀时不再重复拼接 */
+/** 章节显示名：标题已带「第X章」前缀时不再重复拼接（宽正则与游戏内标题卡对齐） */
 function chapterLabel(rep: { chapterIndex: number; title: string }): string {
   const base = (rep.title ?? "").trim() || t("未命名");
-  return /^第\s*[0-9一二三四五六七八九十百千零〇两]+\s*[章回节]/.test(base)
+  return /^第\s*[0-9一二三四五六七八九十百千零〇两]+\s*[章回节话篇部幕卷]/.test(base)
     ? base
     : `${t("第")}${rep.chapterIndex + 1}${t("章")} ${base}`;
 }
 /** 逐章重写/核对操作锁：管线/队列/素材任务任一在跑时都禁用（runChapterFullRegen 的 fromQueue
  *  会绕过队列检查，队列间隙点击会插进第二条链） */
 const regenLocked = computed(() => busy.value || queueRunning.value || !!assetBusy.value);
+
+/** 章节列表分页 + 搜索：百章时不再直出数百个输入框，默认只渲前 20 章 */
+const scriptQuery = ref("");
+const scriptVisibleLimit = ref(20);
+const filteredChapters = computed(() => {
+  const q = scriptQuery.value.trim();
+  if (!q) return enabledChapters.value;
+  return enabledChapters.value.filter((ch) => (ch.title ?? "").includes(q));
+});
+const visibleChapters = computed(() => filteredChapters.value.slice(0, scriptVisibleLimit.value));
 
 /** 清空意见：会影响所有章节（包含当前不可见章节）的意见与全量勾选，执行前确认 */
 function clearScriptOpinions(): void {
@@ -52,6 +62,25 @@ function clearScriptOpinions(): void {
   }
   scriptChapterFeedback.value = {};
   chapterForce.value = {};
+}
+
+/** 网页版 openInExplorer 是静默 no-op：给明确提示 + 可复制路径，避免像点了空气 */
+async function openScriptFolder(): Promise<void> {
+  const dir = `${projectState.outputDir}/game/scene`;
+  if (isTauri()) {
+    try {
+      await tauri.openInExplorer(dir);
+    } catch (e) {
+      window.alert(`${t("打开文件夹失败")}: ${e instanceof Error ? e.message : String(e)}\n${dir}`);
+    }
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(dir);
+    window.alert(`${t("网页版无法直接打开本地文件夹，路径已复制")}\n${dir}`);
+  } catch {
+    window.alert(`${t("网页版无法直接打开本地文件夹，请手动打开")}\n${dir}`);
+  }
 }
 </script>
 
@@ -65,17 +94,30 @@ function clearScriptOpinions(): void {
       </div>
     </div>
       <p class="hint mb-3">{{ t("选择章节 → 填写意见（填了才按意见重写）或勾全量（直接重写）→ 点击「重新生成此章」。都不选=只补缺失。其余章节自动复用缓存。") }}</p>
-    <div v-for="ch in enabledChapters" :key="ch.index" class="stage-row mb-2">
+    <div class="row mb-3" style="gap: 8px">
+      <input
+        v-model="scriptQuery"
+        type="text"
+        style="flex: 1; min-width: 160px"
+        :placeholder="t('搜索章节标题…')"
+        @input="scriptVisibleLimit = 20"
+      />
+      <span class="hint">{{ filteredChapters.length }} / {{ enabledChapters.length }}</span>
+    </div>
+    <div v-for="ch in visibleChapters" :key="ch.index" class="stage-row mb-2">
       <!-- min-width:0 + text-ellipsis：长章节标题此前会把整行撑破；title 保留全文可悬浮查看 -->
       <div class="stage-row-label" style="min-width: 0">
         <b class="text-ellipsis" :title="ch.title">{{ ch.title }}</b>
       </div>
-      <input type="text" v-model="scriptChapterFeedback[ch.index]" :placeholder="t('意见（可选）：这一章节奏太慢，希望更快推进…')" />
+      <input type="text" v-model="scriptChapterFeedback[ch.index]" :disabled="regenLocked" :placeholder="t('意见（可选）：这一章节奏太慢，希望更快推进…')" />
       <label class="opt-item mb-0" :title="t('勾选后该章跳过缓存直接重写，不需要填意见')">
         <input type="checkbox" v-model="chapterForce[ch.index]" :disabled="regenLocked" />
         {{ t("全量") }}
       </label>
       <button class="btn small" :disabled="regenLocked" :title="t('无意见且未勾全量=只补缺失')" @click="regenChapter(ch.index)">{{ t("重新生成此章") }}</button>
+    </div>
+    <div v-if="filteredChapters.length > scriptVisibleLimit" style="text-align: center; margin-top: 8px">
+      <button class="btn secondary small" @click="scriptVisibleLimit += 20">{{ t("显示更多（剩余 {n} 章）", { n: filteredChapters.length - scriptVisibleLimit }) }}</button>
     </div>
   </div>
   <div class="card" v-if="verifyReports.length">
@@ -132,7 +174,7 @@ function clearScriptOpinions(): void {
       <select v-model="currentScript" style="flex: 1; max-width: 260px">
         <option v-for="f in scriptFiles" :key="f.name" :value="f.name">{{ f.name }}</option>
       </select>
-      <button class="btn secondary small" @click="tauri.openInExplorer(projectState.outputDir + '/game/scene')">{{ t("打开剧本文件夹") }}</button>
+      <button class="btn secondary small" :title="t('网页版会复制路径并提示手动打开')" @click="openScriptFolder">{{ t("打开剧本文件夹") }}</button>
     </div>
     <pre style="background: #fbf9ff; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px; margin-top: 10px; max-height: 420px; overflow: auto; font-size: 12px; line-height: 1.7; white-space: pre-wrap">{{ scriptFiles.find((f) => f.name === currentScript)?.text }}</pre>
   </div>

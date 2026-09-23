@@ -15,7 +15,7 @@ type ToggleKey = "useImage" | "useTts" | "useVideoPoints" | "useBgm" | "useSe";
 const PRESETS: { id: Exclude<PresetId, "custom">; label: string; options: Record<ToggleKey, boolean> }[] = [
   {
     id: "standard",
-    label: "标准（图像 + 配音 + 音效）",
+    label: "标准（图像 + 配音 + 视频推荐位 + BGM + 音效）",
     options: { useImage: true, useTts: true, useVideoPoints: true, useBgm: true, useSe: true },
   },
   {
@@ -25,10 +25,12 @@ const PRESETS: { id: Exclude<PresetId, "custom">; label: string; options: Record
   },
 ];
 
-/** 预设是派生值：开关匹配哪一组就显示哪一组，否则「自定义」——改任一开关自动落到自定义 */
+/** 预设是派生值：开关匹配哪一组就显示哪一组，否则「自定义」——改任一开关自动落到自定义
+ *  #1109：老项目 useSe/useBgm 可能为 undefined，引擎按「只有显式 false 才算关」处理（undefined = 开），
+ *  此处统一用 !== false 判定，与引擎语义对齐，避免 undefined 被误判为省钱档 */
 const activePreset = computed<PresetId>(() => {
   const o = projectState.options;
-  const hit = PRESETS.find((p) => (Object.keys(p.options) as ToggleKey[]).every((k) => !!o[k] === p.options[k]));
+  const hit = PRESETS.find((p) => (Object.keys(p.options) as ToggleKey[]).every((k) => (o[k] !== false) === p.options[k]));
   return hit ? hit.id : "custom";
 });
 
@@ -42,13 +44,24 @@ function onPresetChange(e: Event): void {
   }
   Object.assign(projectState.options, preset.options);
 }
+
+/** #1363：清除风格参考图时，已写入「统一画风」的识别结果仍保留会误导用户以为已撤销。
+ *  缩略图必清；统一画风非空时二次确认是否一并清空（保留用户手填画风的选择权）。 */
+function clearStyleRef(): void {
+  styleRefSrc.value = "";
+  if (projectState.options.imageStyle?.trim()) {
+    if (window.confirm(t("是否同时清空上方「统一画风」？（识别结果已写入该输入框，不清空则新图仍沿用该画风）"))) {
+      projectState.options.imageStyle = "";
+    }
+  }
+}
 </script>
 
 <template>
   <div class="card">
     <div class="card-head">
       <h3>{{ t("内容") }}</h3>
-      <span class="hint">{{ t("预设一键写回下排开关；单项仍可单独覆盖") }}</span>
+      <span class="hint">{{ t("预设一键写回 5 个总开关（本页图像/配音＋输出与质量视频推荐位/BGM/音效）；单项仍可单独覆盖") }}</span>
     </div>
 
     <div class="field-grid">
@@ -124,7 +137,7 @@ function onPresetChange(e: Event): void {
             </button>
             <button v-if="styleRecognizing" class="btn small" @click="cancelStyleRecognize">{{ t("取消") }}</button>
             <span v-if="styleRefSrc" class="tag ok">{{ t("已识别") }}</span>
-            <button v-if="styleRefSrc" class="btn small" @click="styleRefSrc = ''">{{ t("清除") }}</button>
+            <button v-if="styleRefSrc" class="btn small" @click="clearStyleRef">{{ t("清除") }}</button>
             <input ref="styleRefInput" type="file" accept="image/*" style="display: none" @change="onStyleRefFile" />
           </div>
           <span class="hint">{{ t("识别结果写入上方「统一画风」；识别失败请检查「API 配置」的视觉模型") }}</span>

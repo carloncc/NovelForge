@@ -30,7 +30,6 @@ const {
   chapterStatus,
   enabledNovelChapters,
   disabledNovelChapters,
-  toggleNovelChapter,
   splitMeta,
   splitMetaText,
   splitConfirmed,
@@ -56,10 +55,19 @@ const {
 /* 页面结构：页头（无动作）→ 状态横幅 → 进度（运行时）→ 范围切换 → 任务区 → 本页结果区（运行/产物/设置/日志） */
 
 const resultRef = ref<HTMLElement | null>(null);
-/** 横幅动作只切结果区 tab 并把它滚进视野：不再有独立结果页可跳 */
-function focusResults(): void {
+/** 横幅动作只切结果区 tab 并把它滚进视野：不再有独立结果页可跳；
+ * 传锚点选择器时直接定位到失败列表 / 视觉守门面板，避免停在统计卡或卡片编辑器顶部 */
+function focusResults(anchor?: string): void {
   void nextTick(() => {
-    resultRef.value?.scrollIntoView({ block: "start", behavior: "smooth" });
+    const root = resultRef.value;
+    if (anchor && root) {
+      const el = root.querySelector(anchor);
+      if (el) {
+        el.scrollIntoView({ block: "start", behavior: "smooth" });
+        return;
+      }
+    }
+    root?.scrollIntoView({ block: "start", behavior: "smooth" });
   });
 }
 
@@ -80,7 +88,7 @@ const notice = computed<{ kind: string; title: string; text: string; action: str
       action: `${t("处理失败项")}（${failedTasks.value.length}）`,
       run: () => {
         tab.value = "run";
-        focusResults();
+        focusResults("#failed-anchor");
       },
     };
   }
@@ -92,7 +100,7 @@ const notice = computed<{ kind: string; title: string; text: string; action: str
       action: t("去确认"),
       run: () => {
         tab.value = "settings";
-        focusResults();
+        focusResults("#visual-bible-anchor");
       },
     };
   }
@@ -171,7 +179,6 @@ const notice = computed<{ kind: string; title: string; text: string; action: str
         :failed-chapters="failedChapterIndexes"
         @regen="runChapterFullRegen"
         @regen-part="runChapterPartRegen"
-        @toggle="toggleNovelChapter"
         @select="toggleChapterSelected"
         @run-selected="runSelectedChapters"
         @run-queue="runChapterQueue"
@@ -219,9 +226,9 @@ const notice = computed<{ kind: string; title: string; text: string; action: str
     opacity: 0.35;
   }
 }
-/* 结果区：scrollIntoView 的落点，顶部留出吸顶进度卡的余量 */
+/* 结果区：scrollIntoView 的落点，顶部留出吸顶进度卡的实际高度（约 120~200px）+ 余量 */
 .gen-results {
   margin-top: 12px;
-  scroll-margin-top: 12px;
+  scroll-margin-top: 200px;
 }
 </style>

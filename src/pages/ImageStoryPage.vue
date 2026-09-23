@@ -5,11 +5,13 @@ import PageHead from "../components/PageHead.vue";
 import LazyThumb from "../components/LazyThumb.vue";
 import AssetPreview from "../components/AssetPreview.vue";
 import { projectState } from "../stores/project";
+import { LANGUAGES } from "../core/types";
 import {
   imageStoryState,
   imageStoryDirForeign,
   imageStoryEstimate,
   imageStoryShots,
+  imageStoryMissingShots,
   loadImageStoryState,
   runImageStory,
   stopImageStory,
@@ -17,6 +19,7 @@ import {
   regenerateShot,
   startImageStoryPreview,
   stopImageStoryPreview,
+  openImageStoryPreviewInBrowser,
   exportImageStoryZip,
   setImageStoryDir,
   followMainProjectDir,
@@ -78,7 +81,9 @@ onBeforeUnmount(() => {
           <h3>{{ t("项目") }}</h3>
           <div class="card-actions">
             <span class="tag ok">{{ t("沿用主项目分章") }}（{{ enabledChapterCount }} {{ t("章") }}）</span>
-            <span v-if="imageStoryState.cards" class="tag ok">{{ t("卡片已就绪") }}</span>
+            <span v-if="imageStoryState.cards" class="tag ok" :title="imageStoryState.cards.title || ''">
+              {{ t("卡片已就绪") }}（{{ imageStoryState.cards.title || projectState.novel?.fileName || "" }}）
+            </span>
             <span v-if="imageStoryState.chapters.length" class="tag ok">{{ t("剧本") }} {{ imageStoryState.chapters.length }}</span>
           </div>
         </div>
@@ -88,6 +93,7 @@ onBeforeUnmount(() => {
             class="grow"
             :value="imageStoryState.outputDir"
             :title="imageStoryState.outputDir"
+            :disabled="busy"
             @change="setImageStoryDir(($event.target as HTMLInputElement).value)"
           />
           <button v-if="isTauri()" class="link-btn" :disabled="busy" @click="pickDir">{{ t("选择目录") }}</button>
@@ -114,6 +120,9 @@ onBeforeUnmount(() => {
         </div>
         <p v-if="imageStoryEstimate.unbounded" class="hint mt-2">
           {{ t("当前不限上限，实际张数以剧本产出为准（上值为按每场景 2 张的粗估）。") }}
+        </p>
+        <p v-else-if="!imageStoryEstimate.exact && imageStoryState.options.shotsTotal > 0" class="hint mt-2">
+          {{ t("已按总张数上限 {n} 封顶（粗估）。", { n: imageStoryState.options.shotsTotal }) }}
         </p>
         <div class="opt-grid">
           <label class="opt-item">
@@ -157,16 +166,15 @@ onBeforeUnmount(() => {
             <label class="opt-item">
               <input type="checkbox" v-model="imageStoryState.useSe" /> {{ t("环境音效（SE）") }}
             </label>
-            <label class="opt-item" :title="t('先生成一张全项目画风基准图，背景/CG 以其为参考图，强制所有图片画风统一（推荐开启）')">
-              <input type="checkbox" v-model="imageStoryState.options.styleAnchor" /> {{ t("风格锚点（背景/CG 统一画风）") }}
+            <label class="opt-item" :title="t('图片小说模式暂不支持风格锚点：分镜不引用锚点参考图，为避免无效计费已停止生成锚点图')">
+              <input type="checkbox" v-model="imageStoryState.options.styleAnchor" disabled /> {{ t("风格锚点（图片小说暂不支持，已自动跳过）") }}
+              <span class="hint">{{ t("图片小说分镜不引用锚点参考图：开启也不会生成、不计费") }}</span>
             </label>
             <label class="opt-item">
               <span>{{ t("目标语言（留空用原文；复用主项目翻译缓存）") }}</span>
               <select v-model="imageStoryState.options.language">
                 <option value="">{{ t("不翻译（使用原文）") }}</option>
-                <option value="en">English</option>
-                <option value="ja">日本語</option>
-                <option value="ko">한국어</option>
+                <option v-for="l in LANGUAGES" :key="l.code" :value="l.code">{{ l.label }}</option>
               </select>
             </label>
           </div>
@@ -205,12 +213,19 @@ onBeforeUnmount(() => {
       </div>
 
       <!-- 分镜结果 -->
-      <div v-if="imageStoryShots.length" class="card">
+      <div v-if="imageStoryShots.length || imageStoryMissingShots.length" class="card">
         <div class="card-head">
           <h3>{{ t("分镜结果") }}</h3>
           <div class="card-actions">
             <span v-if="imageStoryState.previewRunning" class="tag ok">{{ t("预览已启动") }}</span>
             <button class="btn secondary small" :disabled="busy" @click="startImageStoryPreview">{{ t("预览") }}</button>
+            <button
+              v-if="imageStoryState.previewRunning"
+              class="btn secondary small"
+              @click="openImageStoryPreviewInBrowser"
+            >
+              {{ t("系统浏览器打开") }}
+            </button>
             <button
               v-if="imageStoryState.previewRunning"
               class="btn secondary small"
@@ -235,9 +250,28 @@ onBeforeUnmount(() => {
               <div class="shot-actions">
                 <button class="link-btn" @click="preview = { path: s.path, label: s.note }">{{ t("放大") }}</button>
                 <button class="link-btn" :disabled="busy" @click="regenerateShot(s.id)">{{ t("重生成这张") }}</button>
+          </div>
+        </div>
+        <div v-if="imageStoryMissingShots.length" class="mb-3">
+          <div class="stage-row-label" style="margin-bottom: 6px">
+            <b>{{ t("缺失分镜（{n} 张未生成）", { n: imageStoryMissingShots.length }) }}</b>
+            <span class="faint small">{{ t("点「重试失败项」补跑（命中缓存不重复计费）") }}</span>
+          </div>
+          <div class="shot-grid">
+            <div v-for="m in imageStoryMissingShots.slice(0, 24)" :key="m.id" class="shot-cell">
+              <div class="shot-thumb" style="display: flex; align-items: center; justify-content: center; background: var(--panel); border: 1px dashed var(--border)">
+                <span class="hint">{{ m.title || `${t("第")}${m.chapter + 1}${t("章")}` }} · {{ m.note }}</span>
+              </div>
+              <div class="shot-actions">
+                <span class="hint">{{ m.id }}</span>
               </div>
             </div>
           </div>
+          <p v-if="imageStoryMissingShots.length > 24" class="hint mt-1">
+            {{ t("还有 {n} 张缺失分镜未列出", { n: imageStoryMissingShots.length - 24 }) }}
+          </p>
+        </div>
+      </div>
         </div>
       </div>
       <div v-else class="card empty-next">

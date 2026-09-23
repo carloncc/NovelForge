@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { projectState } from "../stores/project";
+import { notifyPreviewTaken } from "../stores/imageStory";
+import { previewOwner, claimPreview, releasePreview } from "../stores/preview";
 import { tauri } from "../utils/tauri";
 import { t } from "../i18n";
 import { errMsg } from "../utils/errors";
@@ -47,13 +49,17 @@ async function startPreview(): Promise<void> {
   }
   starting.value = true;
   try {
-    await tauri.stopPreviewServer();
-    const res = await tauri.startPreviewServer(dir);
-    url.value = res.url;
+    // #1323：经共享持有者接管。若图片小说持有服务，先清掉它那边的"已启动"假状态再接管。
+    const prev = previewOwner();
+    const started = await claimPreview("main", dir);
+    if (prev === "imageStory") notifyPreviewTaken("主项目预览");
+    url.value = started;
     reloadKey.value++;
-    log.info("page", "预览服务器启动", { dir, url: res.url });
+    log.info("page", "预览服务器启动", { dir, url: started });
   } catch (e) {
     log.error("page", "预览服务器启动失败", { dir, error: errMsg(e) });
+    // #1368：启动失败时旧服务已被 stop 杀掉，必须清空 url，否则鉴赏室/浏览器按钮仍指向死链
+    url.value = "";
     error.value = errMsg(e);
   } finally {
     starting.value = false;
@@ -62,10 +68,11 @@ async function startPreview(): Promise<void> {
 
 async function stopPreview(): Promise<void> {
   try {
-    await tauri.stopPreviewServer();
+    // #1323：只停自己持有的；若服务已被图片小说接管，这里不杀别人的服务，只清本地显示
+    const released = await releasePreview("main");
     url.value = "";
     error.value = "";
-    log.info("page", "预览服务器已停止");
+    log.info("page", released ? "预览服务器已停止" : "主项目未持有预览服务（图片小说的服务未动），已清除本地显示");
   } catch (e) {
     log.error("page", "停止预览失败", { error: errMsg(e) });
     error.value = t("停止预览失败：{error}（可重试；若服务已退出可忽略）", { error: errMsg(e) });
@@ -104,7 +111,9 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   document.removeEventListener("fullscreenchange", onFullscreenChange);
-  void tauri.stopPreviewServer();
+  // #1323：只停自己持有的预览——切页不再无条件杀掉图片小说的服务；本地 url 随组件销毁，无需保留
+  void releasePreview("main").catch(() => undefined);
+  url.value = "";
 });
 </script>
 
@@ -144,7 +153,7 @@ onBeforeUnmount(() => {
         <span class="hint">{{ t("全屏后可用 Esc 退出；游戏内坐标系按 16:9 适配") }}</span>
       </div>
       <div ref="stageRef" class="preview-stage" :class="{ zoomed: zoom > 100 }" :style="stageStyle">
-        <iframe :key="reloadKey" class="preview-frame" :src="url" allow="fullscreen" />
+        <iframe :key="reloadKey" class="preview-frame" :src="url" allow="fullscreen; autoplay" />
       </div>
     </div>
     <div v-else class="card empty">

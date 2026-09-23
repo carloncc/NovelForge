@@ -318,6 +318,18 @@ export function nodeDefaultDir(kind: "output" | "resources"): string {
   return kind === "output" ? "/app/exports" : "/app/template";
 }
 
+/** 登记文件所在目录（对话框选中文件后调用）：取父目录登记，失败静默
+ *  （后续文件命令会给出明确拒绝，不在这里打断用户流程）。 */
+export async function blessParentDir(filePath: string): Promise<void> {
+  if (!isTauri() || !filePath) return;
+  const parent = filePath.replace(/\\/g, "/").split("/").slice(0, -1).join("/") || filePath;
+  try {
+    await tauri.blessProjectDir(parent);
+  } catch {
+    /* 登记失败不阻断，后续文件命令会给出明确拒绝 */
+  }
+}
+
 export const tauri = {
   http: wrap("http", (args: {
     method: string;
@@ -356,6 +368,13 @@ export const tauri = {
     return import("node:fs/promises").then(async (fs) => {
       await fs.mkdir(path, { recursive: true });
     });
+  }),
+  /** 登记用户自选目录（#1292）：桌面端文件白名单只放行工作目录/临时目录/家目录 +
+   *  此处登记的目录。切换项目、系统对话框选中文件/目录后调用——用户已明示授权。
+   *  非桌面端为 no-op（网页版走 VFS/代理，不受 Rust 白名单约束）。 */
+  blessProjectDir: wrap("blessProjectDir", async (path: string): Promise<void> => {
+    if (!isTauri()) return;
+    await invoke("bless_project_dir", { path });
   }),
   copyFile: wrap("copyFile", (src: string, dst: string): Promise<void> => {
     if (isTauri()) return invoke("copy_file", { src, dst });

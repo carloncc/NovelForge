@@ -1,4 +1,5 @@
 import type { ApiConfig, ApiPreset, ChannelKey, VoiceProfile } from "../core/types";
+import { t } from "../i18n";
 
 export const CONFIG_SCHEMA_VERSION = 3 as const;
 
@@ -55,6 +56,10 @@ export interface ProjectEntry {
 export interface ConfigMigrationResult {
   config: ConfigFile;
   migrated: boolean;
+  /** #1308：丢弃/改名/回填项的人类可读警告（UI 侧用 t key 占位展示，见下方 t() 调用） */
+  warnings: string[];
+  /** #1308：重复 id 改名映射（oldId→newId），用于密钥跟随 */
+  renames: Array<{ oldId: string; newId: string }>;
 }
 
 type ConfigFactory = () => ApiConfig;
@@ -72,6 +77,8 @@ export interface ConfigLoadResult {
   migrationPending: boolean;
   migrationSaveError?: Error;
   secretStoreError?: Error;
+  /** #1308：迁移警告透给 UI 横幅 */
+  migrationWarnings?: string[];
 }
 
 export class UnsupportedConfigVersionError extends Error {
@@ -137,6 +144,7 @@ function normalizePreset(
   shouldMigrate: boolean,
   createId: () => string,
   createVisionDefault: ConfigFactory,
+  warnings?: string[],
 ): ApiPreset {
   const preset = recordOrEmpty(input);
   const channels = recordOrEmpty(preset.channels);
@@ -151,6 +159,8 @@ function normalizePreset(
     const migratedVision = migratedVisionConfig(llm, activeId(active, "llm"), createId, createVisionDefault);
     vision = [migratedVision];
     visionId = migratedVision.id;
+    // #1308：回填需可见（尤其 v2 升级路径）
+    warnings?.push(t("已自动补齐图片识别通道（沿用文本模型配置）"));
   } else if (!vision.some((config) => config.id === visionId)) {
     visionId = vision[0]?.id ?? "";
   }
@@ -183,15 +193,22 @@ export function migrateConfigFile(
   if (version !== undefined && version !== 1 && version !== 2 && version !== 3 && version !== CONFIG_SCHEMA_VERSION) {
     throw new UnsupportedConfigVersionError(version);
   }
-  const shouldAddVision = version === undefined || version === 1;
+  // #1308：v2 无 vision 永不补——放宽到 version<3（undefined/1/2 均回填）
+  const shouldAddVision = version === undefined || (typeof version === "number" && version < 3);
   const shouldMigrate = version !== CONFIG_SCHEMA_VERSION;
+  const warnings: string[] = [];
   const presets = Array.isArray(root.presets)
-    ? root.presets.map((preset) => normalizePreset(preset, shouldAddVision, createId, createVisionDefault))
+    ? root.presets.map((preset) => normalizePreset(preset, shouldAddVision, createId, createVisionDefault, warnings))
     : [];
-  const repairedDuplicateIds = repairDuplicateConfigIds(presets, createId);
+  const { repaired, renames } = repairDuplicateConfigIds(presets, createId);
+  for (const r of renames) {
+    warnings.push(t("配置 id 重复已自动改名：{old} → {new}（密钥已跟随）", { old: r.oldId, new: r.newId }));
+  }
 
   return {
-    migrated: shouldMigrate || repairedDuplicateIds,
+    migrated: shouldMigrate || repaired,
+    warnings,
+    renames,
     config: {
       configSchemaVersion: CONFIG_SCHEMA_VERSION,
       presets,
@@ -200,20 +217,29 @@ export function migrateConfigFile(
       recentOutputDirs: Array.isArray(root.recentOutputDirs)
         ? root.recentOutputDirs.filter((dir): dir is string => typeof dir === "string")
         : [],
-      projects: normalizeProjects(root.projects, createId),
-      voiceProfiles: normalizeVoiceProfiles(root.voiceProfiles),
+      projects: normalizeProjects(root.projects, createId, warnings),
+      voiceProfiles: normalizeVoiceProfiles(root.voiceProfiles, warnings),
       cutout: normalizeCutoutSettings(root.cutout),
     },
   };
 }
 
-function normalizeProjects(input: unknown, createId: () => string): ProjectEntry[] {
+function normalizeProjects(input: unknown, createId: () => string, warnings?: string[]): ProjectEntry[] {
   if (!Array.isArray(input)) return [];
   const seen = new Set<string>();
   return input.flatMap((candidate) => {
     const record = recordOrEmpty(candidate);
     const outputDir = typeof record.outputDir === "string" ? record.outputDir : "";
-    if (!outputDir || seen.has(outputDir)) return [];
+    if (!outputDir) {
+      warnings?.push(t("项目条目缺少输出目录已跳过"));
+      return [];
+    }
+    // #1308：重复 outputDir 不再静默丢弃——保留首条并警告（含名称供定位）
+    if (seen.has(outputDir)) {
+      const dupName = typeof record.name === "string" && record.name ? record.name : outputDir;
+      warnings?.push(t("重复项目目录已保留首条并跳过：{dir}（跳过“{name}”）", { dir: outputDir, name: dupName }));
+      return [];
+    }
     seen.add(outputDir);
     const novelFileName = typeof record.novelFileName === "string" ? record.novelFileName : "";
     return [{
@@ -242,16 +268,20 @@ function normalizeCutoutSettings(input: unknown): CutoutSettings {
   return { mode, modelId };
 }
 
-function normalizeVoiceProfiles(input: unknown): VoiceProfile[] {
+function normalizeVoiceProfiles(input: unknown, warnings?: string[]): VoiceProfile[] {
   if (!Array.isArray(input)) return [];
-  return input.flatMap((candidate) => {
+  // #1308：逐条校验、只丢坏条并警告（此前审计称整库丢弃；现逐条保留好条）
+  return input.flatMap((candidate, idx) => {
     const profile = recordOrEmpty(candidate);
     if (
       typeof profile.id !== "string" || !profile.id ||
       typeof profile.name !== "string" || !profile.name ||
       typeof profile.ttsConfigId !== "string" || !profile.ttsConfigId ||
       typeof profile.voiceId !== "string" || !profile.voiceId
-    ) return [];
+    ) {
+      warnings?.push(t("音色库第 {n} 条缺少必填字段已跳过（id/name/ttsConfigId/voiceId 任一缺失）", { n: idx + 1 }));
+      return [];
+    }
     return [{
       id: profile.id,
       name: profile.name,
@@ -268,8 +298,9 @@ function normalizeVoiceProfiles(input: unknown): VoiceProfile[] {
   });
 }
 
-function repairDuplicateConfigIds(presets: ApiPreset[], createId: () => string): boolean {
+function repairDuplicateConfigIds(presets: ApiPreset[], createId: () => string): { repaired: boolean; renames: Array<{ oldId: string; newId: string }> } {
   const seen = new Set<string>();
+  const renames: Array<{ oldId: string; newId: string }> = [];
   let repaired = false;
   for (const preset of presets) {
     for (const kind of ["llm", "vision", "image", "tts"] as const) {
@@ -281,12 +312,13 @@ function repairDuplicateConfigIds(presets: ApiPreset[], createId: () => string):
         const duplicateId = apiConfig.id;
         do apiConfig.id = createId(); while (seen.has(apiConfig.id));
         seen.add(apiConfig.id);
+        renames.push({ oldId: duplicateId, newId: apiConfig.id });
         if (preset.active[kind] === duplicateId) preset.active[kind] = apiConfig.id;
         repaired = true;
       }
     }
   }
-  return repaired;
+  return { repaired, renames };
 }
 
 function apiConfigs(config: ConfigFile): ApiConfig[] {
@@ -325,8 +357,24 @@ export async function loadConfigFile(raw: string, options: ConfigLoadOptions): P
   try {
     const configs = apiConfigs(migration.config);
     const stored = await options.readSecrets(configs.map((apiConfig) => apiConfig.id));
+    // #1308：改名即丢 key——新 id 缺失时从旧 id 跟随（文件内联 key 优先，store 回退跟随）
+    for (const { oldId, newId } of migration.renames) {
+      if (!Object.prototype.hasOwnProperty.call(stored, newId) && Object.prototype.hasOwnProperty.call(stored, oldId)) {
+        stored[newId] = stored[oldId];
+      }
+    }
     for (const apiConfig of configs) {
       if (Object.prototype.hasOwnProperty.call(stored, apiConfig.id)) apiConfig.apiKey = stored[apiConfig.id];
+    }
+    // 跟随出的新密钥尽快落库，避免下次仍只有旧 key
+    if (migration.renames.length) {
+      const carry: Record<string, string> = {};
+      for (const { newId } of migration.renames) {
+        if (Object.prototype.hasOwnProperty.call(stored, newId)) carry[newId] = stored[newId];
+      }
+      if (Object.keys(carry).length) {
+        await options.writeSecrets(carry).catch(() => undefined);
+      }
     }
   } catch (error) {
     secretStoreError = error instanceof Error ? error : new Error(String(error));
@@ -337,6 +385,7 @@ export async function loadConfigFile(raw: string, options: ConfigLoadOptions): P
     migrationPending: Boolean(migrationSaveError),
     migrationSaveError,
     secretStoreError,
+    migrationWarnings: migration.warnings,
   };
 }
 
