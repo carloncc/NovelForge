@@ -22,8 +22,8 @@ async function main(): Promise<void> {
     "不同名应判 different",
   );
   assert(
-    decideNovelImport({ fileName: "a.txt", titleSig: "一|二" }, { fileName: "a.txt", titleSig: "一|三" }) === "different",
-    "同名不同章节签名应判 different",
+    decideNovelImport({ fileName: "a.txt", titleSig: "一|二" }, { fileName: "a.txt", titleSig: "一|三" }) === "same",
+    "同文件名应判 same（#1364：titleSig 含 AI 分章后标题/用户改名，同书重导必然不一致，不能据此判不同小说）",
   );
 
   // 子目录名建议（纯函数）

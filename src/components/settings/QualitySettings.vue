@@ -38,6 +38,20 @@ function onSeedChange(e: Event): void {
   projectState.options.imageSeed = clamped;
   if (el.value.trim() !== String(clamped)) el.value = String(clamped);
 }
+
+/** 1399：SE 音量。seVolume 未进 GenerationOptions 类型表（白名单外），用可选交集读写；
+ *  渲染侧缺省为 35，这里同口径回显，避免未设置时显示空值。 */
+type OptionsWithSeVolume = { seVolume?: number };
+function getSeVolume(): number {
+  const v = (projectState.options as OptionsWithSeVolume).seVolume;
+  return typeof v === "number" && Number.isFinite(v) ? v : 35;
+}
+function onSeVolumeChange(e: Event): void {
+  const el = e.target as HTMLInputElement;
+  const clamped = Math.min(100, clampNonNegativeInt(el.value));
+  (projectState.options as OptionsWithSeVolume).seVolume = clamped;
+  if (el.value.trim() !== String(clamped)) el.value = String(clamped);
+}
 </script>
 
 <template>
@@ -73,6 +87,14 @@ function onSeedChange(e: Event): void {
             {{ t("环境音效（SE）") }}
             <span class="hint">{{ t("按场景氛围播放内置雨/雷/风等音效（留空/缺省按开启处理）") }}</span>
           </span>
+        </label>
+      </div>
+      <!-- 1399：SE 音量入口（此前 seVolume 无任何 UI/调用方，恒为 35） -->
+      <div v-if="projectState.options.useSe !== false" class="field-grid mt-3">
+        <label class="field">
+          <span>{{ t("环境音效音量（0-100，默认 35）") }}</span>
+          <input type="number" min="0" max="100" :value="getSeVolume()" @change="onSeVolumeChange" />
+          <span class="hint">{{ t("仅影响按氛围播放的 SE（雨/雷/风等），不影响 BGM 与配音") }}</span>
         </label>
       </div>
     </div>

@@ -77,6 +77,9 @@ export function buildExportOverridePrompt(report: LintReport): string {
 const CMD_RE = /^(changeBg|changeFigure|intro|bgm|playEffect|end|changeScene|unlockCg|unlockBgm|label|jumpLabel|choose|playVideo|filmMode|setFilter|setAnimation|setTempAnimation|setTransform):.*;$/;
 const END_RE = /^end;$/;
 const LINE_RE = /^(?:[^:;\\]|\\[:;,\.`\\])*:(.*);$/;
+// 1449：引擎裸选项白名单只认 ogg/mp3/wav/opus（bundle match(/.ogg|.mp3|.wav|.opus/)，flac 0 命中）。
+// render 已改用 -vocal= 显式键（不校验扩展名），lint 在此拦截 flac/m4a 配音，避免“有文件但无声”静默包。
+const ENGINE_VOCAL_EXTS = new Set(["mp3", "ogg", "wav", "opus"]);
 
 export async function lintProject(outputDir: string): Promise<LintReport> {
   const report: LintReport = {
@@ -168,7 +171,8 @@ export async function lintProject(outputDir: string): Promise<LintReport> {
         if (END_RE.test(line)) fileHasEnd.add(f.name);
         if (line.startsWith("label:")) {
           const name = line.slice(6, -1).trim();
-          if (labels.has(name)) warn(`语法(${f.name})`, `label 重复：${name}`);
+          // 1462：sanitizeId 折叠后撞名会跳进另一个场景的分支（render 已加哈希前缀），重复 label 从 warn 提升为 error 拦截。
+          if (labels.has(name)) err(`语法(${f.name})`, `label 重复：${name}`);
           labels.add(name);
           continue;
         }
@@ -193,30 +197,37 @@ export async function lintProject(outputDir: string): Promise<LintReport> {
         if (cmd === "playVideo") videoRefs++;
         const assetDir = assetDirOf(cmd);
         // unlockCg/unlockBgm/playEffect 均需校验存在性；bgm:none / changeFigure:none 豁免
+        // 1460 兼容：unlock 内容现为 game/background|bgm/<file> 相对路径，取 basename 比对（旧裸文件名同样兼容）。
         if (assetDir) {
-          const fileName = line.slice(cmd.length + 1).split(" ")[0].replace(/;$/, "").toLowerCase();
+          const rawName = line.slice(cmd.length + 1).split(" ")[0].replace(/;$/, "");
+          const fileName = (rawName.split(/[\\/]/).pop() || rawName).toLowerCase();
           if (fileName !== "none" && !assetFiles[assetDir].has(fileName)) {
             report.summary.missingAssets++;
             err(`素材(${f.name})`, `引用缺失：${fileName}（game/${assetDir}/ 中不存在）`);
           }
+          continue;
         }
         continue;
       }
 
       if (LINE_RE.test(line)) {
         lineCount++;
-        // 对话语音参数 -xxx.mp3;（含 flac/m4a/opus/ogg/wav 全格式）
-        const vocalMatch = line.match(/ -([\w\u4e00-\u9fa5.-]+\.(mp3|ogg|opus|wav|flac|m4a));$/);
+        // 对话语音参数 -vocal=xxx / 裸 -xxx（1449：render 已统一输出 -vocal=，旧包裸参数仍兼容校验）
+        const vocalMatch = line.match(/ -(?:vocal=)?([\w\u4e00-\u9fa5.-]+\.(mp3|ogg|opus|wav|flac|m4a));$/);
         if (vocalMatch) {
           vocalRefs++;
           const v = vocalMatch[1].toLowerCase();
-          if (!assetFiles.vocal.has(v)) {
+          const ext = (vocalMatch[2] || "").toLowerCase();
+          if (!ENGINE_VOCAL_EXTS.has(ext)) {
+            report.summary.missingAssets++;
+            err(`素材(${f.name})`, `配音格式引擎不支持：${v}（WebGAL 只认 ogg/mp3/wav/opus，请转码）`);
+          } else if (!assetFiles.vocal.has(v)) {
             report.summary.missingAssets++;
             err(`素材(${f.name})`, `配音缺失：${v}（game/vocal/ 中不存在）`);
           }
         }
         // 超长台词告警：与 TTS 合成上限同口径（超限会按句自动拆段配音，仍建议人工拆句以优化阅读）
-        const textPart = line.split(":").slice(1).join(":").replace(/ -[^ ]+\.(mp3|ogg|opus|wav|flac|m4a);$/, "");
+        const textPart = line.split(":").slice(1).join(":").replace(/ -(?:vocal=)?[^ ]+\.(mp3|ogg|opus|wav|flac|m4a);$/, "");
         if (textPart.length > TTS_SPEECH_MAX_CHARS) {
           warn(`体验(${f.name})`, `超长台词（${textPart.length}字 > ${TTS_SPEECH_MAX_CHARS}）：已按句自动拆分配音，仍建议拆句`);
         }

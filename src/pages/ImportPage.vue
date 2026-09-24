@@ -135,6 +135,10 @@ async function onNovelFile(e: Event): Promise<void> {
 
 async function loadDemo(): Promise<void> {
   if (!guardRunning(t("加载示例"))) return;
+  // #1415：与其它导入入口同口径——先清旧 error/notice，避免残留上一次失败提示；
+  // guardNovelDir 内含 mkdirAll/restoreProject 可能抛错，必须 catch 写入 error（异步点击处理器裸 rejection 只进 console）。
+  error.value = "";
+  notice.value = "";
   if (projectState.novel && !window.confirm(t("加载示例小说将覆盖当前已导入的小说（标题修改/章节停用一并丢失）。继续吗？"))) return;
   const doc: NovelDoc = {
     fileName: "星陨之城的守夜人.txt",
@@ -143,9 +147,14 @@ async function loadDemo(): Promise<void> {
     fullText: DEMO_NOVEL,
     chapters: splitChapters(DEMO_NOVEL, "星陨之城的守夜人"),
   };
-  if (!(await guardNovelDir(doc))) return;
-  projectState.novel = doc;
-  log.info("page", "加载示例小说", { chapters: doc.chapters.length, charCount: doc.fullText.length });
+  try {
+    if (!(await guardNovelDir(doc))) return;
+    projectState.novel = doc;
+    log.info("page", "加载示例小说", { chapters: doc.chapters.length, charCount: doc.fullText.length });
+  } catch (e) {
+    log.error("page", "加载示例小说失败", { error: errMsg(e) });
+    error.value = t("加载示例失败：{error}", { error: errMsg(e) });
+  }
 }
 
 async function pickMaterials(): Promise<void> {
@@ -318,6 +327,8 @@ async function newProject(): Promise<void> {
   if (!guardRunning(t("新建项目"))) return;
   const picked = await open({ directory: true, multiple: false });
   if (!picked || typeof picked !== "string") return;
+  // #1414：先登记用户自选目录再读快照，否则白名单外路径恒返回 null，「已有项目缓存」确认守卫静默失效
+  await blessParentDir(picked);
   const snap = await readDirNovelIdentity(picked);
   if (snap && !window.confirm(t("该目录已有「{name}」的项目缓存。点「确定」打开它，点「取消」换个目录。", { name: snap.fileName }))) return;
   try {

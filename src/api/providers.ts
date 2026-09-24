@@ -276,6 +276,23 @@ export interface DiscoveredModel {
  */
 const DEFAULT_CONTEXT_LENGTH = 128_000;
 
+/** 上下文长度输入下限（#1384）：与输入框 min=1024 对齐，手输更小值时 clamp */
+export const MIN_CONTEXT_LENGTH = 1024;
+
+/**
+ * #1384 上下文长度输入清洗（纯函数，供 ConfigPage 与单测共用）：
+ * - 空串 → undefined（回显空，走自动探测）
+ * - 非有限数（abc/NaN/Infinity）→ undefined（不再写入 NaN 落盘变 null）
+ * - 有限数 → 向下取整后 clamp 到 >= MIN_CONTEXT_LENGTH
+ */
+export function sanitizeContextLengthInput(raw: string): number | undefined {
+  const v = (raw ?? "").trim();
+  if (v === "") return undefined;
+  const n = Number(v);
+  if (!Number.isFinite(n)) return undefined;
+  return Math.max(MIN_CONTEXT_LENGTH, Math.floor(n));
+}
+
 /** 从 /models 单项里尽量抽出一个 token 数；找不到返回 undefined */
 function extractContextLength(record: Record<string, unknown>): number | undefined {
   const candidates = [

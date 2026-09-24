@@ -67,7 +67,8 @@ onBeforeUnmount(() => {
         {{ imageStoryState.stopping ? t("正在停止…") : t("停止") }}
       </button>
     </PageHead>
-    <p class="hint" style="margin: 8px 2px">{{ t("图片小说模式暂不支持配音（如需人声请使用立绘模式）。") }}</p>
+    <!-- #1140：配音开关（默认关）开启后跑配音阶段；关闭时与此前一致无配音 -->
+    <p class="hint" style="margin: 8px 2px">{{ imageStoryState.useVoice ? t("配音已开启：按台词行合成语音（TTS 计费，命中缓存不重复计费），失败可在下方失败清单重试。") : t("配音默认关闭：如需人物语音请勾选高级设置里的「配音」。") }}</p>
 
     <div v-if="!projectState.novel" class="card empty-next">
       <p class="hint">{{ t("还没有小说：导入小说（或加载示例小说）后即可生成图片版。") }}</p>
@@ -127,23 +128,23 @@ onBeforeUnmount(() => {
         <div class="opt-grid">
           <label class="opt-item">
             <span>{{ t("每场景张数（0=不限）") }}</span>
-            <input type="number" min="0" style="width: 80px" v-model.number="imageStoryState.options.shotsPerScene" />
+            <input type="number" min="0" style="width: 80px" v-model.number="imageStoryState.options.shotsPerScene" :disabled="busy" />
           </label>
           <label class="opt-item">
             <span>{{ t("每章上限（0=不限）") }}</span>
-            <input type="number" min="0" style="width: 80px" v-model.number="imageStoryState.options.shotsPerChapter" />
+            <input type="number" min="0" style="width: 80px" v-model.number="imageStoryState.options.shotsPerChapter" :disabled="busy" />
           </label>
           <label class="opt-item">
             <span>{{ t("总张数上限（0=不限，到达后暂停可续跑）") }}</span>
-            <input type="number" min="0" style="width: 80px" v-model.number="imageStoryState.options.shotsTotal" />
+            <input type="number" min="0" style="width: 80px" v-model.number="imageStoryState.options.shotsTotal" :disabled="busy" />
           </label>
           <label class="opt-item">
             <span>{{ t("统一画风") }}</span>
-            <input type="text" class="grow" v-model="imageStoryState.options.imageStyle" :placeholder="t('例：unified Japanese anime style, cel shading, clean line art')" />
+            <input type="text" class="grow" v-model="imageStoryState.options.imageStyle" :placeholder="t('例：unified Japanese anime style, cel shading, clean line art')" :disabled="busy" />
           </label>
           <label class="opt-item" :title="t('只影响台词/旁白的写作风格，不影响画面；改画风不会让剧本重写')">
             <span>{{ t("剧本文风（留空用默认；改画风不会重写剧本）") }}</span>
-            <input type="text" class="grow" v-model="imageStoryState.scriptStyle" :placeholder="t('例：冷峻简洁的短句对白')" />
+            <input type="text" class="grow" v-model="imageStoryState.scriptStyle" :placeholder="t('例：冷峻简洁的短句对白')" :disabled="busy" />
           </label>
         </div>
         <details class="mt-2">
@@ -151,20 +152,25 @@ onBeforeUnmount(() => {
           <div class="opt-grid mt-2">
             <label class="opt-item" :title="t('固定所有图片生成的随机种子：同一种子下背景/CG/立绘的画风与角色更稳定一致。0 = 按小说标题自动派生')">
               <span>{{ t("固定种子（0 = 按标题自动派生）") }}</span>
-              <input type="number" min="0" style="width: 100px" v-model.number="imageStoryState.options.imageSeed" />
+              <input type="number" min="0" style="width: 100px" v-model.number="imageStoryState.options.imageSeed" :disabled="busy" />
             </label>
             <label class="opt-item" :title="t('使用独立图片识别 API 核对生成图，不合格自动重生成 1 次（会增加费用与耗时）')">
-              <input type="checkbox" v-model="imageStoryState.options.imageSelfCheck" /> {{ t("图像自检（多模态核对，不合格自动重生成）") }}
+              <input type="checkbox" v-model="imageStoryState.options.imageSelfCheck" :disabled="busy" /> {{ t("图像自检（多模态核对，不合格自动重生成）") }}
             </label>
             <label class="opt-item" :title="t('图片小说模式不展示物品图：渲染端只出文字卡、鉴赏室也不收录，生成即浪费费用，故已禁用')">
               <input type="checkbox" v-model="imageStoryState.options.includeItems" disabled /> {{ t("生成物品图（默认关闭）") }}
               <span class="hint">{{ t("图片小说模式不展示物品图，已自动跳过（开启也不会生成）") }}</span>
             </label>
             <label class="opt-item">
-              <input type="checkbox" v-model="imageStoryState.useBgm" /> {{ t("背景音乐（BGM）") }}
+              <input type="checkbox" v-model="imageStoryState.useBgm" :disabled="busy" /> {{ t("背景音乐（BGM）") }}
             </label>
             <label class="opt-item">
-              <input type="checkbox" v-model="imageStoryState.useSe" /> {{ t("环境音效（SE）") }}
+              <input type="checkbox" v-model="imageStoryState.useSe" :disabled="busy" /> {{ t("环境音效（SE）") }}
+            </label>
+            <p class="hint mt-1">{{ t("BGM/SE 开关切换后需重新点「开始生成」完成组装才生效（组装本地免费）") }}</p>
+            <!-- #1140：配音开关（默认关），复用主项目 TTS 配置与音色库 -->
+            <label class="opt-item" :title="t('复用主项目 TTS 配置与音色库：按台词行合成语音，产物随组装进入游戏')">
+              <input type="checkbox" v-model="imageStoryState.useVoice" /> {{ t("配音（TTS 台词语音，默认关闭）") }}
             </label>
             <label class="opt-item" :title="t('图片小说模式暂不支持风格锚点：分镜不引用锚点参考图，为避免无效计费已停止生成锚点图')">
               <input type="checkbox" v-model="imageStoryState.options.styleAnchor" disabled /> {{ t("风格锚点（图片小说暂不支持，已自动跳过）") }}
@@ -172,7 +178,7 @@ onBeforeUnmount(() => {
             </label>
             <label class="opt-item">
               <span>{{ t("目标语言（留空用原文；复用主项目翻译缓存）") }}</span>
-              <select v-model="imageStoryState.options.language">
+              <select v-model="imageStoryState.options.language" :disabled="busy">
                 <option value="">{{ t("不翻译（使用原文）") }}</option>
                 <option v-for="l in LANGUAGES" :key="l.code" :value="l.code">{{ l.label }}</option>
               </select>
@@ -188,7 +194,8 @@ onBeforeUnmount(() => {
             <span v-if="busy" class="spinner" />
             {{ busy ? t("生成中…") : t("开始生成") }}
           </button>
-          <span class="hint">{{ imageStoryState.stage || t("提取 → 分镜剧本 → 图片 → 组装（复用缓存，只补缺失）") }}</span>
+          <!-- #1140：配音开启时运行链含配音阶段 -->
+          <span class="hint">{{ imageStoryState.stage || (imageStoryState.useVoice ? t("提取 → 分镜剧本 → 图片 → 配音 → 组装（复用缓存，只补缺失）") : t("提取 → 分镜剧本 → 图片 → 组装（复用缓存，只补缺失）")) }}</span>
           <span class="grow" />
           <span class="hint">{{ t("已生成 {n} 张", { n: imageStoryState.produced }) }}</span>
           <span v-if="failed.length" class="tag warn">{{ t("失败 {n} 张", { n: failed.length }) }}</span>
@@ -249,14 +256,29 @@ onBeforeUnmount(() => {
               <LazyThumb :path="s.path" :alt="s.note" class="shot-thumb" @click="preview = { path: s.path, label: s.note }" />
               <div class="shot-actions">
                 <button class="link-btn" @click="preview = { path: s.path, label: s.note }">{{ t("放大") }}</button>
-                <button class="link-btn" :disabled="busy" @click="regenerateShot(s.id)">{{ t("重生成这张") }}</button>
+                <button
+                  class="link-btn"
+                  :disabled="busy"
+                  :title="t('无图像 API 或该分镜被当前张数设置排除时，点击会在日志中提示原因')"
+                  @click="regenerateShot(s.id)"
+                >
+                  {{ t("重生成这张") }}
+                </button>
+              </div>
+            </div>
           </div>
         </div>
+        <!-- #1402：缺失块与 v-for 平级（此前误嵌在 group/shot-grid 内导致重复 N 次、零成功分镜时不可见） -->
         <div v-if="imageStoryMissingShots.length" class="mb-3">
           <div class="stage-row-label" style="margin-bottom: 6px">
             <b>{{ t("缺失分镜（{n} 张未生成）", { n: imageStoryMissingShots.length }) }}</b>
-            <span class="faint small">{{ t("点「重试失败项」补跑（命中缓存不重复计费）") }}</span>
+            <span class="faint small">{{ t("点「补跑缺失分镜」补跑（命中缓存不重复计费）") }}</span>
+            <!-- #1403：独立补跑入口（不依赖 failed 列表；failed 为空时「重试失败项」不存在） -->
+            <button class="btn secondary small" :disabled="busy" @click="retryFailedImages">{{ t("补跑缺失分镜") }}</button>
           </div>
+          <p v-if="imageStoryState.options.shotsTotal > 0" class="hint mt-1">
+            {{ t("已达总张数上限时缺失分镜不在计划内：请提高总张数上限后重试") }}
+          </p>
           <div class="shot-grid">
             <div v-for="m in imageStoryMissingShots.slice(0, 24)" :key="m.id" class="shot-cell">
               <div class="shot-thumb" style="display: flex; align-items: center; justify-content: center; background: var(--panel); border: 1px dashed var(--border)">
@@ -270,8 +292,6 @@ onBeforeUnmount(() => {
           <p v-if="imageStoryMissingShots.length > 24" class="hint mt-1">
             {{ t("还有 {n} 张缺失分镜未列出", { n: imageStoryMissingShots.length - 24 }) }}
           </p>
-        </div>
-      </div>
         </div>
       </div>
       <div v-else class="card empty-next">

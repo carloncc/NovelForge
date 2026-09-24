@@ -2,7 +2,7 @@
 import { computed, defineAsyncComponent, onMounted, ref, type Component } from "vue";
 import ImportPage from "./pages/ImportPage.vue";
 import AboutDialog from "./components/AboutDialog.vue";
-import { configReady, configState } from "./stores/config";
+import { configReady, configState, webSecretsMigrationWarning } from "./stores/config";
 import { projectState, restoreProject } from "./stores/project";
 import { tauri } from "./utils/tauri";
 import { installLogFileSink } from "./utils/logFile";
@@ -31,11 +31,14 @@ const noticeText = computed(() => {
   const parts: string[] = [];
   if (projectState.saveError) parts.push(`${t("自动保存失败")}：${projectState.saveError}`);
   parts.push(...projectState.visualBibleWarnings);
+  // #1296：Web 端旧明文密钥迁移/加密存储警告（config 侧产出，此处统一横幅透出）
+  if (webSecretsMigrationWarning.value) parts.push(webSecretsMigrationWarning.value);
   return parts.join("；");
 });
 function dismissNotices(): void {
   projectState.saveError = null;
   projectState.visualBibleWarnings = [];
+  webSecretsMigrationWarning.value = "";
 }
 
 // 全局运行态（G1/G2/G12）：离开生成页后管线仍在跑——侧栏常驻显示运行中 + 停止入口，并由导航徽标提示失败项

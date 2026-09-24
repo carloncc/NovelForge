@@ -13,19 +13,22 @@ import type {
   Shot,
 } from "./types";
 import { chatJson, type LlmProgressEvent } from "../api/openaiCompatible";
-import { inputCharBudgetForText, outputTokensForText } from "../api/providers";
+import { estimateCharsPerToken, inputCharBudgetForText, outputTokensForText } from "../api/providers";
 import { splitNovelForAgent } from "./textSplit";
 import { log as logger } from "../utils/logger";
 import { tauri } from "../utils/tauri";
 import { scriptCacheRest } from "./cache";
+import { loreContextForScript } from "./cards";
 import type { ApiConfig } from "./types";
 
 /**
- * 剧本单次请求的输出 token 上限：慢后端上小响应才 fit 得进 300s 超时（30 tok/s ≈ 270s），
- * 超出部分由续写循环分段取回。planScriptChunks 必须用同一预算切分章节——
- * 否则计划按大预算排、请求按小预算发，长章会被整块塞进一次请求而空转（被思考耗尽/截断→重试/超时）。
+ * 剧本单次请求的输出 token 上限（32768，与旧版一致）。
+ * 思考型模型的思维链计入 max_tokens：预算太小（8K）会被思考整段吃光、正文一个字都出不来，
+ * 于是每轮都「空输出→放大预算→再空」地空转。给足预算让模型「思考多少、正文写多少」，
+ * 超出部分由续写循环「生成多少、下轮接着往后补」分段取回。
+ * planScriptChunks 只按输入上下文切块（与输出预算无关），不预先按输出预算切章。
  */
-const SCRIPT_PART_OUTPUT_TOKENS = 8192;
+const SCRIPT_PART_OUTPUT_TOKENS = 32768;
 
 interface ScriptModel {
   title: string;
@@ -178,6 +181,9 @@ export interface ScriptChapterOptions {
   onPart?: (info: { part: number; total: number; phase: "start" | "done"; elapsedMs: number }) => void;
   /** 请求级日志回调（续写/修复/重试/预算升级等模型请求事件；调用方接到后打面向用户的日志） */
   onLog?: (message: string) => void;
+  /** 流式生成进度（真实字符数）：桌面端剧本路径开启 SSE 后随增量上报
+   *  （每次新请求开始先归零），供调用方心跳日志显示「已生成 N 字」；网页版/非流式不会触发。 */
+  onProgress?: (p: { contentChars: number; reasoningChars: number }) => void;
   /** 视频推荐位开关（#1135）：false=提示词不再要求 videoPoints（省 token、不挤占台词篇幅）；
    *  缺省 undefined=保持原行为（要求 1-3 个），避免已上线调用方行为突变 */
   useVideoPoints?: boolean;
@@ -242,10 +248,18 @@ export function narrationPolicyText(compressNarration?: boolean): string {
     : "旁白处理策略（忠实全文，硬约束）：必须完整保留原文全部旁白与心理/环境/氛围描写，只可合并同义重复句，禁止删减任何带信息量/情绪/伏笔的句子；原文每个自然段至少要产出一条 line（narration 或 dialogue）。";
 }
 
-/** 剧本分块（纯函数，供单测）：**不按单次输出预算预先切章**——输出长度由 chatJson 的续写循环处理
- *  （先生成一部分，被长度截断后下一次从中断处继续补，直到整章产出完整）。
- *  这里只按「一次能把多少正文喂进模型上下文」设上限：只有整章正文超出上下文才分块，
- *  否则整章一次喂进去、由续写补完（这样长章不会被输出预算切碎成多段独立生成）。 */
+/**
+ * 单次输出预算里留给正文 JSON 的比例：思考型模型会把大量预算/上下文用于思维链
+ * （实测 mimo-v2.6-flash 生成 3 万字章节前先思考约 3.8 万 token、耗时 6 分钟），
+ * 只按输出预算反推正文量会让「一次要的 JSON」超过模型实际能给 → 截断。
+ */
+const SCRIPT_CHUNK_OUTPUT_RATIO = 1 / 3;
+
+/** 剧本分块（纯函数，供单测）：按「单次请求能产出多少 JSON」反推每次喂多少正文。
+ *  为什么不只按上下文切：整章一次喂进去要 4~6 万字的 JSON，思考型模型在上下文耗尽时把 JSON 截断，
+ *  而**续写补残 JSON 并不可靠**——实测截断后模型只补 274 字就 finish=stop，拼接结果解析失败，
+ *  随后「修复」还要再烧一次 6 分钟的思考。按输出预算（留 1/3 给思考）切块，每块都能在一次响应里产出完整 JSON。
+ *  上限取「输出侧」与「输入侧（上下文能容纳的正文量）」的较小者。 */
 export function planScriptChunks(
   cfg: ApiConfig,
   chapter: ChapterInfo,
@@ -253,9 +267,15 @@ export function planScriptChunks(
   extra: string[],
   cards: ExtractionResult,
 ): string[] {
+  const probeTokens = outputTokensForText(
+    cfg,
+    `${systemPrompt}\n${buildScriptUser(chapter, cards, extra, chapter.text.slice(0, 4000))}`,
+  );
+  const cpt = estimateCharsPerToken(chapter.text);
+  const byOutput = Math.max(3000, Math.floor(probeTokens * SCRIPT_CHUNK_OUTPUT_RATIO * cpt));
   const feedChars = inputCharBudgetForText(cfg, chapter.text);
   const overhead = systemPrompt.length + buildScriptUser(chapter, cards, extra, "").length;
-  const chunkBudget = Math.max(3000, feedChars - overhead);
+  const chunkBudget = Math.max(3000, Math.min(byOutput, feedChars - overhead));
   return chapter.text.length <= chunkBudget ? [chapter.text] : splitNovelForAgent(chapter.text, chunkBudget);
 }
 
@@ -267,11 +287,14 @@ function buildScriptUser(
   body: string,
   partNote = "",
 ): string {
+  // #799：世界观设定卡拼在场景卡之后（空串则不注入，避免多出空节）
+  const loreSection = loreContextForScript(cards);
   return [
     `章节：第 ${chapter.index + 1} 章 ${chapter.title}`,
     `\n角色卡：\n${buildCharacterContext(cards.characters)}`,
     `\n物品卡：\n${buildItemContext(cards.items)}`,
     `\n场景卡：\n${cards.scenes.map((s) => `${s.id}（${s.location}）：${s.atmosphere}`).join("\n")}`,
+    ...(loreSection ? [`\n${loreSection}`] : []),
     ...extra,
     partNote,
     `\n章节正文：\n${body}`,
@@ -326,6 +349,12 @@ interface ScriptSceneContext {
   cgMax?: number;
 }
 
+/** 纯函数：物品事件触发行号钳制（#1422 与渲染/校验同口径：允许 ==lineCount 表示场景末尾事件，render.ts 消费该值）。 */
+export function clampItemTriggerIndex(raw: number, lineCount: number): number {
+  if (lineCount <= 0) return 0;
+  return Math.max(0, Math.min(lineCount, Math.floor(raw)));
+}
+
 /** 把一次模型回执映射为场景数组（含分支/CG/物品/视频位/分镜清洗与配额） */
 function mapScriptScenes(model: ScriptModel, ctx: ScriptSceneContext): SceneJSON[] {
   // 分支/CG 配额：与 prompt 规则一致（#795/#798）。超出上限的只告警并放弃多余项，
@@ -347,9 +376,11 @@ function mapScriptScenes(model: ScriptModel, ctx: ScriptSceneContext): SceneJSON
     const itemEvents: ItemEvent[] = rawItemEvents.map((ie, j) => ({
       // 均匀分布到场景时间轴（旧公式 j*2+1 与剧情无关，且多事件时被钳到最后一行堆叠）：
       // 渲染端支持同一行多事件，这里保证事件按顺序散开。
-      triggerIndex: lines.length
-        ? Math.min(lines.length - 1, Math.floor(((j + 1) * lines.length) / (rawItemEvents.length + 1)))
-        : 0,
+      // #1422：上界与渲染/校验同口径为 lineCount（==lineCount 为场景末尾事件）。
+      triggerIndex: clampItemTriggerIndex(
+        Math.floor(((j + 1) * lines.length) / (rawItemEvents.length + 1)),
+        lines.length,
+      ),
       itemId: ie.itemId,
       action: ie.action || "show",
       description: ie.description || "",
@@ -591,19 +622,33 @@ export async function scriptChapter(
     // 单个子块生成（含空结果带提示重试一次；无场景即抛错，由外层决定是否降级拆分）
     const genOnePart = async (bodyText: string, note: string, tag: string): Promise<{ model: ScriptModel; scenes: SceneJSON[] }> => {
       const user = buildScriptUser(chapter, cards, extra, bodyText, note);
-      // 单次输出预算 8K：慢后端上小响应才 fit 得进 300s（30 tok/s 下约 270s）；
-      // 整章正文一次喂进去，输出长度由续写循环「先生成一部分、截断后下一次从中断处接着补」补完，
-      // 不再按输出预算预先切章。续写轮次放宽以覆盖整章（大章可能需要多次续写）。
+      // 单次输出预算给足（32K，同旧版）：思考型模型的思维链计入 max_tokens，
+      // 预算太小会被思考整段吃光、正文一个字都出不来（8K 预算下实测 8K→18K→28K→35K 连续空转）。
+      // 整章正文一次喂进去，输出长度由续写循环「生成多少、下轮接着往后补」补完，不预先切章。
       const maxTokens = outputTokensForText(cfg, `${systemPrompt}\n${user}`, SCRIPT_PART_OUTPUT_TOKENS);
       const llmEvent = llmEventFor(tag);
-      // 超时零容忍盲重试：第一次 300s 超时即抛，外层按段落拆小后重试（小请求才 fit 得进超时）。
-      // 总量无天花板：单次 8K fit 超时，超出部分由续写循环"生成多少、下轮往后补"（最多 10 轮 +
-      // 停滞保护），请求预算提到 16 覆盖 1 首轮 + 10 续写 + 2 修复 + 升级余量。
+      // 流式进度（桌面端 SSE）：首字/首次思考到达时打一条日志（之后不再逐条打，由 90s 心跳显示计数）；
+      // 计数同时透出给调用方（pipeline 心跳「已生成 N 字」）。每次模型请求开始时计数归零。
+      let deltaLogged = false;
+      const onDelta = (d: { contentChars: number; reasoningChars: number }): void => {
+        opts.onProgress?.(d);
+        if (deltaLogged || (d.contentChars <= 0 && d.reasoningChars <= 0)) return;
+        deltaLogged = true;
+        const detail =
+          d.contentChars > 0
+            ? `模型已开始出字（已生成 ${d.contentChars} 字${d.reasoningChars > 0 ? `，思考 ${d.reasoningChars} 字` : ""}）`
+            : `模型已开始思考（思考 ${d.reasoningChars} 字）`;
+        opts.onLog?.(`第 ${chapter.index + 1} 章${tag}${detail}…`);
+      };
+      // 超时零容忍盲重试：超时即抛，外层按段落拆小后重试（小请求才 fit 得进超时）。
+      // 总量无天花板：超出单次预算的部分由续写循环补（最多 10 轮 + 停滞保护），
+      // 请求预算 16 覆盖 1 首轮 + 10 续写 + 2 修复 + 升级余量。
       const chatOpts = {
         maxTokens,
         onUsage,
         timeoutSecs: 300,
         onEvent: llmEvent,
+        onDelta,
         timeoutRetries: 0,
         maxContinue: 10,
         minContinueProgress: 500,

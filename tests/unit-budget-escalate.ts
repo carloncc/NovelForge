@@ -4,7 +4,7 @@
  * 截断但有内容的响应（含残缺 JSON）一律不升级——由续写循环分段取回，
  * 否则慢后端上更大的单次输出更注定超时。
  */
-import { shouldEscalateBudget, nextBudgetAfterThinking, shouldContinueJson } from "../src/api/openaiCompatible";
+import { shouldEscalateBudget, nextBudgetAfterThinking, shouldContinueJson, reasoningTokensUsed, escalationFutile } from "../src/api/openaiCompatible";
 
 function assert(cond: boolean, msg: string): void {
   if (!cond) throw new Error(msg);
@@ -37,6 +37,24 @@ assert(!shouldEscalateBudget(undefined, ""), "无 finishReason 不升级");
   // 无任何思考信息时至少比上次多 8000，避免原地打转
   const next = nextBudgetAfterThinking(8192, { reasoningTokens: 0, reasoning: "" }, 8192);
   assert(next === 8192 + 8000, `无思考信息时应至少 +8000，实际 ${next}`);
+}
+
+/* ---------- 思考量估算 ---------- */
+assert(reasoningTokensUsed({ reasoningTokens: 9000 }) === 9000, "优先用服务端报告的 reasoning_tokens");
+assert(reasoningTokensUsed({ reasoningTokens: 0, reasoning: "思".repeat(10000) }) === 5000, "缺失统计按文本估 token");
+assert(reasoningTokensUsed({ reasoningTokens: 9000, reasoning: "思".repeat(10000) }) === 9000, "报告值更大时取报告值");
+assert(reasoningTokensUsed({}) === 0, "无任何思考信息为 0");
+
+/* ---------- 膨胀判定：放大后又被思考耗尽 → 停手（用户实测 8K→18K→28K→35K 全空） ---------- */
+assert(escalationFutile(18567, { reasoningTokens: 18571 }), "放大到 18.5K 又全被思考吃掉必须判停");
+assert(escalationFutile(8192, { reasoning: "思".repeat(16000) }), "按文本估算吃满预算也判停");
+assert(!escalationFutile(18567, { reasoningTokens: 5000 }), "思考量明显小于预算属其它故障，不判停");
+assert(!escalationFutile(18567, {}), "无思考信息不判停（无法归因）");
+assert(!escalationFutile(0, { reasoningTokens: 100 }), "预算为 0 不判停");
+{
+  // 有界思考模型：放大后思考 9K（占 18.5K 的 49%）→ 不判停，正文得以产出
+  const next = nextBudgetAfterThinking(8192, { reasoningTokens: 8192 }, 8192);
+  assert(!escalationFutile(next, { reasoningTokens: 9000 }), "有界思考模型放大一次后不得被误停");
 }
 
 /* ---------- 续写判定：生成多少、下轮往后补（总量无天花板，有停滞保护） ---------- */

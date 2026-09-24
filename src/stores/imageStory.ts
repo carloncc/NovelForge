@@ -20,7 +20,7 @@ import { runIsBusy, runStatusSyncSource, registerRunStopSource } from "./runStat
 import { previewOwner, claimPreview, releasePreview } from "./preview";
 import { projectState } from "./project";
 import { goPage } from "./nav";
-import { tauri, isTauri, downloadZipWeb, blessParentDir } from "../utils/tauri";
+import { tauri, isTauri, downloadZipWeb, blessParentDir, isPathInsideDir } from "../utils/tauri";
 import { errMsg } from "../utils/errors";
 import { log as logger } from "../utils/logger";
 import { readAssetMap, updateAssetMap, backupAssetMap, emptyAssetMap } from "../core/assetMap";
@@ -33,13 +33,18 @@ import {
   buildImageStoryPlan,
   deriveImageStoryDir,
   estimateImageStoryPlan,
+  mergeImageStoryLogs,
   normalizeShotTriggers,
   planChapterContinuity,
   resolveImageStoryDirOnLoad,
   runImageStoryTasks,
+  shouldBlockAssembleOnZeroShots,
+  shouldRunPostScriptStages,
 } from "../core/imageStory";
 import { shotCharacterIdsOf } from "../core/images";
 import { assembleProject, gameKeyFor } from "../core/project";
+// #1140：图片小说配音阶段复用主管线 TTS 管线（buildVoiceJobs/generateVoice 按台词行出音频）
+import { buildVoiceJobs, generateVoice, pruneStaleImageStoryVocal, toImageStoryVoiceFailedItem } from "../core/voice";
 import { inferWebgalLanguage } from "../core/render";
 import { resolveTemplateDir } from "../utils/template";
 
@@ -64,6 +69,8 @@ export interface ImageStoryState {
   useBgm: boolean;
   /** 组装：环境音效（SE）开关（#1104） */
   useSe: boolean;
+  /** 配音开关（#1140，默认关）：开启时跑配音阶段，复用主管线 TTS 配置与音色库 */
+  useVoice: boolean;
   cards: ExtractionResult | null;
   chapters: ChapterScript[];
   assets: AssetMap;
@@ -104,6 +111,7 @@ export const imageStoryState = reactive<ImageStoryState>({
   dirProjectKey: "",
   useBgm: true,
   useSe: true,
+  useVoice: false, // #1140：配音默认关闭
   cards: null,
   chapters: [],
   assets: emptyAssetMap(),
@@ -163,6 +171,7 @@ interface ImageStoryMeta {
   scriptStyle?: string;
   useBgm?: boolean;
   useSe?: boolean;
+  useVoice?: boolean; // #1140：配音开关持久化
   dirAuto?: boolean;
   projectKey?: string;
 }
@@ -214,9 +223,10 @@ async function readLogFile(dir: string): Promise<PipelineEvent[]> {
   return out.slice(-LOG_FILE_LIMIT);
 }
 
-/** 恢复日志：本次会话已有内存日志时以内存为准（避免半落盘把本次运行截断） */
+/** 恢复日志：按 dir 合并（#1439：读盘历史 + 本次新条目去重，避免 pushLog-before-sync 后整文件覆写清掉历史） */
 async function syncLogsFromDisk(dir: string): Promise<void> {
-  if (!diskLogEvents.length) diskLogEvents = await readLogFile(dir);
+  const disk = await readLogFile(dir);
+  diskLogEvents = mergeImageStoryLogs(disk, diskLogEvents, LOG_FILE_LIMIT);
   imageStoryState.logs = diskLogEvents.slice(-DISPLAY_LOG_LIMIT);
 }
 
@@ -272,6 +282,7 @@ function persist(): void {
       scriptStyle: imageStoryState.scriptStyle,
       useBgm: imageStoryState.useBgm,
       useSe: imageStoryState.useSe,
+      useVoice: imageStoryState.useVoice, // #1140
       dirAuto: imageStoryState.dirAuto,
       projectKey: imageStoryState.dirProjectKey,
     },
@@ -341,6 +352,7 @@ function applyMeta(meta: ImageStoryMeta | null): void {
   imageStoryState.scriptStyle = typeof meta?.scriptStyle === "string" ? meta.scriptStyle : "";
   imageStoryState.useBgm = meta?.useBgm !== false;
   imageStoryState.useSe = meta?.useSe !== false;
+  imageStoryState.useVoice = meta?.useVoice === true; // #1140：默认关，显式开过才开
   if (includeItems) pushLog("物品图", t("图片小说模式不展示物品图，已关闭「生成物品图」开关（避免付费后游戏内看不到）"), "warn");
 }
 
@@ -405,7 +417,7 @@ export function followMainProjectDir(): void {
 }
 
 watch(
-  () => JSON.stringify([imageStoryState.options, imageStoryState.scriptStyle, imageStoryState.useBgm, imageStoryState.useSe]),
+  () => JSON.stringify([imageStoryState.options, imageStoryState.scriptStyle, imageStoryState.useBgm, imageStoryState.useSe, imageStoryState.useVoice]), // #1140：配音开关加入持久化监听
   () => {
     refreshPlan();
     // #1103：每键入即写盘 → 防抖 500ms，连续调参只落盘一次
@@ -511,8 +523,16 @@ async function readCachedChapters(): Promise<ChapterScript[]> {
   const fp = scriptFp(imageStoryState.cards);
   const cacheDir = CACHE_ROOT(dir);
   const out: ChapterScript[] = [];
+  // #1435：载入期禁止付费翻译，未命中翻译缓存时降级原文（effectiveChapterText 内部直接返回原文）
+  const lang = (imageStoryState.options.language ?? "").trim();
+  let fallbackCount = 0;
   for (const ch of chapters) {
-    const eff = await effectiveChapterText(ch);
+    const eff = await effectiveChapterText(ch, { allowPaidTranslate: false });
+    if (lang && eff.text === ch.text) {
+      // 原文直通可能是「本就不用翻译」也可能是「缓存缺失降级」；仅在设置了语言时计数，
+      // 最终统一 warn 一次（避免每章一条刷屏），计费翻译只在 run 阶段发起。
+      fallbackCount++;
+    }
     const file = scriptCacheFileName(cacheDir, false, ch.index, eff.title, eff.text, fp);
     try {
       const { text } = await tauri.readTextFile(file);
@@ -522,11 +542,19 @@ async function readCachedChapters(): Promise<ChapterScript[]> {
       /* 未生成 */
     }
   }
+  if (lang && fallbackCount > 0) {
+    pushLog("翻译", t("载入期未自动翻译（{n} 章暂用原文）：如需翻译请点「开始生成」在运行阶段生成（复用主项目翻译缓存）", { n: fallbackCount }), "warn");
+  }
   return out.sort((a, b) => a.chapter - b.chapter);
 }
 
-/** 翻译复用：优先读主项目的翻译缓存（同一本小说只翻一次），否则按需翻译 */
-async function effectiveChapterText(ch: ChapterInfo): Promise<{ title: string; text: string }> {
+/** 翻译复用：优先读主项目的翻译缓存（同一本小说只翻一次），否则按需翻译
+ *  #1435：载入/refresh 路径禁止付费翻译（allowPaidTranslate=false 时缓存未命中直接降级原文），
+ *  只有 run 阶段（runScriptStage）允许发起付费翻译，避免打开页面即全书扣费。 */
+async function effectiveChapterText(
+  ch: ChapterInfo,
+  opts: { allowPaidTranslate?: boolean } = {},
+): Promise<{ title: string; text: string }> {
   const lang = (imageStoryState.options.language ?? "").trim();
   if (!lang) return { title: ch.title, text: ch.text };
   const mainDir = projectState.outputDir;
@@ -548,12 +576,15 @@ async function effectiveChapterText(ch: ChapterInfo): Promise<{ title: string; t
   } catch {
     /* 需要翻译 */
   }
+  // #1435：载入期直接降级原文（不发起付费 LLM 翻译、不注册中止，调用方统一 warn 一次）
+  if (!opts.allowPaidTranslate) return { title: ch.title, text: ch.text };
   const llm = activeConfig("llm");
   if (!llm?.apiKey) return { title: ch.title, text: ch.text };
   try {
     const translated = await translateChapter(llm, ch, lang, undefined, undefined);
     await tauri.mkdirAll(`${imageStoryState.outputDir}/.novel2vn/translate`);
     await tauri.writeTextFile(ownFile, JSON.stringify(translated, null, 2));
+    pushLog("翻译", `第 ${ch.index + 1} 章翻译完成（${lang}，已写入翻译缓存）`, "success");
     return translated;
   } catch (e) {
     pushLog("翻译", `第 ${ch.index + 1} 章翻译失败，改用原文：${errMsg(e).slice(0, 120)}`, "warn");
@@ -673,7 +704,8 @@ async function runScriptStage(llm: NonNullable<ReturnType<typeof activeConfig>>,
   for (let i = 0; i < chapters.length; i++) {
     if (abortFlag) break;
     const ch = chapters[i];
-    const eff = await effectiveChapterText(ch);
+    // #1435：只有 run 阶段允许付费翻译（载入期已禁止），带阶段/进度/停止能力
+    const eff = await effectiveChapterText(ch, { allowPaidTranslate: true });
     imageStoryState.stage = "剧本";
     imageStoryState.progress = { done: i, total: chapters.length };
     const file = scriptCacheFileName(cacheDir, false, ch.index, eff.title, eff.text, fp);
@@ -768,7 +800,75 @@ async function runImageStage(cards: ExtractionResult, chapters: ChapterScript[])
   });
   imageStoryState.assets = await readAssetMap(dir);
   imageStoryState.progress = null;
+  // #1437：停止后不再打「图片完成 0 张」假成功（runOne 中断未派发的不计失败，中途停应走停止分支）
+  if (abortFlag) {
+    pushLog("图片", t("图片生成已停止（已完成的产物与缓存保留）"), "warn");
+    return;
+  }
   pushLog("图片", `图片完成：产出 ${result.produced} 张，失败 ${result.failed} 张`, result.failed ? "warn" : "success");
+}
+
+/* ==================== 配音阶段（#1140：复用主管线 TTS 管线，按台词行出音频进 assets.vocal） ==================== */
+
+/** 图片小说配音阶段：开关默认关；开启时按台词行合成（缓存命中不重复计费）。
+ * 产物合并进 assets.vocal（组装时自动拷入 game/vocal，渲染侧 imageOnly 已支持 vocal 查表），
+ * 失败逐句进失败清单（key `vocal_<台词key>`），可用「重试失败项」补配。 */
+async function runImageStoryVoiceStage(cards: ExtractionResult, chapters: ChapterScript[]): Promise<void> {
+  const dir = imageStoryState.outputDir;
+  const ttsCfg = activeConfig("tts");
+  imageStoryState.stage = "配音";
+  if (!ttsCfg?.apiKey) {
+    const msg = t("配音已开启但未配置 TTS API：已跳过配音（配置后可用「重试失败项」补配）");
+    pushLog("配音", msg, "warn");
+    imageStoryState.failed.push({ key: "voice_config", label: t("配音配置缺失"), message: msg });
+    imageStoryState.stage = "";
+    return;
+  }
+  let expected = 0;
+  try {
+    // 预检：音色库为空时 buildVoiceJobs 直接抛可读错误（#1139），转失败项而不打断运行
+    expected = buildVoiceJobs(ttsCfg, chapters, cards.characters).length;
+  } catch (e) {
+    const msg = errMsg(e).slice(0, 300);
+    pushLog("配音", `配音无法开始：${msg}`, "error");
+    imageStoryState.failed.push({ key: "voice_stage", label: t("配音音色库为空"), message: msg });
+    imageStoryState.stage = "";
+    return;
+  }
+  if (!expected) {
+    pushLog("配音", "当前剧本没有可配音的台词，已跳过配音", "warn");
+    imageStoryState.stage = "";
+    return;
+  }
+  pushLog("配音", `开始生成配音：${expected} 句（命中缓存不重复计费）…`);
+  const { vocal, failed } = await generateVoice(
+    ttsCfg,
+    chapters,
+    cards.characters,
+    CACHE_ROOT(dir),
+    (ev) => {
+      if (ev.progress) imageStoryState.progress = { done: ev.progress.done, total: ev.progress.total };
+      pushLog(ev.step || "配音", ev.message, ev.level);
+    },
+    concurrencyFor(ttsCfg, "tts"),
+    false,
+    () => abortFlag,
+  );
+  imageStoryState.progress = null;
+  const previous = await readAssetMap(dir).catch(() => emptyAssetMap());
+  const merged = { ...previous.vocal, ...vocal };
+  const removed = pruneStaleImageStoryVocal(merged, chapters);
+  await updateAssetMap(dir, (map) => {
+    map.vocal = merged;
+  }).catch(() => undefined);
+  imageStoryState.assets = await readAssetMap(dir).catch(() => imageStoryState.assets);
+  for (const f of failed) imageStoryState.failed.push(toImageStoryVoiceFailedItem(f));
+  imageStoryState.stage = "";
+  pushLog(
+    "配音",
+    `配音完成：本次产出/复用 ${Object.keys(vocal).length}/${expected} 句${failed.length ? `，失败 ${failed.length} 句（已进失败清单，可重试补配）` : ""}${removed.length ? `，清理过期映射 ${removed.length} 项` : ""}`,
+    failed.length ? "warn" : "success",
+  );
 }
 
 async function runAssembleStage(cards: ExtractionResult, chapters: ChapterScript[]): Promise<boolean> {
@@ -799,6 +899,14 @@ async function runAssembleStage(cards: ExtractionResult, chapters: ChapterScript
   }
   const templateDir = await resolveTemplateDir();
   const assets = await readAssetMap(dir);
+  // #1436：一张图都没有（无图像 API / 全失败 / 空计划）时阻断组装，避免零 changeBg 成品报 success
+  const shotCount = Object.keys(assets.shot ?? {}).length;
+  if (shouldBlockAssembleOnZeroShots(imageStoryState.produced, shotCount)) {
+    const msg = t("组装已中止：没有可用的分镜图片（0 张），成品将全程无画面。请先配置图像 API 并生成图片后再组装");
+    pushLog("组装", msg, "error");
+    imageStoryState.lastError = msg;
+    return false;
+  }
   const title = (projectState.novel?.fileName ?? "图片小说").replace(/\.txt$/i, "");
   const sample = ordered
     .slice(0, 3)
@@ -861,6 +969,10 @@ export async function runImageStory(): Promise<void> {
     imageStoryState.lastError = t("请先在「API 配置」页配置文本 LLM（分镜剧本需要）");
     return;
   }
+  // #1436：无图像 API 时前置预警（与缺 LLM 同口径提示位置）：仍允许跑提取/剧本，但明确组装会被零图门禁阻断
+  if (!activeConfig("image")?.apiKey) {
+    pushLog("图片", t("未配置图像 API：本次仍会生成提取与剧本，但图片阶段将跳过、组装会被阻断（成品无画面）"), "warn");
+  }
   abortFlag = false;
   beginAbortableRun();
   imageStoryState.running = true;
@@ -881,11 +993,14 @@ export async function runImageStory(): Promise<void> {
     imageStoryState.chapters = chapters;
     refreshPlan();
     if (!abortFlag && chapters.length) await runImageStage(cards, chapters);
+    // #1140：配音阶段（默认关闭；开启时复用主管线 TTS 管线按台词行出音频，产物进 assets.vocal 供组装引用）
+    if (!abortFlag && chapters.length && imageStoryState.useVoice) await runImageStoryVoiceStage(cards, chapters);
     let assembled = false;
     if (!abortFlag && chapters.length) assembled = await runAssembleStage(cards, chapters);
     if (abortFlag) pushLog("运行", "已停止（已完成的产物与缓存保留）", "warn");
     else if (!chapters.length) pushLog("运行", "没有生成任何章节的分镜剧本：已跳过组装（见上方失败项）", "warn");
-    else if (!assembled) pushLog("运行", `运行结束：分镜剧本 ${chapters.length} 章，图片产出 ${imageStoryState.produced} 张；组装未完成（缺章，见上方错误）`, "warn");
+    // #1436：组装失败可能是缺章也可能是零图，不再写死「缺章」，以上方具体错误为准
+    else if (!assembled) pushLog("运行", `运行结束：分镜剧本 ${chapters.length} 章，图片产出 ${imageStoryState.produced} 张；组装未完成（见上方错误）`, "warn");
     else pushLog("运行", `全部完成：分镜剧本 ${chapters.length} 章，图片产出 ${imageStoryState.produced} 张`, "success");
     await refreshFromDisk();
   } catch (e) {
@@ -931,10 +1046,16 @@ export async function retryFailedImages(): Promise<void> {
     const chapters = await runScriptStage(llm, cards);
     imageStoryState.chapters = chapters;
     refreshPlan();
-    if (chapters.length) {
+    // #1437：补 runImageStory 同款 abortFlag 门（停止后不跑图片/组装、不追加缺章假失败项）
+    if (shouldRunPostScriptStages(abortFlag, chapters.length)) {
       await runImageStage(cards, chapters);
+      // #1140：重试同样补配音（generateVoice 内部缓存命中跳过，只补缺失；失败进失败清单）
+      if (!abortFlag && chapters.length && imageStoryState.useVoice) await runImageStoryVoiceStage(cards, chapters);
+    }
+    if (shouldRunPostScriptStages(abortFlag, chapters.length)) {
       await runAssembleStage(cards, chapters);
     }
+    if (abortFlag) pushLog("运行", "已停止（已完成的产物与缓存保留）", "warn");
     await refreshFromDisk();
   } catch (e) {
     imageStoryState.lastError = errMsg(e).slice(0, 400);
@@ -952,10 +1073,27 @@ export async function regenerateShot(taskId: string): Promise<void> {
   const chapters = imageStoryState.chapters;
   const dir = imageStoryState.outputDir;
   const imageCfg = activeConfig("image");
-  if (!cards || !chapters.length || !imageCfg?.apiKey) return;
+  // #1404：三处前置静默 return 改为 pushLog + lastError（页面已有 lastError 展示行），点击有反馈
+  if (!cards || !chapters.length) {
+    const msg = t("没有可重生成的分镜：请先完成提取与剧本");
+    imageStoryState.lastError = msg;
+    pushLog("图片", msg, "warn");
+    return;
+  }
+  if (!imageCfg?.apiKey) {
+    const msg = t("未配置图像 API：请先在「API 配置」页配置图像 API 后再重生成");
+    imageStoryState.lastError = msg;
+    pushLog("图片", msg, "warn");
+    return;
+  }
   const plan = buildImageStoryPlan(chapters, cards, imageStoryState.options);
   const task = plan.tasks.find((t) => t.kind === "shot" && t.id === taskId);
-  if (!task) return;
+  if (!task) {
+    const msg = t("该分镜不在当前张数设置内：请恢复每场景/每章/总张数上限后再重生成");
+    imageStoryState.lastError = msg;
+    pushLog("图片", msg, "warn");
+    return;
+  }
   const assets = await readAssetMap(dir);
   const figureBase: Record<string, string> = {};
   for (const [id, path] of Object.entries(assets.figure)) figureBase[id] = path;
@@ -1075,6 +1213,13 @@ export async function exportImageStoryZip(): Promise<void> {
       filters: [{ name: t("ZIP 压缩包"), extensions: ["zip"] }],
     });
     if (!target) return;
+    // #1434：复用主路径 #1116 守卫——目标在项目目录内会把正在写入的 zip 半成品打进包里
+    if (isPathInsideDir(dir, target)) {
+      const msg = t("保存位置不能在项目目录内部（否则会把正在写入的 zip 自身打进包里）：请换一个目录");
+      pushLog("导出", msg, "error");
+      imageStoryState.lastError = msg;
+      return;
+    }
     // #1292：登记保存位置所在目录（用户经保存对话框明示授权），否则写 zip 被白名单拒绝
     await blessParentDir(target);
     const stats = await tauri.buildZip(dir, target, [".novel2vn"]);

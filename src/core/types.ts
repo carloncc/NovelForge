@@ -585,3 +585,21 @@ export interface ExportSettings {
   gameKey: string;
   language: "zh_CN" | "zh_TW" | "en" | "ja" | "ko";
 }
+
+/** 世界观卡片（#799） */
+export type LoreKind = "map" | "quest" | "faction" | "artifact" | "system" | "other";
+export interface LoreCard {
+  id: string;
+  /** 短标题（如「黑水城防线图」「铁盟入会试炼」） */
+  title: string;
+  /** 设定类别：map=地图/路线，quest=任务/委托，faction=组织/制度，artifact=器物/货币，system=世界规则，其他=other */
+  kind: LoreKind;
+  /** 原文关键信息（保留原文表述，不得概括压缩） */
+  content: string;
+  /** 出处备注（可选：章节/段落提示） */
+  sourceNote?: string;
+}
+/** #799：ExtractionResult 增量合并（仅追加 lore 可选字段，既有三个数组原样不动） */
+export interface ExtractionResult {
+  lore?: LoreCard[];
+}

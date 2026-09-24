@@ -86,7 +86,7 @@ function hasOpinion(s: StageKey): boolean {
         :disabled="busy"
         :title="s === 'split'
           ? t('点击即全书重新分章（有 LLM 时计费；章节边界变化会使下游剧本/图像/配音缓存作废重跑）')
-          : t('无意见且未勾全量=只补缺失/失败项，不计费')"
+          : t('无意见且未勾全量=只补缺失/失败项（已缓存的复用不计费；若确有缺失项，补齐会按实际用量计费）')"
         @click="emit('regen', s)"
       >
         {{ t("重新生成") }}

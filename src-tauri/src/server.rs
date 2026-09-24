@@ -16,8 +16,6 @@ pub struct ServerHandle {
     port: u16,
     /// 已校验的预览根（canonical）：#1329 回滚重启旧实例用
     root: PathBuf,
-    /// 每实例随机 token：随启动响应返回，供前端后续做严格鉴权时携带
-    token: String,
 }
 
 /// #1294：每请求 thread::spawn 无上限 → 请求洪水打爆线程；并发处理数封顶，超限回 503。
@@ -31,10 +29,6 @@ impl ServerHandle {
     /// #1329 回滚用：旧实例的已校验根
     pub fn preview_root(&self) -> &Path {
         &self.root
-    }
-    /// 启动时生成的随机 token（随 start_preview_server 响应返回前端）
-    pub fn preview_token(&self) -> &str {
-        &self.token
     }
     pub fn stop(&self) {
         self.stop_flag.store(1, Ordering::Relaxed);
@@ -80,33 +74,6 @@ pub fn validate_preview_root(root: &str) -> Result<PathBuf, String> {
         return Err("目录不是有效的预览输出（缺少 index.html），已拒绝分享".to_string());
     }
     Ok(canon)
-}
-
-/// 每实例随机 token（128 bit）：优先 OS 随机源，失败退化为时间+进程+计数哈希
-/// （退化路径仅保证唯一性、不保证不可预测，日志中明确标记）。
-fn generate_preview_token() -> String {
-    let mut bytes = [0u8; 16];
-    match getrandom::getrandom(&mut bytes) {
-        Ok(()) => bytes.iter().map(|b| format!("{b:02x}")).collect(),
-        Err(error) => {
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            static COUNTER: AtomicUsize = AtomicUsize::new(0);
-            let mut hasher = DefaultHasher::new();
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-                .hash(&mut hasher);
-            std::process::id().hash(&mut hasher);
-            COUNTER.fetch_add(1, Ordering::Relaxed).hash(&mut hasher);
-            thread::current().id().hash(&mut hasher);
-            let h1 = hasher.finish();
-            let h2 = h1.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-            eprintln!("[novelforge] 警告: 预览 token 随机源不可用（{error}），已退化为弱 token");
-            format!("{h1:016x}{h2:016x}")
-        }
-    }
 }
 
 fn request_header_value(request: &tiny_http::Request, name: &str) -> Option<String> {
@@ -189,7 +156,6 @@ fn start_with_server(root: &str, server: Server) -> Result<ServerHandle, String>
         .to_ip()
         .map(|addr| addr.port())
         .unwrap_or(17892);
-    let token = generate_preview_token();
     let server = Arc::new(server);
     let stop_flag = Arc::new(AtomicUsize::new(0));
 
@@ -228,11 +194,13 @@ fn start_with_server(root: &str, server: Server) -> Result<ServerHandle, String>
         thread: Mutex::new(Some(thread)),
         port,
         root,
-        token,
     })
 }
 
 fn handle_request(root: &Path, request: tiny_http::Request, port: u16) {
+    // #1446：per-instance token 已删除（从未被校验），不再做 token 鉴权。
+    // 生效防线为 127.0.0.1 绑定 + Host/DNS-rebinding 校验；缺失 Host/Origin/Referer 时放行
+    //（HTTP/1.0 兼容/顶层导航首跳），同机非浏览器客户端可直连属本地预览设计使然，不在此收紧。
     // #1294：Host/Origin/Referer 校验（DNS rebinding 与跨站读防护）
     if !preview_host_allowed(request_header_value(&request, "Host").as_deref(), port)
         || !preview_origin_allowed(request_header_value(&request, "Origin").as_deref(), port)
@@ -523,7 +491,7 @@ struct _MutexGuardGuard(Mutex<()>);
 
 #[cfg(test)]
 mod tests {
-    use super::{cache_control_for, content_type_for, generate_preview_token, http_date, is_preview_blocked, parse_range, preview_host_allowed, preview_origin_allowed, safe_file_path, start_with_server, validate_preview_root};
+    use super::{cache_control_for, content_type_for, http_date, is_preview_blocked, parse_range, preview_host_allowed, preview_origin_allowed, safe_file_path, start_with_server, validate_preview_root};
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpStream;
@@ -741,13 +709,6 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// #1294：每实例 token 唯一且为 32 位十六进制
-    #[test]
-    fn preview_tokens_are_unique_hex() {
-        let a = generate_preview_token();
-        let b = generate_preview_token();
-        assert_eq!(a.len(), 32);
-        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
-        assert_ne!(a, b);
-    }
+    // #1446：per-instance token 已删除（生成了也从不校验，前端亦直接丢弃，纯装饰）。
+    // 生效防线为 loopback 绑定 + Host/DNS-rebinding 校验；不再为已删除的 token 保留单测。
 }

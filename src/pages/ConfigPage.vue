@@ -9,6 +9,10 @@ import {
   configState,
   configPersistenceError,
   applyTemplate,
+  VOICE_LIBRARY_EMPTY_MESSAGE,
+  modelFetchSignature,
+  applyDiscoveredModelsSuccess,
+  applyDiscoveredModelsFailure,
 } from "../stores/config";
 import { testLlm, testVision, testTts, testImage, fetchModelsForChannel } from "../api/openaiCompatible";
 import { templatesForCapability } from "../api/templates";
@@ -19,13 +23,14 @@ import { currentLang, t } from "../i18n";
 import PageHead from "../components/PageHead.vue";
 import { knownImageModelCapabilities, isImageCapabilityConflict } from "../api/providers";
 import { checkCustomTemplate } from "../api/templates";
-import { resolveContextLength, inputCharBudget } from "../api/providers";
+import { resolveContextLength, inputCharBudget, sanitizeContextLengthInput } from "../api/providers";
 import { DEFAULT_CONCURRENCY_BY_CHANNEL, type CutoutMode } from "../stores/configMigration";
 import type { ApiConfig, ChannelKey, ImageModelCapabilities } from "../core/types";
 import type { DiscoveredModel } from "../api/providers";
 import { CUTOUT_MODELS, findCutoutModel, type CutoutModel } from "../core/cutout/models";
-import { cutoutModelStatus, downloadCutoutModelAndWait, removeCutoutModel, type CutoutModelStatus } from "../core/cutout/download";
+import { cutoutModelStatus, downloadCutoutModelAndWait, removeCutoutModel, shouldApplyCutoutStatus, type CutoutModelStatus } from "../core/cutout/download";
 import { tauri, isTauri } from "../utils/tauri";
+import { isPersistOptIn, setPersistOptIn, flushWebSecrets } from "../utils/webKeys";
 
 const cutoutModels = CUTOUT_MODELS;
 const cutoutStatus = ref<CutoutModelStatus | null>(null);
@@ -33,6 +38,16 @@ const cutoutBusy = ref(false);
 const cutoutError = ref("");
 const cutoutModelDir = ref("");
 let cutoutPollTimer: number | undefined;
+
+// #1296：Web 端密钥「会话内加密持久化」opt-in（默认关，桌面端走系统凭据库、不显示该开关）。
+const persistWebSecrets = ref(isPersistOptIn());
+function onPersistWebSecrets(e: Event): void {
+  const on = (e.target as HTMLInputElement).checked;
+  persistWebSecrets.value = on;
+  setPersistOptIn(on);
+  // 开启时把当前内存密钥立即加密落盘；关闭时 setPersistOptIn 已删除会话密文（内存保留到页面关闭）
+  if (on) void flushWebSecrets();
+}
 
 const currentCutoutModel = computed<CutoutModel>(() => findCutoutModel(configState.cutout?.modelId ?? "isnet-anime"));
 const cutoutMode = computed<CutoutMode>(() => configState.cutout?.mode ?? "ai");
@@ -97,12 +112,21 @@ function stopCutoutPoll(): void {
 
 async function downloadCurrentModel(): Promise<void> {
   const model = currentCutoutModel.value;
+  // #1386：下载任务持有发起时的 modelId，回调写状态前校验归属（切模型后旧进度直接丢弃）
+  const targetId = model.id;
   cutoutBusy.value = true;
   cutoutError.value = "";
   log.info("page", "开始下载 AI 抠图模型", { modelId: model.id, sizeMB: model.sizeMB });
   try {
-    await downloadCutoutModelAndWait(model, (status) => { cutoutStatus.value = status; });
-    cutoutStatus.value = await cutoutModelStatus(model);
+    await downloadCutoutModelAndWait(model, (status) => {
+      if (!shouldApplyCutoutStatus(targetId, currentCutoutModel.value.id)) return;
+      if (status.modelId && status.modelId !== targetId) return;
+      cutoutStatus.value = status;
+    });
+    const done = await cutoutModelStatus(model);
+    if (shouldApplyCutoutStatus(targetId, currentCutoutModel.value.id)) {
+      cutoutStatus.value = done;
+    }
     log.info("page", "AI 抠图模型下载完成", { modelId: model.id });
   } catch (error) {
     cutoutError.value = errMsg(error);
@@ -133,6 +157,8 @@ async function removeCurrentModel(): Promise<void> {
 watch(
   () => configState.cutout?.modelId,
   () => {
+    // #1386：下载中下拉已禁用，此处再加一道 guard（程序化切换也不得打断下载轮询/覆盖旧进度）
+    if (cutoutBusy.value) return;
     cutoutError.value = "";
     void refreshCutoutStatus();
   },
@@ -149,6 +175,18 @@ onUnmounted(stopCutoutPoll);
 
 function defaultConcurrency(kind: ChannelKey): number {
   return DEFAULT_CONCURRENCY_BY_CHANNEL[kind] ?? 3;
+}
+
+/**
+ * #1411 跨包协调：SSRF 局域网开关 plumbing（openaiCompatible + ApiConfig.allowLan 类型声明）由另一路做；
+ * 本文件只负责 llm 高级区复选框 UI。为不改 src/core/types.ts，此处经 unknown 中转读写顶层 allowLan，
+ * 待另一路在 types.ts 正式声明 ApiConfig.allowLan 后可去掉中转（行为不变）。
+ */
+function allowLanOf(cfg: ApiConfig): boolean {
+  return !!((cfg as unknown as Record<string, unknown>).allowLan);
+}
+function setAllowLan(cfg: ApiConfig, v: boolean): void {
+  (cfg as unknown as Record<string, unknown>).allowLan = v;
 }
 
 /** 格式化 MiniMax 滑块参数的显示值（保留最多 1 位小数） */
@@ -215,7 +253,11 @@ function invalidateTest(cfg: ApiConfig): void {
   if (testResult.value?.id === cfg.id) testResult.value = null;
 }
 
-const modelFetching = ref<string | null>(null);
+/** #1385：多配置并发拉取各自独立，单值 ref 会互相覆盖 spinner 归属，改按 cfg.id 集合判断 */
+const modelFetching = ref<Set<string>>(new Set());
+function isModelFetching(id: string): boolean {
+  return modelFetching.value.has(id);
+}
 const modelFetchError = ref<Record<string, string>>({});
 const customModelOpen = ref<Record<string, boolean>>({});
 
@@ -416,16 +458,21 @@ function isLocalBaseUrl(url: string): boolean {
 }
 
 async function fetchModels(kind: ChannelKey, cfg: ApiConfig): Promise<void> {
-  modelFetching.value = cfg.id;
+  modelFetching.value = new Set([...modelFetching.value, cfg.id]);
   try {
     const models = await fetchModelsForChannel(cfg, kind);
     cfg.extra ??= {};
-    cfg.extra.discoveredModels = models;
+    // #1385：成功才替换；失败保留旧列表（不再先清空后失败即丢）
+    cfg.extra.discoveredModels = applyDiscoveredModelsSuccess(cfg.extra.discoveredModels, models);
     modelFetchError.value[cfg.id] = "";
   } catch (error) {
+    cfg.extra ??= {};
+    cfg.extra.discoveredModels = applyDiscoveredModelsFailure(cfg.extra.discoveredModels);
     modelFetchError.value[cfg.id] = errMsg(error);
   } finally {
-    if (modelFetching.value === cfg.id) modelFetching.value = null;
+    const next = new Set(modelFetching.value);
+    next.delete(cfg.id);
+    modelFetching.value = next;
   }
 }
 
@@ -435,12 +482,15 @@ function autoFetchModels(kind: ChannelKey, cfg: ApiConfig): void {
   if (timer) window.clearTimeout(timer);
   modelFetchTimers.delete(cfg.id);
   cfg.extra ??= {};
-  cfg.extra.discoveredModels = [];
+  // #1385：不再 debounce 前先清空旧列表（此前下拉闪空、失败即丢）；
+  // 只有确实无法拉取（无 URL / 非本地又无 Key）时才清空，避免 stale 列表误导。
   if (!url) {
+    cfg.extra.discoveredModels = [];
     modelFetchError.value[cfg.id] = "";
     return;
   }
   if (!cfg.apiKey?.trim() && !isLocalBaseUrl(url)) {
+    cfg.extra.discoveredModels = [];
     modelFetchError.value[cfg.id] = "";
     return;
   }
@@ -451,22 +501,19 @@ function autoFetchModels(kind: ChannelKey, cfg: ApiConfig): void {
 }
 
 watch(
-  () => configState.presets.flatMap((preset) =>
-    (["llm", "vision", "image", "tts"] as const).flatMap((kind) =>
-      preset.channels[kind].map((cfg) =>
-        `${cfg.id}|${cfg.baseUrl}|${cfg.extra?.pathPrefix ?? ""}|${cfg.apiKey ? "K" : "-"}`,
-      ),
-    ),
+  // #1385：只跟随当前激活配置组的签名——开页不再遍历全部配置组（含未使用组）自动发起 /models
+  () => (["llm", "vision", "image", "tts"] as const).flatMap((kind) =>
+    activePreset().channels[kind].map((cfg) => modelFetchSignature(cfg)),
   ).join("~"),
   () => {
-    for (const preset of configState.presets) {
-      for (const kind of ["llm", "vision", "image", "tts"] as const) {
-        for (const cfg of preset.channels[kind]) {
-          const signature = `${cfg.id}|${cfg.baseUrl}|${cfg.extra?.pathPrefix ?? ""}|${cfg.apiKey ? "K" : "-"}`;
-          if (modelFetchSignatures.get(cfg.id) !== signature) {
-            modelFetchSignatures.set(cfg.id, signature);
-            autoFetchModels(kind, cfg);
-          }
+    const preset = activePreset();
+    for (const kind of ["llm", "vision", "image", "tts"] as const) {
+      for (const cfg of preset.channels[kind]) {
+        // #1385：签名纳入 apiKey 实际值指纹（store 侧 modelFetchSignature），K→K 但内容变了也能重拉
+        const signature = modelFetchSignature(cfg);
+        if (modelFetchSignatures.get(cfg.id) !== signature) {
+          modelFetchSignatures.set(cfg.id, signature);
+          autoFetchModels(kind, cfg);
         }
       }
     }
@@ -499,6 +546,15 @@ watch(
         </button>
       </div>
       <button v-if="configState.presets.length > 1" class="btn danger small ml-auto" @click="confirmRemovePreset(configState.activePresetId)">{{ t("删除该组") }}</button>
+    </div>
+
+    <!-- #1296：Web 端密钥持久化 opt-in（默认关；桌面端走系统凭据库，不显示） -->
+    <div v-if="!isTauri()" class="card">
+      <label class="check">
+        <input type="checkbox" :checked="persistWebSecrets" @change="onPersistWebSecrets" />
+        {{ t("Web 端持久化密钥（会话内加密存储）") }}
+      </label>
+      <p class="hint">{{ t("默认只存内存，关闭或刷新页面即失效；勾选后把密钥用浏览器加密密钥加密存入会话存储（仅当前标签页有效），不写明文。") }}</p>
     </div>
 
     <div class="cfg-grid">
@@ -551,7 +607,7 @@ watch(
           </div>
           <div class="cfg-row">
             <label class="field cfg-model-field">
-              <span>Model<span v-if="modelFetching === cfg.id" class="cfg-model-loading"> {{ t("获取模型中…") }}</span></span>
+              <span>Model<span v-if="isModelFetching(cfg.id)" class="cfg-model-loading"> {{ t("获取模型中…") }}</span></span>
               <div class="cfg-model-row">
                 <select :value="modelValueFor(cfg)" @change="onModelSelect(ch.key, cfg, $event)">
                   <option v-if="!cfg.model" value="" disabled>{{ t("填写 Base URL 后自动加载模型…") }}</option>
@@ -562,16 +618,17 @@ watch(
               </div>
               <input v-if="customModelOpen[cfg.id]" type="text" v-model="cfg.model" :placeholder="t('输入模型名，例如 deepseek-chat')" @input="invalidateTest(cfg)" />
               <span v-if="modelFetchError[cfg.id]" class="cfg-model-error">{{ modelFetchError[cfg.id] }}</span>
+              <button v-if="modelFetchError[cfg.id]" class="btn ghost small" :disabled="isModelFetching(cfg.id)" @click="fetchModels(ch.key, cfg)">{{ t("重试") }}</button>
             </label>
           </div>
           <div class="cfg-row">
             <label class="field grow-2">
               <span>API Key</span>
-              <input type="password" v-model="cfg.apiKey" placeholder="sk-…" />
+              <input type="password" v-model="cfg.apiKey" placeholder="sk-…" @input="invalidateTest(cfg)" />
             </label>
             <label class="field">
               <span>{{ t("路径前缀（可选）") }}</span>
-              <input type="text" v-model="cfg.extra!.pathPrefix" :placeholder="t('留空自动 /v1')" />
+              <input type="text" v-model="cfg.extra!.pathPrefix" :placeholder="t('留空自动 /v1')" @input="invalidateTest(cfg)" />
             </label>
           </div>
 
@@ -589,6 +646,9 @@ watch(
                 />
               </label>
             </div>
+            <div v-if="ch.key === 'llm'" class="cfg-row mt-2">
+              <label class="check"><input type="checkbox" :checked="allowLanOf(cfg)" @change="(e: any) => setAllowLan(cfg, (e.target as HTMLInputElement).checked)" /> {{ t("允许局域网目标（默认关，有 SSRF 风险）") }}</label>
+            </div>
             <div v-if="ch.key === 'llm' || ch.key === 'vision'" class="cfg-row">
               <label class="field grow-2">
                 <span>{{ t("上下文长度 token（留空 = 自动探测，探测失败时回退 128000）") }}</span>
@@ -600,8 +660,10 @@ watch(
                   :placeholder="t('例如 128000')"
                   @change="
                     (e: any) => {
-                      const v = (e.target as HTMLInputElement).value.trim();
-                      cfg.extra!.contextLength = v === '' ? undefined : Number(v);
+                      const el = (e.target as HTMLInputElement);
+                      const next = sanitizeContextLengthInput(el.value);
+                      cfg.extra!.contextLength = next;
+                      el.value = next === undefined ? '' : String(next);
                     }
                   "
                 />
@@ -644,7 +706,7 @@ watch(
               />
             </label>
             <div v-if="isVoiceLibraryCleared(cfg)" class="notice danger mt-2">
-              {{ t("音色库为空：配音将不可用（各 TTS 服务均无名为 default 的音色）。请至少填写一个可用音色，或从 MiniMax 获取。") }}
+              {{ t(VOICE_LIBRARY_EMPTY_MESSAGE) }}
             </div>
             <div v-if="cfg.adapter === 'minimax-tts' || /minimaxi?\.com/i.test(cfg.baseUrl)" class="row mt-2">
               <button class="btn secondary small" :disabled="voiceFetching === cfg.id || !cfg.apiKey" @click="fetchVoicesFor(cfg)">
@@ -664,7 +726,7 @@ watch(
                 <span>{{ t("模型") }}</span>
                 <select
                   :value="cfg.model ?? 'speech-2.6-hd'"
-                  @change="(e: any) => { cfg.model = (e.target as HTMLSelectElement).value; }"
+                  @change="(e: any) => { cfg.model = (e.target as HTMLSelectElement).value; invalidateTest(cfg); }"
                 >
                   <option value="speech-2.8-hd">speech-2.8-hd{{ t("（最新高质量）") }}</option>
                   <option value="speech-2.8-turbo">speech-2.8-turbo{{ t("（低延迟）") }}</option>
@@ -678,7 +740,7 @@ watch(
                 <span>{{ t("情感") }}</span>
                 <select
                   :value="(cfg.extra!.emotion as string | undefined) ?? ''"
-                  @change="(e: any) => { cfg.extra!.emotion = (e.target as HTMLSelectElement).value || undefined; }"
+                  @change="(e: any) => { cfg.extra!.emotion = (e.target as HTMLSelectElement).value || undefined; invalidateTest(cfg); }"
                 >
                   <option value="">{{ t("自动（默认）") }}</option>
                   <option value="happy">{{ t("高兴") }}</option>
@@ -699,7 +761,7 @@ watch(
                   max="2"
                   step="0.05"
                   :value="cfg.extra!.speed ?? 1.1"
-                  @input="(e: any) => { cfg.extra!.speed = Number((e.target as HTMLInputElement).value); }"
+                  @input="(e: any) => { cfg.extra!.speed = Number((e.target as HTMLInputElement).value); invalidateTest(cfg); }"
                 />
               </label>
               <label class="field cfg-narrow">
@@ -710,7 +772,7 @@ watch(
                   max="10"
                   step="0.1"
                   :value="cfg.extra!.vol ?? 1"
-                  @input="(e: any) => { cfg.extra!.vol = Number((e.target as HTMLInputElement).value); }"
+                  @input="(e: any) => { cfg.extra!.vol = Number((e.target as HTMLInputElement).value); invalidateTest(cfg); }"
                 />
               </label>
               <label class="field cfg-narrow">
@@ -721,14 +783,14 @@ watch(
                   max="12"
                   step="1"
                   :value="cfg.extra!.pitch ?? 0"
-                  @input="(e: any) => { cfg.extra!.pitch = Number((e.target as HTMLInputElement).value); }"
+                  @input="(e: any) => { cfg.extra!.pitch = Number((e.target as HTMLInputElement).value); invalidateTest(cfg); }"
                 />
               </label>
               <label class="field cfg-narrow">
                 <span>{{ t("输出格式") }}</span>
                 <select
                   :value="(cfg.extra!.ttsFormat as string | undefined) ?? 'mp3'"
-                  @change="(e: any) => { cfg.extra!.ttsFormat = (e.target as HTMLSelectElement).value; }"
+                  @change="(e: any) => { cfg.extra!.ttsFormat = (e.target as HTMLSelectElement).value; invalidateTest(cfg); }"
                 >
                   <option value="mp3">mp3{{ t("（推荐）") }}</option>
                   <option value="wav">wav</option>
@@ -829,6 +891,7 @@ watch(
           <span>{{ t("抠图方式") }}</span>
           <select
             :value="cutoutMode"
+            :disabled="cutoutBusy"
             @change="(e: any) => { configState.cutout!.mode = (e.target as HTMLSelectElement).value as CutoutMode; }"
           >
             <option value="ai">{{ t("AI 抠图优先（失败自动降级色度键）") }}</option>
@@ -842,7 +905,7 @@ watch(
           <span>{{ t("抠图模型") }}</span>
           <select
             :value="configState.cutout?.modelId ?? 'isnet-anime'"
-            :disabled="cutoutMode !== 'ai'"
+            :disabled="cutoutMode !== 'ai' || cutoutBusy"
             @change="(e: any) => { configState.cutout!.modelId = (e.target as HTMLSelectElement).value; }"
           >
             <option v-for="m in cutoutModels" :key="m.id" :value="m.id">{{ m.label }}（{{ m.sizeMB }} MB）</option>

@@ -174,14 +174,18 @@ watch(assetTab, () => {
               <label class="asset-sel" @click.stop><input type="checkbox" :aria-label="`${row.name} · ${t('三视图')}`" :checked="selected.has(`threeview:${row.id}`)" @change="toggleSelect(`threeview:${row.id}`)" /></label>
               <LazyThumb :path="row.threeView" :alt="t('三视图')" />
               <span class="thumb-label">{{ t("三视图") }}</span>
-              <button class="btn ghost small" :disabled="regenLocked" @click.stop="reCutout('figure', `${row.id}_threeview`, row.threeView)">{{ t("抠图") }}</button>
+              <!-- #1122：缩略图操作收敛（最小折叠方案）：常驻只留复选框，「抠图」收进折叠菜单，点击不触发放大 -->
+              <details class="thumb-ops" @click.stop><summary>{{ t("操作") }}</summary><button class="btn ghost small" :disabled="regenLocked" @click.stop="reCutout('figure', `${row.id}_threeview`, row.threeView)">{{ t("抠图") }}</button></details>
             </div>
             <div v-for="e in row.emotions" :key="e.emo" class="asset-thumb" :class="{ missing: !e.file }" :title="`${EMOTION_LABELS[e.emo] ?? e.emo}（点击放大）`" @click="e.file && openPreview(e.file, `${row.name} · ${EMOTION_LABELS[e.emo] ?? e.emo}`)">
               <label class="asset-sel" @click.stop><input type="checkbox" :aria-label="`${row.name} · ${EMOTION_LABELS[e.emo] ?? e.emo}`" :checked="selected.has(`figure:${row.id}:${e.emo}`)" @change="toggleSelect(`figure:${row.id}:${e.emo}`)" /></label>
               <LazyThumb v-if="e.file" :path="e.file" :alt="EMOTION_LABELS[e.emo] ?? e.emo" />
               <span class="thumb-label">{{ EMOTION_LABELS[e.emo] ?? e.emo }}</span>
-              <button class="btn ghost small" :disabled="regenLocked" @click.stop="regenFigureEmotion(row.id, e.emo)">{{ t("重生成") }}</button>
-              <button v-if="e.file" class="btn ghost small" :disabled="regenLocked" @click.stop="reCutout('figure', e.emo === 'normal' ? row.id : `${row.id}_${e.emo}`, e.file)">{{ t("抠图") }}</button>
+              <!-- #1122：同上，「重生成/抠图」收进折叠菜单 -->
+              <details class="thumb-ops" @click.stop><summary>{{ t("操作") }}</summary>
+                <button class="btn ghost small" :disabled="regenLocked" @click.stop="regenFigureEmotion(row.id, e.emo)">{{ t("重生成") }}</button>
+                <button v-if="e.file" class="btn ghost small" :disabled="regenLocked" @click.stop="reCutout('figure', e.emo === 'normal' ? row.id : `${row.id}_${e.emo}`, e.file)">{{ t("抠图") }}</button>
+              </details>
             </div>
           </div>
           <div v-if="row.costumes.length" style="border-top: 1px dashed var(--border); margin-top: 8px; padding-top: 8px">
@@ -190,8 +194,11 @@ watch(assetTab, () => {
                 <label class="asset-sel" @click.stop><input type="checkbox" :aria-label="`${row.name} · ${ct.name}`" :checked="selected.has(`figure:${row.id}:ct_${ct.id}`)" @change="toggleSelect(`figure:${row.id}:ct_${ct.id}`)" /></label>
                 <LazyThumb v-if="ct.file" :path="ct.file" :alt="ct.name" />
                 <span class="thumb-label">{{ ct.name }}</span>
-                <button class="btn ghost small" :disabled="regenLocked" @click.stop="regenCostume(row.id, ct.id, ct.name)">{{ t("重生成") }}</button>
-                <button v-if="ct.file" class="btn ghost small" :disabled="regenLocked" @click.stop="reCutout('figure', `${row.id}_ct_${ct.id}`, ct.file)">{{ t("抠图") }}</button>
+                <!-- #1122：同上，「重生成/抠图」收进折叠菜单 -->
+                <details class="thumb-ops" @click.stop><summary>{{ t("操作") }}</summary>
+                  <button class="btn ghost small" :disabled="regenLocked" @click.stop="regenCostume(row.id, ct.id, ct.name)">{{ t("重生成") }}</button>
+                  <button v-if="ct.file" class="btn ghost small" :disabled="regenLocked" @click.stop="reCutout('figure', `${row.id}_ct_${ct.id}`, ct.file)">{{ t("抠图") }}</button>
+                </details>
               </div>
             </div>
           </div>
@@ -201,8 +208,11 @@ watch(assetTab, () => {
                 <label class="asset-sel" @click.stop><input type="checkbox" :aria-label="`${row.name} · ${a.name}`" :checked="selected.has(`action:${row.id}:${a.id}`)" @change="toggleSelect(`action:${row.id}:${a.id}`)" /></label>
                 <LazyThumb v-if="a.file" :path="a.file" :alt="a.name" />
                 <span class="thumb-label">{{ a.name }}</span>
-                <button class="btn ghost small" :disabled="regenLocked" @click.stop="regenAction(row.id, a.id, a.name)">{{ t("重生成") }}</button>
-                <button v-if="a.file" class="btn ghost small" :disabled="regenLocked" @click.stop="reCutout('figure', `${row.id}_act_${a.id}`, a.file)">{{ t("抠图") }}</button>
+                <!-- #1122：同上，「重生成/抠图」收进折叠菜单 -->
+                <details class="thumb-ops" @click.stop><summary>{{ t("操作") }}</summary>
+                  <button class="btn ghost small" :disabled="regenLocked" @click.stop="regenAction(row.id, a.id, a.name)">{{ t("重生成") }}</button>
+                  <button v-if="a.file" class="btn ghost small" :disabled="regenLocked" @click.stop="reCutout('figure', `${row.id}_act_${a.id}`, a.file)">{{ t("抠图") }}</button>
+                </details>
               </div>
             </div>
           </div>
@@ -381,5 +391,19 @@ watch(assetTab, () => {
   background: rgba(255, 255, 255, 0.88);
   line-height: 0;
   cursor: pointer;
+}
+/* #1122：缩略图操作折叠菜单（常驻只留复选框 + 一个 summary，展开后才露出重生成/抠图） */
+.thumb-ops {
+  font-size: 11px;
+}
+.thumb-ops > summary {
+  cursor: pointer;
+  color: var(--text-faint);
+  font-size: 11px;
+  line-height: 1.6;
+  user-select: none;
+}
+.thumb-ops > button {
+  margin: 2px 2px 0 0;
 }
 </style>

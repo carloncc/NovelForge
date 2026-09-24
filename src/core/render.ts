@@ -56,8 +56,18 @@ export function inferWebgalLanguage(text: string): WebgalLanguage {
   return "zh_CN";
 }
 
-/** 台词配音键：渲染与配音阶段共用同一公式，保证键一致 */
+/** 台词配音键（1462）：渲染与配音阶段共用同一公式，保证键一致。
+ *  sanitizeId 会把非词字符折叠成 _，sc_a b 与 sc_a_b 会得到相同键（配音串台、分支 label 撞名）。
+ *  仅当原始 id 被 sanitizeId「有损折叠」时才追加 4 位短哈希——如此既区分撞名 id，
+ *  又让绝大多数（本就用 [A-Za-z0-9_-] 的）id 沿用历史键，旧配音文件无需迁移/重配。 */
 export function sceneVocalKey(chapter: number, sceneId: string, idx: number): string {
+  const clean = sanitizeId(sceneId);
+  const suffix = clean === (sceneId || "") ? "" : `_${stableHash(sceneId).slice(0, 4)}`;
+  return `ch${chapter}_${clean}${suffix}_${idx}`;
+}
+
+/** 旧版配音键（无哈希，1462 迁移用）：仅用于回退查找历史缓存，避免升级后旧项目装配时无声。 */
+export function legacySceneVocalKey(chapter: number, sceneId: string, idx: number): string {
   return `ch${chapter}_${sanitizeId(sceneId)}_${idx}`;
 }
 
@@ -116,8 +126,59 @@ function sanitizeLabel(text: string): string {
   return (text || "章节").replace(/[\\/:*?"<>|\r\n;]/g, "_").slice(0, 30);
 }
 
+/** 章节显示标题（1354）：统一宽口径去重 + 统一用重编号。
+ *  宽正则 [章回节话篇部幕卷]（render 标题卡口径，修过“第1章·第一卷第一章”重复投诉）；
+ *  标题自带编号时直接返回原标题，否则拼“第 N 章 · 原标题”。空标题只返回章号。 */
+export function chapterDisplayTitle(chapterNumber: number, title: string): string {
+  const raw = (title ?? "").trim();
+  if (!raw) return `第 ${chapterNumber} 章`;
+  if (/第\s*[0-9零〇一二三四五六七八九十百千万两]+\s*[章回节话篇部幕卷]/.test(raw)) return raw;
+  return `第 ${chapterNumber} 章 · ${raw}`;
+}
+
+/** 引擎安全素材文件名（1452 纯函数，便于单测；渲染与落盘共用）。
+ *  引擎把 ; 当截断、| 当分隔、“ -”当选项起点；文件名照抄 esc 口径映射，
+ *  否则自备素材在脚本与磁盘“一致地一起坏掉”（有文件但 404）。 */
+export function engineSafeFileName(name: string): string {
+  const base = name.split(/[\\/]/).pop() || name;
+  return base.replace(/;/g, "；").replace(/\|/g, "｜").replace(/ -/g, " ‑");
+}
+
 function getBaseName(f: string): string {
-  return f.split(/[\\/]/).pop() || f;
+  return engineSafeFileName(f);
+}
+
+/** 人名安全转义（1457）：ASCII 冒号映射为全角，禁止走 esc 的 \: 转义。
+ *  引擎用裸 /:/ 切分“人名:台词”，\: 照样命中，导致名牌“ Alice\”+正文“Bob:Hi”。文本侧仍用 esc。 */
+function escName(text: string): string {
+  return esc((text || "").replace(/:/g, "："));
+}
+
+/** 短哈希（1462）：sanitizeId 把非词字符折叠成 _，sc_a b 与 sc_a_b 会撞 label 与配音键。
+ *  branchPrefix 与 sceneVocalKey 均追加本哈希；旧无哈希配音键由 legacySceneVocalKey 回退兼容。 */
+export function stableHash(s: string): string {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
+  return h.toString(36);
+}
+
+/** 分支 label 前缀（1462）：ch{N}_{sanitizeId}_{hash4}，保证原始 id 不同则前缀不同。 */
+export function branchPrefix(chapterNumber: number, sceneId: string): string {
+  return `ch${chapterNumber}_${sanitizeId(sceneId)}_${stableHash(sceneId).slice(0, 4)}`;
+}
+
+/** 选项文案清洗（1450）：WebGAL choose 按 -> 切分、按 (?<!\\): 切文本/目标，
+ *  ( ) [ ] 是 showCondition/enableCondition/jump 保留字符；文本含任一即 TypeError 卡死
+ *  （forward 在 currentSentenceId++ 前抛错，当前句永不消费）。仅全角化上述保留字符
+ *  （: ; , 由 esc 的反斜杠转义处理，不在此改字形），清洗后为空兜底“继续”。 */
+export function sanitizeChoicePrompt(prompt: string): string {
+  const s = (prompt || "")
+    .replace(/->/g, "→")
+    .replace(/\(/g, "（").replace(/\)/g, "）")
+    .replace(/\[/g, "【").replace(/\]/g, "】")
+    .replace(/\|/g, "｜")
+    .trim();
+  return s || "继续";
 }
 
 /* ===== 人物动作：入场动画 + 情绪动作 + 剧情镜头震动 ===== */
@@ -187,15 +248,30 @@ export function detectSe(scene: SceneJSON): string | null {
   return null;
 }
 
-function isDramatic(text: string): boolean {
-  return /(轰鸣|爆炸|崩塌|巨响|震耳|怒吼|嘶吼|冲撞|猛然|狠狠|轰然|剧烈|颤抖|踉跄|飞扑|倒下|拔出|挥剑|斩|劈开)/.test(text);
+/** 高潮句判定（1432）：按渲染文本语言无关匹配——zh 简/繁 + en/ja/ko 关键词组。
+ *  管线是 分章→翻译→提取→剧本，render 拿到的是目标语言文本；旧实现只有简体中文，
+ *  en/ja/ko 项目恒 false。英文用词边界避免误配，CJK/假名/谚文用子串匹配。 */
+export function isDramatic(text: string): boolean {
+  const t = text || "";
+  if (/(轰鸣|爆炸|崩塌|巨响|震耳|怒吼|嘶吼|冲撞|猛然|狠狠|轰然|剧烈|颤抖|踉跄|飞扑|倒下|拔出|挥剑|斩|劈开)/.test(t)) return true;
+  // zh_TW 繁体字形（轟鳴/巨響/衝撞/顫抖/踉蹌/飛撲/揮劍/劈開 等）
+  if (/(轟鳴|巨響|衝撞|顫抖|踉蹌|飛撲|拔出|揮劍|劈開|崩塌|怒吼|嘶吼|猛然|狠狠|轟然|劇烈)/.test(t)) return true;
+  // en：高潮/冲击/动作词（词边界，大小写不敏感）
+  if (/\b(explosion|thunder|roar|crash|violent|tremble|stagger|lunge|collapse|slash|unsheathe|draw (?:his|her|their|the) sword|battle cry|scream)\b/i.test(t)) return true;
+  // ja：爆発/轟音/咆哮/衝突/震え/斬 等
+  if (/(爆発|轟音|咆哮|衝突|激しく|震え|よろめ|斬|抜刀|轟)/.test(t)) return true;
+  // ko：폭발/굉음/포효/충돌/격렬/떨림/베기 等
+  if (/(폭발|굉음|포효|충돌|격렬|떨림|비틀|베기|抜刀|굉)/.test(t)) return true;
+  return false;
 }
 
 /** 长消息按句读拆成多条 WebGAL 消息（一屏一句，接近 galgame 节奏）。
- * 仅在「无配音」时拆分：有配音的台词保持单条，避免换页掐断语音。 */
-const MESSAGE_MAX_CHARS = 48;
-/** 非 CJK（英文等）阈值：48 字符会从单词中间断开，放宽到约 120 并按单词/句末边界切 */
-const MESSAGE_MAX_CHARS_LATIN = 120;
+ *  仅在「无配音」时拆分：有配音的台词保持单条，避免换页掐断语音。
+ *  1458：按引擎真实几何（white-space:nowrap + overflow:hidden，每行约 32 中文字符，
+ *  medium 默认只显示 2 行）收紧，旧 48/120 会从第 3 分段起被静默丢弃。 */
+export const MESSAGE_MAX_CHARS = 32;
+/** 非 CJK（英文等）阈值：按单词边界切，旧 120 在 nowrap 下同样溢出，收紧到 80 */
+export const MESSAGE_MAX_CHARS_LATIN = 80;
 
 /** 非 CJK 文本按空格/句末标点切分，避免从单词中间硬切（UI106） */
 function splitLatinMessage(t: string): string[] {
@@ -238,9 +314,10 @@ function splitUnvoicedMessage(text: string, voiced: boolean): string[] {
   return out.length ? out : [t];
 }
 
-/** 文本框单页字符上限（UI99）：2560×1440 设计画布下约 3 行；超过则在语句/单词边界插入
- *  WebGAL 的 `|` 行分段（同一句内多行），配合 config 的 Max_line 避免长台词溢出对话框。 */
-export const TEXTBOX_PAGE_MAX_CHARS = 140;
+/** 文本框单页字符上限（UI99/1458）：引擎文本框 white-space:nowrap + overflow:hidden，
+ *  每行仅约 32 中文字符、默认可见 2 行；旧 140 配 Max_line:8 会使第 3 分段起被丢弃。
+ *  收紧到 64（2 行），配合 Max_line:2 与引擎真实容量对齐。 */
+export const TEXTBOX_PAGE_MAX_CHARS = 64;
 export function paginateForTextBox(text: string, maxChars = TEXTBOX_PAGE_MAX_CHARS): string {
   const t = text || "";
   if (t.length <= maxChars) return t;
@@ -321,20 +398,30 @@ export function renderChapter(
     out.push(`changeFigure:none${clearExit} -next;`);
     out.push(`changeFigure:none -right${clearExit} -next;`);
   }
-  // 跨章演出复位（#789）：引擎的 changeScene 不清舞台，上一章的 BGM/黑边/滤镜会残留进本章。
+  // 跨章演出复位（#789/1463）：引擎的 changeScene 不清舞台，上一章的 BGM/黑边/滤镜/背景会残留进本章。
   // 章首显式归零，避免「上一章的紧张黑边/胶片颗粒/音乐带进本章无配乐场景」。
+  // 1463：首场景无背景 visual 时上一章最后一幕会带着 Ken Burns 缩放黏连进新章（整场用错图），
+  // 此时无条件 changeBg:none + bg-main 全量归零；有 visual 的首场景靠自身 changeBg 覆盖，不额外闪黑。
   out.push(`; ---- 跨章复位 ----`);
   out.push(`bgm:none -enter=0 -next;`);
   out.push(`filmMode:none;`);
   out.push(`setTransform:{"oldFilm":0} -target=bg-main -duration=0 -next;`);
   out.push(`setTransform:{"godrayFilm":0} -target=bg-main -duration=0 -next;`);
+  {
+    const firstScene = chapter.scenes[0];
+    const firstHasVisual = !!firstScene && !!(
+      opts.assets.bg[firstScene.id] ||
+      (imageOnly && (firstScene.shots ?? []).some((s) => opts.assets.shot?.[s.id]))
+    );
+    if (!firstHasVisual) {
+      out.push(`changeBg:none -duration=0 -next;`);
+      out.push(`setTransform:{"blur":0,"oldFilm":0,"godrayFilm":0,"scale":{"x":1,"y":1}} -target=bg-main -duration=0 -next;`);
+    }
+  }
   // 章节标题卡：黑屏全屏章节名（成熟视觉小说标配，点击继续）。
-  // 标题本身已含「第X章/第X卷」时不再重复拼「第 N 章 ·」（用户实测：显示成「第 1 章 · 第一卷 第一章 …」）
+  // 1354：统一用 chapterDisplayTitle（宽口径去重 + 重编号），与流程图同口径。
   out.push(`; ---- 章节标题卡 ----`);
-  const rawChapterTitle = (chapter.title ?? "").trim();
-  const cardTitle = /第\s*[0-9零〇一二三四五六七八九十百千万两]+\s*[章回节话篇部幕卷]/.test(rawChapterTitle)
-    ? rawChapterTitle
-    : `第 ${chapter.chapter + 1} 章 · ${rawChapterTitle}`;
+  const cardTitle = chapterDisplayTitle(chapter.chapter + 1, chapter.title ?? "");
   out.push(`intro:${esc(cardTitle)} -fontColor=rgba(255,255,255,1) -fontSize=large -hold;`);
 
   // 舞台立绘管理：同时最多 2 个角色（左/右插槽），新角色出现时按最近说话顺序驱逐
@@ -347,6 +434,8 @@ export function renderChapter(
   // BGM 状态：WebGAL 的 changeScene 不自动清舞台，跨场景/跨章节残留的音乐需显式停止
   let lastBgm: string | null = null;
   let lastSe: string | null = null;
+  // 1453：CG 恢复背景在 bgFile 为空时回填上一张已发射背景（避免整场纯黑）；按章重置（1463 跨章不沿用）。
+  let lastBgEmitted: string | null = null;
   const bgmUnlocked = new Set<string>();
   // 自动电影黑边 / 影调滤镜 状态（按值变化输出，避免每行重复指令）
   let lastFilm = false;
@@ -357,17 +446,26 @@ export function renderChapter(
   const charById = new Map(opts.characters.map((c) => [c.id, c]));
   const itemById = new Map(opts.items.map((i) => [i.id, i]));
 
+  // 配音键回退（1462 迁移）：优先新键（含哈希），未生成时回退旧的无哈希键，
+  // 保证升级后旧项目仅「重新组装」也能沿用历史配音文件而不静音（新键由配音阶段按内容索引 0 计费认领）。
+  const vocalFor = (scene: SceneJSON, idx: number, si = 0, total = 1): string | undefined => {
+    const baseKey = sceneVocalKey(chapter.chapter, scene.id, idx);
+    const legacyKey = legacySceneVocalKey(chapter.chapter, scene.id, idx);
+    return opts.assets.vocal[sceneVocalKeyPart(baseKey, si, total)]
+      ?? opts.assets.vocal[sceneVocalKeyPart(legacyKey, si, total)];
+  };
+
   // 台词文本输出（立绘版/图片版共用）：超长台词按句拆成多段（每段一条消息 + 独立配音），
   // 修复「玩家读到全文、听到的却只有前 500 字」的声画不一致
+  // 1449：配音一律用显式键 -vocal=（引擎裸选项白名单只认 ogg/mp3/wav/opus，flac/m4a 会被当成普通开关整行静音）
   const emitDialogueText = (line: Line, scene: SceneJSON, idx: number, name: string): void => {
-    const baseKey = sceneVocalKey(chapter.chapter, scene.id, idx);
-    const vocalFile = opts.assets.vocal[baseKey];
-    const vocalArg = vocalFile ? ` -${getBaseName(vocalFile)}` : "";
+    const vocalFile = vocalFor(scene, idx);
+    const vocalArg = vocalFile ? ` -vocal=${getBaseName(vocalFile)}` : "";
     const speechParts = splitLineForSpeech(line.text);
     if (speechParts.length > 1) {
       speechParts.forEach((seg, si) => {
-        const partFile = opts.assets.vocal[sceneVocalKeyPart(baseKey, si, speechParts.length)];
-        out.push(`${name}:${esc(paginateForTextBox(seg))}${partFile ? ` -${getBaseName(partFile)}` : ""};`);
+        const partFile = vocalFor(scene, idx, si, speechParts.length);
+        out.push(`${name}:${esc(paginateForTextBox(seg))}${partFile ? ` -vocal=${getBaseName(partFile)}` : ""};`);
       });
     } else {
       // 长句按句读拆成多条消息（一屏一句）；有配音的保持单条，避免换页掐断语音
@@ -385,18 +483,21 @@ export function renderChapter(
     if (line.type === "dialogue") {
       if (imageOnly) {
         // 图片小说（#810）：无立绘/入场/动作/资料卡；高潮句只做背景震动与虚化，文本与配音与立绘版同口径
-        if (useActions && isDramatic(line.text)) {
+        // 1431：背景震动/虚化与人物动作无关，去掉 useActions 门控（否则 figureActions:false 时专属效果永不输出）。
+        // 1456：同目标 -next 在同一收集窗按 performName 折叠（只剩最后一条），复位 blur:0 去掉 -next 落到下一窗，
+        // 否则 blur:5 与 shake 都被折叠、演出全灭。shake 与 blur:5 仍同窗（至少虚化可见），已在注释说明局限。
+        if (isDramatic(line.text)) {
           out.push(`setAnimation:shake -target=bg-main -next;`);
           out.push(`setTransform:{"blur":5} -target=bg-main -duration=700 -next;`);
-          out.push(`setTransform:{"blur":0} -target=bg-main -duration=900 -next;`);
+          out.push(`setTransform:{"blur":0${useActions ? `,"scale":{"x":1.04,"y":1.04}` : ""}} -target=bg-main -duration=900;`);
         }
         const speaker = charById.get(line.characterId || "") ?? opts.characters.find((c) => c.id === line.characterId);
         if (speaker) {
-          emitDialogueText(line, scene, idx, esc(speaker.name));
+          emitDialogueText(line, scene, idx, escName(speaker.name));
         } else {
           // 说话人不可识别时按旁白输出，避免生成「???」人名
-          const narVocal = opts.assets.vocal[sceneVocalKey(chapter.chapter, scene.id, idx)];
-          out.push(`:${esc(paginateForTextBox(line.text))}${narVocal ? ` -${getBaseName(narVocal)}` : ""};`);
+          const narVocal = vocalFor(scene, idx);
+          out.push(`:${esc(paginateForTextBox(line.text))}${narVocal ? ` -vocal=${getBaseName(narVocal)}` : ""};`);
         }
         return;
       }
@@ -495,17 +596,24 @@ export function renderChapter(
         lastFigureFile.set(effCharId, displayFile);
       }
       // 情绪动作：说话时的震动/弹出/跳动（入场那一句跳过，避免与入场动画叠加）
+      // 1448：setTempAnimation 从单位变换起播（ignoreDefault=true），末帧回到 {0,0}/{1,1} 会摧毁半身取景。
+      // 取景只在 figureChanged 时补发，丢一次就丢到下次换图。补复位行；复位不用 -next（1456 同窗折叠会吞掉 motion 本体）。
       if (useActions && displayFile && !appearing && slot && effEmotion && effEmotion !== "normal") {
         const motion = motionFor(effEmotion);
-        if (motion) out.push(`setTempAnimation:${motion} -target=fig-${slot} -next;`);
+        if (motion) {
+          out.push(`setTempAnimation:${motion} -target=fig-${slot} -next;`);
+          out.push(`setTransform:${FIGURE_FRAMING} -target=fig-${slot} -duration=0;`);
+        }
       }
       // 高潮台词演出：背景虚化 + 说话立绘特写推进（1500ms），句末回到半身取景
+      // 1456：同目标 -next 同窗按 performName 折叠（bg 只剩 blur:0、fig 只剩收尾取景，演出全灭）。
+      // 初段（blur:5/bg + zoom/fig，不同 target，可同窗）保留 -next；复位段去掉 -next 落到后续窗，保住初段演出。
       if (useActions && isDramatic(line.text)) {
         if (slot) {
           out.push(`setTransform:{"blur":5} -target=bg-main -duration=700 -next;`);
           out.push(`setTransform:${FIGURE_FRAMING_ZOOM} -target=fig-${slot} -duration=1500 -next;`);
-          out.push(`setTransform:${FIGURE_FRAMING} -target=fig-${slot} -duration=800 -next;`);
-          out.push(`setTransform:{"blur":0} -target=bg-main -duration=800 -next;`);
+          out.push(`setTransform:${FIGURE_FRAMING} -target=fig-${slot} -duration=800;`);
+          out.push(`setTransform:{"blur":0,"scale":{"x":1.04,"y":1.04}} -target=bg-main -duration=800;`);
         }
       }
       // 更新最近说话顺序（用于驱逐）
@@ -522,21 +630,21 @@ export function renderChapter(
           out.push(`:${esc(seg)};`);
         }
       }
-      const name = esc(char?.name || effCharId || "???");
+      const name = escName(char?.name || effCharId || "???");
       emitDialogueText(line, scene, idx, name);
     } else {
       // 旁白与内心独白统一走普通旁白行：intro: 指令不带语音播放，
       // 之前独白渲染成 intro:…-v.mp3 导致引擎忽略语音后缀、独白全程无声。
       // 改回 ':' 旁白行后与配音任务同 key，语音正常播放。
+      // 1456：复位 blur:0 去掉 -next（同窗折叠会吞掉 shake/blur:5）。
       if (useActions && isDramatic(line.text)) {
         out.push(`setAnimation:shake -target=bg-main -next;`);
         out.push(`setTransform:{"blur":5} -target=bg-main -duration=700 -next;`);
-        out.push(`setTransform:{"blur":0} -target=bg-main -duration=900 -next;`);
+        out.push(`setTransform:{"blur":0,"scale":{"x":1.04,"y":1.04}} -target=bg-main -duration=900;`);
       }
       // 旁白同样带配音，避免整段静默；超长旁白与对话同口径按句拆段配音
-      const narBaseKey = sceneVocalKey(chapter.chapter, scene.id, idx);
-      const narVocalFile = opts.assets.vocal[narBaseKey];
-      const narVocalArg = narVocalFile ? ` -${getBaseName(narVocalFile)}` : "";
+      const narVocalFile = vocalFor(scene, idx);
+      const narVocalArg = narVocalFile ? ` -vocal=${getBaseName(narVocalFile)}` : "";
       // B75：分段与配音阶段统一按「原始 line.text」切（voice.ts 同公式），
       // 渲染时再对每段单独加「」——旧实现先加引号再分段，_pN 段首/段尾多出引号，
       // 与配音任务的文本哈希对不上（长独白语音错位/无法复用）。
@@ -548,8 +656,8 @@ export function renderChapter(
       const narParts = splitLineForSpeech(line.text);
       if (narParts.length > 1) {
         narParts.forEach((seg, si) => {
-          const partFile = opts.assets.vocal[sceneVocalKeyPart(narBaseKey, si, narParts.length)];
-          out.push(`:${esc(paginateForTextBox(wrapMonologue(seg)))}${partFile ? ` -${getBaseName(partFile)}` : ""};`);
+          const partFile = vocalFor(scene, idx, si, narParts.length);
+          out.push(`:${esc(paginateForTextBox(wrapMonologue(seg)))}${partFile ? ` -vocal=${getBaseName(partFile)}` : ""};`);
         });
       } else {
         // 内心独白用「」包裹区分（WebGAL 无行内样式，括号标记最稳妥；独白不拆行）
@@ -566,11 +674,16 @@ export function renderChapter(
     out.push("");
     out.push(`; ---- 场景：${comment(scene.location)}（${comment(scene.atmosphere)} ${comment(scene.time)}）----`);
 
-    // 电影黑边 + 影调滤镜：紧张/战斗场景自动压暗黑边，回忆/梦境加胶片颗粒，其余恢复。
-    // 引擎命令（filmMode / setFilter，滤镜参数与 Pixi 滤镜对象同名）已确认存在；按值变化输出。
+    // 影调滤镜 + 视频黑边（1459：已核实引擎 4.6.3 语义）。
+    // filmMode 并不是「电影黑边」：它 setStage("enableFilm")，只有两处消费——① 视频覆盖层 letterbox
+    // （FullScreenPerform 高度 76%/top 12%）；② 把文本框切到 IOe 分支（不渲染说话人名、无黑色底板、
+    // 字号 50*textSize+200%，medium=250%）。故 atmosphere 命中就 filmMode:true 会把绝大多数动作/冲突场景
+    // 的对话框弄坏；现改为只有本场景确实播放视频时才开（letterbox 唯一正确用途），氛围改走 setTransform 滤镜。
     const mood = `${scene.atmosphere || ""} ${scene.location || ""}`;
-    const wantFilm = /紧张|激烈|决战|战斗|高潮|危机|追逐|逃生|对峙/i.test(mood);
-    const wantFilter = /回忆|梦境|往事|过去|童年|记忆|梦/i.test(mood) ? "oldFilm" : wantFilm ? "godrayFilm" : "";
+    const tenseMood = /紧张|激烈|决战|战斗|高潮|危机|追逐|逃生|对峙/i.test(mood);
+    const wantFilter = /回忆|梦境|往事|过去|童年|记忆|梦/i.test(mood) ? "oldFilm" : tenseMood ? "godrayFilm" : "";
+    const sceneHasVideo = (scene.videoPoints || []).some((vp) => !!opts.videos?.[sanitizeId(vp.id)]);
+    const wantFilm = sceneHasVideo;
     if (wantFilm !== lastFilm) {
       // 引擎语义：不填或填 none 才关闭电影模式，其他任何字符串（包括 "false"）都会开启。
       // 旧实现输出 filmMode:false，进入紧张场景后电影模式永不退出（自定义对话框消失、说话人名字不显示）
@@ -595,7 +708,9 @@ export function renderChapter(
         bgmUnlocked.add(bgmFile);
         // 鉴赏室显示可读中文标签（此前显示 bgm_ambient_1 这类原始文件名）
         const bgmName = bgmDisplayName(getBaseName(bgmFile));
-        out.push(`unlockBgm:${getBaseName(bgmFile)} -name=${esc(bgmName)};`);
+        // 1460：unlockBgm/unlockCg 的 content 被引擎原样存进 appreciationData.url（无目录补全），
+        // 裸文件名在鉴赏室解析到游戏根目录全破图/404；输出带目录的相对路径（鉴赏页在输出根目录可解析）。
+        out.push(`unlockBgm:game/bgm/${getBaseName(bgmFile)} -name=${esc(bgmName)};`);
       }
       lastBgm = bgmFile;
     } else if (lastBgm) {
@@ -604,6 +719,10 @@ export function renderChapter(
     }
 
     const bgFile = opts.assets.bg[scene.id];
+    // CG 映射（1453 预读）：triggerIndex<=0 的 CG 在场景开场即播，此时跳过前置 changeBg（否则淡入两次）。
+    const cgFilePeek = scene.cgFile || opts.assets.cg[`${chapter.chapter}_${scene.id}`] || opts.assets.cg[scene.id];
+    const cgTriggerPeek = (scene.cgEvent as { triggerIndex?: number } | undefined)?.triggerIndex ?? 0;
+    const cgAtStart = !!cgFilePeek && !imageOnly && cgTriggerPeek <= 0;
     // 图片小说分镜（#810）：按 triggerLineIndex 排序，只保留已有产物的分镜；有分镜时不再铺场景背景
     const shotList = imageOnly
       ? (scene.shots ?? [])
@@ -611,22 +730,24 @@ export function renderChapter(
           .filter((entry): entry is { shot: NonNullable<SceneJSON["shots"]>[number]; file: string } => !!entry.file)
           .sort((a, b) => a.shot.triggerLineIndex - b.shot.triggerLineIndex)
       : [];
-    if (bgFile && (!imageOnly || !shotList.length)) {
+    if (bgFile && (!imageOnly || !shotList.length) && !cgAtStart) {
       // 场景切换：干净利落的交叉淡化（WebGAL changeBg 自带透明度淡入，500ms 即完成），
       // 叠加轻微推近（Ken Burns 运镜）制造电影感，符合主流 galgame 的 dissolve 过渡。
       // 注意不要在此叠加 blur 聚焦——changeBg 已含淡入，双重动画叠加是"生硬"的来源。
       out.push(`changeBg:${getBaseName(bgFile)} -duration=500 -ease=easeInOut -next;`);
+      lastBgEmitted = getBaseName(bgFile);
       if (useActions) {
         out.push(`setTransform:{"scale":{"x":1.04,"y":1.04}} -target=bg-main -duration=3000 -next;`);
       }
     }
-    // 分镜切换：只淡入（#814 决策 9），不推近；同时解锁鉴赏室（分镜按 CG 画廊展示）
+    // 分镜切换：只淡入（#814 决策 9），不推近；同时解锁鉴赏室（分镜按 CG 画廊展示，1460 带目录路径）
     let shotCursor = 0;
     const emitDueShots = (lineIndex: number): void => {
       while (shotCursor < shotList.length && shotList[shotCursor].shot.triggerLineIndex <= lineIndex) {
         const { shot, file } = shotList[shotCursor++];
         out.push(`changeBg:${getBaseName(file)} -duration=400 -ease=easeInOut -next;`);
-        out.push(`unlockCg:${getBaseName(file)} -name=${esc(shot.note || scene.location || "分镜")};`);
+        lastBgEmitted = getBaseName(file);
+        out.push(`unlockCg:game/background/${getBaseName(file)} -name=${esc(shot.note || scene.location || "分镜")};`);
       }
     };
     // 触发点 ≤ 0 的分镜在第一句之前就切换
@@ -637,7 +758,8 @@ export function renderChapter(
       if (shotList.length && shotList[0].shot.triggerLineIndex > 0) {
         const { shot, file } = shotList[shotCursor++];
         out.push(`changeBg:${getBaseName(file)} -duration=400 -ease=easeInOut -next;`);
-        out.push(`unlockCg:${getBaseName(file)} -name=${esc(shot.note || scene.location || "分镜")};`);
+        lastBgEmitted = getBaseName(file);
+        out.push(`unlockCg:game/background/${getBaseName(file)} -name=${esc(shot.note || scene.location || "分镜")};`);
       } else {
         emitDueShots(0);
       }
@@ -664,16 +786,21 @@ export function renderChapter(
         out.push(`; ---- 视频演出：${comment(vp.title)} ----`);
         out.push(`playVideo:${getBaseName(vfile)};`);
       } else {
-        out.push(`; [视频位] ${comment(vp.title)}：${comment(vp.description)}（提示词见 video_plan.txt，把生成的 mp4 命名为 video_${sanitizeId(vp.id)}.mp4 放入 video 文件夹后刷新即启用）`);
+        out.push(`; [视频位] ${comment(vp.title)}：${comment(vp.description)}（提示词见 video_plan.txt，把视频命名为 video_${sanitizeId(vp.id)}.mp4 放入 video 文件夹后，需重新组装（结果区点「重新组装生效」）才会写入演出指令）`);
       }
     }
 
     // CG 映射 key 为 `${chapter.chapter}_${scene.id}`（images.ts 按此记录），
     // 直接用 scene.id 查不到会导致 CG 演出整段被跳过；scene.cgFile 是生成阶段写入的捷径，两者都兜底。
+    // 1453：CG 按 cgEvent.triggerIndex 在台词流中触发（与 itemEvents 同索引表），不再固定场景开场；
+    // trigger<=0/缺失保持开场（兼容旧数据）；bg 为空时回填 lastBgEmitted 而非 none（避免后半整场纯黑）。
     const cgFile = scene.cgFile || opts.assets.cg[`${chapter.chapter}_${scene.id}`] || opts.assets.cg[scene.id];
     const cg = scene.cgEvent;
-    // 图片小说模式没有立绘舞台，CG 演出（清场/恢复立绘）整块跳过；分镜已承担画面切换
-    if (cgFile && !imageOnly) {
+    const cgTrigger = (cg as { triggerIndex?: number } | undefined)?.triggerIndex ?? 0;
+    let cgEmitted = false;
+    const emitCg = (): void => {
+      if (!cgFile || imageOnly || cgEmitted) return;
+      cgEmitted = true;
       // CG 前记录立绘状态：播完 CG 原样恢复（不带入场动画），否则所有角色会带 enter 动画重新跳入
       const cgBefore = stageOrder
         .map((id) => ({ id, slot: stageSlot.get(id), file: lastFigureFile.get(id) }))
@@ -686,12 +813,14 @@ export function renderChapter(
       // CG 后舞台实际已空，必须同步清立绘文件记忆，否则 CG 后同文件角色会被误判“未换装”而跳过 changeFigure，导致人物消失
       lastFigureFile.clear();
       out.push(`changeBg:${getBaseName(cgFile)} -duration=400 -ease=easeInOut -next;`);
+      lastBgEmitted = getBaseName(cgFile);
       // 名场面特写运镜：缓慢推近 CG，强化冲击力
       out.push(`setTransform:{"scale":{"x":1.08,"y":1.08}} -target=bg-main -duration=2500 -next;`);
       // 有 cgEvent 用事件标题/描述，无事件（旧图残留/手动放图）也解锁，避免鉴赏室漏 CG
-      out.push(`unlockCg:${getBaseName(cgFile)} -name=${esc(cg?.title || cg?.description || scene.location || "CG")};`);
+      out.push(`unlockCg:game/background/${getBaseName(cgFile)} -name=${esc(cg?.title || cg?.description || scene.location || "CG")};`);
       out.push(`:${esc(cg?.description || cg?.title || `${scene.location} ${scene.atmosphere || ""}`.trim() || "名场面")};`);
-      out.push(`changeBg:${bgFile ? getBaseName(bgFile) : "none"} -duration=500 -ease=easeInOut -next;`);
+      out.push(`changeBg:${bgFile ? getBaseName(bgFile) : (lastBgEmitted ?? "none")} -duration=500 -ease=easeInOut -next;`);
+      if (bgFile) lastBgEmitted = getBaseName(bgFile);
       // 原样恢复 CG 前的立绘（无入场动画；状态同步回填，后续台词按原表情/服装继续）
       for (const b of cgBefore) {
         out.push(`changeFigure:${getBaseName(b.file)} -${b.slot} -next;`);
@@ -700,7 +829,9 @@ export function renderChapter(
         lastFigureFile.set(b.id, b.file);
         stageOrder.push(b.id);
       }
-    }
+    };
+    // 图片小说模式没有立绘舞台，CG 演出整块跳过；分镜已承担画面切换。开场 CG 只在 trigger<=0 时播。
+    if (cgTrigger <= 0) emitCg();
 
     // 同一触发行支持多个物品事件：旧实现每个索引只保留第一个，多事件时后续事件被静默丢弃
     const eventIdxsByTrigger = new Map<number, number[]>();
@@ -712,6 +843,8 @@ export function renderChapter(
 
     scene.lines.forEach((line, i) => {
       if (imageOnly) emitDueShots(i);
+      // 1453：CG 按 triggerIndex 在台词流中触发（开场已播的不重复）。
+      if (!imageOnly && cgFile && !cgEmitted && cgTrigger === i) emitCg();
       const evIdxs = eventIdxsByTrigger.get(i);
       if (evIdxs) {
         for (const evIdx of evIdxs) out.push(...renderItemEvent(scene, evIdx, opts, itemById));
@@ -731,14 +864,24 @@ export function renderChapter(
     if (lastEvIdxs) {
       for (const evIdx of lastEvIdxs) out.push(...renderItemEvent(scene, evIdx, opts, itemById));
     }
+    // 1453：trigger 越界（>=lines.length）或 CG 从未触发，兜底在场景末播出，避免名场面丢失。
+    if (!imageOnly && cgFile && !cgEmitted && cgTrigger >= scene.lines.length) emitCg();
 
     // 分支选择：场景末尾弹出选项，各分支为独立 label 块，结束后跳回合并点继续
+    // 1450：选项文案全角化保留字符（->()[]|:;,），空兜底“继续”，避免 choose 解析 TypeError 卡死。
+    // 1462：label 前缀追加短哈希，避免 sc_a b 与 sc_a_b 撞名跳错场景（vocalKey 暂不动，需 voice.ts 同步）。
+    // 1461：分支台词走 renderLine 会改舞台（changeFigure/setTransform），join 后按快照复原，避免分支角色带进下一场景。
     if (scene.choices && scene.choices.length) {
-      const prefix = `ch${chapter.chapter + 1}_${sanitizeId(scene.id)}`;
+      const prefix = branchPrefix(chapter.chapter + 1, scene.id);
       const joinLabel = `${prefix}_join`;
       const args = scene.choices
-        .map((c, ci) => `${esc((c.prompt || "继续").replace(/\|/g, "｜"))}:${prefix}_c${ci + 1}`)
+        .map((c, ci) => `${esc(sanitizeChoicePrompt(c.prompt || "继续"))}:${prefix}_c${ci + 1}`)
         .join("|");
+      // 1461 快照：choose 之前记录舞台（槽位/顺序/文件/BGM），join 后复原。
+      const branchSlots = new Map(stageSlot);
+      const branchOrder = [...stageOrder];
+      const branchFiles = new Map(lastFigureFile);
+      const branchBgm: string | null = lastBgm;
       out.push("");
       out.push(`; ---- 分支选择 ----`);
       out.push(`choose:${args};`);
@@ -748,6 +891,30 @@ export function renderChapter(
         out.push(`jumpLabel:${joinLabel};`);
       });
       out.push(`label:${joinLabel};`);
+      // 1461 复原：清空当前（分支残留）舞台，按快照重发 changeFigure + 取景；BGM 若被分支改动则恢复。
+      out.push(`; ---- 分支舞台复原 ----`);
+      out.push(`changeFigure:none -left -next;`);
+      out.push(`changeFigure:none -right -next;`);
+      stageSlot.clear();
+      stageOrder.length = 0;
+      lastFigureFile.clear();
+      for (const id of branchOrder) {
+        const slot = branchSlots.get(id);
+        const file = branchFiles.get(id);
+        if (slot && file) {
+          out.push(`changeFigure:${getBaseName(file)} -${slot} -next;`);
+          out.push(`setTransform:${FIGURE_FRAMING} -target=fig-${slot} -duration=0 -next;`);
+          stageSlot.set(id, slot);
+          lastFigureFile.set(id, file);
+          stageOrder.push(id);
+        }
+      }
+      out.push(`setTransform:{"blur":0} -target=bg-main -duration=0 -next;`);
+      if (lastBgm !== branchBgm) {
+        if (branchBgm) out.push(`bgm:${getBaseName(branchBgm)} -enter=600 -next;`);
+        else if (lastBgm) out.push(`bgm:none -enter=600 -next;`);
+        lastBgm = branchBgm;
+      }
     }
   }
 
@@ -774,8 +941,12 @@ export function renderStart(chapterCount: number, title: string): string {
   return out.join("\n");
 }
 
-function cleanConfigValue(text: string): string {
-  return (text || "").replace(/[;\r\n]+/g, " ").trim().slice(0, 60);
+function cleanConfigValue(text: string, isFile = false): string {
+  // 1452：旧实现只清 ; 与换行，不清 | 与“ -”（同样截断引擎解析）；且无条件 slice(0,60)
+  // 会把 Title_img/Game_Logo/Title_bgm 真实文件名截成不存在的路径（入口白屏/标题静音）。
+  // 文件类值不再截断，只清洗；标题类保留 60 截断。
+  const s = (text || "").replace(/[;\r\n|]+/g, " ").replace(/ -/g, " ‑").trim();
+  return isFile ? s : s.slice(0, 60);
 }
 
 export type WebgalLanguage = "zh_CN" | "zh_TW" | "en" | "ja" | "ko";
@@ -803,17 +974,18 @@ export function renderConfig(
     `Enable_flowchart:${toggles?.flowchart === false ? "false" : "true"};`,
     `Show_panic:true;`,
     `Default_Language:${language};`,
-    // 文本框排版（引擎 globalGameVar，UI99）：Max_line 限制一句内 `|` 分段的最多行数
-    // （不写时 medium 字号默认只显示 2 行，长台词分页会被截掉），
-    // Line_height 为行高（em），配合渲染层长台词 `|` 分页避免溢出对话框
-    `Max_line:8;`,
+    // 文本框排版（引擎 globalGameVar，UI99/1458）：Max_line 限制一句内 `|` 分段的最多行数。
+    // 1458：引擎文本框 white-space:nowrap + overflow:hidden，medium 默认只显示 2 行；
+    // 旧值 8 与实际 2 行差 3-4 倍，第 3 分段起被引擎丢弃。改为 2 与真实容量一致。
+    // Line_height 为行高（em），配合渲染层长台词 `|` 分页（PAGE=64）避免溢出对话框
+    `Max_line:2;`,
     `Line_height:1.6;`,
   ];
-  if (titleImg) lines.push(`Title_img:${cleanConfigValue(titleImg)};`);
-  if (titleBgm) lines.push(`Title_bgm:${cleanConfigValue(titleBgm)};`);
+  if (titleImg) lines.push(`Title_img:${cleanConfigValue(titleImg, true)};`);
+  if (titleBgm) lines.push(`Title_bgm:${cleanConfigValue(titleBgm, true)};`);
   // 引擎把 Title_img / Game_Logo 按 ./game/background/<值> 解析（见 generateTitleArt）；
   // 缺失的 Title_img 会让入口页卡在白色遮罩，故只在确有文件时才写这两行
-  if (gameLogo) lines.push(`Game_Logo:${cleanConfigValue(gameLogo)};`);
+  if (gameLogo) lines.push(`Game_Logo:${cleanConfigValue(gameLogo, true)};`);
   return lines.join("\n");
 }
 

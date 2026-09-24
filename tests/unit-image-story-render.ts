@@ -68,7 +68,7 @@ const line3 = out.indexOf("爱丽丝:该走了。;");
 assert(shot1 >= 0 && shot2 >= 0, "两张分镜都应切换");
 assert(shot1 < line1, "第一张分镜应在第一句之前切换（trigger=0）");
 assert(shot2 > line2 && shot2 < line3, "第二张分镜应在第二句之后、第三句之前切换（trigger=2）");
-assert(out.includes("unlockCg:shot_ch1_s1_1.png -name=城门"), "分镜应解锁鉴赏室并带短标题");
+assert(out.includes("unlockCg:game/background/shot_ch1_s1_1.png -name=城门"), "分镜应解锁鉴赏室并带短标题（#1460：unlockCg 需带目录，否则引擎鉴赏室缩略图 404）");
 assert(!out.includes('setTransform:{"scale":{"x":1.08'), "分镜切换不做推近（#814 决策 9）");
 
 // 3) 台词/旁白照常输出

@@ -1,4 +1,4 @@
-import type { ApiConfig, CharacterAction, CharacterCard, CharacterCostume, ExtractionResult, ItemCard, SceneCard } from "./types";
+import type { ApiConfig, CharacterAction, CharacterCard, CharacterCostume, ExtractionResult, ItemCard, LoreCard, SceneCard } from "./types";
 import { chatCompletion, chatJson } from "../api/openaiCompatible";
 import type { ChatMessage, ChatTool, ToolCall } from "../api/openaiCompatible";
 import { inputCharBudgetForText, outputTokensForText } from "../api/providers";
@@ -54,6 +54,14 @@ export interface ExtractAgentState {
   characters: Map<string, CharacterCard>;
   scenes: Map<string, SceneCard>;
   items: Map<string, ItemCard>;
+  /** #799 世界观卡片（可选：老调用方构造的三字段 state 仍可用，各消费处做 ?? 兼容） */
+  lore?: Map<string, LoreCard>;
+}
+
+/** #799：取 lore 表（不存在即建，不动已有三个表） */
+export function loreMapOf(state: ExtractAgentState): Map<string, LoreCard> {
+  if (!state.lore) state.lore = new Map();
+  return state.lore;
 }
 
 export interface AgentChatResponse {
@@ -243,6 +251,25 @@ const SCAN_TOOLS: ChatTool[] = [
   {
     type: "function",
     function: {
+      name: "add_lore",
+      description:
+        "新增一条世界观/设定卡（#799）：地图与路线、任务/委托流程、组织与制度、货币与器物细节、世界规则。content 保留原文关键信息全文，不要概括压缩。若设定已存在请保持 id 一致。",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "唯一标识，如 blackwater_map" },
+          title: { type: "string", description: "短标题，如 黑水城防线图" },
+          kind: { type: "string", enum: ["map", "quest", "faction", "artifact", "system", "other"], description: "设定类别" },
+          content: { type: "string", description: "原文关键信息（保留原文表述，不要概括）" },
+          sourceNote: { type: "string", description: "出处备注（可选）" },
+        },
+        required: ["id", "title", "content"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "finish_extraction",
       description: "处理完当前片段后调用，表示本段扫描结束。",
       parameters: { type: "object", properties: {} },
@@ -387,6 +414,33 @@ export function applyTool(state: ExtractAgentState, call: AgentToolCall): AgentT
         });
         return ok(`已收录物品「${name}」(${id})，当前共 ${state.items.size} 个物品`);
       }
+      case "add_lore": {
+        // #799 世界观卡片分支（新增，不碰角色/场景/物品三分支）
+        const title = str(call.args.title).trim();
+        const content = str(call.args.content).trim();
+        if (!title) return fail("add_lore 缺少 title");
+        if (!content) return fail("add_lore 缺少 content（须保留原文关键信息）");
+        const loreMap = loreMapOf(state);
+        const id = normalizeEntityId(call.args.id, "l") || `l${loreMap.size + 1}`;
+        const kindRaw = str(call.args.kind).trim();
+        const kind = (["map", "quest", "faction", "artifact", "system", "other"] as const).includes(kindRaw as LoreCard["kind"])
+          ? (kindRaw as LoreCard["kind"])
+          : "other";
+        const existing = loreMap.get(id);
+        if (existing) {
+          if (normalizeName(existing.title) !== normalizeName(title) && existing.title.trim()) {
+            const freshId = `${id}_${loreMap.size + 1}`;
+            loreMap.set(freshId, { id: freshId, title, kind, content, sourceNote: str(call.args.sourceNote) || undefined });
+            logger.warn("extractAgent", `同设定 id 指代不同条目，已分卡：${id}（${existing.title}）vs 新卡 ${freshId}（${title}）`, {});
+            return ok(`设定 id「${id}」已被「${existing.title}」占用，与「${title}」不是同一条目，已独立建卡 ${freshId}`);
+          }
+          if (!existing.content && content) existing.content = content;
+          if (!existing.sourceNote && str(call.args.sourceNote)) existing.sourceNote = str(call.args.sourceNote);
+          return ok(`设定「${existing.title || title}」(${id}) 已存在，已补齐缺失字段，当前共 ${loreMap.size} 条设定`);
+        }
+        loreMap.set(id, { id, title, kind, content, sourceNote: str(call.args.sourceNote) || undefined });
+        return ok(`已收录设定「${title}」(${id})，当前共 ${loreMap.size} 条设定`);
+      }
       case "finish_extraction":
         return ok("扫描完成");
       default:
@@ -454,8 +508,14 @@ export function stateSummary(state: ExtractAgentState): string {
     time: s.time,
   }));
   let items = [...state.items.values()].map((i) => ({ id: i.id, name: i.name, note: clip(i.note, 80) }));
-  const build = (): string => JSON.stringify({ characters, scenes, items });
+  // #799：世界观设定摘要（content 限长防爆预算；老三字段 state 无 lore 时视为空）
+  let lore = [...(state.lore?.values() ?? [])].map((l) => ({ id: l.id, title: l.title, kind: l.kind, content: clip(l.content, 160) }));
+  const build = (): string => JSON.stringify({ characters, scenes, items, lore });
   let json = build();
+  while (json.length > MAX_STATE_SUMMARY_CHARS && lore.length) {
+    lore = lore.slice(0, -1);
+    json = build();
+  }
   while (json.length > MAX_STATE_SUMMARY_CHARS && scenes.length) {
     scenes = scenes.slice(0, -1);
     json = build();
@@ -610,6 +670,45 @@ export function mergeCandidates(state: ExtractAgentState): void {
         if (!other) continue;
         mergeCharacter(kept, other);
         state.characters.delete(group[i]);
+      }
+    }
+  }
+}
+
+/** #799 世界观卡片去重（纯函数，单测入口）：同标题（去首尾空白精确一致）并卡，
+ *  content 取较长者（保留更多原文信息），sourceNote 缺字段补齐；不同标题保留多卡交人工处理。 */
+export function dedupeLore(state: ExtractAgentState): void {
+  const loreMap = state.lore;
+  if (!loreMap || loreMap.size < 2) return;
+  const byTitle = new Map<string, string[]>();
+  for (const [id, l] of loreMap) {
+    const key = normalizeName(l.title);
+    if (!key) continue;
+    const list = byTitle.get(key) ?? [];
+    list.push(id);
+    byTitle.set(key, list);
+  }
+  for (const ids of byTitle.values()) {
+    if (ids.length < 2) continue;
+    const exactGroups = new Map<string, string[]>();
+    for (const id of ids) {
+      const card = loreMap.get(id);
+      if (!card) continue;
+      const exact = (card.title || "").trim();
+      const group = exactGroups.get(exact) ?? [];
+      group.push(id);
+      exactGroups.set(exact, group);
+    }
+    for (const group of exactGroups.values()) {
+      if (group.length < 2) continue;
+      const kept = loreMap.get(group[0]);
+      if (!kept) continue;
+      for (let i = 1; i < group.length; i++) {
+        const other = loreMap.get(group[i]);
+        if (!other) continue;
+        if ((other.content?.length ?? 0) > (kept.content?.length ?? 0)) kept.content = other.content;
+        if (!kept.sourceNote && other.sourceNote) kept.sourceNote = other.sourceNote;
+        loreMap.delete(group[i]);
       }
     }
   }
@@ -833,6 +932,8 @@ export function finalizeState(state: ExtractAgentState, lib: string[], title: st
     characters: [...state.characters.values()],
     scenes: [...state.scenes.values()],
     items: [...state.items.values()],
+    // #799：世界观卡直通（无图像 prompt、无需视觉补全；normalizeExtractionResult 原样保留未知字段）
+    lore: [...(state.lore?.values() ?? [])],
   };
   return normalizeExtractionResult(result, lib, title);
 }
@@ -858,10 +959,12 @@ function scanSystemPrompt(feedback?: string): string {
 - update_character(id, patch)：更新已有角色的字段。
 - add_scene(id, location, atmosphere, time)：新增一个故事场景地点。
 - add_item(id, name, appearance, note)：新增重要物品（获得、交接、使用的关键道具）。
+- add_lore(id, title, kind, content, sourceNote)：新增一条世界观/设定卡（#799）。地图与路线、任务/委托流程、组织与制度、货币与器物细节、世界规则这类「不是人物也不是关键道具」的信息量段落必须用它收录，content 保留原文关键信息全文、不要概括压缩；kind 取 map/quest/faction/artifact/system/other。
 - finish_extraction()：处理完当前片段后调用，表示本段扫描结束。
 
 规则：
 - 只从当前片段识别，不要编造当前片段未出现的人物/场景/物品。
+- 世界观/设定类描写（地图、路线、任务委托、组织制度、货币器物、世界规则）不要丢进旁白了事：必须逐条调用 add_lore 收录（#799），id 用英文或拼音小写，必须唯一。
 - id 用英文或拼音小写（如 linxiao），必须唯一；若角色已在「当前已收录卡片」中出现，保持原 id 并用 update_character 补充或修正。
 - 场景/物品若已存在，请保持 id 一致。
 - 外貌、服装、性格、音色描述用中文，简洁准确。
@@ -895,7 +998,8 @@ export async function extractFromNovelAgent(
   // 预算按实际语种估算（中文约 0.6 字符/token），否则中文长文单段超大触发网关 500
   const chunks = splitNovelForAgent(novelText, extractChunkBudget(cfg, novelText, opts.chunkChars));
   const system = scanSystemPrompt(opts.feedback);
-  const state: ExtractAgentState = { characters: new Map(), scenes: new Map(), items: new Map() };
+  // #799：lore 表随 state 初始化（文本协议回退时同步清空，见下）
+  const state: ExtractAgentState = { characters: new Map(), scenes: new Map(), items: new Map(), lore: new Map() };
 
   const scanAll = async (toolCalls: boolean): Promise<void> => {
     for (let i = 0; i < chunks.length; i++) {
@@ -916,15 +1020,17 @@ export async function extractFromNovelAgent(
     state.characters.clear();
     state.scenes.clear();
     state.items.clear();
+    state.lore?.clear();
     await scanAll(false);
   }
 
-  logFn?.(`扫描完成：${state.characters.size} 角色 / ${state.scenes.size} 场景 / ${state.items.size} 物品，正在合并去重…`);
+  logFn?.(`扫描完成：${state.characters.size} 角色 / ${state.scenes.size} 场景 / ${state.items.size} 物品 / ${state.lore?.size ?? 0} 设定，正在合并去重…`);
   mergeCandidates(state);
-  logFn?.(`合并完成：${state.characters.size} 角色 / ${state.scenes.size} 场景 / ${state.items.size} 物品，正在补全详细设定…`);
+  dedupeLore(state);
+  logFn?.(`合并完成：${state.characters.size} 角色 / ${state.scenes.size} 场景 / ${state.items.size} 物品 / ${state.lore?.size ?? 0} 设定，正在补全详细设定…`);
   await enrichCards(cfg, state, title, lib, onUsage, opts.feedback, logFn);
   const result = finalizeState(state, lib, title);
-  logFn?.(`Agent 提取完成：${result.characters.length} 角色 / ${result.scenes.length} 场景 / ${result.items.length} 物品`, "success");
+  logFn?.(`Agent 提取完成：${result.characters.length} 角色 / ${result.scenes.length} 场景 / ${result.items.length} 物品 / ${result.lore?.length ?? 0} 设定`, "success");
   return result;
 }
 
@@ -974,7 +1080,8 @@ export async function extractFromNovelChunked(
     return extractFromNovel(cfg, fullText, title, opts.onUsage, opts.feedback, lib);
   }
   opts.log?.(`小说全文 ${fullText.length} 字超出单次上下文，分 ${chunks.length} 段扫描提取（覆盖全书）…`);
-  const state: ExtractAgentState = { characters: new Map(), scenes: new Map(), items: new Map() };
+  // #799：lore 表随 state 初始化（经典单次 extractFromNovel 不产出 lore，此处仅透传后段可能带出的 lore）
+  const state: ExtractAgentState = { characters: new Map(), scenes: new Map(), items: new Map(), lore: new Map() };
   // 1306：id→name 注册表带入后续 chunk prompt，避免后段复用 id 指代不同人。
   const registryText = (): string => {
     const chars = [...state.characters.values()].map((c) => `${c.id}=${c.name}`).join("、");
@@ -1036,10 +1143,28 @@ export async function extractFromNovelChunked(
         }
       }
     }
+    // #799：后段带出的 lore 透传入表（同 id 不同标题独立建卡，其余缺字段补齐；不碰上面三类合并）
+    for (const l of part.lore ?? []) {
+      const loreMap = loreMapOf(state);
+      const prev = loreMap.get(l.id);
+      if (!prev) {
+        loreMap.set(l.id, { ...l });
+      } else if (normalizeName(prev.title) !== normalizeName(l.title)) {
+        let freshId = `${l.id}_${i + 1}`;
+        let n = 2;
+        while (loreMap.has(freshId)) freshId = `${l.id}_${i + 1}_${n++}`;
+        logger.warn("extractAgent", `分段提取同设定 id 指代不同条目，已分卡：${l.id}（${prev.title}）vs 第${i + 1}段（${l.title}→${freshId}）`, {});
+        loreMap.set(freshId, { ...l, id: freshId });
+      } else {
+        if ((l.content?.length ?? 0) > (prev.content?.length ?? 0)) prev.content = l.content;
+        if (!prev.sourceNote && l.sourceNote) prev.sourceNote = l.sourceNote;
+      }
+    }
   }
-  opts.log?.(`分段扫描完成：${state.characters.size} 角色 / ${state.scenes.size} 场景 / ${state.items.size} 物品，正在合并去重…`);
+  opts.log?.(`分段扫描完成：${state.characters.size} 角色 / ${state.scenes.size} 场景 / ${state.items.size} 物品 / ${state.lore?.size ?? 0} 设定，正在合并去重…`);
   mergeCandidates(state);
+  dedupeLore(state);
   const result = finalizeState(state, lib, title);
-  opts.log?.(`分段提取完成（覆盖全书）：${result.characters.length} 角色 / ${result.scenes.length} 场景 / ${result.items.length} 物品`, "success");
+  opts.log?.(`分段提取完成（覆盖全书）：${result.characters.length} 角色 / ${result.scenes.length} 场景 / ${result.items.length} 物品 / ${result.lore?.length ?? 0} 设定`, "success");
   return result;
 }

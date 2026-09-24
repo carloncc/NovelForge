@@ -6,13 +6,16 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
-use tauri::Manager;
+use std::time::{Duration, Instant};
+use tauri::{Emitter, Manager};
 
 use crate::{preview, server};
 
 const API_SECRET_SERVICE: &str = "com.novelforge.app.api";
 const HTTP_BODY_LIMIT: usize = 64 * 1024 * 1024;
+/// 流式增量合并节流：每累计 8KB 或每 200ms 才发一次 IPC 事件，避免小 chunk 刷爆事件通道
+const STREAM_EMIT_BYTES: usize = 8 * 1024;
+const STREAM_EMIT_INTERVAL: Duration = Duration::from_millis(200);
 /// read_file_header 允许读取的最大头部字节数：无论调用方传多大都不读取整文件
 const READ_FILE_HEADER_LIMIT: usize = 64 * 1024;
 static ATOMIC_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -155,6 +158,19 @@ fn canonicalize_with_missing_tail(path: &Path) -> Result<PathBuf, String> {
     }
 }
 
+/// #1416：家目录下高危凭据目录（全平台生效）：此前仅 Windows 分支拦截 .ssh，
+/// Linux/macOS 下 ~/.ssh 等可被任意读写。canonicalize 后的绝对路径按组件比较，
+/// 相似名前缀（如 .ssh-backup）不会误伤。
+const CREDENTIAL_HOME_REL_DIRS: &[&str] = &[".ssh", ".aws", ".gnupg", ".kube", ".config/gcloud"];
+
+/// 纯函数（可单测）：canon 是否落在 home 下的凭据目录内。
+fn path_within_home_credential_dir(canon: &Path, home: &Path) -> bool {
+    CREDENTIAL_HOME_REL_DIRS.iter().any(|rel| {
+        let dir = home.join(rel);
+        *canon == dir || canon.starts_with(&dir)
+    })
+}
+
 fn is_sensitive_system_path(canon: &Path) -> bool {
     #[cfg(target_os = "windows")]
     {
@@ -165,13 +181,18 @@ fn is_sensitive_system_path(canon: &Path) -> bool {
                 return true;
             }
         }
-        // 家目录整体放行（用户工程常在其中），但直属高危凭据目录除外
-        if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
-            if !home.is_empty() {
-                let ssh = PathBuf::from(&home).join(".ssh");
-                if *canon == ssh || canon.starts_with(&ssh) {
-                    return true;
-                }
+    }
+    // #1416：凭据目录检查移出 Windows cfg，全平台生效
+    // （家目录整体仍放行用户工程，仅直属凭据目录除外）
+    if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
+        if !home.trim().is_empty() {
+            let home_path = PathBuf::from(&home);
+            // 家目录本身可能是符号链接（如 macOS /Users）：canonicalize 后再比一次，避免拼写绕过
+            let canon_home = home_path.canonicalize().unwrap_or(home_path.clone());
+            if path_within_home_credential_dir(canon, &home_path)
+                || path_within_home_credential_dir(canon, &canon_home)
+            {
+                return true;
             }
         }
     }
@@ -258,7 +279,14 @@ fn ipv4_blocked(octets: &[u8; 4]) -> bool {
         || (a == 203 && b == 0) // TEST-NET-3
 }
 
-fn ssrf_reject_reason(url: &reqwest::Url) -> Option<String> {
+/// #1411：用户显式放行时才允许的“自用局域网”范围（RFC1918）。
+/// CGNAT/文档网段/组播/未指定/云元数据即使放行也不解禁，见 ssrf_reject_reason。
+fn is_user_lan_ipv4(octets: &[u8; 4]) -> bool {
+    let [a, b, ..] = *octets;
+    a == 10 || (a == 172 && (16..=31).contains(&b)) || (a == 192 && b == 168)
+}
+
+fn ssrf_reject_reason(url: &reqwest::Url, allow_lan: bool) -> Option<String> {
     let host = url
         .host_str()
         .unwrap_or_default()
@@ -272,29 +300,56 @@ fn ssrf_reject_reason(url: &reqwest::Url) -> Option<String> {
     if let Some(ip) = parse_numeric_ip(&host) {
         match ip {
             std::net::IpAddr::V4(v) => {
+                // 未指定/组播/保留/广播：即使显式放行也不解禁
+                if v.is_unspecified() || v.is_multicast() || v.octets()[0] >= 224 {
+                    return Some(format!("特殊地址 {host} 已拒绝（SSRF 防护）"));
+                }
+                // 云元数据与链路本地（含 169.254.169.254）：即使显式放行也不解禁
+                if v.octets()[0] == 169 && v.octets()[1] == 254 {
+                    return Some(format!("内网/特殊地址 {host} 已拒绝（SSRF 防护）"));
+                }
                 if v.is_loopback() {
                     if url.port_or_known_default() == Some(OLLAMA_LOCAL_PORT) {
                         return None;
                     }
+                    // #1411：显式放行后，本机其它端口（LM Studio 1234/llama.cpp 8080/vLLM 8000 等）允许
+                    if allow_lan {
+                        return None;
+                    }
                     return Some("回环地址仅放行本地模型端口 11434，已拒绝".to_string());
                 }
-                if v.is_unspecified() || v.is_multicast() || ipv4_blocked(&v.octets()) {
+                // #1411：RFC1918 自用局域网在显式放行后允许；其余特殊段（CGNAT/文档网段等）一律拒绝
+                if is_user_lan_ipv4(&v.octets()) {
+                    if allow_lan {
+                        return None;
+                    }
+                    return Some(format!("内网/特殊地址 {host} 已拒绝（SSRF 防护）"));
+                }
+                if ipv4_blocked(&v.octets()) {
                     return Some(format!("内网/特殊地址 {host} 已拒绝（SSRF 防护）"));
                 }
                 return None;
             }
             std::net::IpAddr::V6(v) => {
+                // 未指定/组播：即使显式放行也不解禁
+                if v.is_unspecified() || v.is_multicast() {
+                    return Some(format!("特殊地址 {host} 已拒绝（SSRF 防护）"));
+                }
                 if v.is_loopback() {
                     if url.port_or_known_default() == Some(OLLAMA_LOCAL_PORT) {
                         return None;
                     }
+                    if allow_lan {
+                        return None;
+                    }
                     return Some("回环地址仅放行本地模型端口 11434，已拒绝".to_string());
                 }
-                if v.is_unspecified() || v.is_multicast() {
-                    return Some(format!("特殊地址 {host} 已拒绝（SSRF 防护）"));
-                }
                 let seg = v.segments();
+                // ULA fc00::/7 与链路本地 fe80::/10：显式放行后允许（局域网 IPv6 自建网关）
                 if (seg[0] & 0xfe00) == 0xfc00 || (seg[0] & 0xffc0) == 0xfe80 {
+                    if allow_lan {
+                        return None;
+                    }
                     return Some(format!("内网地址 {host} 已拒绝（SSRF 防护）"));
                 }
                 return None;
@@ -305,17 +360,25 @@ fn ssrf_reject_reason(url: &reqwest::Url) -> Option<String> {
         if url.port_or_known_default() == Some(OLLAMA_LOCAL_PORT) {
             return None;
         }
+        if allow_lan {
+            return None;
+        }
         return Some("回环主机仅放行本地模型端口 11434，已拒绝".to_string());
     }
-    if host.ends_with(".local")
-        || host.ends_with(".internal")
-        || host.ends_with(".lan")
-        || host == "metadata.google.internal"
-        || host == "instance-data"
-    {
+    // 云元数据主机名：即使显式放行也不解禁
+    if host == "metadata.google.internal" || host == "instance-data" {
+        return Some(format!("内网主机名 {host} 已拒绝（SSRF 防护）"));
+    }
+    if host.ends_with(".local") || host.ends_with(".internal") || host.ends_with(".lan") {
+        if allow_lan {
+            return None;
+        }
         return Some(format!("内网主机名 {host} 已拒绝（SSRF 防护）"));
     }
     if !host.contains('.') && !host.contains(':') {
+        if allow_lan {
+            return None;
+        }
         return Some(format!("单标签主机名 {host} 疑似内网，已拒绝（SSRF 防护）"));
     }
     None
@@ -334,6 +397,15 @@ pub struct HttpRequestArgs {
     pub body_base64: Option<String>,
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
+    /// #1411：用户显式放行局域网/本机其它端口（前端 ApiConfig.allowLan 透传，默认关闭）。
+    /// 缺省 false = 旧口径（回环仅 11434、私网/内网名全部拒绝），安全底线不变。
+    #[serde(default)]
+    pub allow_lan: bool,
+    /// 剧本 SSE 流式（仅前端流式路径传 true）：边收边把增量经 nf-http-stream 事件发给前端
+    ///（心跳日志显示「已生成 N 字」），返回值仍是完整响应体（契约不变）。
+    /// 缺省 false = 老调用方行为完全不变（extract/translate/图像/TTS/视觉等仍整包等待）。
+    #[serde(default)]
+    pub stream: bool,
 }
 
 fn default_timeout() -> u64 {
@@ -346,7 +418,9 @@ fn http_target(args: &HttpRequestArgs) -> Result<reqwest::Url, String> {
         return Err("仅支持 HTTP/HTTPS 地址".to_string());
     }
     // #1293：scheme 校验之外再拦截私网/回环（Ollama 11434 除外）/特殊地址与内网主机名
-    if let Some(reason) = ssrf_reject_reason(&target) {
+    // #1411：用户显式放行（allowLan，默认关闭）后，自用局域网/回环其它端口/内网名允许，
+    // 高危目标（未指定/组播/云元数据等）仍拒绝
+    if let Some(reason) = ssrf_reject_reason(&target, args.allow_lan) {
         return Err(reason);
     }
     let encoded_size = args.body.as_ref().map_or(0, String::len)
@@ -379,15 +453,20 @@ async fn limited_response_bytes(mut response: reqwest::Response) -> Result<Vec<u
 }
 
 #[tauri::command]
-pub async fn http_request(args: HttpRequestArgs, request_id: Option<u64>) -> Result<Value, String> {
+pub async fn http_request(
+    app: tauri::AppHandle,
+    args: HttpRequestArgs,
+    request_id: Option<u64>,
+) -> Result<Value, String> {
     // #784：支持取消的在途请求。无 request_id（旧调用方/一次性请求）时直接在当前任务执行；
     // 有 request_id 时把请求放进独立任务，注册 abort 句柄，前端「停止」可中断在途请求
     //（否则点停止后最长仍会跑完 600s 并继续计费）。
+    // 流式（args.stream）同样沿用它：任务被 abort 时读取随 future 一起停止。
     if request_id.is_none() {
-        return do_http_request(args).await;
+        return do_http_request(&app, args, None).await;
     }
-    let handle = tauri::async_runtime::spawn(async move { do_http_request(args).await });
     let id = request_id.unwrap();
+    let handle = tauri::async_runtime::spawn(async move { do_http_request(&app, args, Some(id)).await });
     {
         let abort = handle.inner().abort_handle();
         if let Ok(mut registry) = http_aborts().lock() {
@@ -424,9 +503,16 @@ fn http_aborts() -> &'static std::sync::Mutex<HashMap<u64, HttpAbortFn>> {
     REGISTRY.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
-async fn do_http_request(args: HttpRequestArgs) -> Result<Value, String> {    let target = http_target(&args)?;
+async fn do_http_request(
+    app: &tauri::AppHandle,
+    args: HttpRequestArgs,
+    request_id: Option<u64>,
+) -> Result<Value, String> {
+    let target = http_target(&args)?;
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(args.timeout_secs.clamp(1, 600)))
+        // 上限与前端 requestTimeoutSecs 对齐（1800s）：32K 输出在 30 tok/s 后端上要约 1090s，
+        // 旧上限 600s 会把「慢但在出字」的大请求掐掉，掐掉后拆小重跑更慢更贵
+        .timeout(Duration::from_secs(args.timeout_secs.clamp(1, 1800)))
         // 连接超时独立封顶 30s：建连/TLS 阶段卡住时不再烧完整次超时（如 300s）才报错，
         // 慢响应仍享有完整总超时；与 models.rs 的 CONNECT_TIMEOUT_MS 口径一致
         .connect_timeout(Duration::from_secs(30))
@@ -468,13 +554,71 @@ async fn do_http_request(args: HttpRequestArgs) -> Result<Value, String> {    le
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let bytes = limited_response_bytes(resp).await?;
+    // 流式（仅剧本路径传 stream=true）：边收边 emit 增量给前端，返回值仍是完整响应体；
+    // 其余调用方保持原有限流整包读取，行为完全不变。
+    let bytes = if args.stream {
+        let app = app.clone();
+        let id = request_id.unwrap_or(0);
+        read_streaming_bytes(resp, move |chunk| emit_stream_chunk(&app, id, chunk)).await?
+    } else {
+        limited_response_bytes(resp).await?
+    };
 
     Ok(serde_json::json!({
         "status": status,
         "contentType": content_type,
         "bodyBase64": B64.encode(bytes),
     }))
+}
+
+/// 流式读取响应体（仅 args.stream=true 走此路径）：边累积完整字节，边把增量交给 on_chunk。
+/// 返回值与 limited_response_bytes 完全一致（同样受 64MB 上限约束、同样的错误文案）；
+/// 任务被 abort 时整个 future 被丢弃，读取随之停止（取消语义由 http_request 的 AbortHandle 提供）。
+async fn read_streaming_bytes(
+    mut response: reqwest::Response,
+    mut on_chunk: impl FnMut(&[u8]),
+) -> Result<Vec<u8>, String> {
+    use futures_util::StreamExt;
+    if response
+        .content_length()
+        .is_some_and(|size| size > HTTP_BODY_LIMIT as u64)
+    {
+        return Err("响应超过 64MB 上限，已拒绝".to_string());
+    }
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut pending: Vec<u8> = Vec::new();
+    let mut last_emit = Instant::now();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("读取响应失败: {e}"))?;
+        if bytes.len() + chunk.len() > HTTP_BODY_LIMIT {
+            return Err("响应超过 64MB 上限，已拒绝".to_string());
+        }
+        bytes.extend_from_slice(&chunk);
+        pending.extend_from_slice(&chunk);
+        // 合并节流：够 8KB 或距上次已 200ms 才发一次；结束时残留必定 flush，增量不丢
+        if pending.len() >= STREAM_EMIT_BYTES || last_emit.elapsed() >= STREAM_EMIT_INTERVAL {
+            on_chunk(&pending);
+            pending.clear();
+            last_emit = Instant::now();
+        }
+    }
+    if !pending.is_empty() {
+        on_chunk(&pending);
+    }
+    Ok(bytes)
+}
+
+/// 把一段流式增量发给前端（base64 承载任意字节，前端按 requestId 过滤自己的流）。
+/// 事件发送失败不影响请求本身：返回值仍是完整响应体，前端解析不受影响。
+fn emit_stream_chunk(app: &tauri::AppHandle, request_id: u64, data: &[u8]) {
+    let payload = serde_json::json!({
+        "requestId": request_id,
+        "dataBase64": B64.encode(data),
+    });
+    if let Err(error) = app.emit("nf-http-stream", payload) {
+        eprintln!("[novelforge] 流式事件发送失败: {error}");
+    }
 }
 
 #[tauri::command]
@@ -519,9 +663,12 @@ fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn write_text_file(path: String, content: String) -> Result<(), String> {
+pub async fn write_text_file(path: String, content: String) -> Result<(), String> {
+    // #1413：原子写（建目录+写临时+rename）是阻塞 IO（autosave 高频调用，MB 级快照），放阻塞线程池
     let safe = resolve_safe_path(&path)?;
-    atomic_write(&safe, content.as_bytes())
+    tauri::async_runtime::spawn_blocking(move || atomic_write(&safe, content.as_bytes()))
+        .await
+        .map_err(|e| format!("写入任务执行失败: {e}"))?
 }
 
 #[tauri::command]
@@ -584,36 +731,41 @@ pub async fn write_file_base64(path: String, data_b64: String) -> Result<(), Str
 }
 
 #[tauri::command]
-pub fn list_dir(path: String) -> Result<Value, String> {
+pub async fn list_dir(path: String) -> Result<Value, String> {
+    // #1413：目录遍历+元数据是阻塞 IO（生成期高频扫素材目录），放阻塞线程池
     let p = resolve_safe_path(&path)?;
-    let mut out = Vec::new();
-    if !p.exists() {
-        return Ok(Value::Array(out));
-    }
-    let entries = std::fs::read_dir(&p).map_err(|e| format!("读取目录失败: {e}"))?;
-    for entry in entries.flatten() {
-        let meta = entry.metadata().ok();
-        let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-        let size = meta.map(|m| m.len()).unwrap_or(0);
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') {
-            continue;
+    tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
+        let mut out = Vec::new();
+        if !p.exists() {
+            return Ok(Value::Array(out));
         }
-        out.push(serde_json::json!({
-            "name": name,
-            // #1292 回归：entry.path() 继承 read_dir 入参的 canonical 前缀（`\\?\D:\...`），
-            // 原样返回会导致前端下一次调用被当 UNC 拒绝；去前缀后再返回。
-            "path": display_path(&entry.path()),
-            "isDir": is_dir,
-            "size": size,
-        }));
-    }
-    out.sort_by(|a, b| {
-        let ad = a["isDir"].as_bool().unwrap_or(false);
-        let bd = b["isDir"].as_bool().unwrap_or(false);
-        bd.cmp(&ad).then(a["name"].as_str().cmp(&b["name"].as_str()))
-    });
-    Ok(Value::Array(out))
+        let entries = std::fs::read_dir(&p).map_err(|e| format!("读取目录失败: {e}"))?;
+        for entry in entries.flatten() {
+            let meta = entry.metadata().ok();
+            let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+            let size = meta.map(|m| m.len()).unwrap_or(0);
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+            out.push(serde_json::json!({
+                "name": name,
+                // #1292 回归：entry.path() 继承 read_dir 入参的 canonical 前缀（`\\?\D:\...`），
+                // 原样返回会导致前端下一次调用被当 UNC 拒绝；去前缀后再返回。
+                "path": display_path(&entry.path()),
+                "isDir": is_dir,
+                "size": size,
+            }));
+        }
+        out.sort_by(|a, b| {
+            let ad = a["isDir"].as_bool().unwrap_or(false);
+            let bd = b["isDir"].as_bool().unwrap_or(false);
+            bd.cmp(&ad).then(a["name"].as_str().cmp(&b["name"].as_str()))
+        });
+        Ok(Value::Array(out))
+    })
+    .await
+    .map_err(|e| format!("读取任务执行失败: {e}"))?
 }
 
 #[tauri::command]
@@ -623,17 +775,22 @@ pub fn mkdir_all(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn copy_file(src: String, dst: String) -> Result<(), String> {
+pub async fn copy_file(src: String, dst: String) -> Result<(), String> {
+    // #1413：文件复制是阻塞 IO（视频导入可达数百 MB），放阻塞线程池（与 copy_dir_all 对齐）
     let safe_src = resolve_safe_path(&src)?;
     let safe_dst = resolve_safe_path(&dst)?;
     if safe_src == safe_dst {
         return Err("源与目标相同，已拒绝".to_string());
     }
-    if let Some(parent) = safe_dst.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
-    }
-    std::fs::copy(&safe_src, &safe_dst).map_err(|e| format!("复制失败: {e}"))?;
-    Ok(())
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        if let Some(parent) = safe_dst.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
+        }
+        std::fs::copy(&safe_src, &safe_dst).map_err(|e| format!("复制失败: {e}"))?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("复制任务执行失败: {e}"))?
 }
 
 fn atomic_write_temp_path(path: &std::path::Path) -> PathBuf {
@@ -643,47 +800,53 @@ fn atomic_write_temp_path(path: &std::path::Path) -> PathBuf {
 }
 
 #[tauri::command]
-pub fn replace_path(src: String, dst: String) -> Result<(), String> {
+pub async fn replace_path(src: String, dst: String) -> Result<(), String> {
+    // #1413：改名/备份/清理是阻塞 IO，放阻塞线程池
     let source = resolve_safe_path(&src)?;
     let destination = resolve_safe_path(&dst)?;
     guard_against_wipe(&destination)?;
-    let backup = PathBuf::from(format!("{}.replace-backup", destination.to_string_lossy()));
-    if !source.exists() {
-        return Err(format!("替换失败：源路径不存在 {src}"));
-    }
-    if backup.exists() {
-        if backup.is_dir() {
-            std::fs::remove_dir_all(&backup)
-        } else {
-            std::fs::remove_file(&backup)
+    let src_display = src.clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let backup = PathBuf::from(format!("{}.replace-backup", destination.to_string_lossy()));
+        if !source.exists() {
+            return Err(format!("替换失败：源路径不存在 {src_display}"));
         }
-        .map_err(|e| format!("清理替换备份失败: {e}"))?;
-    }
-    let had_destination = destination.exists();
-    if had_destination {
-        std::fs::rename(&destination, &backup).map_err(|e| format!("创建替换备份失败: {e}"))?;
-    }
-    if let Err(error) = std::fs::rename(&source, &destination) {
+        if backup.exists() {
+            if backup.is_dir() {
+                std::fs::remove_dir_all(&backup)
+            } else {
+                std::fs::remove_file(&backup)
+            }
+            .map_err(|e| format!("清理替换备份失败: {e}"))?;
+        }
+        let had_destination = destination.exists();
         if had_destination {
-            if let Err(rollback_error) = std::fs::rename(&backup, &destination) {
-                return Err(format!(
-                    "发布替换路径失败: {error}; 回滚原路径也失败: {rollback_error}"
-                ));
+            std::fs::rename(&destination, &backup).map_err(|e| format!("创建替换备份失败: {e}"))?;
+        }
+        if let Err(error) = std::fs::rename(&source, &destination) {
+            if had_destination {
+                if let Err(rollback_error) = std::fs::rename(&backup, &destination) {
+                    return Err(format!(
+                        "发布替换路径失败: {error}; 回滚原路径也失败: {rollback_error}"
+                    ));
+                }
+            }
+            return Err(format!("发布替换路径失败: {error}"));
+        }
+        if had_destination {
+            let cleanup = if backup.is_dir() {
+                std::fs::remove_dir_all(&backup)
+            } else {
+                std::fs::remove_file(&backup)
+            };
+            if let Err(error) = cleanup {
+                eprintln!("清理替换备份失败（发布已成功）: {error}");
             }
         }
-        return Err(format!("发布替换路径失败: {error}"));
-    }
-    if had_destination {
-        let cleanup = if backup.is_dir() {
-            std::fs::remove_dir_all(&backup)
-        } else {
-            std::fs::remove_file(&backup)
-        };
-        if let Err(error) = cleanup {
-            eprintln!("清理替换备份失败（发布已成功）: {error}");
-        }
-    }
-    Ok(())
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("替换任务执行失败: {e}"))?
 }
 
 /// 原子写临时文件名：`<name>.<pid>.<seq>.tmp`（与本文件 atomic_write_temp_path 同构）
@@ -746,16 +909,21 @@ fn cleanup_stale_dir(dir: &Path, depth: usize, removed: &mut u64, restored: &mut
 
 /// 启动清理入口：扫描项目目录并清理崩溃残留（非递归到符号链接之外，深度默认 6）
 #[tauri::command]
-pub fn cleanup_stale_files(root: String, max_depth: Option<usize>) -> Result<Value, String> {
+pub async fn cleanup_stale_files(root: String, max_depth: Option<usize>) -> Result<Value, String> {
+    // #1413：启动时递归扫整个输出目录是阻塞 IO（App.vue 启动即调），放阻塞线程池
     let path = resolve_safe_path(&root)?;
     guard_against_wipe(&path)?;
-    if !path.is_dir() {
-        return Ok(serde_json::json!({ "removed": 0, "restored": 0 }));
-    }
-    let mut removed = 0u64;
-    let mut restored = 0u64;
-    cleanup_stale_dir(&path, max_depth.unwrap_or(6).clamp(1, 16), &mut removed, &mut restored);
-    Ok(serde_json::json!({ "removed": removed, "restored": restored }))
+    tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
+        if !path.is_dir() {
+            return Ok(serde_json::json!({ "removed": 0, "restored": 0 }));
+        }
+        let mut removed = 0u64;
+        let mut restored = 0u64;
+        cleanup_stale_dir(&path, max_depth.unwrap_or(6).clamp(1, 16), &mut removed, &mut restored);
+        Ok(serde_json::json!({ "removed": removed, "restored": restored }))
+    })
+    .await
+    .map_err(|e| format!("清理任务执行失败: {e}"))?
 }
 
 #[tauri::command]
@@ -892,20 +1060,84 @@ pub fn read_api_secrets(ids: Vec<String>) -> Result<HashMap<String, String>, Str
 
 #[tauri::command]
 pub fn write_api_secrets(secrets: HashMap<String, String>) -> Result<(), String> {
-    for (id, secret) in secrets {
-        validate_secret_id(&id)?;
-        let entry = keyring::Entry::new(API_SECRET_SERVICE, &id)
-            .map_err(|e| format!("创建系统凭据项失败（{id}）：{e}"))?;
-        if secret.is_empty() {
-            if let Err(e) = entry.delete_credential() {
-                if !matches!(e, keyring::Error::NoEntry) {
-                    return Err(format!("删除系统凭据失败（{id}）：{e}"));
+    // #1441：先校验全部 id，再快照旧值，最后逐条应用；中途失败尽力回滚已处理条目，
+    // 杜绝“前几条已删/已写、后几条失败直接返回”的半表状态（“密钥已删但配置组仍在”不可恢复）。
+    // 空串仍表示删除（config.ts removeConfig/removePreset 的显式删除依赖此语义）；
+    // “无密钥≠删除”由前端只提交非空值保证（configMigration.nonEmptySecrets），迁移路径不再送空串。
+    for id in secrets.keys() {
+        validate_secret_id(id)?;
+    }
+    enum Previous {
+        Missing,
+        Present(String),
+    }
+    let mut previous: Vec<(String, Previous)> = Vec::with_capacity(secrets.len());
+    for id in secrets.keys() {
+        let prev = match keyring::Entry::new(API_SECRET_SERVICE, id) {
+            Err(_) => Previous::Missing,
+            Ok(entry) => match entry.get_password() {
+                Ok(secret) => Previous::Present(secret),
+                // 旧值读不出（未解锁/损坏）时按缺失记：回滚即删除本次写入，不残留不可追溯的值
+                Err(_) => Previous::Missing,
+            },
+        };
+        previous.push((id.clone(), prev));
+    }
+    let ordered: Vec<(String, String)> = secrets.into_iter().collect();
+    let mut applied = 0usize;
+    let mut first_error: Option<String> = None;
+    for (id, secret) in &ordered {
+        let result = (|| -> Result<(), String> {
+            let entry = keyring::Entry::new(API_SECRET_SERVICE, id)
+                .map_err(|e| format!("创建系统凭据项失败（{id}）：{e}"))?;
+            if secret.is_empty() {
+                match entry.delete_credential() {
+                    Ok(()) => Ok(()),
+                    Err(keyring::Error::NoEntry) => Ok(()),
+                    Err(e) => Err(format!("删除系统凭据失败（{id}）：{e}")),
                 }
+            } else {
+                entry
+                    .set_password(secret)
+                    .map_err(|e| format!("写入系统凭据失败（{id}）：{e}"))?;
+                Ok(())
             }
-        } else {
-            entry.set_password(&secret)
-                .map_err(|e| format!("写入系统凭据失败（{id}）：{e}"))?;
+        })();
+        if let Err(error) = result {
+            first_error = Some(error);
+            break;
         }
+        applied += 1;
+    }
+    if let Some(error) = first_error {
+        let mut rollback_errors = Vec::new();
+        for (id, _) in ordered.iter().take(applied) {
+            let prev = previous.iter().find(|(p, _)| p == id).map(|(_, p)| p);
+            let result = (|| -> Result<(), String> {
+                let entry = keyring::Entry::new(API_SECRET_SERVICE, id)
+                    .map_err(|e| format!("创建系统凭据项失败（{id}）：{e}"))?;
+                match prev {
+                    Some(Previous::Present(old)) => entry
+                        .set_password(old)
+                        .map_err(|e| format!("回滚写入失败（{id}）：{e}")),
+                    _ => match entry.delete_credential() {
+                        Ok(()) => Ok(()),
+                        Err(keyring::Error::NoEntry) => Ok(()),
+                        Err(e) => Err(format!("回滚删除失败（{id}）：{e}")),
+                    },
+                }
+            })();
+            if let Err(e) = result {
+                rollback_errors.push(e);
+            }
+        }
+        if rollback_errors.is_empty() {
+            return Err(format!("{error}（已回滚 {applied} 条）"));
+        }
+        return Err(format!(
+            "{error}（回滚 {applied} 条时又失败：{}）",
+            rollback_errors.join("；")
+        ));
     }
     Ok(())
 }
@@ -941,14 +1173,15 @@ fn start_preview_server_blocking(root: &str) -> Result<Value, String> {
     match server::start(root) {
         Ok(handle) => {
             let port = handle.port();
-            let token = handle.preview_token().to_string();
             let url = format!("http://127.0.0.1:{port}/index.html");
             preview()
                 .running
                 .lock()
                 .map_err(|_| "锁获取失败".to_string())?
                 .replace(handle);
-            Ok(serde_json::json!({ "url": url, "port": port, "token": token }))
+            // #1446：不再生成/回传装饰性 token（从未被校验，前端亦直接丢弃）。
+            // 生效的防线是 loopback 绑定 + Host/DNS-rebinding 校验，见 server.rs handle_request 注释。
+            Ok(serde_json::json!({ "url": url, "port": port }))
         }
         Err(error) => {
             // 端口被外部进程占用时旧实例已被停掉：尽力用旧根重启恢复，
@@ -990,6 +1223,35 @@ pub async fn stop_preview_server() -> Result<(), String> {
     .map_err(|e| format!("预览停止任务失败: {e}"))?
 }
 
+/// #1330：Linux 打开命令的参数表（纯函数，可单测）：gio 必须带 `open` 子命令，
+/// 直接 `gio <path>` 会报 Unknown command（退出码非零）；xdg-open/nautilus 直接接路径。
+/// 仅 Linux 运行时与单测使用（Windows/macOS 分支用不到，避免 unused 警告）。
+#[cfg(any(target_os = "linux", test))]
+fn linux_open_args(cmd: &str, target: &str) -> Vec<String> {
+    if cmd == "gio" {
+        vec!["open".to_string(), target.to_string()]
+    } else {
+        vec![target.to_string()]
+    }
+}
+
+/// #1330：候选命令全部失败时的错误文案（带已尝试列表，方便用户定位缺哪个工具）。
+#[cfg(any(target_os = "linux", test))]
+fn linux_open_failed(what: &str, attempted: &[String]) -> String {
+    format!("{what}失败，已尝试：{}（均不可用或返回失败）", attempted.join("、"))
+}
+
+/// #1330：运行单个打开命令，按退出码判定（spawn 成功≠打开成功：
+/// xdg-open 存在但无默认浏览器/headless 时退出码非零，必须判 status().success()）。
+#[cfg(target_os = "linux")]
+fn try_linux_open(cmd: &str, target: &str) -> bool {
+    std::process::Command::new(cmd)
+        .args(linux_open_args(cmd, target))
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 #[tauri::command]
 pub fn open_in_explorer(path: String) -> Result<(), String> {
     let safe = resolve_safe_path(&path)?;
@@ -1007,12 +1269,16 @@ pub fn open_in_explorer(path: String) -> Result<(), String> {
     }
     #[cfg(target_os = "linux")]
     {
+        // #1330：按退出码判定 + gio 带 open 子命令；未经 Linux 真机验证（见回写）。
+        let dir_str = dir.to_string_lossy().to_string();
+        let mut attempted = Vec::new();
         for cmd in ["xdg-open", "gio", "nautilus"] {
-            if std::process::Command::new(cmd).arg(&dir).spawn().is_ok() {
+            attempted.push(if cmd == "gio" { "gio open".to_string() } else { cmd.to_string() });
+            if try_linux_open(cmd, &dir_str) {
                 return Ok(());
             }
         }
-        return Err("没有可用的文件管理器".to_string());
+        return Err(linux_open_failed("打开文件管理器", &attempted));
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
@@ -1058,12 +1324,15 @@ pub fn open_url(url: String) -> Result<(), String> {
     }
     #[cfg(target_os = "linux")]
     {
+        // #1330：同 open_in_explorer（gio open + 退出码判定）；未经 Linux 真机验证（见回写）。
+        let mut attempted = Vec::new();
         for cmd in ["xdg-open", "gio"] {
-            if std::process::Command::new(cmd).arg(trimmed).spawn().is_ok() {
+            attempted.push(if cmd == "gio" { "gio open".to_string() } else { cmd.to_string() });
+            if try_linux_open(cmd, trimmed) {
                 return Ok(());
             }
         }
-        return Err("没有可用的浏览器打开方式".to_string());
+        return Err(linux_open_failed("打开链接", &attempted));
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
@@ -1140,8 +1409,11 @@ pub async fn cutout_image(
 }
 
 #[tauri::command]
-pub fn has_transparency(data_b64: String) -> Result<bool, String> {
-    crate::cutout::has_transparency(&data_b64)
+pub async fn has_transparency(data_b64: String) -> Result<bool, String> {
+    // #1413：base64 解码+整图解码+全像素扫描是 CPU 密集（每张候选图都调），放阻塞线程池
+    tauri::async_runtime::spawn_blocking(move || crate::cutout::has_transparency(&data_b64))
+        .await
+        .map_err(|e| format!("透明检测任务执行失败: {e}"))?
 }
 
 #[tauri::command]
@@ -1192,8 +1464,11 @@ fn write_zip_contents(
 ) -> Result<serde_json::Value, String> {
     let file = std::fs::File::create(zip_path).map_err(|e| format!("创建 zip 失败: {e}"))?;
     let mut writer = zip::ZipWriter::new(std::io::BufWriter::new(file));
-    let options: zip::write::SimpleFileOptions =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let options: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        // #1440：启用 ZIP64。项目内单文件 ≥4GiB（如导入的长视频）否则必失败
+        // 「Large file option has not been set」且半成品 zip 被删除；对小文件行为一致。
+        .large_file(true);
 
     // 排除项按「路径组件」精确匹配：把 "game/vocal" 这类写法归一化为组件序列，
     // 旧实现 s.ends_with(e) 会把 "not.novel2vn"、"xnode_modules" 等相似名误伤
@@ -1290,7 +1565,10 @@ fn write_zip_contents(
 
 #[cfg(test)]
 mod atomic_write_tests {
-    use super::{atomic_write, atomic_write_temp_path, bless_project_dir, cancel_http_request, cleanup_stale_dir, display_path, guard_against_wipe, http_aborts, http_target, is_atomic_tmp_name, reject_unsafe_path_syntax, resolve_safe_path, ssrf_reject_reason, strip_verbatim_prefix, validate_secret_id, HttpRequestArgs};
+    use super::{atomic_write, atomic_write_temp_path, bless_project_dir, cancel_http_request, cleanup_stale_dir, cleanup_stale_files, copy_file, display_path, guard_against_wipe, has_transparency, http_aborts, http_target, is_atomic_tmp_name, linux_open_args, linux_open_failed, list_dir, path_exists, path_within_home_credential_dir, reject_unsafe_path_syntax, replace_path, resolve_safe_path, ssrf_reject_reason, strip_verbatim_prefix, validate_secret_id, write_api_secrets, write_text_file, HttpRequestArgs};
+    use std::path::Path;
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    use image::ImageEncoder as _;
     use std::collections::HashMap;
 
     #[test]
@@ -1368,10 +1646,54 @@ mod atomic_write_tests {
     }
 
     #[test]
+    fn credential_dirs_are_sensitive_on_all_platforms() {
+        // #1416：纯函数单测（不碰环境变量，避免并行测试竞态）
+        let home = Path::new("/home/testuser");
+        for rel in [".ssh", ".aws", ".gnupg", ".kube", ".config/gcloud"] {
+            let dir = home.join(rel);
+            assert!(path_within_home_credential_dir(&dir, home), "{rel} 应敏感");
+            assert!(
+                path_within_home_credential_dir(&dir.join("id_rsa"), home),
+                "{rel} 下文件应敏感"
+            );
+        }
+        assert!(!path_within_home_credential_dir(&home.join("projects/a.txt"), home));
+        assert!(
+            !path_within_home_credential_dir(&home.join(".ssh-backup/key"), home),
+            "相似名前缀不得误伤"
+        );
+    }
+
+    #[test]
     fn secret_ids_reject_unsafe_values() {        assert!(validate_secret_id("llm-config_1").is_ok());
         assert!(validate_secret_id("").is_err());
         assert!(validate_secret_id("../credential").is_err());
         assert!(validate_secret_id(&"x".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn linux_open_args_use_gio_open_subcommand() {
+        // #1330：分支逻辑单测（平台无关的纯函数部分；真机 spawn/退出码需 Linux 验证）
+        assert_eq!(
+            linux_open_args("gio", "https://example.com"),
+            vec!["open".to_string(), "https://example.com".to_string()]
+        );
+        assert_eq!(
+            linux_open_args("xdg-open", "https://example.com"),
+            vec!["https://example.com".to_string()]
+        );
+        assert_eq!(linux_open_args("nautilus", "/tmp/x"), vec!["/tmp/x".to_string()]);
+        let msg = linux_open_failed("打开链接", &["xdg-open".to_string(), "gio open".to_string()]);
+        assert!(msg.contains("xdg-open") && msg.contains("gio open"), "{msg}");
+    }
+
+    #[test]
+    fn write_api_secrets_validates_all_ids_before_applying() {
+        // #1441：全量校验前置——非法 id 直接 Err，且发生在任何凭据库读写之前（无副作用，CI 可执行）
+        let mut secrets = HashMap::new();
+        secrets.insert("valid-id-1".to_string(), "secret".to_string());
+        secrets.insert("../evil".to_string(), "x".to_string());
+        assert!(write_api_secrets(secrets).is_err());
     }
 
     #[test]
@@ -1383,6 +1705,8 @@ mod atomic_write_tests {
             body: None,
             body_base64: None,
             timeout_secs: 120,
+            allow_lan: false,
+            stream: false,
         };
         assert!(http_target(&args).is_err());
     }
@@ -1487,7 +1811,7 @@ mod atomic_write_tests {
         ];
         for url in blocked {
             let target = reqwest::Url::parse(url).unwrap();
-            assert!(ssrf_reject_reason(&target).is_some(), "应拦截 SSRF 目标: {url}");
+            assert!(ssrf_reject_reason(&target, false).is_some(), "应拦截 SSRF 目标: {url}");
         }
         // 公网 API 与本地模型通道（回环 11434）放行
         for url in [
@@ -1496,7 +1820,7 @@ mod atomic_write_tests {
             "http://127.0.0.1:11434/v1",
         ] {
             let target = reqwest::Url::parse(url).unwrap();
-            assert!(ssrf_reject_reason(&target).is_none(), "应放行合法目标: {url}");
+            assert!(ssrf_reject_reason(&target, false).is_none(), "应放行合法目标: {url}");
         }
         // 入口级：http_target 同样拦截元数据地址
         let args = HttpRequestArgs {
@@ -1506,8 +1830,199 @@ mod atomic_write_tests {
             body: None,
             body_base64: None,
             timeout_secs: 120,
+            allow_lan: false,
+            stream: false,
         };
         assert!(http_target(&args).is_err());
+    }
+
+    #[test]
+    fn ssrf_allow_lan_opens_loopback_and_private_only() {
+        // #1411：默认关闭 = 旧口径（本机其它端口/私网/内网名全部拒绝）
+        for url in [
+            "http://127.0.0.1:8080/v1",
+            "http://localhost:1234/v1",
+            "http://192.168.1.10:8000/v1",
+            "http://10.0.0.5/v1",
+            "http://nas.local/v1",
+            "http://intranet/v1",
+        ] {
+            let target = reqwest::Url::parse(url).unwrap();
+            assert!(ssrf_reject_reason(&target, false).is_some(), "默认应拦截: {url}");
+            assert!(ssrf_reject_reason(&target, true).is_none(), "显式放行后应允许: {url}");
+        }
+        // 公网与 Ollama 11434：无论开关都放行
+        for url in ["https://api.openai.com/v1", "http://localhost:11434/v1"] {
+            let target = reqwest::Url::parse(url).unwrap();
+            assert!(ssrf_reject_reason(&target, false).is_none());
+            assert!(ssrf_reject_reason(&target, true).is_none());
+        }
+        // 高危目标：即使显式放行也不解禁（未指定/组播/云元数据 IP 与主机名）
+        for url in [
+            "http://169.254.169.254/latest/meta-data",
+            "http://0.0.0.0/v1",
+            "http://224.0.0.1/v1",
+            "http://metadata.google.internal/v1",
+            "http://instance-data/v1",
+        ] {
+            let target = reqwest::Url::parse(url).unwrap();
+            assert!(ssrf_reject_reason(&target, true).is_some(), "放行后仍应拦截: {url}");
+        }
+        // 入口级：allowLan 透传到 http_target（默认关闭仍拦截局域网）
+        let lan_args = HttpRequestArgs {
+            method: "GET".to_string(),
+            url: "http://192.168.1.10:8000/v1/models".to_string(),
+            headers: HashMap::new(),
+            body: None,
+            body_base64: None,
+            timeout_secs: 20,
+            allow_lan: true,
+            stream: false,
+        };
+        assert!(http_target(&lan_args).is_ok());
+        let default_args = HttpRequestArgs { allow_lan: false, ..lan_args };
+        assert!(http_target(&default_args).is_err());
+    }
+
+    /// #1413：阻塞文件命令改为 async + spawn_blocking 后的接线回归
+    /// （临时目录在允许根内，resolve_safe_path 放行）。
+    #[tokio::test]
+    async fn blocking_file_commands_roundtrip() {
+        let dir = std::env::temp_dir().join("novelforge_blocking_cmds_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sub = dir.join("sub");
+        let src = sub.join("a.txt");
+        write_text_file(src.to_string_lossy().to_string(), "hello".to_string())
+            .await
+            .unwrap();
+        assert!(path_exists(src.to_string_lossy().to_string()));
+        let list = list_dir(sub.to_string_lossy().to_string()).await.unwrap();
+        assert_eq!(list.as_array().map(|a| a.len()).unwrap_or(0), 1);
+        let dst = dir.join("b.txt");
+        copy_file(src.to_string_lossy().to_string(), dst.to_string_lossy().to_string())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&dst).unwrap(), "hello");
+        // replace_path：目标已存在时走备份-发布-清理路径
+        let src2 = dir.join("c.txt");
+        std::fs::write(&src2, b"new").unwrap();
+        replace_path(src2.to_string_lossy().to_string(), dst.to_string_lossy().to_string())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&dst).unwrap(), "new");
+        // 1x1 不透明 PNG：透明检测应 Ok(false)
+        let mut rgba = image::RgbaImage::new(1, 1);
+        rgba.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(rgba.as_raw(), 1, 1, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        assert_eq!(has_transparency(B64.encode(&png)).await.unwrap(), false);
+        // cleanup_stale_files：.tmp 删除、中断替换恢复
+        std::fs::write(dir.join("x.json.1234.5.tmp"), b"partial").unwrap();
+        std::fs::write(dir.join("orphan.bin.replace-backup"), b"old").unwrap();
+        let report = cleanup_stale_files(dir.to_string_lossy().to_string(), Some(3))
+            .await
+            .unwrap();
+        assert_eq!(report["removed"], serde_json::json!(1));
+        assert_eq!(report["restored"], serde_json::json!(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod http_stream_tests {
+    use super::{limited_response_bytes, read_streaming_bytes};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    /// 本地假服务：接受 2 个连接，按 chunked 编码分块返回 payload（块间 sleep 模拟流式到达）。
+    /// 与 server.rs 的 TcpStream 测试同一写法（直接写原始 HTTP 响应）。
+    fn spawn_chunked_server(chunks: Vec<Vec<u8>>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut sock, _)) = listener.accept() else { break };
+                // 读到请求头即停（测试只发 GET，无请求体）
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf);
+                sock.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+                for chunk in &chunks {
+                    sock.write_all(format!("{:x}\r\n", chunk.len()).as_bytes()).unwrap();
+                    sock.write_all(chunk).unwrap();
+                    sock.write_all(b"\r\n").unwrap();
+                    sock.flush().unwrap();
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                sock.write_all(b"0\r\n\r\n").unwrap();
+                sock.flush().unwrap();
+            }
+        });
+        format!("http://{addr}/stream")
+    }
+
+    async fn get(url: &str) -> reqwest::Response {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+            .get(url)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// 核心契约：流式读取累积的字节与整包读取完全一致（前端拿到的 bodyBase64 与旧路径相同），
+    /// 且增量拼接后同样等于完整响应（剧本路径的进度计数据此可靠）。
+    #[tokio::test]
+    async fn streaming_read_matches_full_read() {
+        let payload: Vec<u8> =
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n".repeat(512);
+        let chunks: Vec<Vec<u8>> = payload.chunks(4096).map(|c| c.to_vec()).collect();
+        let url = spawn_chunked_server(chunks);
+
+        let streamed = {
+            let mut emitted: Vec<u8> = Vec::new();
+            let mut emissions = 0usize;
+            let bytes = read_streaming_bytes(get(&url).await, |chunk| {
+                emitted.extend_from_slice(chunk);
+                emissions += 1;
+            })
+            .await
+            .unwrap();
+            assert!(emissions >= 1, "流式读取至少要发一次增量");
+            assert_eq!(emitted, bytes, "增量拼接必须与完整字节一致");
+            bytes
+        };
+
+        let full = limited_response_bytes(get(&url).await).await.unwrap();
+        assert_eq!(streamed, full, "流式与整包读取的字节必须完全一致");
+        assert_eq!(full, payload, "响应体应与假服务发送的 payload 一致");
+    }
+
+    /// 小响应（单块 < 8KB）在流结束时也要 flush 一次，增量不能丢。
+    #[tokio::test]
+    async fn small_response_is_flushed_once() {
+        let payload = b"data: [DONE]\n\n".to_vec();
+        let url = spawn_chunked_server(vec![payload.clone()]);
+        let mut emitted: Vec<u8> = Vec::new();
+        let mut emissions = 0usize;
+        let bytes = read_streaming_bytes(get(&url).await, |chunk| {
+            emissions += 1;
+            emitted.extend_from_slice(chunk);
+        })
+        .await
+        .unwrap();
+        assert_eq!(emissions, 1, "小响应应在结束时 flush 恰好一次");
+        assert_eq!(emitted, payload);
+        assert_eq!(bytes, payload);
     }
 }
 

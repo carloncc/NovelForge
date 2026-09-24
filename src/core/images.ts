@@ -18,7 +18,7 @@ import { referenceRouteRejection, resolveImageModelCapabilities } from "../api/p
 import { editImageVariant, supportsImageEdits } from "../api/imageEdits";
 import { verifyImage } from "./selfcheck";
 import { runFaceCompositeTask } from "./faceComposite";
-import { formatSpriteVerifyFailure, isExpressionDiffTask, verifyExpressionFiles } from "./spriteVerify";
+import { isExpressionDiffTask, verifyExpressionFiles } from "./spriteVerify";
 import { describeReferenceImageCached } from "./recognize";
 import { tauri } from "../utils/tauri";
 import { errMsg } from "../utils/errors";
@@ -1543,25 +1543,24 @@ export async function runImageTask(
     }
   }
 
-  // #1084 表情差分像素核验（只读、best-effort）：表情任务落盘后，用 base 立绘校验
-  // 允许区外 RGBA + 整幅 alpha 逐像素一致；不合格抛错记失败项（可单张重生成），日志带差异像素数与 bbox。
-  // Node/解码不可用或缺少 base 时 verifyExpressionFiles 返回 null = 跳过，不记失败。
+  // #1084/#1418 表情差分像素核验（只读、best-effort）：
+  // 生图/编辑路径输出是整幅扩散重绘，允许区外必然存在噪声（抠图边缘还会额外制造 alpha 差异），
+  // 旧实现用严格逐像素口径核验所有差分 → 系统性误杀 → 删已付费图片 → 重试再失败的死循环。
+  // 故这里改用容差核验：仅当明显超出容差（身体/衣物整体漂移）时记 warn 提示，绝不删图、不抛错。
+  // 像素冻结的脸部合成路径已在 compositeExpressionFace 内部做严格核验（失败即抛错/回退），不在此重复。
   if (path && isExpressionDiffTask(task) && !aborted()) {
     const basePath = task.refFromTask ? opts.figureBase?.[task.refFromTask] : undefined;
     if (basePath) {
       try {
-        const vr = await verifyExpressionFiles(basePath, path);
+        const vr = await verifyExpressionFiles(basePath, path, undefined, undefined, "diffusion");
         if (vr && !vr.ok) {
-          const msg = formatSpriteVerifyFailure(task.usage ?? task.id, vr);
-          logger.warn("images", "表情差分核验未通过（已记失败项，可单张重生成）", { id: task.id, ...vr });
-          log({ step: "图像", message: msg, level: "error", at: Date.now(), taskId: task.id, taskKind: "image" });
-          await tauri.removePath(path).catch(() => {});
-          throw new Error(msg);
+          const note = vr.sizeMismatch
+            ? "画布尺寸与底图不一致"
+            : `允许区外差异 ${vr.outsideMismatch} 像素、alpha 差异 ${vr.alphaMismatch} 像素`;
+          logger.warn("images", "表情差分容差核验差异偏大（已保留原图，仅提示）", { id: task.id, ...vr });
+          log({ step: "图像", message: `表情差分核验提示：${task.usage ?? task.id}（${note}，超出容差，疑似身体/衣物漂移；已保留原图，可单张重生成）`, level: "warn", at: Date.now(), taskId: task.id, taskKind: "image" });
         }
       } catch (e) {
-        // 核验自身的读图/解码失败已在 verifyExpressionFiles 内消化（返回 null 跳过）；
-        // 这里只透出「核验未通过」的显式失败，其他意外错误降级为 warn 保留原图。
-        if (e instanceof Error && e.message.startsWith("表情差分核验未通过")) throw e;
         logger.warn("images", "表情差分核验过程出错（保留原图）", { id: task.id, error: errMsg(e).slice(0, 160) });
       }
     }

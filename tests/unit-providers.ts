@@ -33,13 +33,16 @@ function main(): void {
   const explicit = classifyModelCapabilities({ id: "vendor/custom", capabilities: ["image_generation"] }, "custom");
   assert(explicit.length === 1 && explicit[0] === "image", "应优先使用供应商返回的能力标签");
 
-  let invalidThrew = false;
+  // #1317：坏条（字段类型错误）改为过滤 + warn，保住其余可用模型，不再整单抛出
+  const mixed = parseModelList({ data: [{ id: "ok" }, { id: 42 }] }, "custom");
+  assert(mixed.length === 1 && mixed[0].id === "ok", "坏条应被过滤，保留其余合法模型");
+  let emptyThrew = false;
   try {
-    parseModelList({ data: [{ id: "ok" }, { id: 42 }] }, "custom");
+    parseModelList({ data: [{ id: 42 }] }, "custom");
   } catch {
-    invalidThrew = true;
+    emptyThrew = true;
   }
-  assert(invalidThrew, "第三方模型响应字段类型错误时应拒绝");
+  assert(emptyThrew, "全部条目非法（过滤后为空）时应拒绝");
 
   // 语种感知预算：中文约 0.6 字符/token（以前按 1.5 算，中文长文分段超大触发网关 500）
   const zh = "林澈拔剑而起，星陨剑划破长空，剑气纵横三万里。".repeat(2000);

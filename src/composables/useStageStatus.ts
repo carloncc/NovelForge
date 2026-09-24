@@ -2,7 +2,7 @@ import { computed, reactive } from "vue";
 import type { ApiConfig, AssetMap, FailedTask, GenerationOptions, NovelDoc, PipelineResult, StageKey } from "../core/types";
 import { STAGE_ORDER, STEP_TO_STAGE } from "../core/types";
 import { buildImageTasks } from "../core/images";
-import { buildVoiceJobs } from "../core/voice";
+import { buildVoiceJobsOrEmpty } from "../core/voice";
 import { scriptCacheRest, scriptFingerprint, titleHash, cardsFingerprint } from "../core/cache";
 import { tauri } from "../utils/tauri";
 import { parseAssetMap } from "../core/assetMap";
@@ -141,8 +141,12 @@ export function useStageStatus(input: StageStatusInput) {
   function allExpectedVoicesExist(map: AssetMap, result: PipelineResult, config: ApiConfig): boolean {
     // 同上：无剧本时不判完成，避免「0 条配音也全绿」
     if (!result.chapters.length) return false;
-    return buildVoiceJobs(config, result.chapters, result.cards.characters)
-      .every((job) => Boolean(map.vocal[job.key]));
+    // #1427：音色库为空时 buildVoiceJobs 会 throw（#1139）；计数路径改用非抛出变体
+    // （音色库清空也允许，config.ts:82），否则 refresh() 在最后一行抛异常，
+    // base.voice 永不更新（配音灯不绿）且留下未处理 rejection。空库直接判「未完成」。
+    const jobs = buildVoiceJobsOrEmpty(config, result.chapters, result.cards.characters);
+    if (!jobs.length) return false;
+    return jobs.every((job) => Boolean(map.vocal[job.key]));
   }
 
   /** B30：刷新并发令牌。多次 refresh 重叠时（配置/卡片变化与运行结束几乎同时触发），

@@ -58,6 +58,9 @@ const outputDir = computed(() => projectState.lastResult?.meta.outputDir ?? proj
 const { busy: pipelineBusy, assetBusy: genAssetBusy, queueRunning: genQueueRunning, execute } = useGenerateController();
 /** 生成/素材任务运行中禁止打包与写配置：会把写到一半的文件打进包里 */
 const runBusy = computed(() => pipelineBusy.value || !!genAssetBusy.value || genQueueRunning.value);
+// #1394：网页版无本地文件选择器，「自定义图片…」为死分支——禁用选项并提供相对路径输入兜底
+const isWeb = computed(() => !isTauri());
+const webCustomCoverTip = computed(() => (isWeb.value ? t("自定义图片仅桌面版可选（网页版请在下方填写项目相对路径，或去桌面版选择）") : undefined));
 
 function setMsg(m: string, ok = true): void {
   // #1348：连续调用时旧 timer 会提前抹掉新消息（成败反馈 0.x 秒消失）：先清旧 timer
@@ -233,6 +236,11 @@ async function saveAndAssemble(): Promise<void> {
     setMsg(t("还没有生成结果：请先在「生成项目」页生成并组装后再应用设置"), false);
     return;
   }
+  // #1393：打包中同样禁止保存并重新组装——组装重写 game/scene/config，与 zip 流式读并发会混入新旧两套剧本
+  if (packing.value) {
+    setMsg(t("正在打包：请等打包完成后再保存，避免与打包并发读写同一目录"), false);
+    return;
+  }
   if (runBusy.value) {
     setMsg(t("生成任务正在运行：请等它完成后再保存，避免把配置写进正在写入的目录"), false);
     return;
@@ -307,25 +315,14 @@ async function packZip(): Promise<void> {
   }
   // #1107：检查错误不再硬拦截——素材缺失多为模板/环境回填问题，用户无法在生成页修复。
   // 允许二次确认后强制导出，并把放弃的错误数留痕（日志面板 + 文件日志）。
+  // #1433：留痕延后到真正开始打包时再记——此前在保存对话框前就记，取消保存会留下「继续打包」假记录
+  let overrideErrors = 0;
   if (report.errors.length) {
     if (!window.confirm(buildExportOverridePrompt(report))) {
       setMsg(t("存在导出检查错误，已取消打包（见上方检查结果）"), false);
       return;
     }
-    log.warn("page", "用户确认忽略导出检查错误继续打包", {
-      dir,
-      errors: report.errors.length,
-      missingAssets: report.summary.missingAssets,
-    });
-    pushLog({
-      step: "导出",
-      message: t("已确认风险：忽略 {n} 个导出检查错误继续打包（缺失素材 {m}）", {
-        n: report.errors.length,
-        m: report.summary.missingAssets,
-      }),
-      level: "warn",
-      at: Date.now(),
-    });
+    overrideErrors = report.errors.length;
   }
   const base = dir.split(/[\\/]/).filter(Boolean).pop() || "novelforge";
   // UI79：目录名已在 dir 末尾，旧式 `dir + _${base}_web.zip` 会得到 A_A_web.zip；直接拼 _web.zip 即 A_web.zip
@@ -337,7 +334,11 @@ async function packZip(): Promise<void> {
       defaultPath,
       filters: [{ name: t("ZIP 压缩包"), extensions: ["zip"] }],
     });
-    if (!picked) return;
+    // #1433：取消保存是明确动作，给出反馈（此前零反馈，且风险日志已先落造成矛盾）
+    if (!picked) {
+      setMsg(t("已取消保存，未打包"));
+      return;
+    }
     // #1116：目标在项目目录内部时拒绝——Rust 先创建 zip 再递归打包，会把正在写入的自身半成品打进包里
     if (isPathInsideDir(dir, picked)) {
       setMsg(t("保存位置不能在项目目录内部（否则会把正在写入的 zip 自身打进包里）：请换一个目录"), false);
@@ -346,6 +347,24 @@ async function packZip(): Promise<void> {
     // #1292：登记保存位置所在目录（用户经保存对话框明示授权），否则写 zip 被白名单拒绝
     await blessParentDir(picked);
     target = picked;
+  }
+
+  // #1433：拿到保存位置并通过目录校验后、真正开始打包时才留痕
+  if (overrideErrors > 0) {
+    log.warn("page", "用户确认忽略导出检查错误继续打包", {
+      dir,
+      errors: overrideErrors,
+      missingAssets: report.summary.missingAssets,
+    });
+    pushLog({
+      step: "导出",
+      message: t("已确认风险：忽略 {n} 个导出检查错误继续打包（缺失素材 {m}）", {
+        n: overrideErrors,
+        m: report.summary.missingAssets,
+      }),
+      level: "warn",
+      at: Date.now(),
+    });
   }
 
   packing.value = true;
@@ -436,9 +455,9 @@ async function openExternal(url: string): Promise<void> {
       <div class="card-head">
         <h3>{{ t("导出设置") }}</h3>
         <div class="card-actions">
-          <button class="btn" :disabled="runBusy" @click="saveAndAssemble">
-            <span v-if="runBusy" class="spinner" />
-            {{ runBusy ? t("组装中…") : t("保存并重新组装") }}
+          <button class="btn" :disabled="runBusy || packing" @click="saveAndAssemble">
+            <span v-if="runBusy || packing" class="spinner" />
+            {{ packing ? t("打包中…") : runBusy ? t("组装中…") : t("保存并重新组装") }}
           </button>
         </div>
       </div>
@@ -471,7 +490,7 @@ async function openExternal(url: string): Promise<void> {
             <select v-model="titleForm.coverMode" @change="markTitleDirty">
               <option value="auto">{{ t("自动生成（按主题配色，推荐）") }}</option>
               <option value="none">{{ t("不使用封面") }}</option>
-              <option value="custom">{{ t("自定义图片…") }}</option>
+              <option value="custom" :disabled="isWeb" :title="webCustomCoverTip">{{ t("自定义图片…") }}</option>
             </select>
           </label>
           <label class="field" v-if="titleForm.coverMode === 'custom'">
@@ -480,13 +499,15 @@ async function openExternal(url: string): Promise<void> {
               <button class="btn ghost small" @click="pickTitleFile('cover')">{{ t("选择图片…") }}</button>
               <span class="hint" :title="titleForm.coverPath">{{ titleForm.coverPath ? fileNameOf(titleForm.coverPath) : t("未选择") }}</span>
             </div>
+            <input v-if="isWeb" type="text" v-model="titleForm.coverPath" @input="markTitleDirty" :placeholder="t('项目相对路径（如 game/background/cover.png），网页版无文件选择器')" style="margin-top: 6px" />
+            <span v-if="isWeb" class="hint">{{ t("网页版无法浏览本地文件：请填写项目相对路径") }}</span>
           </label>
           <label class="field">
             <span>{{ t("标题 Logo") }}</span>
             <select v-model="titleForm.logoMode" @change="markTitleDirty">
               <option value="auto">{{ t("自动生成文字 Logo（推荐）") }}</option>
               <option value="none">{{ t("不显示 Logo") }}</option>
-              <option value="custom">{{ t("自定义图片…") }}</option>
+              <option value="custom" :disabled="isWeb" :title="webCustomCoverTip">{{ t("自定义图片…") }}</option>
             </select>
           </label>
           <label class="field" v-if="titleForm.logoMode === 'custom'">
@@ -495,6 +516,8 @@ async function openExternal(url: string): Promise<void> {
               <button class="btn ghost small" @click="pickTitleFile('logo')">{{ t("选择图片…") }}</button>
               <span class="hint" :title="titleForm.logoPath">{{ titleForm.logoPath ? fileNameOf(titleForm.logoPath) : t("未选择") }}</span>
             </div>
+            <input v-if="isWeb" type="text" v-model="titleForm.logoPath" @input="markTitleDirty" :placeholder="t('项目相对路径（如 game/image/logo.png），网页版无文件选择器')" style="margin-top: 6px" />
+            <span v-if="isWeb" class="hint">{{ t("网页版无法浏览本地文件：请填写项目相对路径") }}</span>
           </label>
           <label class="field">
             <span>{{ t("标题音乐") }}</span>

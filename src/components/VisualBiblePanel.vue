@@ -18,6 +18,9 @@ import {
   approveVisualBible,
   computeProjectVisualBibleFingerprint,
   createVisualBibleDraft,
+  loadVisualBible,
+  localizeVisualBibleApprovalError,
+  localizeVisualBibleApprovalErrors,
   persistRegeneratedCharacterDescription,
   refreshVisualBibleFingerprint,
   regenerateAllCharacterSheets,
@@ -247,6 +250,45 @@ async function refreshApprovalValidation(): Promise<void> {
   approvalErrors.value = result.errors;
 }
 
+/** #1409：core 的批准校验错误是英文硬编码；渲染前经 localizeVisualBibleApprovalError 映射为 t() key。 */
+const localizedApprovalErrors = computed(() =>
+  localizeVisualBibleApprovalErrors(approvalErrors.value).map((entry) => t(entry.key, entry.params)),
+);
+
+/** #1409：approve/accept 抛错的英文 stale 文案同样本地化；ReferenceImage/Vision 等已有中文文案原样保留。 */
+function visualBibleErrorText(error: unknown, context: { imageModel?: string; visionModel?: string }): string {
+  const raw = visualBibleErrorMessage(error, context);
+  const localized = localizeVisualBibleApprovalError(raw);
+  return t(localized.key, localized.params);
+}
+
+/** #1445：core 在清单已落盘后才会抛「清单已发布，但发布后处理失败」——属成功态+待清理，非批准失败。 */
+function isPostPublishCleanupFailure(error: unknown): boolean {
+  const message = errMsg(error);
+  return message.includes("已发布，但发布后处理失败") || message.includes("状态已落盘");
+}
+
+/** #1406：面板显式「刷新指纹」入口——改完输入后无需切页重进即可对齐指纹并重算批准校验。 */
+async function refreshFingerprintManually(): Promise<void> {
+  const current = bible.value;
+  if (!current || !outputDir.value) return;
+  busyKey.value = "refresh-fp";
+  approvalError.value = "";
+  try {
+    await refreshFingerprint();
+    await refreshApprovalValidation();
+    await afterMutation();
+    pushLog({ step: "视觉守门", message: t("视觉守门指纹已刷新"), level: "success", at: Date.now() });
+  } catch (e) {
+    approvalError.value = visualBibleErrorText(e, {
+      imageModel: activeConfig("image")?.model,
+      visionModel: activeConfig("vision")?.model,
+    });
+  } finally {
+    busyKey.value = "";
+  }
+}
+
 watch(
   () => [bible.value, characters.value.map((character) => character.id).join(",")],
   () => {
@@ -340,8 +382,31 @@ async function createDraft(): Promise<void> {
     pushLog({ step: "视觉守门", message: `视觉守门草稿已生成（风格分析覆盖全书 ${novel.chapters.length} 章，${cards.characters.length} 个角色全部建档），请逐项确认后批准`, level: "success", at: Date.now() });
   } catch (e) {
     if (vbAbort.value) {
-      pushLog({ step: "视觉守门", message: "已中断创建草稿：未保存任何内容（已完成的图片保留在缓存，可重新发起）", level: "warn", at: Date.now() });
+      // #1443：core 已让「末角色窗口中止」在落盘前抛错（不静默发布），但仍按实际落盘结果区分——
+      // 发布后处理失败等已在磁盘留下草稿的情形不能再报「未保存任何内容」，否则用户重来再付一次全款。
+      let savedDraft = false;
+      try {
+        const loaded = await loadVisualBible(outputDir.value);
+        if (loaded.visualBible && loaded.visualBible.status === "draft") {
+          projectState.visualBible = loaded.visualBible;
+          savedDraft = true;
+        }
+      } catch {
+        /* 读取失败则按未保存处理 */
+      }
+      pushLog({
+        step: "视觉守门",
+        message: savedDraft
+          ? t("已中断创建草稿：草稿已完整保存（可在面板继续确认），已完成的图片保留在缓存")
+          : t("已中断创建草稿：未保存任何内容（已完成的图片保留在缓存，可重新发起）"),
+        level: "warn",
+        at: Date.now(),
+      });
       createError.value = "";
+      if (savedDraft) {
+        await refreshApprovalValidation();
+        await afterMutation();
+      }
     } else {
       createError.value = visualBibleErrorMessage(e, {
         imageModel: activeConfig("image")?.model,
@@ -580,6 +645,8 @@ async function regenerateCharacterDesc(characterId: string): Promise<void> {
         lastResult.cards.characters.splice(idx, 1, updatedCard);
       }
     }
+    // #1406：imagePrompt/threeViewPrompt 已改（计入指纹），必须刷新指纹，否则批准撞 stale
+    await refreshFingerprint();
     await refreshApprovalValidation();
     await afterMutation();
     pushLog({
@@ -723,6 +790,8 @@ async function regenerateAllCharacters(): Promise<void> {
         if (u) lastResult.cards.characters.splice(i, 1, u);
       }
     }
+    // #1406：全局重生成改了 prompt（计入指纹），刷新指纹避免批准撞 stale
+    await refreshFingerprint();
     await refreshApprovalValidation();
     await afterMutation();
     pushLog({
@@ -781,10 +850,25 @@ async function approve(): Promise<void> {
     pushLog({ step: "视觉守门", message: t("视觉守门已批准，开始续跑剩余阶段"), level: "success", at: Date.now() });
     emit("approve");
   } catch (e) {
-    approvalError.value = visualBibleErrorMessage(e, {
-      imageModel: activeConfig("image")?.model,
-      visionModel: activeConfig("vision")?.model,
-    });
+    if (isPostPublishCleanupFailure(e)) {
+      // #1445：清单已 approved 落盘、pendingInvalidation 已删，仅发布后缓存清理失败。
+      // 不能把这当成「批准失败」——否则 UI 与磁盘态矛盾、旧立绘清理被永久跳过且无重试入口。
+      // 按成功态处理：刷新校验、继续续跑，并提示待清理可走素材页。
+      await refreshApprovalValidation();
+      await afterMutation();
+      pushLog({
+        step: "视觉守门",
+        message: t("视觉守门清单已批准并落盘；部分旧缓存待清理（可在素材页「清理无效素材」收尾）"),
+        level: "warn",
+        at: Date.now(),
+      });
+      emit("approve");
+    } else {
+      approvalError.value = visualBibleErrorText(e, {
+        imageModel: activeConfig("image")?.model,
+        visionModel: activeConfig("vision")?.model,
+      });
+    }
   } finally {
     busyKey.value = "";
   }
@@ -849,14 +933,16 @@ async function regenCostumeSheet(characterId: string, costumeId: string): Promis
   busyKey.value = `char-sheet-ct:${characterId}:${costumeId}`;
   charErrors.value[characterId] = "";
   if (!window.confirm(hasSheet
-    ? t("重新生成「{name}」的「{costume}」三视图？将覆盖当前版本（角色打回待确认），并产生 1 张图片费用。", { name: character.name, costume: costumeName })
-    : t("生成「{name}」的「{costume}」三视图？该服装暂无锚点（角色打回待确认），并产生 1 张图片费用。", { name: character.name, costume: costumeName }))) {
+    ? t("重新生成「{name}」的「{costume}」三视图？将覆盖当前版本（角色打回待确认；仅作废该服装锚点图，不影响表情/动作/其它服装立绘），并产生 1 张图片费用。", { name: character.name, costume: costumeName })
+    : t("生成「{name}」的「{costume}」三视图？该服装暂无锚点（角色打回待确认；仅作废该服装锚点图，不影响表情/动作/其它服装立绘），并产生 1 张图片费用。", { name: character.name, costume: costumeName }))) {
     busyKey.value = "";
     return;
   }
   pushLog({ step: "视觉守门", message: `角色「${character.name}」服装「${costumeName}」三视图重生成开始…`, level: "info", at: Date.now() });
   try {
     await regenerateCostumeSheetApi(outputDir.value, current, { character, imageCfg, costumeId });
+    // #1406：服装锚点 revision/prompt 计入指纹，刷新后批准才不会撞 stale
+    await refreshFingerprint();
     await refreshApprovalValidation();
     await afterMutation();
     pushLog({ step: "视觉守门", message: `角色「${character.name}」服装「${costumeName}」三视图已重新生成`, level: "success", at: Date.now() });
@@ -1099,15 +1185,26 @@ async function regenCostumeSheet(characterId: string, costumeId: string): Promis
         <div class="vb-approval-bar">
           <div>
             <div v-if="approvalErrors.length" class="vb-error">
-              {{ approvalErrors.join("；") }}
+              {{ localizedApprovalErrors.join("；") }}
             </div>
             <p v-else class="vb-sub">{{ resumeHint }}</p>
             <p v-if="approvalError" class="vb-error">{{ approvalError }}</p>
           </div>
-          <button class="btn" :disabled="!canApprove" @click="approve">
-            <span v-if="busyKey === 'approve'" class="spinner" />
-            {{ busyKey === "approve" ? t("正在批准…") : t("批准并续跑生成") }}
-          </button>
+          <div class="row" style="justify-content: flex-end">
+            <button
+              class="btn secondary small"
+              :disabled="runLocked"
+              :title="t('把视觉守门指纹对齐到当前卡片/风格输入（改完输入后无需切页重进）')"
+              @click="refreshFingerprintManually"
+            >
+              <span v-if="busyKey === 'refresh-fp'" class="spinner" />
+              {{ t("刷新指纹") }}
+            </button>
+            <button class="btn" :disabled="!canApprove" @click="approve">
+              <span v-if="busyKey === 'approve'" class="spinner" />
+              {{ busyKey === "approve" ? t("正在批准…") : t("批准并续跑生成") }}
+            </button>
+          </div>
         </div>
       </template>
     </div>

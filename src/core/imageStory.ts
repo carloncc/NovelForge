@@ -266,3 +266,43 @@ export async function runImageStoryTasks(args: ImageStoryRunArgs): Promise<{ pro
   await pool(rest, args.concurrency, runOne);
   return { produced, failed };
 }
+
+/* ==================== nb-nE 修复包纯函数（#1403/#1435-#1439） ==================== */
+
+/** #1403：缺失分镜 + 总张数上限>0 时提示「提高上限后重试」（纯函数，供页面与单测共用） */
+export function shouldShowShotsTotalCapHint(shotsTotal: number, missingCount: number): boolean {
+  return Math.floor(shotsTotal) > 0 && missingCount > 0;
+}
+
+/** #1435：载入/refresh 路径禁止付费翻译（纯策略函数：只有 run 阶段允许） */
+export function isPaidTranslateAllowed(caller: "load" | "run"): boolean {
+  return caller === "run";
+}
+
+/** #1436：图片零产出且无缓存分镜时阻断组装（纯函数） */
+export function shouldBlockAssembleOnZeroShots(produced: number, shotAssetCount: number): boolean {
+  return produced <= 0 && shotAssetCount <= 0;
+}
+
+/** #1437：剧本阶段后是否继续图片/组装（纯函数：停止后不再派发，与 runImageStory 同口径） */
+export function shouldRunPostScriptStages(abortFlag: boolean, chaptersLength: number): boolean {
+  return !abortFlag && chaptersLength > 0;
+}
+
+/** #1439：日志合并（纯函数）：磁盘历史 + 本次内存新条目去重，保历史不被整文件覆写清掉 */
+export function mergeImageStoryLogs(
+  disk: PipelineEvent[],
+  memory: PipelineEvent[],
+  limit: number,
+): PipelineEvent[] {
+  const seen = new Set(disk.map((ev) => `${ev.at}|${ev.step}|${ev.level}|${ev.message}`));
+  const merged = [...disk];
+  for (const ev of memory) {
+    const key = `${ev.at}|${ev.step}|${ev.level}|${ev.message}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      merged.push(ev);
+    }
+  }
+  return merged.slice(-Math.max(1, Math.floor(limit)));
+}

@@ -170,12 +170,21 @@ const chapterByIndex = computed(() => {
   return m;
 });
 function nameList(idxs: number[]): string {
-  return idxs.map((i) => `第${i + 1}章「${chapterByIndex.value.get(i)?.title ?? ""}」`).join("、");
+  // #1423：复用 titleOf 的前缀去重口径，避免标题自带「第X章」时显示重复章号。
+  return idxs.map((i) => {
+    const c = chapterByIndex.value.get(i);
+    if (!c) return `第${i + 1}章`;
+    return `「${titleOf(c)}」`;
+  }).join("、");
 }
 async function regenSelectedPart(part: "script" | "image" | "voice"): Promise<void> {
   if (batchBusy.value || locked.value) return;
   const idxs = selectedEnabled.value;
-  if (!idxs.length) return;
+  // #1421：选中集全为停用章时给明确反馈，不再静默返回。
+  if (!idxs.length) {
+    window.alert(t("选中的均为停用章，无法重跑：请先用「启用选中」启用后再试"));
+    return;
+  }
   // #1334：一次聚合确认（取消则整批不执行），循环内跳过逐章确认——此前取消第 1 章仍继续弹第 2 章
   const label = part === "script" ? "剧本" : part === "image" ? "图像" : "配音";
   const scopeNote =
@@ -196,7 +205,11 @@ async function regenSelectedPart(part: "script" | "image" | "voice"): Promise<vo
 async function regenSelectedFull(): Promise<void> {
   if (batchBusy.value || locked.value) return;
   const idxs = selectedEnabled.value;
-  if (!idxs.length) return;
+  // #1421：选中集全为停用章时给明确反馈，不再静默返回。
+  if (!idxs.length) {
+    window.alert(t("选中的均为停用章，无法重跑：请先用「启用选中」启用后再试"));
+    return;
+  }
   // #1334：同上，一次聚合确认；各章「全量」勾选照常分别生效（行为不变，只收敛确认）
   const forced = idxs.filter((i) => props.force[i]);
   const forceNote = forced.length === idxs.length

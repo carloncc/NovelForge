@@ -21,8 +21,10 @@
   .panel.active { display: block; }
   /* 立绘鉴赏 */
   .stage { display: flex; gap: 20px; flex-wrap: wrap; }
-  .stage-view { flex: 1 1 480px; background: repeating-conic-gradient(#1f1f27 0% 25%, #191921 0% 50%) 50% / 22px 22px; border: 1px solid var(--border); border-radius: 12px; min-height: 520px; display: flex; align-items: center; justify-content: center; position: relative; overflow: hidden; }
-  .stage-view img { max-height: 96%; max-width: 96%; object-fit: contain; transition: transform .25s ease; user-select: none; }
+  /* 立绘鉴赏（1455）：.stage-view 给确定高度让 img max-height:96% 生效（flex auto 高下百分比 max-height 视为 none）；
+     保留 transform 缩放，容器 overflow:auto + safe 居中使放大后可滚动查看（替代裁掉 60% 且无法平移）。 */
+  .stage-view { flex: 1 1 480px; background: repeating-conic-gradient(#1f1f27 0% 25%, #191921 0% 50%) 50% / 22px 22px; border: 1px solid var(--border); border-radius: 12px; min-height: 520px; height: min(72vh, 620px); max-height: 620px; display: flex; align-items: safe center; justify-content: safe center; position: relative; overflow: auto; }
+  .stage-view img { max-height: 96%; max-width: 96%; object-fit: contain; transition: transform .25s ease; user-select: none; flex-shrink: 0; }
   .stage-controls { flex: 1 1 280px; display: flex; flex-direction: column; gap: 12px; }
   .ctl { display: flex; flex-direction: column; gap: 6px; }
   .ctl label { font-size: 12px; color: var(--dim); }
@@ -52,9 +54,9 @@
   .card .name { font-weight: 600; font-size: 14px; }
   .card .desc { color: var(--dim); font-size: 12px; margin-top: 4px; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
   .cg-img { cursor: pointer; }
-  .lightbox { position: fixed; inset: 0; background: rgba(0,0,0,.92); display: none; align-items: center; justify-content: center; z-index: 50; }
+  .lightbox { position: fixed; inset: 0; background: rgba(0,0,0,.92); display: none; align-items: safe center; justify-content: safe center; z-index: 50; overflow: auto; padding: 24px; }
   .lightbox.open { display: flex; }
-  .lightbox img { max-width: 94vw; max-height: 94vh; object-fit: contain; }
+  .lightbox img { max-width: 94vw; max-height: 94vh; object-fit: contain; flex-shrink: 0; }
   .lightbox .close { position: absolute; top: 16px; right: 20px; font-size: 28px; cursor: pointer; color: var(--dim); }
   /* 灯箱切换/缩放：左右切换 + 键盘 ←→/Esc + 滚轮/双击缩放 */
   .lb-nav { position: absolute; top: 50%; transform: translateY(-50%); width: 48px; height: 48px; border-radius: 50%; border: 1px solid var(--border); background: rgba(20, 20, 26, 0.78); color: var(--txt); font-size: 22px; line-height: 1; cursor: pointer; display: grid; place-items: center; }

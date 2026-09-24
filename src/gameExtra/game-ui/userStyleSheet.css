@@ -12,7 +12,15 @@
 
 /* 首屏落地页（点击进入）：Logo 尺寸 + 「点击开始」提示
    （引擎硬编码英文文案；这里给中文默认值，project.ts 的 buildThemeCss 会按作品语言
-   追加同选择器的 content 覆盖：zh_CN/zh_TW/en/ja/ko，见 UI104） */
+   追加同选择器的 content 覆盖：zh_CN/zh_TW/en/ja/ko，见 UI104）
+   1454：原 div 文案靠 font-size:0 隐藏、::after 接管（无双行怪字）；容器 flex 默认 row 会使
+   ::before 标题与点击提示并排挤在一起，这里强制 column 使标题在上、提示在下。 */
+.title-enter-container__center-text {
+  flex-direction: column !important;
+  align-items: center !important;
+  justify-content: center !important;
+  text-align: center;
+}
 .title-enter__initial-background {
   background: radial-gradient(
     120% 120% at 25% 0%,

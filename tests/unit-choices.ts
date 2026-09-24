@@ -66,14 +66,22 @@ function chapterWithChoice(): ChapterScript {
 function main(): void {
   const out = renderChapter(chapterWithChoice(), { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets, introCard: false }, 1);
 
+  // #1462：分支 label 现在带 4 位稳定哈希前缀（区分 sanitizeId 有损折叠后的撞名场景），
+  // 因此先从输出里取出实际前缀，再用它断言同一套 label/choose/jumpLabel。
+  const labelMatch = out.match(/label:(ch1_s1_[0-9a-z]+_c1);/);
+  assert(!!labelMatch, `缺少选项 1 的 label（带哈希前缀）: ${out.split("\n").filter((l) => l.includes("label:")).join(";")}`);
+  const c1 = labelMatch![1];
+  const c2 = c1.replace(/_c1$/, "_c2");
+  const join = c1.replace(/_c1$/, "_join");
+
   // 1) choose 语句：两个选项，选项文本转义
-  assert(out.includes("choose:留下来:ch1_s1_c1|转身离开:ch1_s1_c2;"), `缺少 choose 语句: ${out.split("\n").filter((l) => l.startsWith("choose")).join(";")}`);
+  assert(out.includes(`choose:留下来:${c1}|转身离开:${c2};`), `缺少 choose 语句: ${out.split("\n").filter((l) => l.startsWith("choose")).join(";")}`);
 
   // 2) 分支 label 块 + jumpLabel 回到合并点
-  assert(out.includes("label:ch1_s1_c1;"), "缺少选项 1 的 label");
-  assert(out.includes("label:ch1_s1_c2;"), "缺少选项 2 的 label");
-  assert(out.includes("jumpLabel:ch1_s1_join;"), "缺少分支结束跳转");
-  assert(out.includes("label:ch1_s1_join;"), "缺少分支合并点 label");
+  assert(out.includes(`label:${c1};`), "缺少选项 1 的 label");
+  assert(out.includes(`label:${c2};`), "缺少选项 2 的 label");
+  assert(out.includes(`jumpLabel:${join};`), "缺少分支结束跳转");
+  assert(out.includes(`label:${join};`), "缺少分支合并点 label");
 
   // 3) 分支台词渲染为对话/旁白，且保持合法（冒号 + 分号结尾）
   assert(out.includes("林澈:我留下。;"), "分支对话未渲染");

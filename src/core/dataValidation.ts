@@ -5,6 +5,11 @@ function record(input: unknown, label: string): Record<string, unknown> {
   return input as Record<string, unknown>;
 }
 
+/** 纯函数：物品事件触发行号是否合法（#1422 与渲染/生产同口径：允许 ==lineCount 表示场景末尾事件）。 */
+export function isValidTriggerIndex(trigger: unknown, lineCount: number): boolean {
+  return Number.isInteger(trigger) && (trigger as number) >= 0 && (trigger as number) <= lineCount;
+}
+
 /** 剧本行校验：空 text 会导致渲染 esc(undefined) 崩溃，非法 type 会被渲染端静默跳过。
  * 主流程 lines 与分支 choices.lines 共用同一口径（分支台词同样会被渲染）。 */
 function assertScriptLine(lineInput: unknown, label: string): void {
@@ -34,7 +39,8 @@ export function parseChapterScript(input: unknown): ChapterScript {
     (scene.itemEvents as unknown[]).forEach((evInput, ei) => {
       const where = `chapter ${String(chapterNo)} scene #${si} itemEvent #${ei}`;
       const ev = record(evInput, where);
-      if (!Number.isInteger(ev.triggerIndex) || (ev.triggerIndex as number) < 0 || (ev.triggerIndex as number) > Math.max(0, lineCount - 1)) {
+      // #1422：上界与渲染端可消费的上界一致（==lineCount 为场景末尾事件，render.ts 显式支持）。
+      if (!isValidTriggerIndex(ev.triggerIndex, lineCount)) {
         throw new Error(`${where} has an invalid triggerIndex`);
       }
       if (typeof ev.itemId !== "string" || !ev.itemId.trim()) throw new Error(`${where} has an invalid itemId`);

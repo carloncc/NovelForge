@@ -11,8 +11,8 @@ const files = ["zh-TW", "en", "ja", "ko"];
 
 const CJK_RE = /[一-鿿㐀-䶿]/;
 
-// 值等于键也合法的例外：语言自称，各语言共用原文即正确。
-const COMMON_EQUAL_ALLOW = new Set(["日本語"]);
+// 值等于键也合法的例外：语言自称，以及汉日/简繁同形词（各语言共用原文即正确）。
+const COMMON_EQUAL_ALLOW = new Set(["日本語", "操作"]);
 
 // zh-TW 简繁同形白名单：繁体写法与简体键完全一致，已逐条核对（#1142）。
 // 英文示例原文（`例：unified …`）各语言共用，不翻译。

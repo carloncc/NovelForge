@@ -13,6 +13,18 @@ function displayNameOf(fileName: string, fallback: string): string {
   return base.replace(/\.[^.]+$/, "").trim() || fallback;
 }
 
+/** #1417：项目注册表上限（超出后最旧条目被挤出，文件不丢，可用新建项目对话框导航回来） */
+export const PROJECT_LIST_LIMIT = 30;
+
+/** #1417：最近一次因上限被挤出的条目（供列表尾部提示，不落盘） */
+export let lastEvictedProjects: ProjectEntry[] = [];
+
+/** #1417：截断纯函数（可单测）：保留前 LIMIT 条，返回被挤出的旧条目供提示/恢复 */
+export function truncateProjectList(list: ProjectEntry[]): { kept: ProjectEntry[]; evicted: ProjectEntry[] } {
+  if (list.length <= PROJECT_LIST_LIMIT) return { kept: [...list], evicted: [] };
+  return { kept: list.slice(0, PROJECT_LIST_LIMIT), evicted: list.slice(PROJECT_LIST_LIMIT) };
+}
+
 /** 登记/刷新项目（输出目录即项目键）。 novel 缺省时沿用快照/旧记录。 */
 export function upsertProject(outputDir: string, novel?: { fileName: string; title: string }): void {
   const dir = (outputDir || "").trim();

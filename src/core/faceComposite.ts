@@ -1,5 +1,7 @@
 /**
- * 局部脸部重绘 + 合成器（#1086，默认关闭的可选项）。
+ * 局部脸部重绘 + 合成器（#1086）。
+ * 注意：该能力当前未在界面开放（无设置开关，ImageTask.faceComposite 全仓无写入点，整链暂不可达）；
+ * 保留实现与接口供后续接线。以下错误文案不再指引用户开启已不存在的回退开关（该开关当前同样无入口）。
  * 算法与参数参考 TongjiAI4E/VN_Sprite_Expression_Workflow（MIT），详见仓库根 THIRD_PARTY_NOTICES.md：
  * 按 rig.crop 裁脸 → 复用 editImageVariant 对脸部做表情编辑 → 按仓库算法合成回原图
  * （clean 清理旧五官、brow/mouth 取 dark、eye 取 max(dark,light)、软阈值 (delta-7)/24、
@@ -209,7 +211,7 @@ export async function compositeExpressionFace(opts: {
   assertRigComplete(opts.rig);
   if (!supportsImageEdits(opts.imageCfg.model)) {
     throw new FaceCompositeError(
-      `脸部合成需要图像编辑端点（GPT-Image 系），当前模型 ${opts.imageCfg.model || "（未设置）"} 不支持；请换模型或为任务开启 faceCompositeFallback 回退整张生成`,
+      `脸部合成需要图像编辑端点（GPT-Image 系），当前模型 ${opts.imageCfg.model || "（未设置）"} 不支持；该能力当前未在界面开放（无启用入口），请改用整张生成路径`,
     );
   }
   const mime = opts.baseMime || "image/png";
@@ -332,7 +334,7 @@ export async function compositeExpressionFace(opts: {
   if (!vr.ok) {
     const box = vr.diffBbox ? `bbox(${vr.diffBbox.x0},${vr.diffBbox.y0})-(${vr.diffBbox.x1},${vr.diffBbox.y1})` : "无bbox";
     throw new FaceCompositeError(
-      `脸部合成核验未通过（允许区外差异 ${vr.outsideMismatch} 像素，alpha 差异 ${vr.alphaMismatch} 像素，${box}），已记失败项；可重试或开启 faceCompositeFallback 回退整张生成`,
+      `脸部合成核验未通过（允许区外差异 ${vr.outsideMismatch} 像素，alpha 差异 ${vr.alphaMismatch} 像素，${box}），已记失败项；该能力当前未在界面开放，可重试或改用整张生成路径`,
     );
   }
 
@@ -361,7 +363,7 @@ export interface RunFaceCompositeTaskOptions {
 export async function runFaceCompositeTask(opts: RunFaceCompositeTaskOptions): Promise<FaceCompositeIo> {
   if (!opts.basePath) {
     throw new FaceCompositeError(
-      `脸部合成缺少 base 参考图（任务 ${opts.task.id} 无 refFromTask 对应产物；不得静默降级，请先生成 normal 立绘或开启 faceCompositeFallback）`,
+      `脸部合成缺少 base 参考图（任务 ${opts.task.id} 无 refFromTask 对应产物；不得静默降级，请先生成 normal 立绘）`,
     );
   }
   if (!(await tauri.pathExists(opts.basePath).catch(() => false))) {

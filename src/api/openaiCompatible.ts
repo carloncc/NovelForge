@@ -1,4 +1,4 @@
-import { tauri } from "../utils/tauri";
+import { httpStream, isTauri, tauri, type HttpResult } from "../utils/tauri";
 import { activeAbortSignal } from "./abort";
 import { version as APP_VERSION } from "../../package.json";
 import type { ApiConfig, ChannelKey, ImageModelCapabilities, ImageReference } from "../core/types";
@@ -28,6 +28,11 @@ function httpStatusError(status: number, message: string): Error {
   const e = new Error(message);
   (e as { status?: number }).status = status;
   return e;
+}
+
+/** #1411：用户显式放行局域网/本机其它端口（默认关闭）。types.ts 不加字段（另一路加），此处局部声明透传给 Rust http_request.allowLan。 */
+function lanFlag(cfg: ApiConfig): boolean {
+  return (cfg as { allowLan?: boolean }).allowLan === true;
 }
 
 /**
@@ -146,7 +151,9 @@ export function disposeLimiters(): void {
       ...headersFor(cfg),
     },
     timeoutSecs: 20,
-  }, activeAbortSignal());
+    // #1411：显式放行才透传 allowLan（默认关闭，Rust 侧仍拒绝局域网/回环其它端口）
+    allowLan: lanFlag(cfg),
+  } as unknown as Parameters<typeof tauri.http>[0], activeAbortSignal());
   if (response.status >= 400) {
     const raw = utf8FromB64(response.bodyBase64).slice(0, 400);
     log.error("api", "拉取模型列表失败", { url: redactUrl(url), status: response.status, raw });
@@ -303,6 +310,12 @@ export interface ChatOptions {
    * 不传则行为与旧版完全一致。
    */
   onEvent?: (e: LlmProgressEvent) => void;
+  /**
+   * 流式增量进度（可选，仅剧本路径接线）：传入后请求体带 stream/stream_options，经 Tauri
+   * nf-http-stream 事件边收边回调「已生成正文/思考字符数」（≥100ms 节流，每次新请求开始先回调 0/0）。
+   * 网页版/非 Tauri 拿不到流式接口时静默回退整包请求；不传则行为与旧版完全一致。
+   */
+  onDelta?: (d: { contentChars: number; reasoningChars: number }) => void;
 }
 
 /** 模型请求进度事件：供长调用（剧本/提取等）向用户透出"正在发生什么" */
@@ -489,6 +502,169 @@ export function retryDelayFor(attempt: number): number {
   return attempt === 0 ? 1000 : Math.min(60_000, Math.max(1, attempt) * 10_000);
 }
 
+/** 生成吞吐下限（tok/s）：超时按它给足余量，避免把「慢但在出字」的请求掐死 */
+export const MIN_GEN_TOKENS_PER_SEC = 30;
+
+/**
+ * 单次请求超时（秒，纯函数，供单测）：调用方给的 timeoutSecs 是「期望预算」下的超时，
+ * 实际预算更大时按比例放宽；再叠加吞吐下限（30 tok/s）——32K 输出在 100 tok/s 的模型上要约 330s，
+ * 死守 300s 会把本来能成功的请求掐掉（第 2 章 300s 事件），掐掉后又要拆小重跑，反而更慢更贵。
+ * 上限 30 分钟（真·卡死仍有界，心跳每 90s 可见、可随时停止）。
+ */
+export function requestTimeoutSecs(baseTimeout: number, budget: number, contentBudget: number): number {
+  const scaled = (baseTimeout * budget) / Math.max(1, contentBudget);
+  const byThroughput = budget / MIN_GEN_TOKENS_PER_SEC;
+  return Math.min(1_800, Math.max(baseTimeout, Math.round(Math.max(scaled, byThroughput))));
+}
+
+/* ============ SSE 流式解析（剧本路径「已生成 N 字」进度） ============ */
+
+/** SSE 增量解析状态（parseSseChunks 返回新状态，便于单测与快照） */
+export interface SseStreamState {
+  /** 未以行尾结束的残留文本（跨 chunk 半行，保留到下次拼接） */
+  pending: string;
+  /** 累积正文（choices[0].delta.content） */
+  content: string;
+  /** 累积思考（choices[0].delta.reasoning_content，兼容 reasoning 字段） */
+  reasoning: string;
+  finishReason?: string;
+  promptTokens: number;
+  completionTokens: number;
+  reasoningTokens: number;
+  /** 是否见过 data: 行（false = 响应体不是 SSE，调用方应回退按 JSON 解析） */
+  sawData: boolean;
+  /** 是否收到 data: [DONE] */
+  done: boolean;
+}
+
+/** 残留文本上限：非 SSE 响应（整包 JSON 无换行）时防止 pending 无界增长 */
+const SSE_MAX_PENDING = 1024 * 1024;
+
+export function initialSseState(): SseStreamState {
+  return {
+    pending: "",
+    content: "",
+    reasoning: "",
+    promptTokens: 0,
+    completionTokens: 0,
+    reasoningTokens: 0,
+    sawData: false,
+    done: false,
+  };
+}
+
+/** 解析单个 SSE data 载荷：优先整体 JSON；失败时按括号平衡拆「一行内拼接的多个 JSON 事件」 */
+function parseSsePayloads(payload: string): unknown[] {
+  try {
+    return [JSON.parse(payload)];
+  } catch {
+    /* 继续尝试拼接拆分 */
+  }
+  const out: unknown[] = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < payload.length; i++) {
+    const ch = payload[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === "{") {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (ch === "}") {
+      depth--;
+      if (depth === 0 && start >= 0) {
+        try {
+          out.push(JSON.parse(payload.slice(start, i + 1)));
+        } catch {
+          /* 残缺对象忽略 */
+        }
+        start = -1;
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * 增量解析 SSE（纯函数，供单测）：处理 data: {json} / data: [DONE] / 空行 / \n、\r\n、\r 行尾 /
+ * 注释行（: ping 等 keep-alive）/ 一行内多个事件 / 跨 chunk 半行（保留到下次）。
+ * 从 choices[0].delta.content / .reasoning_content 累积文本与字符数，取 finish_reason 与 usage token
+ *（含 completion_tokens_details.reasoning_tokens）。返回新状态，不改入参。
+ */
+export function parseSseChunks(state: SseStreamState, chunk: string): SseStreamState {
+  let pending = state.pending + chunk;
+  let content = state.content;
+  let reasoning = state.reasoning;
+  let finishReason = state.finishReason;
+  let promptTokens = state.promptTokens;
+  let completionTokens = state.completionTokens;
+  let reasoningTokens = state.reasoningTokens;
+  let sawData = state.sawData;
+  let done = state.done;
+
+  for (;;) {
+    // 行尾支持 \n / \r\n / \r：\r 落在 chunk 末尾时按行尾处理，下一段若以 \n 开头只会多出一个空行（被忽略）
+    let lineEnd = -1;
+    for (let i = 0; i < pending.length; i++) {
+      const ch = pending[i];
+      if (ch === "\n" || ch === "\r") {
+        lineEnd = i;
+        break;
+      }
+    }
+    if (lineEnd < 0) break;
+    const rawLine = pending.slice(0, lineEnd);
+    const terminatorLen = pending[lineEnd] === "\r" && pending[lineEnd + 1] === "\n" ? 2 : 1;
+    pending = pending.slice(lineEnd + terminatorLen);
+    if (!rawLine || rawLine.startsWith(":")) continue; // 空行分隔 / keep-alive 注释
+    if (!rawLine.startsWith("data:")) continue; // event:/id:/retry: 等字段与内容无关
+    sawData = true;
+    const payload = rawLine.slice(5).trim();
+    if (!payload) continue;
+    if (payload === "[DONE]") {
+      done = true;
+      continue;
+    }
+    for (const event of parseSsePayloads(payload)) {
+      const ev = event as { choices?: unknown; usage?: unknown };
+      const choice = Array.isArray(ev?.choices)
+        ? (ev.choices[0] as { delta?: unknown; message?: unknown; finish_reason?: unknown })
+        : undefined;
+      if (choice && typeof choice === "object") {
+        // delta 为主；message 兜底兼容把非流式响应体塞进 data: 的网关
+        const delta = (choice.delta ?? choice.message) as
+          | { content?: unknown; reasoning_content?: unknown; reasoning?: unknown }
+          | undefined;
+        if (delta && typeof delta === "object") {
+          if (typeof delta.content === "string" && delta.content) content += delta.content;
+          if (typeof delta.reasoning_content === "string" && delta.reasoning_content) reasoning += delta.reasoning_content;
+          else if (typeof delta.reasoning === "string" && delta.reasoning) reasoning += delta.reasoning;
+        }
+        if (typeof choice.finish_reason === "string" && choice.finish_reason) finishReason = choice.finish_reason;
+      }
+      const usage = ev?.usage as
+        | { prompt_tokens?: unknown; completion_tokens?: unknown; completion_tokens_details?: { reasoning_tokens?: unknown } }
+        | undefined;
+      if (usage && typeof usage === "object") {
+        if (typeof usage.prompt_tokens === "number") promptTokens = usage.prompt_tokens;
+        if (typeof usage.completion_tokens === "number") completionTokens = usage.completion_tokens;
+        const rt = usage.completion_tokens_details?.reasoning_tokens;
+        if (typeof rt === "number") reasoningTokens = rt;
+      }
+    }
+  }
+  // 非 SSE 响应（无 data: 行）时 pending 会一直累积整包 JSON：超上限只留尾部（纯防御，不影响解析）
+  if (pending.length > SSE_MAX_PENDING) pending = pending.slice(-SSE_MAX_PENDING);
+  return { pending, content, reasoning, finishReason, promptTokens, completionTokens, reasoningTokens, sawData, done };
+}
+
 export async function chatCompletion(
   cfg: ApiConfig,
   messages: ChatMessage[],
@@ -535,10 +711,9 @@ export async function chatCompletion(
   const contentBudget = opts.maxTokens ?? 8000;
   const MAX_OUTPUT_TOKENS = 128_000;
   const MAX_ESCALATIONS = 3;
-  // 单次请求超时按预算缩放：预算越大、生成越久，超时相应放宽（上限 30 分钟）
+  // 单次请求超时按预算缩放（上限 30 分钟）
   const baseTimeout = opts.timeoutSecs ?? 180;
-  const timeoutFor = (budget: number): number =>
-    Math.min(1_800, Math.max(baseTimeout, Math.round((baseTimeout * budget) / Math.max(1, contentBudget))));
+  const timeoutFor = (budget: number): number => requestTimeoutSecs(baseTimeout, budget, contentBudget);
 
   const perform = async (tokenBudget: number) => {
     // B93：中止检查放在预算计数之前——已中止不消耗调用预算，也不再发出付费请求
@@ -556,13 +731,81 @@ export async function chatCompletion(
     }
     const requestBody = { ...body };
     if (tokenBudget > 0) requestBody.max_tokens = tokenBudget;
-    const res = await tauri.http({
-      method: "POST",
-      url,
-      headers: headersFor(cfg),
-      body: JSON.stringify(requestBody),
-      timeoutSecs: timeoutFor(tokenBudget),
-    }, opts.signal ?? activeAbortSignal());
+    // 流式（仅剧本路径接线 opts.onDelta）：请求体带 stream/stream_options，Rust 侧边收边 emit 增量，
+    // 这里把「已生成 N 字」透出给心跳；网页版/流式失败时回退整包重发一次，不让用户任务失败。
+    const wantStream = !!opts.onDelta && isTauri();
+    const bodyFor = (streaming: boolean): string => {
+      const payload = { ...requestBody };
+      if (streaming) {
+        payload.stream = true;
+        payload.stream_options = { include_usage: true };
+      }
+      return JSON.stringify(payload);
+    };
+    const transportArgs = (streaming: boolean): Parameters<typeof tauri.http>[0] =>
+      ({
+        method: "POST",
+        url,
+        headers: headersFor(cfg),
+        body: bodyFor(streaming),
+        timeoutSecs: timeoutFor(tokenBudget),
+        // #1411：显式放行才透传 allowLan（默认关闭）
+        allowLan: lanFlag(cfg),
+      }) as unknown as Parameters<typeof tauri.http>[0];
+    // 新请求开始：进度计数清零（心跳不显示上一请求的残留数字）
+    opts.onDelta?.({ contentChars: 0, reasoningChars: 0 });
+    let res: HttpResult | undefined;
+    let sse: SseStreamState | undefined;
+    if (wantStream) {
+      let live = initialSseState();
+      let lastNotify = 0;
+      const notify = (): void => {
+        const now = Date.now();
+        if (now - lastNotify < 100) return;
+        lastNotify = now;
+        opts.onDelta?.({ contentChars: live.content.length, reasoningChars: live.reasoning.length });
+      };
+      const streamSignal = opts.signal ?? activeAbortSignal();
+      let streamed: HttpResult | null = null;
+      try {
+        streamed = await httpStream(
+          transportArgs(true),
+          (chunkText) => {
+            live = parseSseChunks(live, chunkText);
+            notify();
+          },
+          streamSignal,
+        );
+      } catch (e) {
+        // 用户中止必须原样抛出（重发等于对已取消的请求继续计费）
+        const errText = String(e instanceof Error ? e.message : e);
+        if (streamSignal?.aborted || /已中止|请求被取消|cancelled/i.test(errText)) throw e;
+        log.warn("api", "流式请求失败，回退整包请求重发一次", {
+          url: redactUrl(url),
+          error: errText.slice(0, 200),
+        });
+      }
+      if (streamed) {
+        // 以完整响应体为权威来源解析（事件投递时序不影响最终内容）；无 data: 行则按 JSON 解析
+        const parsed = parseSseChunks(initialSseState(), b64ToUtf8(streamed.bodyBase64));
+        if (streamed.status < 400 || parsed.sawData) {
+          res = streamed;
+          sse = parsed;
+          // 最终计数以完整响应体解析为准（不依赖事件是否全部送达）
+          opts.onDelta?.({ contentChars: parsed.content.length, reasoningChars: parsed.reasoning.length });
+        } else {
+          // 流式请求被网关拒绝（如不支持 stream_options）：整包重发一次
+          log.warn("api", "流式请求返回错误状态，回退整包请求重发一次", {
+            url: redactUrl(url),
+            status: streamed.status,
+          });
+        }
+      }
+    }
+    if (!res) {
+      res = await tauri.http(transportArgs(false), opts.signal ?? activeAbortSignal());
+      sse = undefined;
+    }
     const text = b64ToUtf8(res.bodyBase64);
     if (res.status >= 500 || res.status === 429) {
       log.warn("api", `chatCompletion HTTP ${res.status}`, { url: redactUrl(url), raw: text.slice(0, 600) });
@@ -594,11 +837,34 @@ export async function chatCompletion(
       body: text.slice(0, 600),
     });
     let data: any;
-    try {
-      data = JSON.parse(text);
-    } catch {
-      log.error("api", "chatCompletion 响应不是合法 JSON", { textHead: text.slice(0, 300) });
-      throw new Error(`LLM 响应不是合法 JSON: ${text.slice(0, 300)}`);
+    if (sse?.sawData) {
+      // 流式：把 SSE 累积结果归一成与整包响应完全相同的结构（后续校验/升级/续写逻辑完全复用）
+      data = {
+        choices: [
+          {
+            message: { content: sse.content, reasoning_content: sse.reasoning },
+            finish_reason: sse.finishReason,
+          },
+        ],
+        usage: {
+          prompt_tokens: sse.promptTokens,
+          completion_tokens: sse.completionTokens,
+          completion_tokens_details: { reasoning_tokens: sse.reasoningTokens },
+        },
+      };
+      log.debug("api", "chatCompletion 流式解析完成", {
+        contentLen: sse.content.length,
+        reasoningLen: sse.reasoning.length,
+        finishReason: sse.finishReason ?? "?",
+        done: sse.done,
+      });
+    } else {
+      try {
+        data = JSON.parse(text);
+      } catch {
+        log.error("api", "chatCompletion 响应不是合法 JSON", { textHead: text.slice(0, 300) });
+        throw new Error(`LLM 响应不是合法 JSON: ${text.slice(0, 300)}`);
+      }
     }
     const providerError = extractProviderBaseError(data);
     if (providerError) {
@@ -667,6 +933,24 @@ export async function chatCompletion(
     const seenBudgets = new Set<number>([budget]);
     for (let i = 1; i <= MAX_ESCALATIONS; i++) {
       if (!shouldEscalateBudget(response.finishReason, response.rawContent)) break;
+      // 放大后的预算又被思考耗尽 → 思考量随预算一起膨胀、正文永远分不到预算：
+      // 再放大只会更慢更贵（实测 8K→18K→28K→35K 全空）。第 1 次给足机会（思考有界的模型靠它救回），
+      // 从第 2 次起按「是否又被思考耗尽」判定停手。
+      if (i >= 2 && escalationFutile(budget, response)) {
+        log.warn("api", "预算放大后仍被思考耗尽（思考量随预算膨胀），停止继续放大", {
+          budget,
+          reasoningTokens: response.reasoningTokens,
+          reasoningLen: response.reasoning.length,
+        });
+        opts.onEvent?.({
+          kind: "escalate",
+          attempt: i,
+          finishReason: response.finishReason,
+          contentLen: response.rawContent.length,
+          message: `放大到 ${budget} 后输出仍为空且再次被思考耗尽，判断该模型思考量随预算膨胀，停止继续放大`,
+        });
+        break;
+      }
       const next = Math.min(MAX_OUTPUT_TOKENS, nextBudgetAfterThinking(budget, response, contentBudget));
       if (next <= budget || seenBudgets.has(next)) break;
       seenBudgets.add(next);
@@ -685,6 +969,20 @@ export async function chatCompletion(
       });
       budget = next;
       response = await runOnce(budget);
+    }
+
+    // 升级耗尽后仍为空、且思考再次吃光预算：给出可执行的报错，
+    // 而不是让下游报「JSON 解析失败」并再打 2 次付费修复请求。
+    if (shouldEscalateBudget(response.finishReason, response.rawContent) && escalationFutile(budget, response)) {
+      log.error("api", "模型把全部输出预算用于思考，正文为空", {
+        budget,
+        reasoningTokens: response.reasoningTokens,
+        reasoningLen: response.reasoning.length,
+      });
+      throw httpStatusError(
+        400,
+        `模型把全部输出预算用于思考，正文一个字都没出（已放大到 ${budget} tokens 仍被思考耗尽）。请改用非思考（非推理）模型，或在服务商侧关闭该模型的思考/推理（thinking / reasoning）开关后重试`,
+      );
     }
 
     let content = response.rawContent;
@@ -801,12 +1099,26 @@ export function nextBudgetAfterThinking(
   resp: { reasoningTokens?: number; reasoning?: string },
   contentBudget: number,
 ): number {
-  const reported = typeof resp.reasoningTokens === "number" && resp.reasoningTokens > 0 ? resp.reasoningTokens : 0;
-  // 无 token 统计时按字符估 token（中文约 1.5 字符/token，这里取 2 作保守上限，宁可多留）
-  const estimated = Math.ceil((resp.reasoning ?? "").length / 2);
-  const reasoningUsed = Math.max(reported, estimated);
+  const reasoningUsed = reasoningTokensUsed(resp);
   const want = reasoningUsed + Math.max(1, contentBudget) + 1024;
   return Math.max(prevBudget + 8000, want);
+}
+
+/** 本次响应实际用于思考的 token 数（纯函数，供单测）：优先取服务端报告，
+ *  缺失时按 reasoning 文本估算（中文约 1.5 字符/token，这里取 2 作保守上限，宁可多留）。 */
+export function reasoningTokensUsed(resp: { reasoningTokens?: number; reasoning?: string }): number {
+  const reported = typeof resp.reasoningTokens === "number" && resp.reasoningTokens > 0 ? resp.reasoningTokens : 0;
+  const estimated = Math.ceil((resp.reasoning ?? "").length / 2);
+  return Math.max(reported, estimated);
+}
+
+/**
+ * 再放大预算是否已无意义（纯函数，供单测）：本轮预算又被思考耗尽（≥95%），
+ * 说明思考量随预算一起膨胀——正文永远分不到预算，再放大只会更慢更贵（实测 8K→18K→28K→35K 全空）。
+ * 阈值取 95%：思考量明显小于预算却仍无正文属其它故障（如服务端吞掉 content），不在此拦截。
+ */
+export function escalationFutile(budget: number, resp: { reasoningTokens?: number; reasoning?: string }): boolean {
+  return budget > 0 && reasoningTokensUsed(resp) >= budget * 0.95;
 }
 
 /**
@@ -1008,7 +1320,9 @@ export async function chatVision(
       headers: headersFor(cfg),
       body: JSON.stringify(body),
       timeoutSecs: opts.timeoutSecs ?? 120,
-    }, opts.signal ?? activeAbortSignal());
+      // #1411：显式放行才透传 allowLan（默认关闭）
+      allowLan: lanFlag(cfg),
+    } as unknown as Parameters<typeof tauri.http>[0], opts.signal ?? activeAbortSignal());
     if (res.status >= 500 || res.status === 429) {
       log.error("api", `chatVision 服务端错误 ${res.status}`, { url: redactUrl(chatUrl), model: cfg.model });
       throw httpStatusError(res.status, `HTTP ${res.status}`);

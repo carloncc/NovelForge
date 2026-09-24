@@ -32,6 +32,17 @@ export async function cutoutModelStatus(model: CutoutModel): Promise<CutoutModel
   }
 }
 
+/**
+ * #1386 下载回调归属判定（纯函数，供 ConfigPage 与单测共用）：
+ * 下载任务持有发起时的 modelId，回调写状态前校验仍是当前模型，否则丢弃。
+ * - targetModelId：downloadCurrentModel 发起下载时的模型 id
+ * - currentModelId：回调时刻的当前选中模型 id
+ * 不一致即说明用户（或其它逻辑）已切模型，旧进度不得覆盖新模型状态。
+ */
+export function shouldApplyCutoutStatus(targetModelId: string, currentModelId: string): boolean {
+  return targetModelId === currentModelId;
+}
+
 /** 手动下载模型（不自动确认；下载中请轮询 cutoutModelStatus 展示进度） */
 async function downloadCutoutModel(model: CutoutModel): Promise<void> {
   await tauri.cutoutModelDownload({

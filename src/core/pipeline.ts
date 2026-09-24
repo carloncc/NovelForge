@@ -1940,12 +1940,18 @@ export class Pipeline {
                 at: Date.now(),
               });
               try {
-                // 长调用心跳：单章生成可能持续数分钟（分块多轮 LLM），每 90s 报一次存活，避免看起来卡死
+                // 长调用心跳：单章生成可能持续数分钟（分块多轮 LLM），每 90s 报一次存活，避免看起来卡死。
+                // 桌面端剧本已开 SSE 流式：有真实计数时显示「已生成 N 字」；网页版/首字未到保持原文案。
                 const genStart = Date.now();
+                let genProgress: { contentChars: number; reasoningChars: number } | null = null;
                 const heartbeat = setInterval(() => {
+                  const waited = Math.round((Date.now() - genStart) / 1000);
+                  const p = genProgress;
                   log({
                     step: "剧本",
-                    message: `第 ${chapter.index + 1} 章仍在生成中（已等待 ${Math.round((Date.now() - genStart) / 1000)}s，模型输出较长请继续等待）…`,
+                    message: p && (p.contentChars > 0 || p.reasoningChars > 0)
+                      ? `第 ${chapter.index + 1} 章仍在生成中：已生成 ${p.contentChars} 字（思考 ${p.reasoningChars} 字），已等待 ${waited}s…`
+                      : `第 ${chapter.index + 1} 章仍在生成中（已等待 ${waited}s，模型输出较长请继续等待）…`,
                     level: "info",
                     at: Date.now(),
                   });
@@ -1959,6 +1965,10 @@ export class Pipeline {
                         compressNarration: this.options.compressNarration,
                         feedback: this.feedback.script?.[chapter.index],
                         onLog: (message) => log({ step: "剧本", message, level: "info", at: Date.now() }),
+                        // 流式进度（桌面端）：真实字符数透出给 90s 心跳日志显示「已生成 N 字」
+                        onProgress: (p) => {
+                          genProgress = p;
+                        },
                         // 长章节会分 N 部分逐段生成（每部分约 1–3 分钟）：逐段打日志，否则看起来像卡死
                         onPart: ({ part, total, phase, elapsedMs }) => {
                           if (total <= 1) return;
@@ -2484,6 +2494,9 @@ export class Pipeline {
         figureActions: this.options.figureActions,
         useBgm: this.options.useBgm,
         useSe: this.options.useSe,
+        // 1399：SE 音量透传（设置页「输出与质量」滑杆写入 options.seVolume；缺省 render 用 35）。
+        // 该字段未进 GenerationOptions 类型表（白名单外），此处用交集断言读取可选值。
+        seVolume: (this.options as GenerationOptions & { seVolume?: number }).seVolume,
         // UI98：「不翻译（使用原文）」时不要写死 zh_CN，按原文语种推断 Default_Language
         // （假名→ja、谚文→ko、CJK→zh_CN、拉丁→en），保证游戏界面语言与正文一致。
         // #1320：界面语言优先用独立的 uiLanguage（导出页写入），缺省跟随翻译目标，再缺省推断。

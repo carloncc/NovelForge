@@ -9,7 +9,7 @@ import type {
 } from "./types";
 import { STAGE_ORDER } from "./types";
 import { buildImageTasks } from "./images";
-import { buildVoiceJobs } from "./voice";
+import { buildVoiceJobsOrEmpty } from "./voice";
 
 /**
  * 单阶段重跑后的「下游自动补齐」判定（纯函数，无副作用）。
@@ -96,7 +96,7 @@ function missingImageTaskCount(
   return statusImageTasks(chapters, cards, options).filter((task) => !imageTaskHasAsset(task, assets)).length;
 }
 
-/** 还缺多少句配音（无 TTS 配置或未启用配音时为 0） */
+/** 还缺多少句配音（无 TTS 配置或未启用配音时为 0；#1427 音色库为空时计 0 而不抛，保持纯函数） */
 function missingVoiceJobCount(
   tts: ApiConfig | undefined,
   chapters: ChapterScript[],
@@ -104,7 +104,7 @@ function missingVoiceJobCount(
   assets: AssetMap | undefined,
 ): number {
   if (!tts) return 0;
-  return buildVoiceJobs(tts, chapters, cards.characters).filter((job) => !assets?.vocal[job.key]).length;
+  return buildVoiceJobsOrEmpty(tts, chapters, cards.characters).filter((job) => !assets?.vocal[job.key]).length;
 }
 
 export interface CascadePlan {

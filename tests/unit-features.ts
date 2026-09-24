@@ -99,7 +99,7 @@ function main(): void {
     imagePrompt: "prompt",
   };
   const outCg = renderChapter(chWithCg, { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets: cgAssets, introCard: false }, 2);
-  assert(outCg.includes("unlockCg:cg_0.png -name=城头之战;"), "有 CG 图应输出 unlockCg");
+  assert(outCg.includes("unlockCg:game/background/cg_0.png -name=城头之战;"), "有 CG 图应输出 unlockCg（#1460：需带 game/background/ 目录）");
   const cfgTxt = renderConfig("测试;名字", "key1234");
   assert(cfgTxt.includes("Show_panic:true;"), "config 应启用紧急回避");
   assert(!cfgTxt.includes(";名字"), "config 标题应清洗");
@@ -119,7 +119,7 @@ function main(): void {
   const outEmo = renderChapter(chEmo, { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets: emoAssets, introCard: false }, 2);
   assert(outEmo.includes("changeFigure:f_linche_happy.png -left"), "情绪对话应切换表情立绘");
   assert(outEmo.includes("bgm:battle_theme.mp3"), "匹配到 BGM 应输出 bgm 指令");
-  assert(outEmo.includes("unlockBgm:battle_theme.mp3"), "匹配到 BGM 应解锁鉴赏");
+  assert(outEmo.includes("unlockBgm:game/bgm/battle_theme.mp3"), "匹配到 BGM 应解锁鉴赏（#1460：需带 game/bgm/ 目录）");
   const outEmoOff = renderChapter(chEmo, { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets: emoAssets, introCard: false, figureEmotions: false }, 2);
   assert(!outEmoOff.includes("f_linche_happy"), "表情开关关闭不应切换表情立绘");
   const chNoBgm = chapter(0, false);

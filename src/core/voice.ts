@@ -161,6 +161,18 @@ export function vocalKeysForChapters(chapters: ChapterScript[]): string[] {
   return keys;
 }
 
+/** 计数用非抛出变体（#1427）：音色库为空时返回 []，供看板/级联计数调用；
+ * 真正执行配音仍走 buildVoiceJobs 的抛出路径（#1139 防假音色重试）。 */
+export function buildVoiceJobsOrEmpty(
+  cfg: ApiConfig,
+  chapters: ChapterScript[],
+  characters: CharacterCard[],
+  chapterIndexes?: Set<number>,
+): VoiceJob[] {
+  if (voiceLibraryFor(cfg).length === 0) return [];
+  return buildVoiceJobs(cfg, chapters, characters, chapterIndexes);
+}
+
 export function buildVoiceJobs(  cfg: ApiConfig,
   chapters: ChapterScript[],
   characters: CharacterCard[],
@@ -630,4 +642,28 @@ export async function repairVoiceAssets(
     at: Date.now(),
   });
   return { total, fixed, failed, purged, kept: total - need.length - relinked, relinked, aborted };
+}
+
+/* ==================== 图片小说配音（#1140：复用主管线 TTS 管线，按台词行出音频） ==================== */
+
+/** generateVoice 的 FailedTask → 图片小说失败清单条目（纯函数）。
+ * id 已是 `vocal_<台词key>` 形态：key 原样保留（与 assets.vocal 键对应，便于重试定位），label 取台词 key。 */
+export function toImageStoryVoiceFailedItem(f: FailedTask): { key: string; label: string; message: string } {
+  const lineKey = f.id.startsWith("vocal_") ? f.id.slice("vocal_".length) : f.id;
+  return { key: f.id, label: `配音 ${lineKey}`, message: f.message };
+}
+
+/** 按当前剧本剪枝过期配音映射（纯函数，就地删除，返回被删 key）。
+ * 保留集合与 buildVoiceJobs 的 key 公式同源（vocalKeysForChapters，含长台词 _pN 分段与分支台词），
+ * 重分章/改剧本后调用，避免 game/vocal 里堆积过期音频。 */
+export function pruneStaleImageStoryVocal(vocal: Record<string, string>, chapters: ChapterScript[]): string[] {
+  const keep = new Set(vocalKeysForChapters(chapters));
+  const removed: string[] = [];
+  for (const key of Object.keys(vocal)) {
+    if (!keep.has(key)) {
+      delete vocal[key];
+      removed.push(key);
+    }
+  }
+  return removed;
 }

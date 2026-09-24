@@ -18,7 +18,22 @@ const {
   importVideo,
   onVideoImportFile,
   copyText,
+  execute,
 } = useGenerateController();
+
+/** #1397：导入视频只落盘不组装，scene 里仍是注释占位——面板内给显式重组装入口（本地免费，不调 API） */
+async function reassembleForVideo(): Promise<void> {
+  if (busy.value || assetBusy.value || queueRunning.value) return;
+  await execute({ stages: ["assemble"] });
+}
+
+/** #1400：已启用位置再次导入时二次确认，避免选错文件静默覆盖成品 */
+function confirmImportVideo(vp: { id: string; title: string; enabled?: boolean }): void {
+  if (vp.enabled) {
+    if (!window.confirm(t("该位置已有已导入视频，覆盖吗？（先前导入的成品将被替换且无撤销）"))) return;
+  }
+  void importVideo(vp);
+}
 
 /** 视频推荐位由「剧本」阶段生成：此前本页没有任何重生成入口，用户找不到路径。
  * 这里引导到单阶段重跑并说明缓存语义（默认复用缓存，需覆盖要勾全量/填意见）。 */
@@ -41,9 +56,9 @@ function gotoScriptRegen(): void {
   <div class="card" v-if="videoPoints.length">
     <div class="card-head">
       <h3>{{ t("AI 推荐的视频演出位（{n} 个）", { n: videoPoints.length }) }}</h3>
-      <div class="card-actions"><button class="btn secondary small" :disabled="busy || !!assetBusy || queueRunning" :title="t('刷新视频目录状态')" @click="checkVideos">{{ t("刷新状态") }}</button><button class="btn ghost small" :disabled="busy || !!assetBusy || queueRunning" :title="t('视频推荐位随剧本阶段生成：这里引导到单阶段重跑（默认复用缓存，需覆盖请勾全量）')" @click="gotoScriptRegen">{{ t("重新生成推荐位…") }}</button></div>
+      <div class="card-actions"><button class="btn secondary small" :disabled="busy || !!assetBusy || queueRunning" :title="t('刷新视频目录状态')" @click="checkVideos">{{ t("刷新状态") }}</button><button class="btn small" :disabled="busy || !!assetBusy || queueRunning" :title="t('导入视频后需重新组装，scene 脚本才会写入演出指令（本地免费）')" @click="reassembleForVideo">{{ t("重新组装生效") }}</button><button class="btn ghost small" :disabled="busy || !!assetBusy || queueRunning" :title="t('视频推荐位随剧本阶段生成：这里引导到单阶段重跑（默认复用缓存，需覆盖请勾全量）')" @click="gotoScriptRegen">{{ t("重新生成推荐位…") }}</button></div>
     </div>
-    <p class="hint mb-4">{{ t("提示词粘贴到即梦/可灵生成 mp4，用「导入视频」或手动放入") }} <code>game/video/video_&lt;id&gt;.mp4</code> {{ t("，刷新后自动启用，零 API 费用。") }}</p>
+    <p class="hint mb-4">{{ t("提示词粘贴到即梦/可灵生成视频（支持 mp4/webm/ogg），用「导入视频」或手动放入") }} <code>game/video/video_&lt;id&gt;.mp4</code> {{ t("，导入后需点「重新组装生效」，零 API 费用。") }}</p>
     <div v-for="vp in videoPoints" :key="vp.id" style="border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px 14px; margin-bottom: 10px">
       <div class="row" style="justify-content: space-between">
         <span>
@@ -53,13 +68,13 @@ function gotoScriptRegen(): void {
         </span>
         <div style="display: flex; gap: 8px">
           <button class="btn small" @click="copyText(vp.videoPrompt, t('视频提示词'))">{{ t("复制提示词") }}</button>
-          <button class="btn small" :disabled="busy || !!assetBusy || queueRunning" @click="importVideo(vp)">{{ t("导入视频") }}</button>
+          <button class="btn small" :disabled="busy || !!assetBusy || queueRunning" @click="confirmImportVideo(vp)">{{ t("导入视频") }}</button>
         </div>
       </div>
       <p style="color: var(--text-dim); font-size: 12px; margin-top: 6px">{{ vp.description }}</p>
       <p style="font-size: 12px; margin-top: 6px; color: var(--text-dim)">{{ t("文件名：") }}<code>video_{{ sanitizeId(vp.id) }}.mp4</code></p>
     </div>
-    <input v-if="!isTauri()" ref="videoInput" type="file" accept="video/*" style="display: none" @change="onVideoImportFile" />
+    <input v-if="!isTauri()" ref="videoInput" type="file" accept="video/mp4,video/webm,video/ogg,.mp4,.webm,.ogg" style="display: none" @change="onVideoImportFile" />
   </div>
   <div v-else class="empty">
     <img src="/src/assets/empty-generate.png" alt="" style="width: 220px; opacity: 0.9; margin-bottom: 12px" />

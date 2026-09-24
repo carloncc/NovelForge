@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { log, truncate } from "./logger";
-import { b64encode } from "./base64";
+import { b64decode, b64encode } from "./base64";
 
 let webRuntimePromise: Promise<typeof import("./webRuntime")> | undefined;
 
@@ -169,6 +169,61 @@ async function invokeHttpWithCancel(
     return await invoke("http_request", { args, requestId });
   } finally {
     signal.removeEventListener("abort", onAbort);
+  }
+}
+
+/** Rust 侧流式增量事件负载（emit("nf-http-stream")） */
+interface HttpStreamPayload {
+  requestId?: number;
+  dataBase64?: string;
+}
+
+/**
+ * 流式 HTTP（仅剧本路径使用；仅 Tauri 桌面端）：
+ * 与 tauri.http 相同的入参/返回值契约（返回完整响应体，取消语义一致），额外通过 Rust 的
+ * nf-http-stream 事件把响应增量边收边交给 onChunk（base64 → UTF-8 文本）。
+ * 非 Tauri（网页版）返回 null，调用方静默回退整包请求（拿不到流式接口不报错）。
+ */
+export async function httpStream(
+  args: {
+    method: string;
+    url: string;
+    headers?: Record<string, string>;
+    body?: string;
+    bodyBase64?: string;
+    timeoutSecs?: number;
+    /** #1411：用户显式放行局域网/本机其它端口（与 tauri.http 同口径透传给 Rust） */
+    allowLan?: boolean;
+  },
+  onChunk: (text: string) => void,
+  signal?: AbortSignal,
+): Promise<HttpResult | null> {
+  if (!isTauri()) return null;
+  if (signal?.aborted) throw new Error("已中止");
+  // 动态 import：网页版/Node 测试不加载事件模块
+  const { listen } = await import("@tauri-apps/api/event");
+  // 始终分配 requestId：Rust 侧按它给事件打标（并发流式请求不会串台），同时沿用同一套取消语义
+  const requestId = nextHttpRequestId++;
+  const decoder = new TextDecoder("utf-8");
+  const onAbort = (): void => {
+    void invoke("cancel_http_request", { requestId }).catch(() => undefined);
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
+  let unlisten: (() => void) | undefined;
+  try {
+    unlisten = await listen<HttpStreamPayload>("nf-http-stream", (event) => {
+      const payload = event.payload;
+      if (!payload || payload.requestId !== requestId || typeof payload.dataBase64 !== "string") return;
+      // stream:true 的 decoder：UTF-8 多字节字符被 emit 边界截断时留到下一段再解，避免乱码/计数虚高
+      onChunk(decoder.decode(b64decode(payload.dataBase64), { stream: true }));
+    });
+    // listen 是异步的：等待期间被中止时不能再发出请求（否则无人取消，等于对已取消的请求继续计费）
+    if (signal?.aborted) throw new Error("已中止");
+    log.debug("tauri", "调用 httpStream", { method: args.method, url: args.url, timeoutSecs: args.timeoutSecs });
+    return (await invoke("http_request", { args: { ...args, stream: true }, requestId })) as HttpResult;
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
+    unlisten?.();
   }
 }
 

@@ -390,14 +390,19 @@ async function reduceStyleSummaries(
   initialSummaries: string[],
   dependencies: VisualBibleServiceDependencies,
   concurrency = concurrencyFor(llmCfg, "llm"),
+  isAborted?: () => boolean,
 ): Promise<string[]> {
   let summaries = initialSummaries;
   while (summaries.join("\n").length > SUMMARY_BATCH_LIMIT) {
+    // 1443：风格分析阶段此前全程无中止通道，点取消后按钮无反应。worker 取下一批前检查。
+    if (isAborted?.()) throw new Error("已中止");
     const batches = styleSummaryBatches(summaries);
     const reduced: string[] = new Array(batches.length);
     let batchIdx = 0;
     const worker = async (): Promise<void> => {
       while (batchIdx < batches.length) {
+        // 1443：同上，归约 worker 逐批检查，中止后不再调度后续 LLM 调用。
+        if (isAborted?.()) throw new Error("已中止");
         const i = batchIdx++;
         const merged = await dependencies.chatText(
           llmCfg,
@@ -420,6 +425,7 @@ export async function analyzeNovelStyle(
   dependencies: VisualBibleServiceDependencies = DEFAULT_DEPENDENCIES,
   concurrency = concurrencyFor(llmCfg, "llm"),
   onProgress?: (done: number, total: number) => void,
+  isAborted?: () => boolean,
 ): Promise<string> {
   const chunks = chunkNovelForStyleAnalysis(novel);
   if (!chunks.length) throw new Error("The novel has no enabled chapter text to analyze");
@@ -428,6 +434,9 @@ export async function analyzeNovelStyle(
   let idx = 0;
   const worker = async (): Promise<void> => {
     while (idx < chunks.length) {
+      // 1443：风格分析阶段此前无人读取中止信号，取消后毫无反应。取下一段前检查，
+      // 已发出的请求完成后不再调度新的，中止延迟最多为单个 chunk 的 LLM 耗时。
+      if (isAborted?.()) throw new Error("已中止");
       const index = idx++;
       const summary = await dependencies.chatText(
         llmCfg,
@@ -440,8 +449,12 @@ export async function analyzeNovelStyle(
     }
   };
   await Promise.all(Array.from({ length: Math.min(concurrency, chunks.length) }, () => worker()));
-  const reducedSummaries = await reduceStyleSummaries(llmCfg, summaries, dependencies, concurrency);
+  // 1443：归约前再检查一次，避免分析完成后、综合前oreg的窗口继续花钱做综合。
+  if (isAborted?.()) throw new Error("已中止");
+  const reducedSummaries = await reduceStyleSummaries(llmCfg, summaries, dependencies, concurrency, isAborted);
   const synthesisInput = reducedSummaries.map((summary, index) => `${index + 1}. ${summary}`).join("\n");
+  // 1443：综合是最后一次 LLM 调用，调用前同样检查中止。
+  if (isAborted?.()) throw new Error("已中止");
   const finalStyle = await dependencies.chatText(
     llmCfg,
     "You are a visual-development lead. Consolidate evidence without inventing characters, plot, or branded artist names.",
@@ -694,6 +707,8 @@ async function createDraftStyle(
     dependencies,
     concurrencyFor(input.llmCfg, "llm"),
     (done, total) => input.onProgress?.("style", done, total),
+    // 1443：风格分析阶段透传中止信号，否则取消按钮在该阶段毫无反应。
+    input.isAborted,
   );
   const referencePath = revisionedArtifactPath("style-sample.png", artifactRevision);
   const sample = await generateImageWithModerationRetry(
@@ -803,6 +818,11 @@ export async function createVisualBibleDraft(
       artifactDir,
       artifactRevision,
     );
+    // 1443：中止窗口——角色循环的中止检查只在每次迭代顶部，最后一个角色生成期间
+    // 点「中止」时循环已结束、不再检查，Promise.all 正常 resolve 后草稿会被完整发布，
+    // 而面板只看外部 flag 报「未保存任何内容」，用户重来再付一次全款。
+    // 在构造 draft 落盘前补一次检查：中止则抛，整单不发布，与面板文案一致。
+    if (input.isAborted?.()) throw new Error("已中止");
     const draft: ProjectVisualBible = {
       version: VISUAL_BIBLE_VERSION,
       status: "draft",
@@ -937,7 +957,11 @@ export async function regenerateCostumeSheet(
     nextCharacter.costumeSheets = sheets;
     markCharacterBibleChanged(next, characterId);
     await writeGeneratedImage(visualBibleArtifactPath(artifactDir, nextSheet.threeViewPath), generated);
-    return { bible: next, cards: [characterCard], afterPublish: () => invalidateCharacterCaches(outputDir, invalidationCharacter) };
+    // 1447：单套服装锚点只窄作废该服装的换装底图（invalidateCostumeSheetCaches），
+    // 不再整角色 broad 清理。注：markCharacterBibleChanged 的角色级 pending 范围与
+    // character.approved=false 语义保持不变（批准时粒度细化需改 types.pendingInvalidation
+    // 结构 + 面板确认文案，禁区，转交）；本次只修「重生成即删全量缓存」的直接伤害。
+    return { bible: next, cards: [characterCard], afterPublish: () => invalidateCostumeSheetCaches(outputDir, invalidationCharacter, costumeId) };
   }, bible);
   return visualBiblePath(outputDir, published.characters[characterId].costumeSheets?.[costumeId]?.threeViewPath ?? "");
 }
@@ -1586,6 +1610,66 @@ ${character.imagePrompt || "(none)"}
 }
 
 /**
+ * 1407 纯函数：把视觉守门变更后的角色 prompt 合并回磁盘卡片。
+ * 只合并绘画提示词（imagePrompt/threeViewPrompt）：未知 id 跳过、其余字段原样保留，
+ * 避免把用户在卡片页的手改（姓名/音色/服装名等）覆盖掉。
+ */
+export function mergeUpdatedCardsIntoStored(
+  storedCharacters: CharacterCard[],
+  updated: CharacterCard[],
+): { characters: CharacterCard[]; changedIds: string[] } {
+  const byId = new Map(updated.map((c) => [c.id, c]));
+  const changedIds: string[] = [];
+  const characters = storedCharacters.map((stored) => {
+    const next = byId.get(stored.id);
+    if (!next) return stored;
+    const imagePrompt = next.imagePrompt ?? stored.imagePrompt;
+    const threeViewPrompt = next.threeViewPrompt ?? stored.threeViewPrompt;
+    if (imagePrompt === stored.imagePrompt && threeViewPrompt === stored.threeViewPrompt) return stored;
+    changedIds.push(stored.id);
+    return { ...stored, imagePrompt, threeViewPrompt };
+  });
+  return { characters, changedIds };
+}
+
+/**
+ * 1407：publish 管线内同步 cards.json。
+ * persist/全局重生成此前只写 visual-bible.json 清单 + 内存，主管线与重启恢复
+ * 读的是 .novel2vn/cards.json——新 prompt 对出图零效果、重启后回退。
+ * mutation.cards 自带更新后的卡片，这里读回磁盘双文件（cards.json/cards_demo.json，
+ * demo/正式隔离，哪个存在合哪个）按 id 合并新 prompt 后写回，顶层 _novelFp 等字段保留。
+ * 失败只记 warn 不抛：清单此时已落盘，不能因卡片同步失败把整单判失败。
+ */
+async function syncMutationCardsToDisk(outputDir: string, cards: CharacterCard[]): Promise<void> {
+  if (!cards.length) return;
+  const metaDir = `${normalizePath(outputDir).replace(/\/$/, "")}/.novel2vn`;
+  for (const file of ["cards.json", "cards_demo.json"]) {
+    const path = `${metaDir}/${file}`;
+    let raw: string;
+    try {
+      raw = (await tauri.readTextFile(path)).text;
+    } catch {
+      continue;
+    }
+    let parsed: (ExtractionResult & { _novelFp?: string }) | null = null;
+    try {
+      parsed = JSON.parse(raw) as ExtractionResult & { _novelFp?: string };
+    } catch {
+      logger.warn("visualBible", `卡片同步跳过损坏文件：${file}`, { outputDir });
+      continue;
+    }
+    if (!parsed || !Array.isArray(parsed.characters)) continue;
+    const { characters, changedIds } = mergeUpdatedCardsIntoStored(parsed.characters, cards);
+    if (!changedIds.length) continue;
+    try {
+      await tauri.writeTextFile(path, JSON.stringify({ ...parsed, characters }, null, 2));
+    } catch (e) {
+      logger.warn("visualBible", `卡片同步写盘失败：${file}（${errMsg(e).slice(0, 120)}），内存与清单为新值，重启后可能回退`, { outputDir });
+    }
+  }
+}
+
+/**
  * 把重新生成的角色描述持久化到 visual bible + 同步卡片 + 失效缓存。
  * 必须在 regenerateCharacterDescription 拿到 imagePrompt/threeViewPrompt 之后调用。
  * 返回更新后的（bible, card）供调用方同步更新 projectState.lastResult.cards。
@@ -2185,6 +2269,15 @@ async function publishVisualBibleMutation(
   );
   const canonicalManifest = manifestForSave(manifest);
   await writeManifestAtomically(artifactDir, canonicalManifest);
+  // 1407：清单落盘后同步 cards.json（描述重生成/全局重生成的新 prompt 此前只进清单与内存，
+  // 管线按 cards.json 旧 prompt 出图、重启后回退）。失败只记 warn，见 syncMutationCardsToDisk。
+  if (mutation.cards?.length) {
+    try {
+      await syncMutationCardsToDisk(outputDir, mutation.cards);
+    } catch (e) {
+      logger.warn("visualBible", `卡片同步失败（${errMsg(e).slice(0, 120)}），内存与清单为新值，重启后可能回退`, { outputDir });
+    }
+  }
   for (const migration of migrations) {
     migration.card.referenceImagePath = migration.relativePath;
     delete migration.card.referenceImage;
@@ -2468,6 +2561,69 @@ export async function assertVisualBibleReadyForImages(
   throw new VisualBibleApprovalRequiredError("小说、角色或风格输入已经变化，视觉守门已标记为失效");
 }
 
+/**
+ * 1409：批准/确认英文报错 → 中文 t() key 映射表。
+ * 约定：key 即中文原文（i18n 以 zh-CN 为基准，缺翻译回退原文），调用方（面板）用
+ * localizeVisualBibleApprovalError(s) 把 errors 数组转中文后再渲染。
+ * core 内原英文字符串保持不变（测试与日志口径依赖），只新增映射，不改抛错语义。
+ * i18n 词典（en/ja/ko/zh-TW）由词典负责人补翻译，所需 key 见本函数返回与下方上报清单。
+ */
+export interface LocalizedApprovalError {
+  key: string;
+  params?: Record<string, string | number>;
+  fallback: string;
+}
+
+export function localizeVisualBibleApprovalError(error: string): LocalizedApprovalError {
+  const fallback = error;
+  let m: RegExpMatchArray | null;
+  if (error === "Style description is empty") {
+    return { key: "风格描述为空，请先填写风格描述", fallback };
+  }
+  if ((m = /^Character (.+) is missing from the visual bible(?:: (.+))?$/.exec(error))) {
+    return { key: "角色「{id}」在视觉守门中缺失，请先同步卡片或重建草稿", params: { id: m[1] }, fallback };
+  }
+  if ((m = /^Character (.+) is missing from visual bible: (.+)$/.exec(error))) {
+    return { key: "角色「{id}」在视觉守门中缺失", params: { id: m[2] ?? m[1] }, fallback };
+  }
+  if ((m = /^Character (.+) has not been accepted$/.exec(error))) {
+    return { key: "角色「{id}」的三视图尚未确认，请先点「确认此角色」", params: { id: m[1] }, fallback };
+  }
+  if ((m = /^Character (.+) three-view does not match the current source revision(?:: (.+))?$/.exec(error))) {
+    return { key: "角色「{id}」的三视图与当前参考图版本不一致，请重新生成三视图", params: { id: m[1] }, fallback };
+  }
+  if ((m = /^Character (.+) costume "(.+)" three-view(.*)$/.exec(error))) {
+    return { key: "角色「{id}」服装「{costume}」的三视图缺失或不可读，请重新生成该服装锚点{detail}", params: { id: m[1], costume: m[2], detail: m[3] ? `：${m[3].replace(/^[:\s]+/, "")}` : "" }, fallback };
+  }
+  if ((m = /^Character (.+) three-view(.*)$/.exec(error))) {
+    return { key: "角色「{id}」的三视图缺失或不可读，请重新生成三视图{detail}", params: { id: m[1], detail: m[2] ? `：${m[2].replace(/^[:\s]+/, "")}` : "" }, fallback };
+  }
+  if ((m = /^Character (.+) source reference(.*)$/.exec(error))) {
+    return { key: "角色「{id}」的来源参考图缺失或不可读，请重新上传参考图{detail}", params: { id: m[1], detail: m[2] ? `：${m[2].replace(/^[:\s]+/, "")}` : "" }, fallback };
+  }
+  if ((m = /^Style reference(.*)$/.exec(error))) {
+    return { key: "风格参考图缺失或不可读，请重新生成示例图或替换参考图{detail}", params: { detail: m[1] ? `：${m[1].replace(/^[:\s]+/, "")}` : "" }, fallback };
+  }
+  if (error.startsWith("Visual bible fingerprint is empty or stale")) {
+    return { key: "视觉守门指纹已过期，请点「刷新指纹」后重试", fallback };
+  }
+  if ((m = /^Visual bible fingerprint could not be computed: ([\s\S]+)$/.exec(error))) {
+    return { key: "视觉守门指纹计算失败：{detail}", params: { detail: m[1].slice(0, 160) }, fallback };
+  }
+  if ((m = /^Visual bible cannot be approved: ([\s\S]+)$/.exec(error))) {
+    return { key: "视觉守门暂不能批准：{detail}", params: { detail: m[1].slice(0, 300) }, fallback };
+  }
+  if ((m = /^Approved visual bible is stale: ([\s\S]+)$/.exec(error))) {
+    return { key: "已批准的视觉守门已失效：{detail}", params: { detail: m[1].slice(0, 300) }, fallback };
+  }
+  return { key: fallback, fallback };
+}
+
+/** 1409：批量映射（面板批准条 approvalErrors.join 前调用）。 */
+export function localizeVisualBibleApprovalErrors(errors: string[]): LocalizedApprovalError[] {
+  return errors.map(localizeVisualBibleApprovalError);
+}
+
 export async function validateVisualBibleForApproval(
   outputDir: string,
   bible: ProjectVisualBible,
@@ -2514,6 +2670,24 @@ export async function validateVisualBibleForApproval(
   return { valid: errors.length === 0, errors };
 }
 
+/**
+ * 1406 纯函数：合并显式作废范围与指纹推断范围。
+ * 任一为 global 即 global；角色范围取并集并过滤掉清单里已不存在的 id、排序；
+ * 均为空即 undefined（本次批准无视觉变化，只盖章不动缓存）。
+ */
+export function mergePendingInvalidations(
+  existing: VisualBiblePendingInvalidation | undefined,
+  detected: VisualBiblePendingInvalidation | undefined,
+  characters: Record<string, unknown>,
+): VisualBiblePendingInvalidation | undefined {
+  if (existing?.scope === "global" || detected?.scope === "global") return { scope: "global" };
+  const merged = [...new Set([
+    ...(existing?.scope === "characters" ? existing.characterIds : []),
+    ...(detected?.scope === "characters" ? detected.characterIds : []),
+  ])].filter((id) => !!characters[id]).sort();
+  return merged.length ? { scope: "characters", characterIds: merged } : undefined;
+}
+
 export async function approveVisualBible(
   outputDir: string,
   bible: ProjectVisualBible,
@@ -2534,7 +2708,60 @@ export async function approveVisualBible(
       return staleRejectedMutation(bible, `Visual bible fingerprint could not be computed: ${message}`);
     }
     if (!bible.inputFingerprint || bible.inputFingerprint !== currentFingerprint) {
-      return staleRejectedMutation(bible, "Visual bible fingerprint is empty or stale; refresh the draft before approval");
+      // 1406：草稿/失效态自动对齐——卡片保存、描述重生成、全局重生成、服装锚点重生成
+      // 四条路径改的正是计入指纹的输入（imagePrompt/threeViewPrompt/锚点 revision），
+      // 而面板只在挂载时同步一次指纹，同挂载期改完后批准必然撞 stale。
+      // 面板侧补 refreshFingerprint 调用需改 VisualBiblePanel（禁区，转交）；core 侧兜底：
+      // 非 approved 态不再直接拒绝，而是在批准时按当前输入对齐（最终 approved.inputFingerprint
+      // 本来就要写成 current），并把指纹推断范围并入作废决策，保证外部改动仍会清缓存。
+      // 已 approved 态仍拒绝：那是真正的「批准后输入又变了」，需显式刷新标 stale。
+      // 指纹缺失的 draft/stale 同样走自动对齐（旧项目升级/从未同步过时直接拒绝会复现
+      // 「无刷新入口只能切页重进」的死路，而批准本就要把 inputFingerprint 写成 current）。
+      if (bible.status === "approved") {
+        return staleRejectedMutation(bible, "Visual bible fingerprint is empty or stale; refresh the draft before approval");
+      }
+      // 非 approved 态：best-effort 推断作废范围（参考图读不到等失败时保持原范围继续，
+      // 不因推断失败阻断批准——校验环节仍会拦住缺图等问题）。
+      let autoAligned: VisualBiblePendingInvalidation | undefined;
+      try {
+        const currentSignature = await computeProjectVisualInputSignature(outputDir, bible, request.characters);
+        autoAligned = mergePendingInvalidations(
+          bible.pendingInvalidation,
+          visualInvalidationScope(bible.visualInputs, currentSignature),
+          bible.characters,
+        );
+      } catch {
+        autoAligned = bible.pendingInvalidation;
+      }
+      const validation = await validateVisualBibleForApproval(
+        outputDir,
+        bible,
+        request.characters.map((character) => character.id),
+      );
+      if (!validation.valid) {
+        return staleRejectedMutation(bible, `Visual bible cannot be approved: ${validation.errors.join("; ")}`);
+      }
+      const approved = cloneVisualBible(bible);
+      const pendingInvalidation = autoAligned;
+      const invalidateAll = pendingInvalidation === undefined
+        ? !approved.cacheBinding
+        : pendingInvalidation.scope === "global";
+      const characterScope = pendingInvalidation?.scope === "characters" ? pendingInvalidation : undefined;
+      approved.status = "approved";
+      approved.inputFingerprint = currentFingerprint;
+      approved.approvedAt = (request.now ?? (() => new Date().toISOString()))();
+      approved.cacheBinding = cacheBindingAfterApproval(approved, invalidateAll, currentFingerprint);
+      approved.visualInputs = await computeProjectVisualInputSignature(outputDir, approved, request.characters);
+      delete approved.pendingInvalidation;
+      return {
+        bible: approved,
+        cards: request.characters,
+        afterPublish: invalidateAll
+          ? () => invalidateGlobalCaches(outputDir)
+          : characterScope
+            ? () => invalidateCharacterScopes(outputDir, bible, request.characters, characterScope.characterIds)
+            : undefined,
+      };
     }
     const validation = await validateVisualBibleForApproval(
       outputDir,
@@ -2634,9 +2861,27 @@ async function assetMapExists(outputDir: string): Promise<boolean> {
 async function removeCachedImages(outputDir: string, predicate: (name: string) => boolean): Promise<void> {
   const imageDir = `${normalizePath(outputDir).replace(/\/$/, "")}/.novel2vn/cache/images`;
   if (!(await tauri.pathExists(imageDir))) return;
-  const entries = await tauri.listDir(imageDir);
+  // 1445：此前对 listDir/removePath 完全无 try/catch，一次文件占用或目录瞬时不可读
+  // 就抛，抛点又在清单落盘之后——面板报「发布失败」，该角色旧图清理被永久跳过。
+  // 改为单文件 best-effort：失败记 warn 收集后继续，不阻断整单。
+  let entries: { isDir: boolean; name: string; path: string }[];
+  try {
+    entries = await tauri.listDir(imageDir);
+  } catch (e) {
+    logger.warn("visualBible", `缓存目录读取失败，已跳过本次清理：${errMsg(e).slice(0, 120)}`, { outputDir });
+    return;
+  }
+  const failures: string[] = [];
   for (const entry of entries) {
-    if (!entry.isDir && predicate(entry.name)) await tauri.removePath(entry.path);
+    if (entry.isDir || !predicate(entry.name)) continue;
+    try {
+      await tauri.removePath(entry.path);
+    } catch (e) {
+      failures.push(`${entry.name}(${errMsg(e).slice(0, 80)})`);
+    }
+  }
+  if (failures.length) {
+    logger.warn("visualBible", `部分缓存清理失败（已跳过，下次清理/导出时重试）：${failures.slice(0, 5).join("；")}${failures.length > 5 ? `…等${failures.length}个` : ""}`, { outputDir });
   }
 }
 
@@ -2700,16 +2945,39 @@ function cacheBindingAfterApproval(
   return cacheBindingFromBible(bible, globalFingerprint);
 }
 
+/**
+ * 1445 纯函数：把请求的作废 id 切分为有效/跳过。
+ * 此前 invalidateCharacterScopes 遇到不在 request.characters 的 id 直接 throw，
+ * 抛点在清单落盘之后——整单报「发布失败」，该角色清理被永久跳过。
+ * 现改为跳过+警告（调用方记 warn），多角色时「清一半抛一半」不再发生。
+ */
+export function partitionInvalidationIds(
+  characters: CharacterCard[],
+  characterIds: string[],
+): { valid: CharacterCard[]; skipped: string[] } {
+  const cardsById = new Map(characters.map((character) => [character.id, character]));
+  const valid: CharacterCard[] = [];
+  const skipped: string[] = [];
+  for (const id of characterIds) {
+    const character = cardsById.get(id);
+    if (!character) skipped.push(id);
+    else valid.push(character);
+  }
+  return { valid, skipped };
+}
+
 async function invalidateCharacterScopes(
   outputDir: string,
   bible: ProjectVisualBible,
   characters: CharacterCard[],
   characterIds: string[],
 ): Promise<void> {
-  const cardsById = new Map(characters.map((character) => [character.id, character]));
-  for (const characterId of characterIds) {
-    const character = cardsById.get(characterId);
-    if (!character) throw new Error(`Character is missing from approval request: ${characterId}`);
+  // 1445：缺失 id 跳过+警告而不是 throw（状态已知的正常分支：条目已删/请求子集不含该卡）。
+  const { valid, skipped } = partitionInvalidationIds(characters, characterIds);
+  if (skipped.length) {
+    logger.warn("visualBible", `作废范围跳过不在本次批准请求中的角色：${skipped.join("、")}`, { outputDir });
+  }
+  for (const character of valid) {
     await invalidateCharacterCaches(outputDir, characterWithHistoricalActions(bible, character));
   }
 }
@@ -2734,6 +3002,10 @@ async function invalidateGlobalCaches(outputDir: string): Promise<void> {
     assets.cg = {};
     assets.figure = {};
     assets.item = {};
+    // 1444：此前漏掉 assets.shot——图片小说分镜落在同一缓存目录（imageStory 经 runImageTask），
+    // 全局作废删文件却不清映射，assets.json 里全是死链，渲染 changeBg 取不到图。
+    // vocal 落在 cache/audio 不在此目录，不清。
+    assets.shot = {};
   });
 }
 
@@ -2743,6 +3015,47 @@ async function invalidateCharacterCaches(
 ): Promise<void> {
   const owned = characterOwnedImageTasks(character);
   // B69：旁路参数元数据 `<图>.meta.json` 随图一起失效，避免残留 meta 与新图张冠李戴
+  const ownedFile = (name: string): boolean => owned.fileNames.has(name)
+    || (name.endsWith(".meta.json") && owned.fileNames.has(name.slice(0, -".meta.json".length)));
+  await removeCachedImages(outputDir, ownedFile);
+  if (!(await assetMapExists(outputDir))) return;
+  await updateAssetMap(outputDir, (assets) => {
+    assets.figure = Object.fromEntries(
+      Object.entries(assets.figure).filter(([assetId]) => !owned.assetIds.has(assetId)),
+    );
+  });
+}
+
+/**
+ * 1447：单套服装锚点的窄范围失效。
+ * 此前 regenerateCostumeSheet 复用整角色 broad 清理（全部表情+全部换装+全部动作），
+ * 修一张锚点却删掉该角色 N 张已付费立绘。窄入口只删该服装的换装底图
+ *（figure_<id>_ct_<ctId>_normal.png + 同名 .meta.json）并只剪 assets.figure 中
+ * 对应 `${id}_ct_${ctId}` 条目；表情/动作/其它服装不动。
+ * 纯任务过滤口径：按 buildImageTasks 的 task.costume 字段圈定，不拼文件名，避免
+ * sanitize 口径漂移误删。
+ */
+export function costumeOwnedImageTasks(
+  character: CharacterCard,
+  costumeId: string,
+): { assetIds: Set<string>; fileNames: Set<string> } {
+  const actions = character.actions ?? [];  const actionBatches = actions.length > 0
+    ? Array.from({ length: Math.ceil(actions.length / 4) }, (_, index) => actions.slice(index * 4, index * 4 + 4))
+    : [[]];
+  const tasks = actionBatches.flatMap((actionBatch) => characterImageTasks({ ...character, actions: actionBatch }));
+  const narrow = tasks.filter((task) => (task as { costume?: string }).costume === costumeId);
+  return {
+    assetIds: new Set(narrow.map((task) => task.id)),
+    fileNames: new Set(narrow.map((task) => task.fileName)),
+  };
+}
+
+export async function invalidateCostumeSheetCaches(
+  outputDir: string,
+  character: CharacterCard,
+  costumeId: string,
+): Promise<void> {
+  const owned = costumeOwnedImageTasks(character, costumeId);
   const ownedFile = (name: string): boolean => owned.fileNames.has(name)
     || (name.endsWith(".meta.json") && owned.fileNames.has(name.slice(0, -".meta.json".length)));
   await removeCachedImages(outputDir, ownedFile);

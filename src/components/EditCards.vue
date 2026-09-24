@@ -5,7 +5,7 @@ import { activeConfig, configState, voiceLibraryFor } from "../stores/config";
 import { tauri, isTauri } from "../utils/tauri";
 import { vfsWriteFileBase64 } from "../utils/vfsWeb";
 import { projectState } from "../stores/project";
-import { saveEditedCards } from "../core/cards";
+import { saveEditedCards, shouldBlockCardSave, shouldBlockRecordingStart } from "../core/cards";
 import { open } from "@tauri-apps/plugin-dialog";
 import { errMsg } from "../utils/errors";
 import { fileToBase64 } from "../utils/file";
@@ -43,6 +43,8 @@ const busy = ref(false);
 const openChar = ref<string | null>(null);
 const openItem = ref<string | null>(null);
 const openScene = ref<string | null>(null);
+// #799 世界观卡折叠态（只读展示段自用，不碰角色/物品/场景逻辑）
+const openLore = ref<string | null>(null);
 const charRecognizing = ref<string | null>(null);
 const voiceFileInput = ref<HTMLInputElement | null>(null);
 const voiceFileTarget = ref<CharacterCard | null>(null);
@@ -86,12 +88,15 @@ async function recognizeChar(c: CharacterCard): Promise<void> {
 }
 
 // 父组件卡片更新（重新生成后）时同步刷新本地副本
+// 1408：视觉守门面板用 splice 原位替换 characters 元素（数组引用不变），
+// 浅 watch 感知不到，卡片页显示旧 prompt，点保存还会把新描述覆盖回旧值。加 deep。
 watch(
   () => props.cards,
   () => {
     local.value = JSON.parse(JSON.stringify(props.cards));
     setSavedMsg("");
   },
+  { deep: true },
 );
 
 const voices = computed(() => voiceLibraryFor(activeConfig("tts")));
@@ -199,6 +204,18 @@ function stopRecordingAndWait(recorder: MediaRecorder): Promise<void> {
 async function startSystemAudioRecording(card: CharacterCard): Promise<void> {
   const config = activeConfig("tts");
   if (!config) { setSavedMsg(t("请先配置 TTS"), "err"); return; }
+  // 1401：录音互斥——已有进行中的录音/残留资源时直接拒绝，避免旧音频流泄漏、
+  // 双计时器叠加、参考音频混片（此前直接覆盖引用，旧 getDisplayMedia 轨道无人持有，
+  // 系统录音指示常亮且界面无入口可停）。
+  if (shouldBlockRecordingStart({
+    recordingChar: recordingChar.value,
+    hasRecorder: recorderRef.value !== null,
+    hasStream: recordStreamRef.value !== null,
+    hasTimer: recordTimer !== undefined,
+  })) {
+    setSavedMsg(t("已有录音在进行，请先停止或取消当前录音"), "err");
+    return;
+  }
   if (!window.confirm(t("我将捕获系统正在播放的声音（会弹出选择共享屏幕/窗口的提示，请勾选「分享音频」）。我确认拥有该声音的使用授权。"))) return;
   try {
     // 捕获系统音频：getDisplayMedia 的 audio 轨道（Chrome/Edge/WebView2 支持）
@@ -223,9 +240,15 @@ async function startSystemAudioRecording(card: CharacterCard): Promise<void> {
     recorderRef.value = recorder;
     recorder.ondataavailable = (ev) => { if (ev.data.size) recordChunksRef.value.push(ev.data); };
     recorder.start();
+    // 1401：赋值前先清旧 interval（防御性，避免残留计时器与新计时器叠加导致秒数双倍跳）。
+    if (recordTimer !== undefined) { window.clearInterval(recordTimer); recordTimer = undefined; }
     recordTimer = window.setInterval(() => { recordingSec.value++; }, 1000);
     setSavedMsg(t("正在录音（{name}）：请播放参考视频，完成后点「停止并克隆」", { name: card.name }));
   } catch (e) {
+    // 1401：启动失败（MediaRecorder 构造/start 抛错）时已半赋值 stream/recordingChar，
+    // 不清理则守卫永久拦截且取消按钮归属错乱。失败即复位，下次可直接重试。
+    stopRecordingNow();
+    recordingChar.value = null;
     setSavedMsg(t("录音启动失败：{error}", { error: errMsg(e) }), "err");
   }
 }
@@ -236,6 +259,11 @@ async function stopRecordingAndClone(card: CharacterCard): Promise<void> {
   if (!config) { setSavedMsg(t("请先配置 TTS"), "err"); return; }
   const recorder = recorderRef.value;
   if (!recorder) return;
+  // 1401：录音只属于 recordingChar 的角色，串卡停止会把 A 的分片混入 B 的克隆音频。
+  if (recordingChar.value !== null && recordingChar.value !== card.id) {
+    setSavedMsg(t("当前正在录音的不是该角色，请先停止当前录音"), "err");
+    return;
+  }
   const cardId = recordingChar.value;
   recordingChar.value = null;
   const secs = recordingSec.value;
@@ -351,6 +379,18 @@ async function save(): Promise<void> {
     setSavedMsg(t("已有生成任务在运行：请等它完成（或先点「停止」）后再保存卡片，避免与管线互相覆盖"), "err");
     return;
   }
+  // 1410：AI 识别/音色克隆/AI 选音色/录音在途时禁止保存——它们完成后只写内存不落盘，
+  // 此时保存会把不含新字段的快照写盘，内存与磁盘分叉、重启后付费结果丢失。
+  if (shouldBlockCardSave({
+    saving: busy.value,
+    recognizing: charRecognizing.value !== null,
+    voiceBusy: voiceBusy.value !== null,
+    castBusy: castBusy.value,
+    recording: recordingChar.value !== null,
+  })) {
+    setSavedMsg(t("有识别/克隆/选音色/录音任务在进行：请等它完成后再保存卡片，否则新结果只在内存、重启会丢失"), "err");
+    return;
+  }
   // 「同时重写剧本」= 清空全部章节剧本缓存（下次生成重写，消耗 token）：执行前确认
   if (invalidateScript.value && !window.confirm(t("已勾选「同时重写剧本」：保存会清空全部章节的剧本缓存（下次生成需重写剧本，消耗 token）。继续吗？"))) return;
   busy.value = true;
@@ -418,7 +458,7 @@ onBeforeUnmount(() => {
         <button class="btn secondary small" :disabled="busy || castBusy" @click="aiCastVoices">
           {{ castBusy ? t("AI 挑选中…") : t("AI 选音色") }}
         </button>
-        <button class="btn small" :disabled="busy" @click="save">{{ t("保存卡片") }}</button>
+        <button class="btn small" :disabled="busy || charRecognizing !== null || voiceBusy !== null || castBusy || recordingChar !== null" @click="save">{{ t("保存卡片") }}</button>
         <button class="btn secondary small" @click="reset">{{ t("放弃修改") }}</button>
       </div>
     </div>
@@ -483,7 +523,7 @@ onBeforeUnmount(() => {
           <button
             v-if="recordingChar !== c.id"
             class="btn danger small"
-            :disabled="voiceBusy === c.id"
+            :disabled="voiceBusy === c.id || recordingChar !== null"
             @click="startSystemAudioRecording(c)"
           >🎙 {{ t("录音（捕获正在播放的声音）") }}</button>
           <template v-else>
@@ -575,6 +615,30 @@ onBeforeUnmount(() => {
       <label class="field">
         <span>{{ t("背景图提示词") }}</span>
         <textarea v-model="s.imagePrompt" rows="2" />
+      </label>
+    </Disclosure>
+  </div>
+
+  <!-- #799 世界观卡（只读展示段：地图/任务/组织/器物/制度类设定；仅展示提取结果，不可编辑） -->
+  <div class="card">
+    <h3 class="mb-3">{{ t("世界观卡（{n}）", { n: (local.lore ?? []).length }) }}</h3>
+    <p class="hint mb-2">{{ t("世界观卡只读：展示提取到的地图/路线、任务/委托、组织/制度、器物/货币类设定（content 为原文关键信息，未做概括）。") }}</p>
+    <p v-if="!(local.lore ?? []).length" class="faint small">{{ t("暂无世界观卡（提取时会自动收录设定类描写）。") }}</p>
+    <Disclosure
+      v-for="l in (local.lore ?? [])"
+      :key="l.id"
+      :title="l.title"
+      :subtitle="`${l.id} · ${l.kind}`"
+      :open="openLore === l.id"
+      @update:open="(v) => (openLore = v ? l.id : null)"
+    >
+      <div class="row">
+        <label class="field"><span>{{ t("类别") }}</span><input type="text" :value="l.kind" disabled readonly /></label>
+        <label v-if="l.sourceNote" class="field"><span>{{ t("出处") }}</span><input type="text" :value="l.sourceNote" disabled readonly /></label>
+      </div>
+      <label class="field">
+        <span>{{ t("设定内容（原文关键信息）") }}</span>
+        <textarea :value="l.content" rows="3" disabled readonly />
       </label>
     </Disclosure>
   </div>

@@ -1,10 +1,45 @@
-import type { CharacterCard, ExtractionResult, ItemCard } from "./types";
+import type { CharacterCard, ExtractionResult, ItemCard, LoreCard } from "./types";
 import { sanitizeId } from "./render";
 import { tauri } from "../utils/tauri";
 
 export interface CardsSaveResult {
   scriptCacheCleared: number;
   imageCacheCleared: number;
+}
+
+/**
+ * 录音互斥守卫（1401 纯函数）：
+ * 任意一项为真都说明有进行中的录音/残留资源，此时再起新录音会泄漏旧音频流、
+ * 双计时器叠加、参考音频混片。调用方（EditCards）应在 startSystemAudioRecording
+ * 入口调用，返回 true 即拒绝并提示用户先停止/取消当前录音。
+ */
+export interface RecordingMutexState {
+  recordingChar: string | null;
+  hasRecorder: boolean;
+  hasStream: boolean;
+  hasTimer: boolean;
+}
+
+export function shouldBlockRecordingStart(state: RecordingMutexState): boolean {
+  return !!state.recordingChar || state.hasRecorder || state.hasStream || state.hasTimer;
+}
+
+/**
+ * 保存互斥守卫（1410 纯函数）：
+ * AI 识别/音色克隆/AI 选音色/录音完成后只写内存（local），本身不落 cards.json。
+ * 保存按钮若在这些操作在途时可用，会把不含新字段的快照写盘，内存与磁盘分叉、
+ * 重启后付费结果丢失。返回 true 即应禁用「保存卡片」并在 save() 入口二次拦截。
+ */
+export interface CardSaveMutexState {
+  saving: boolean;
+  recognizing: boolean;
+  voiceBusy: boolean;
+  castBusy: boolean;
+  recording: boolean;
+}
+
+export function shouldBlockCardSave(state: CardSaveMutexState): boolean {
+  return state.saving || state.recognizing || state.voiceBusy || state.castBusy || state.recording;
 }
 
 /**
@@ -140,4 +175,65 @@ export async function saveEditedCards(
     "success",
   );
   return { scriptCacheCleared: scriptCleared, imageCacheCleared: imageCleared };
+}
+
+/* ==================== #799 世界观卡片（纯函数：提取→剧本上下文→展示共用） ==================== */
+
+const LORE_KINDS: ReadonlySet<string> = new Set(["map", "quest", "faction", "artifact", "system", "other"]);
+
+/** 规范化一条 lore（空标题/空内容视为残卡返回 null；kind 非法回退 other） */
+export function normalizeLoreCard(raw: unknown): LoreCard | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  const title = typeof r.title === "string" ? r.title.trim() : "";
+  const content = typeof r.content === "string" ? r.content.trim() : "";
+  const id = typeof r.id === "string" ? r.id.trim() : "";
+  if (!title || !content || !id) return null;
+  const kind = typeof r.kind === "string" && LORE_KINDS.has(r.kind) ? (r.kind as LoreCard["kind"]) : "other";
+  return {
+    id,
+    title,
+    kind,
+    content,
+    sourceNote: typeof r.sourceNote === "string" && r.sourceNote.trim() ? r.sourceNote.trim() : undefined,
+  };
+}
+
+/** lore 去重（标题精确一致并卡，content 取较长者；保序） */
+export function dedupeLoreCards(list: unknown): LoreCard[] {
+  if (!Array.isArray(list)) return [];
+  const out: LoreCard[] = [];
+  const byTitle = new Map<string, LoreCard>();
+  for (const raw of list) {
+    const card = normalizeLoreCard(raw);
+    if (!card) continue;
+    const key = card.title.toLowerCase().replace(/\s+/g, "");
+    const hit = byTitle.get(key);
+    if (hit && hit.title.trim() === card.title.trim()) {
+      if (card.content.length > hit.content.length) hit.content = card.content;
+      if (!hit.sourceNote && card.sourceNote) hit.sourceNote = card.sourceNote;
+      continue;
+    }
+    byTitle.set(key, card);
+    out.push(card);
+  }
+  return out;
+}
+
+/** 单条 lore 的剧本上下文行：`id（标题［类别］）：content 全文`（不概括压缩，#799） */
+export function loreContextLine(l: LoreCard): string {
+  return `${l.id}（${l.title}［${l.kind}］）：${l.content}`;
+}
+
+/** lore 区剧本上下文（供剧本提示词消费；无 lore 返回 ""，调用方按空即不注入处理） */
+export function buildLoreContext(lore: LoreCard[] | undefined): string {
+  const list = dedupeLoreCards(lore ?? []);
+  if (!list.length) return "";
+  return list.map(loreContextLine).join("\n");
+}
+
+/** 从 ExtractionResult 取 lore 上下文节（剧本 user 消息直接拼在场景卡之后） */
+export function loreContextForScript(cards: Pick<ExtractionResult, "lore">): string {
+  const body = buildLoreContext(cards.lore);
+  return body ? `世界观设定卡：\n${body}` : "";
 }

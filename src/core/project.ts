@@ -1,10 +1,11 @@
 ﻿import type { ChapterScript, ExtractionResult, ProjectMeta } from "./types";
 import type { RenderAssets, WebgalLanguage } from "./render";
-import { renderChapter, renderConfig, renderStart, sanitizeId } from "./render";
+import { renderChapter, renderConfig, renderStart, chapterDisplayTitle, sanitizeId, engineSafeFileName } from "./render";
 import { tauri, type FsEntry } from "../utils/tauri";
 import { basename, joinPath, normalizePath } from "../utils/path";
 import { log } from "../utils/logger";
 import { errMsg } from "../utils/errors";
+import { validateTemplateFill } from "../utils/template";
 import { ConcurrencyLimiter } from "../utils/performance";
 import { brandUrl, brandFooterHtml } from "../utils/branding";
 import { extractAccentFromImage, hslOf, type AccentPair } from "./themeColors";
@@ -24,6 +25,8 @@ export interface AssembleInput {
   useBgm?: boolean;
   /** 环境音效（SE）：默认关闭（与 useBgm 同为「声音」开关） */
   useSe?: boolean;
+  /** 环境音效音量（0-100，默认 35）；透传到 renderChapter 的 playEffect -volume */
+  seVolume?: number;
   /** 界面语言（默认 zh_CN）；正文语言由翻译阶段决定 */
   language?: WebgalLanguage;
   /** 标题封面：auto=按主题自动生成（默认）；none=不使用封面；custom=用 titleCoverPath */
@@ -62,6 +65,13 @@ export async function assembleProject(input: AssembleInput): Promise<{ gameDir: 
   // 标准化路径
   const normalizedOutputDir = normalizePath(outputDir);
   const normalizedTemplateDir = normalizePath(templateDir);
+
+  // #1382：组装入口校验模板回填（主题 0 字节 / 内置 SE 空目录），避免 tauri dev / 应用内组装
+  // 静默产出「缺定制主题、开启音效时 playEffect 全部 404」的成品（pnpm build 才拦，拦不住 dev）。
+  const fillProblems = await validateTemplateFill(normalizedTemplateDir);
+  if (fillProblems.length) {
+    input.log(`警告：WebGAL 模板回填不完整——${fillProblems.join("；")}。成品会丢失定制主题、开启音效时 playEffect 会 404；请运行 pnpm prepare:template 回填（开发/新检出环境常见）`);
+  }
   
   await tauri.mkdirAll(normalizedOutputDir);
   await tauri.mkdirAll(joinPath(normalizedOutputDir, "game/scene"));
@@ -159,6 +169,7 @@ export async function assembleProject(input: AssembleInput): Promise<{ gameDir: 
       figureEmotions: input.figureEmotions,
       figureActions: input.figureActions,
       useSe: input.useSe,
+      seVolume: input.seVolume,
       mode: input.mode,
     }, chapterCount);
     rendered.set(`ch${chapter.chapter + 1}.txt`, txt);
@@ -251,6 +262,14 @@ export async function assembleProject(input: AssembleInput): Promise<{ gameDir: 
   await writeExportGuide(normalizedOutputDir, title);
   // 玩家上手指南（WebGAL 无内置教学）
   await writeHowToPlay(normalizedOutputDir, title);
+  // 1451：随包启动脚本（Windows .bat / macOS .command），把「双击即玩」落到真实可用的 HTTP 服务
+  await writeStartScripts(normalizedOutputDir);
+  // 1452：组装末素材自检（含标题封面/Logo/标题曲），把「有文件却 404」的口径不一致暴露到日志
+  await auditAssetReferences(normalizedOutputDir, rendered, [
+    ...(titleImg ? [{ dir: "background", file: engineSafeFileName(titleImg) }] : []),
+    ...(gameLogo ? [{ dir: "background", file: engineSafeFileName(gameLogo) }] : []),
+    ...(titleBgm ? [{ dir: "bgm", file: engineSafeFileName(titleBgm) }] : []),
+  ], (m) => input.log(m));
 
   const meta: ProjectMeta = {
     title,
@@ -663,7 +682,9 @@ async function writeGameThemeCss(
   }
 }
 
-/** 流程图 JSON（纯函数，便于单测）：按实际章节重建节点与连线（模板自带 demo 节点会指向不存在的场景） */
+/** 流程图 JSON（纯函数，便于单测）：按实际章节重建节点与连线（模板自带 demo 节点会指向不存在的场景）
+ *  1354：节点 label 统一用 chapterDisplayTitle（宽口径去重 + 重编号），与游戏内标题卡同口径，
+ *  修复“第 2 章 第三章 …”双编号。 */
 export function buildFlowchartJson(chapters: ChapterScript[], title: string): string {
   const nodes = [
     {
@@ -676,7 +697,7 @@ export function buildFlowchartJson(chapters: ChapterScript[], title: string): st
       id: `ch${c.chapter + 1}`,
       type: "chapter",
       position: { x: 120 + (i % 5) * 240, y: 140 + Math.floor(i / 5) * 140 },
-      data: { label: `第 ${c.chapter + 1} 章${c.title ? ` ${c.title}` : ""}`, sceneName: `ch${c.chapter + 1}.txt` },
+      data: { label: chapterDisplayTitle(c.chapter + 1, c.title ?? ""), sceneName: `ch${c.chapter + 1}.txt` },
     })),
   ];
   const edges = chapters.map((c, i) => {
@@ -764,15 +785,62 @@ async function writeHowToPlay(outputDir: string, title: string): Promise<void> {
     "· 保存进度：菜单 → 存档（含快速存档 F5 / 快速读档 F7）",
     "· 鉴赏室：标题页或游戏内菜单进入（立绘 / CG / 角色 / 音乐）",
     "",
-    "通过本地 HTTP 服务访问：在游戏目录执行 `python -m http.server 8080` 后",
-    "浏览器打开 http://localhost:8080/index.html —— 直接双击 index.html（file://）",
-    "会因浏览器安全策略导致字体与离线缓存受限。",
+    "【重要】必须通过本地 HTTP 服务打开，不能直接双击 index.html：",
+    "本游戏引擎是 ES module，浏览器在 file:// 下会以 CORS 模式拦截，引擎不会启动",
+    "（表现为停在「PRESS THE SCREEN TO START」空白页、控制台一片 CORS 报错）。",
+    "推荐任一方式：",
+    "  1. 双击随包的 start_game.bat（Windows）或 start_game.command（macOS），",
+    "     脚本会自动在游戏目录启动本地服务并打开浏览器；",
+    "  2. 或在本游戏目录执行 `python -m http.server 8080`，再打开 http://localhost:8080/index.html；",
+    "  3. 或把整个文件夹部署到任意静态托管后访问。",
     "",
   ].join("\n");
   try {
     await tauri.writeTextFile(joinPath(outputDir, "game/HOW_TO_PLAY.txt"), text);
   } catch {
     /* 指南写入失败不影响游戏 */
+  }
+}
+
+/** 随包启动脚本（1451）：把「双击即玩」兑现为可用的本地 HTTP 服务。
+ *  引擎是 ES module，file:// 下被 CORS 拦截，双击 index.html 只能看到空白开始页。
+ *  Windows 写 start_game.bat，macOS 写 start_game.command（ASCII 内容，避免 cmd 编码问题）。 */
+async function writeStartScripts(outputDir: string): Promise<void> {
+  const bat = [
+    "@echo off",
+    "setlocal",
+    'cd /d "%~dp0"',
+    "set PY=python",
+    "where python >nul 2>nul || set PY=py",
+    "%PY% -c \"import sys\" >nul 2>nul",
+    "if errorlevel 1 (",
+    "  echo [NovelForge] Python not found. Please install Python 3, then run this file again.",
+    "  echo [NovelForge] Or serve this folder with any static web server (see game/HOW_TO_PLAY.txt).",
+    "  pause",
+    "  exit /b 1",
+    ")",
+    "echo [NovelForge] Serving game at http://localhost:8080/index.html",
+    "echo [NovelForge] Keep this window open. Press Ctrl+C to stop.",
+    'start "NovelForge Server" cmd /k %PY% -m http.server 8080',
+    "timeout /t 1 >nul",
+    'start "" "http://localhost:8080/index.html"',
+    "exit /b 0",
+    "",
+  ].join("\r\n");
+  const sh = [
+    "#!/bin/bash",
+    'cd "$(dirname "$0")" || exit 1',
+    "if command -v python3 >/dev/null 2>&1; then PY=python3; else PY=python; fi",
+    "echo '[NovelForge] Serving game at http://localhost:8080/index.html (Ctrl+C to stop)'",
+    '( sleep 1; open "http://localhost:8080/index.html" ) &',
+    'exec "$PY" -m http.server 8080',
+    "",
+  ].join("\n");
+  try {
+    await tauri.writeTextFile(joinPath(outputDir, "start_game.bat"), bat);
+    await tauri.writeTextFile(joinPath(outputDir, "start_game.command"), sh);
+  } catch (e) {
+    log.warn("project", `启动脚本写入失败（不影响游戏本体）：${errMsg(e).slice(0, 100)}`);
   }
 }
 
@@ -879,7 +947,9 @@ async function copyAssets(assets: RenderAssets, outputDir: string): Promise<void
   const limiter = new ConcurrencyLimiter(8);
   const copy = async (path: string | undefined, destDir: string): Promise<void> => {
     if (!path) return;
-    const name = basename(path);
+    // 1452：落盘文件名必须与 render 的 getBaseName/engineSafeFileName 同口径，
+    // 否则含 ; | 或“ -”的素材「脚本里改了名、磁盘上没改」→ 有文件却 404。
+    const name = engineSafeFileName(basename(path));
     const destKey = destDir + name;
     // 去重判断在提交任务前同步完成，保证并发下不重复拷贝
     if (seen.has(destKey)) return;
@@ -918,6 +988,78 @@ async function copyDirIfExists(src: string, dst: string): Promise<void> {
   }
 }
 
+/** 脚本素材引用指令 → 资源目录（1452 自检用）。 */
+const REF_DIRS: Array<[RegExp, string]> = [
+  [/^changeBg:/, "background"],
+  [/^changeFigure:/, "figure"],
+  [/^bgm:/, "bgm"],
+  [/^playEffect:/, "vocal"],
+  [/^playVideo:/, "video"],
+];
+
+/** 从一个「指令:参数 -opt ...;」行取出参数（文件名可含空格；引擎用「 -」起选项）。 */
+function directiveArg(line: string): string {
+  const after = line.slice(line.indexOf(":") + 1);
+  let file = after.split(";")[0];
+  const opt = file.indexOf(" -");
+  if (opt >= 0) file = file.slice(0, opt);
+  return file.trim();
+}
+
+/** 提取 WebGAL 脚本中真正加载文件的素材引用（1452 纯函数，便于单测 + 组装末自检）。
+ *  取 changeBg/changeFigure/bgm/playEffect/playVideo 的文件参数与行内 -vocal= 音频；none/注释跳过。
+ *  unlockCg/unlockBgm 只是鉴赏登记、不属播放依赖，故不收集。 */
+export function extractAssetRefs(script: string): Array<{ dir: string; file: string }> {
+  const out: Array<{ dir: string; file: string }> = [];
+  for (const rawLine of (script || "").split("\n")) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith(";")) continue;
+    for (const [re, dir] of REF_DIRS) {
+      if (re.test(line)) {
+        const file = directiveArg(line).replace(/\\/g, "");
+        if (file && file !== "none") out.push({ dir, file });
+        break;
+      }
+    }
+    const v = /(?:^|\s)-vocal=([^\s;]+)/.exec(line);
+    if (v) {
+      const file = v[1].replace(/\\/g, "").trim();
+      if (file && file !== "none") out.push({ dir: "vocal", file });
+    }
+  }
+  return out;
+}
+
+/** 组装末素材自检（1452）：脚本引用的每个文件都应存在于 game/<dir>/，
+ *  缺失通常意味着文件名映射不一致或自备素材放错目录，游戏内会静默丢失（背景/音乐/视频）。 */
+async function auditAssetReferences(
+  outputDir: string,
+  rendered: Map<string, string>,
+  extra: Array<{ dir: string; file: string }>,
+  logFn: (msg: string) => void,
+): Promise<void> {
+  const refs = [...extra];
+  for (const txt of rendered.values()) refs.push(...extractAssetRefs(txt));
+  const seen = new Set<string>();
+  const missing: string[] = [];
+  await Promise.all(refs.map(async ({ dir, file }) => {
+    const key = `game/${dir}/${file}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    const ok = await tauri.pathExists(joinPath(outputDir, key)).catch(() => true);
+    if (!ok) missing.push(key);
+  }));
+  if (missing.length) {
+    const sample = missing.slice(0, 8).join("、");
+    logFn(`自检：脚本引用了 ${missing.length} 个不存在的素材文件（${sample}${missing.length > 8 ? " 等" : ""}）——游戏内会静默缺失，请检查 game/ 目录或文件名是否含非法字符`);
+  }
+}
+
+/** 视频推荐位可识别的文件扩展名（1396）：与 stores/generate.ts 的 importVideo 选择器 / checkVideos
+ *  扫描口径一致（引擎 playVideo 用原生 <video>，支持 mp4/webm/ogg）。三处若不一致会出现
+ *  「面板已启用 / video_plan 未生成 / 游戏内不播」的矛盾。 */
+export const VIDEO_FILE_RE = /^video_(.+)\.(mp4|webm|ogg)$/i;
+
 async function detectVideos(outputDir: string): Promise<Record<string, string>> {
   const videoMap: Record<string, string> = {};
   const videoDir = joinPath(outputDir, "game/video");
@@ -926,7 +1068,7 @@ async function detectVideos(outputDir: string): Promise<Record<string, string>> 
     const entries = await tauri.listDir(videoDir);
     for (const e of entries) {
       if (e.isDir) continue;
-      const match = /^video_(.+)\.mp4$/i.exec(e.name);
+      const match = VIDEO_FILE_RE.exec(e.name);
       if (match) videoMap[match[1]] = e.path;
     }
   } catch {
@@ -1019,8 +1161,8 @@ async function writeVideoPlan(
     "======================",
     "以下位置适合插入视频演出（AI 推荐，是否生成由你决定）：",
     "在即梦 / 可灵 / 海螺 等平台用下方「视频提示词」生成视频，",
-    "将 mp4 命名为 video_<id>.mp4 放入 game/video/ 文件夹，",
-    "重新生成项目（或在预览页刷新）后会自动启用视频演出。",
+    "将视频命名为 video_<id>.mp4（也支持 .webm / .ogg）放入 game/video/ 文件夹，",
+    "重新组装后才会写入演出指令——在结果区点「重新组装生效」，或重新生成项目。",
     "",
   ];
   for (const p of points) {
@@ -1029,7 +1171,7 @@ async function writeVideoPlan(
     lines.push(`  描述：${p.description}`);
     lines.push(`  提示词：${p.videoPrompt}`);
     lines.push(`  建议时长：${p.durationSecs} 秒`);
-    lines.push(`  文件名：video_${sanitizeId(p.id)}.mp4`);
+    lines.push(`  文件名：video_${sanitizeId(p.id)}.mp4（或 .webm / .ogg）`);
     lines.push("");
   }
   await tauri.writeTextFile(joinPath(outputDir, "video_plan.txt"), lines.join("\n"));
@@ -1062,9 +1204,13 @@ export function buildExportGuideText(title: string, outputDir: string): string {
     `本游戏由 NovelForge（AI 视觉小说工坊）生成 · 官网：${brandUrl()}`,
     "",
     "1) 网页版（手机/PC 浏览器即玩，零成本）",
-    "   整个文件夹即完整网页游戏。推荐部署到任意静态托管（GitHub Pages / Vercel / 服务器 / 网盘）后访问，",
+    "   整个文件夹即完整网页游戏，但必须通过 HTTP 打开：本游戏引擎是 ES module，",
+    "   浏览器在 file:// 下会以 CORS 模式拦截、引擎无法启动（双击 index.html 会停在空白开始页）。",
+    "   因此直接双击属于受限玩法（字体、离线缓存与引擎加载都不完整），请改用下面任一方式；",
+    "   推荐部署到任意静态托管（GitHub Pages / Vercel / 服务器 / 网盘）后访问；",
     "   或在游戏目录执行 `python -m http.server 8080` 后打开 http://localhost:8080/index.html。",
-    "   直接双击 index.html（file://）基本可玩，但字体与离线缓存可能受限（详见 game/HOW_TO_PLAY.txt）。",
+    "   Windows 可直接双击随包的 start_game.bat，macOS 双击 start_game.command（自动起本地服务并打开浏览器）。",
+    "   详见 game/HOW_TO_PLAY.txt。",
     "",
     `2) PC 端 exe`,
     `   下载 WebGAL Terre 编辑器：https://www.openwebgal.com/zh-cn/download/`,

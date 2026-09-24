@@ -41,6 +41,36 @@ export interface SpriteVerifyResult extends SpriteVerifyCounts {
   ok: boolean;
 }
 
+/**
+ * 核验容差（#1418）：允许区外像素的比对口径。缺省/严格模式三项均为 0 = 逐像素完全一致。
+ * 生图/编辑路径是整幅扩散重绘 + 抠图，允许区外必然存在噪声，严格口径会系统性误杀。
+ */
+export interface SpriteVerifyTolerance {
+  /** 每像素每通道允许的最大差值（0=严格逐像素）；差值 <= 该值不计失败 */
+  channelTolerance: number;
+  /** 允许的区外不一致像素数上限（0=不允许） */
+  maxOutsideMismatch: number;
+  /** 允许的 alpha 不一致像素数上限（0=不允许，alpha 仍按整幅比对） */
+  maxAlphaMismatch: number;
+}
+
+/** 严格口径（合成等像素冻结产物用）：区外 RGBA 与整幅 alpha 必须逐像素一致 */
+export const STRICT_VERIFY_TOLERANCE: SpriteVerifyTolerance = {
+  channelTolerance: 0,
+  maxOutsideMismatch: 0,
+  maxAlphaMismatch: 0,
+};
+
+/** 扩散口径默认值：每通道 16、区外/alpha 差异各占整图 2%（#1418，仍能抓身体/衣物整体漂移） */
+export const DIFFUSION_CHANNEL_TOLERANCE = 16;
+export const DIFFUSION_DIFF_RATIO = 0.02;
+
+/** 按画布面积换算扩散核验容差（差异像素上限随分辨率缩放） */
+export function diffusionToleranceFor(width: number, height: number): SpriteVerifyTolerance {
+  const cap = Math.ceil(Math.max(0, width * height) * DIFFUSION_DIFF_RATIO);
+  return { channelTolerance: DIFFUSION_CHANNEL_TOLERANCE, maxOutsideMismatch: cap, maxAlphaMismatch: cap };
+}
+
 export function clamp01(v: number): number {
   return v <= 0 ? 0 : v >= 1 ? 1 : v;
 }
@@ -98,9 +128,10 @@ export function defaultCoarseFaceEllipse(width: number, height: number): SpriteE
 /**
  * 三项校验（纯函数，逐像素）：
  * a) 已由调用方保证同尺寸（长度不符即 sizeMismatch，不合格）；
- * b) 允许区外（mask == 0）的 RGBA 与 base 逐像素完全一致；
- * c) 整幅 alpha 通道与 base 完全一致。
+ * b) 允许区外（mask == 0）的 RGBA 与 base 逐像素一致（容差范围内）；
+ * c) 整幅 alpha 通道与 base 一致（容差范围内）。
  * 允许区内（mask > 0）的 RGB 差异是合法的表情变化，不计数。
+ * tolerance 缺省为严格逐像素（合成路径）；生图/编辑路径应传 diffusionToleranceFor(...)（#1418）。
  */
 export function verifySpriteImage(
   base: Uint8Array | Uint8ClampedArray,
@@ -108,6 +139,7 @@ export function verifySpriteImage(
   width: number,
   height: number,
   mask: Float32Array,
+  tolerance: SpriteVerifyTolerance = STRICT_VERIFY_TOLERANCE,
 ): SpriteVerifyResult {
   const fail = (partial: Partial<SpriteVerifyCounts>): SpriteVerifyResult => ({
     width,
@@ -124,6 +156,7 @@ export function verifySpriteImage(
   if (base.length !== width * height * 4 || variant.length !== width * height * 4 || mask.length !== width * height) {
     return fail({});
   }
+  const tol = Math.max(0, tolerance.channelTolerance);
   let alphaMismatch = 0;
   let outsideMismatch = 0;
   let diffPixels = 0;
@@ -133,14 +166,14 @@ export function verifySpriteImage(
   let y1 = -1;
   for (let i = 0; i < width * height; i++) {
     const o = i * 4;
-    const alphaSame = base[o + 3] === variant[o + 3];
+    const alphaSame = Math.abs(base[o + 3] - variant[o + 3]) <= tol;
     if (!alphaSame) alphaMismatch++;
     let bad = !alphaSame;
     if (mask[i] <= 0) {
       const outsideSame = alphaSame
-        && base[o] === variant[o]
-        && base[o + 1] === variant[o + 1]
-        && base[o + 2] === variant[o + 2];
+        && Math.abs(base[o] - variant[o]) <= tol
+        && Math.abs(base[o + 1] - variant[o + 1]) <= tol
+        && Math.abs(base[o + 2] - variant[o + 2]) <= tol;
       if (!outsideSame) outsideMismatch++;
       bad = bad || !outsideSame;
     }
@@ -154,7 +187,7 @@ export function verifySpriteImage(
       if (y > y1) y1 = y;
     }
   }
-  const ok = alphaMismatch === 0 && outsideMismatch === 0;
+  const ok = alphaMismatch <= tolerance.maxAlphaMismatch && outsideMismatch <= tolerance.maxOutsideMismatch;
   return {
     width,
     height,
@@ -257,12 +290,15 @@ export async function loadImageRgba(path: string): Promise<DecodedRgba | null> {
  * 表情差分文件级核验（只读，不改产物）：
  * 返回 null = 跳过（Node 无解码能力/读图失败/缺少 base），调用方不得记失败；
  * 返回非 null = 核验结论（ok=false 时由调用方记 warn + 失败项）。
+ * mode="strict"（默认）：像素冻结产物（脸部合成）用，逐像素完全一致；
+ * mode="diffusion"：生图/编辑路径用，按面积放宽容差（#1418），避免整幅重绘被系统性误杀。
  */
 export async function verifyExpressionFiles(
   basePath: string,
   variantPath: string,
   ellipses?: SpriteEllipse[],
   featherPx: number = SPRITE_MASK_FEATHER_PX_DEFAULT,
+  mode: "strict" | "diffusion" = "strict",
 ): Promise<SpriteVerifyResult | null> {
   const [b, v] = await Promise.all([loadImageRgba(basePath), loadImageRgba(variantPath)]);
   if (!b || !v) return null;
@@ -284,5 +320,6 @@ export async function verifyExpressionFiles(
     ellipses && ellipses.length ? ellipses : [defaultCoarseFaceEllipse(b.width, b.height)],
     featherPx,
   );
-  return verifySpriteImage(b.data, v.data, b.width, b.height, mask);
+  const tolerance = mode === "diffusion" ? diffusionToleranceFor(b.width, b.height) : STRICT_VERIFY_TOLERANCE;
+  return verifySpriteImage(b.data, v.data, b.width, b.height, mask, tolerance);
 }

@@ -63,14 +63,14 @@ function main(): void {
   assert(out1.includes("\\:"), "冒号未转义");
   assert(out1.includes("\\`"), "反引号未转义");
   assert(out1.includes("\\\\"), "反斜杠未转义");
-  assert(nonCommentLines(out1).length === 17, "行数异常（label+清场3+跨章复位4+章节标题卡+changeBg+推近+playEffect+changeFigure+取景+2句+end）");
+  assert(nonCommentLines(out1).length === 16, "行数异常（label+清场3+bgm复位+film复位2+章节标题卡+changeBg+推近+changeFigure+取景+2句+end；#1328 后黄昏/夜晚不再误配 playEffect）");
 
   // 2) 恶意角色名 → 不产生裸分号注入
   const s2 = makeScript();
   const evilChars = cards.characters.map((c) => ({ ...c, name: "林;澈:evil`\n" }));
   const out2 = renderChapter(s2, { title: "t", gameKey: "k", characters: evilChars, items: cards.items, assets, introCard: false }, 1);
   const line2 = nonCommentLines(out2).find((l) => l.includes("evil"))!;
-  assert(line2.startsWith("林\\;澈\\:evil\\` :"), `角色名未正确转义: ${line2}`);
+  assert(line2.startsWith("林\\;澈：evil\\` :"), `角色名未正确转义（#1457：姓名内冒号转全角「：」避免被引擎拆成说话人分隔符）: ${line2}`);
 
   // 3) 恶意 itemId → sanitize 进指令参数
   const s3 = makeScript({
@@ -127,7 +127,7 @@ function main(): void {
   const cgAssets: RenderAssets = { ...assets, cg: { "0_s1": "/x/cg_0_s1.png" } };
   const out6 = renderChapter(s6, { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets: cgAssets, introCard: false }, 1);
   assert(out6.includes("changeBg:cg_0_s1.png"), "CG 未按 章节_sceneId key 播放");
-  assert(out6.includes("unlockCg:cg_0_s1.png"), "CG 未解锁（unlockCg 缺失）");
+  assert(out6.includes("unlockCg:game/background/cg_0_s1.png"), "CG 未解锁（unlockCg 缺失；#1460 需带 game/background/ 目录，否则引擎鉴赏室缩略图 404）");
   const s7 = makeScript({
     scenes: [{
       id: "s1",
@@ -174,8 +174,11 @@ function main(): void {
   ];
   const out9 = renderChapter(s9, { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets, introCard: false }, 1);
   const nar9 = nonCommentLines(out9).filter((l) => l.startsWith(":"));
-  assert(nar9.length === 2, `长旁白应拆成 2 条，实际 ${nar9.length}: ${nar9.join(" | ")}`);
-  assert(nar9[0].includes("渐行渐远的人流。") && nar9[1].includes("站了整整六个时辰。"), "长旁白拆分点错误");
+  // #1458：分页阈值下调到与文本框实际容量对齐（MESSAGE_MAX 32 / TEXTBOX_PAGE 64），
+  // 长句拆成多屏（此处 3 屏）；去掉消息前缀后拼接必须与原文逐字一致（不得静默裁掉）。
+  assert(nar9.length >= 2, `长旁白应拆成多屏，实际 ${nar9.length}: ${nar9.join(" | ")}`);
+  const cleaned9 = nar9.map((l) => l.replace(/^:/, "").replace(/;$/, "")).join("");
+  assert(cleaned9 === "城门前，守夜人林澈握着佩剑，目光如鹰隼般扫视着官道上渐行渐远的人流。他已经在城门口站了整整六个时辰。", `长旁白拆分后内容应逐字完整，实际: ${JSON.stringify(cleaned9)}`);
 
   // 10) 动作标签旁白吸收：形如「X叹了口气：」不独立成行，下句对话保留
   const s10 = makeScript();
@@ -230,7 +233,10 @@ function main(): void {
   });
   const battleAssets: RenderAssets = { ...assets, bgm: { s1: "/x/bgm_battle.mp3" } };
   const outCh1 = renderChapter(ch1, { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets: battleAssets, introCard: false }, 1);
-  assert(outCh1.includes("filmMode:true;"), "紧张场景应开启电影黑边");
+  // #1459：filmMode 经核实不是「电影黑边」而是替换整个对话框（丢名牌/底板、文字 250%），
+  // 改为仅「本场景确有视频播放」时启用；紧张氛围改走 godrayFilm 滤镜。
+  assert(outCh1.includes("filmMode:none;"), "紧张场景不应再开 filmMode（#1459：改用滤镜）");
+  assert(outCh1.includes('setTransform:{"godrayFilm":0.35}'), "紧张场景应开启 godrayFilm 滤镜");
   assert(outCh1.includes("bgm:bgm_battle.mp3"), "战斗场景应播放 BGM");
 
   const ch2 = makeScript({

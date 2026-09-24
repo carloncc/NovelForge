@@ -3,7 +3,7 @@ import { t } from "../i18n";
 import { open } from "@tauri-apps/plugin-dialog";
 import { projectState, pushLog, clearLogs, scheduleSave, restoreProject, flushPendingProjectSave, getStageLastLevels, getLastActiveStage, resetActiveStage } from "../stores/project";
 import { readWorkingCards } from "../utils/persist";
-import { activeConfig, configState, addRecentOutputDir } from "../stores/config";
+import { activeConfig, configState, addRecentOutputDir, VOICE_LIBRARY_EMPTY_MESSAGE } from "../stores/config";
 import { upsertProject } from "../stores/projects";
 import { Pipeline, novelFingerprint, joinAppendText, dedupeSceneIdsAcrossChapters } from "../core/pipeline";
 import type { SplitMethod } from "../core/pipeline";
@@ -164,6 +164,47 @@ export function canTransferAssetToRun(state: { busy: boolean; assetBusy: string;
 /** 纯函数：续点令牌是否过期 */
 export function isStaleRunId(runId: number, activeId: number): boolean {
   return runId !== activeId;
+}
+/** 纯函数：单章全链是否需要确认（#1398：全量或填意见都要确认，批量聚合入口跳过） */
+export function shouldConfirmChapterFullRegen(forceAll: boolean, hasFeedback: boolean, skipConfirm?: boolean): boolean {
+  return (forceAll || hasFeedback) && !skipConfirm;
+}
+/** 纯函数：单章全链确认文案（#1398：明示单章全链范围与是否含配音） */
+export function buildChapterFullRegenConfirmMessage(
+  novelIdx: number,
+  title: string,
+  opts: { forceAll: boolean; canFillImages: boolean; includeVoice: boolean },
+): string {
+  const voiceNote = opts.includeVoice ? "含配音" : "不含配音";
+  if (opts.forceAll) {
+    return `第 ${novelIdx + 1} 章「${title}」将全量重跑（剧本重写${opts.canFillImages ? "＋该章背景/CG 重画" : ""}，scene 变化后该章配音需重配）。继续吗？`;
+  }
+  return `第 ${novelIdx + 1} 章「${title}」将按意见重写剧本（单章全链：剧本重写${opts.canFillImages ? "＋该章背景/CG 可能重画" : ""}，${voiceNote}）。继续吗？`;
+}
+/** 纯函数：选中章中实际可执行的启用章（#1421：停用章不参与生成） */
+export function enabledSelectedIndexes(selected: number[], enabledIndexes: Set<number> | number[]): number[] {
+  const set = Array.isArray(enabledIndexes) ? new Set(enabledIndexes) : enabledIndexes;
+  return selected.filter((i) => set.has(i));
+}
+/** 纯函数：单阶段剧本意见铺设范围（#1424：只铺选中章节，不铺全书） */
+export function buildScriptStageFeedbackMap(
+  fb: string,
+  chapters: { index: number }[],
+  scope: number[] | null | undefined,
+): Record<number, string> {
+  const map: Record<number, string> = {};
+  if (!fb) return map;
+  if (Array.isArray(scope)) {
+    const set = new Set(scope);
+    for (const c of chapters) if (set.has(c.index)) map[c.index] = fb;
+    return map;
+  }
+  for (const c of chapters) map[c.index] = fb;
+  return map;
+}
+/** 纯函数：级联补齐守门续跑的章节范围（#1426：与确认规模同口径为全书 null，不按当前勾选收窄） */
+export function resolveCascadeResumeRerunChapters(): null {
+  return null;
 }
 /** 同步抢占运行锁：成功即置 busy 并返回令牌，失败返回 null（必须在任何 await 之前调用） */
 function claimRun(fromQueue = false): number | null {
@@ -718,11 +759,16 @@ async function runSelectedChapters(): Promise<void> {
   const novel = projectState.novel;
   const enabledSet = new Set((novel?.chapters ?? []).filter((c) => c.enabled !== false).map((c) => c.index));
   const dropped = selectedChapters.value.filter((i) => !enabledSet.has(i));
-  const targets = selectedChapters.value.filter((i) => enabledSet.has(i));
+  // #1421：复用纯函数口径过滤启用章
+  const targets = enabledSelectedIndexes(selectedChapters.value, enabledSet);
   if (dropped.length) {
     pushLog({ step: "单章", message: `已跳过 ${dropped.length} 个停用章节（${dropped.map((i) => `第${i + 1}章`).join("、")}），只生成启用的 ${targets.length} 章`, level: "warn", at: Date.now() });
   }
-  if (!targets.length) return;
+  // #1421：全为停用章时给页面级反馈，不再只写日志静默返回
+  if (!targets.length) {
+    error.value = t("选中的均为停用章，未执行：请先启用章节后再生成");
+    return;
+  }
   await runChapterBatch(targets);
 }
 
@@ -2291,8 +2337,9 @@ function runStageRegen(stage: StageKey): void {
       return true;
     }
     // 图像要过视觉守门：交给守门页，批准后由 resumeAfterVisualApproval 续跑这批阶段
+    // #1426：与确认规模（全书缺失数）同口径传 null，不按当前勾选收窄（否则确认 N 张实际少跑）
     if (plan.stages.includes("image") && visualBibleNeedsReview(projectState.visualBible)) {
-      setPendingResume(plan.stages, { rerunChapters: rerunChapters.value });
+      setPendingResume(plan.stages, { rerunChapters: resolveCascadeResumeRerunChapters() });
       tab.value = "settings";
       pushLog({
         step: "视觉守门",
@@ -2324,7 +2371,14 @@ function runStageRegen(stage: StageKey): void {
       if (await cascadeDownstream(stage)) return;
       staleHint?.();
     } catch (e) {
-      pushLog({ step: "级联", message: `下游自动补齐失败：${errMsg(e)}`, level: "error", at: Date.now() });
+      // #1427：音色库为空是配置问题不是补齐失败，不吞下游过期提示
+      const msg = errMsg(e);
+      if (msg.includes("音色库为空") || msg.includes(VOICE_LIBRARY_EMPTY_MESSAGE.slice(0, 8))) {
+        pushLog({ step: "级联", message: `下游自动补齐未执行（${VOICE_LIBRARY_EMPTY_MESSAGE}）`, level: "warn", at: Date.now() });
+        staleHint?.();
+        return;
+      }
+      pushLog({ step: "级联", message: `下游自动补齐失败：${msg}`, level: "error", at: Date.now() });
     }
   };
 
@@ -2351,12 +2405,12 @@ function runStageRegen(stage: StageKey): void {
     case "translate": {
       // 全量（意见/开关）→ 全量重翻；否则「继续」：只补未缓存/失败的章节，已翻译的复用缓存
       // 严格单阶段：不联动提取/剧本/图像，下游过期需手动重跑
+      // #1424：不传 rerunChapters 以继承整书面板勾选（此前传 null 强制全书，与确认文案不符）
       const force = full ? (["translate"] as StageKey[]) : undefined;
       void execute({
         stages: ["translate"],
         feedback: feedback as StageFeedback | undefined,
         forceStages: force,
-        rerunChapters: null,
       }).then((ok) => {
         if (ok) { clearFb(); stageForce.value[stage] = false; }
         void afterStage(ok, "translate", () => {
@@ -2387,9 +2441,9 @@ function runStageRegen(stage: StageKey): void {
       // 跑完自动补齐下游缺失的图/配音并重新组装（复用缓存、只补缺失，见 cascadeDownstream）
       const stages: StageKey[] = ["script"];
       if (full) {
-        const fbMap: Record<number, string> = {};
-        if (fb) for (const c of projectState.novel?.chapters ?? []) fbMap[c.index] = fb;
-        void execute({ stages, feedback: fb ? { script: fbMap } : undefined, forceStages: ["script"], rerunChapters: null }).then((ok) => {
+        // #1424：意见只铺选中章节，执行继承整书面板勾选（不传 rerunChapters，此前传 null 强制全书计费）
+        const fbMap = buildScriptStageFeedbackMap(fb, projectState.novel?.chapters ?? [], rerunChapters.value ?? undefined);
+        void execute({ stages, feedback: fb ? { script: fbMap } : undefined, forceStages: ["script"] }).then((ok) => {
           if (ok) { clearFb(); stageForce.value[stage] = false; }
           void loadScripts();
           void afterStage(ok, "script", () => hintDownstreamStale("剧本", "图像 / 配音"));
@@ -2402,8 +2456,9 @@ function runStageRegen(stage: StageKey): void {
           void afterStage(ok, "script", () => hintDownstreamStale("剧本", "图像 / 配音"));
         });
       } else {
-        // 「继续」：全部章节复用缓存，缺缓存的补生成，不整批重写（避免白烧 LLM 费用）
-        void execute({ stages, rerunChapters: null }).then((ok) => {
+        // 「继续」：继承整书面板勾选复用缓存，缺缓存的补生成，不整批重写（避免白烧 LLM 费用）
+        // #1424：不传 rerunChapters（此前传 null 强制全书，与前置日志的勾选范围矛盾）
+        void execute({ stages }).then((ok) => {
           if (ok) { clearFb(); stageForce.value[stage] = false; }
           void loadScripts();
           void afterStage(ok, "script", () => hintDownstreamStale("剧本", "图像 / 配音"));
@@ -2498,9 +2553,16 @@ async function runChapterFullRegen(novelIdx: number, opts?: { fromQueueBatch?: b
   const voiceNote = chapterIncludeVoice.value ? "含配音" : "不含配音";
   const fb = scriptChapterFeedback.value[novelIdx]?.trim() ?? "";
   const forceAll = !!chapterForce.value[novelIdx];
-  // 全量单章先确认（影响：整章剧本重写＋该章背景/CG 重画）。
+  // 单章全链先确认（#1398：填意见即计费重写剧本、可连带重画图像，须明示范围与是否含配音）。
   // #1334：批量入口传 skipConfirm（工作台已做一次聚合确认），避免 N 章弹 N 次、取消也停不下来
-  if (forceAll && !opts?.skipConfirm && !window.confirm(`第 ${novelIdx + 1} 章「${ch.title}」将全量重跑（剧本重写${canFillImages ? "＋该章背景/CG 重画" : ""}，scene 变化后该章配音需重配）。继续吗？`)) return false;
+  if (shouldConfirmChapterFullRegen(forceAll, !!fb, opts?.skipConfirm)) {
+    const msg = buildChapterFullRegenConfirmMessage(novelIdx, ch.title, {
+      forceAll,
+      canFillImages,
+      includeVoice: chapterIncludeVoice.value,
+    });
+    if (!window.confirm(msg)) return false;
+  }
   chapterForce.value[novelIdx] = false;
   pushLog({
     step: "单章",
@@ -4397,6 +4459,24 @@ function onCardsSaved(cards: unknown): void {
   // 否则卡片页改了角色，看板与章节盘仍按旧卡片显示完成/缺失。
   void stageStatus.refresh();
   void chapterStatus.refresh();
+  // #1406：EditCards「保存卡片」改的 imagePrompt/threeViewPrompt 计入视觉守门指纹，
+  // 但此路径原先只刷看板 → 同挂载期内不重算指纹，批准必撞 stale。保存后同步指纹。
+  void syncFingerprintAfterCardsSaved();
+}
+
+/** #1406：卡片保存后把视觉守门指纹对齐到当前输入（无守门/无小说时跳过；失败不阻断保存）。 */
+async function syncFingerprintAfterCardsSaved(): Promise<void> {
+  const out = projectState.outputDir;
+  const bible = projectState.visualBible;
+  const novel = projectState.novel;
+  const cards = projectState.lastResult?.cards;
+  if (!out || !bible || !novel || !cards) return;
+  try {
+    const fp = await computeProjectVisualBibleFingerprint(out, bible, novel, cards.characters);
+    await refreshVisualBibleFingerprint(out, bible, fp, cards.characters);
+  } catch {
+    /* 指纹同步失败不阻断卡片保存；点批准时仍会报具体原因 */
+  }
 }
 
 function fileExistsLabel(file: string | undefined): string {

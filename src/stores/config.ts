@@ -1,7 +1,13 @@
 import { reactive, ref, watch } from "vue";
 import type { ApiConfig, ApiPreset, ChannelKey, VoiceProfile } from "../core/types";
 import { t } from "../i18n";
-import { tauri } from "../utils/tauri";
+import { isTauri, tauri } from "../utils/tauri";
+import {
+  initWebSecrets,
+  readWebSecrets,
+  webKeysPersistError,
+  writeWebSecretsAsync,
+} from "../utils/webKeys";
 import { getTemplate } from "../api/templates";
 import {
   CONFIG_SCHEMA_VERSION,
@@ -96,7 +102,9 @@ export function isVoiceLibraryEmpty(cfg: ApiConfig | undefined): boolean {
 /** 取出可用音色库：为空时抛可读错误（#1139），调用方据此阻止配音阶段 */
 export function requireVoiceLibrary(cfg: ApiConfig | undefined): string[] {
   const lib = voiceLibraryFor(cfg);
-  if (!lib.length) throw new Error(VOICE_LIBRARY_EMPTY_MESSAGE);
+  // #1420：VOICE_LIBRARY_EMPTY_MESSAGE 本身即 i18n key（文案即 key），此处经 t() 抛出——
+  // 中文界面行为不变，外语界面待 en/ja/ko/zh-TW 词典补齐该 key 后自动显示译文（词典由专人补，不在此改）。
+  if (!lib.length) throw new Error(t(VOICE_LIBRARY_EMPTY_MESSAGE));
   return lib;
 }
 
@@ -160,23 +168,80 @@ let pendingMigrationSecrets: Record<string, string> = {};
 let migrationRetryTimer: number | undefined;
 let secretStoreUnavailable = false;
 export const configPersistenceError = ref("");
+/* #1296：旧明文迁移警告（供另一路的 ConfigPage 复选框横幅消费；本文件只做存储核心+迁移） */
+export const webSecretsMigrationWarning = ref("");
+
+/* ==================== #1296 Web 密钥读写接线（仅接线：桌面端原样走 OS keyring） ==================== */
+
+/** Web 密钥模式：浏览器环境且非 Tauri（Node 单测走桌面分支，原行为不变） */
+function useWebKeyStore(): boolean {
+  return typeof window !== "undefined" && !isTauri();
+}
+
+/** 稳态写（全量合并语义：空串删键；opt-in 时加密落盘并透出失败横幅） */
+async function writeSecretsEntry(secrets: Record<string, string>): Promise<void> {
+  if (useWebKeyStore()) {
+    await writeWebSecretsAsync(secrets);
+    const err = webKeysPersistError();
+    if (err) configPersistenceError.value = err;
+    return;
+  }
+  return tauri.writeApiSecrets(secrets);
+}
+
+async function readSecretsEntry(ids: string[]): Promise<Record<string, string>> {
+  if (useWebKeyStore()) return readWebSecrets(ids);
+  return tauri.readApiSecrets(ids);
+}
+
+/** 初始加载期写（只加不删：迁移回写全是空值时不得冲掉刚迁入内存的旧明文密钥） */
+async function writeSecretsLoadPhase(secrets: Record<string, string>): Promise<void> {
+  if (useWebKeyStore()) {
+    const nonEmpty = Object.fromEntries(Object.entries(secrets).filter(([, v]) => !!v));
+    if (Object.keys(nonEmpty).length) await writeWebSecretsAsync(nonEmpty);
+    return;
+  }
+  return tauri.writeApiSecrets(secrets);
+}
+
 export const configReady = loadPersisted();
 
 async function loadPersisted() {
+  // #1296：Web 先迁旧明文进内存（后出现的 readSecretsEntry 才能读到迁入值）
+  let webInitWarnings: string[] = [];
+  if (useWebKeyStore()) {
+    try {
+      const init = await initWebSecrets();
+      webInitWarnings = init.warnings;
+    } catch {
+      /* 迁移失败不挡配置加载 */
+    }
+  }
   try {
     const raw = await tauri.readConfig();
-    if (!raw || raw === "{}") return;
+    if (!raw || raw === "{}") {
+      if (webInitWarnings.length) {
+        for (const w of webInitWarnings) log.warn("config", w, {});
+        webSecretsMigrationWarning.value = webInitWarnings.join("\n");
+      }
+      return;
+    }
     const loaded = await loadConfigFile(raw, {
       createId: makeId,
       createVisionDefault: () => defaultApiConfig("vision"),
       writeConfig: (content) => tauri.writeConfig(content),
-      readSecrets: (ids) => tauri.readApiSecrets(ids),
-      writeSecrets: (secrets) => tauri.writeApiSecrets(secrets),
+      readSecrets: (ids) => readSecretsEntry(ids),
+      writeSecrets: (secrets) => writeSecretsLoadPhase(secrets),
     });
     const parsed = loaded.config;
     // #1308：迁移丢弃/改名不再静默——打日志并在横幅透出（UI 文案均为 t() key）
     if (loaded.migrationWarnings?.length) {
       for (const w of loaded.migrationWarnings) log.warn("config", w, {});
+    }
+    // #1296：旧明文迁移警告同样打日志并透给另一路横幅
+    if (webInitWarnings.length) {
+      for (const w of webInitWarnings) log.warn("config", w, {});
+      webSecretsMigrationWarning.value = webInitWarnings.join("\n");
     }
     if (loaded.migrationPending) {
       configPersistenceBlocked = true;
@@ -237,7 +302,7 @@ function persistedConfigContent(): string {
  */
 async function writeConfigAndSecrets(content: string, secrets: Record<string, string>, secretsSig: string): Promise<boolean> {
   try {
-    await tauri.writeApiSecrets(secrets);
+    await writeSecretsEntry(secrets);
     await tauri.writeConfig(content);
   } catch (error) {
     configPersistenceError.value = t("配置自动保存失败：{error}", { error: error instanceof Error ? error.message : String(error) });
@@ -279,7 +344,7 @@ async function retryMigrationPersistence(): Promise<void> {
   const currentContent = persistedConfigContent();
   if (currentContent === lastPersistedContent) return;
   try {
-    await tauri.writeApiSecrets(configSecrets(configState));
+    await writeSecretsEntry(configSecrets(configState));
     await tauri.writeConfig(currentContent);
     lastPersistedContent = currentContent;
   } catch (error) {
@@ -363,7 +428,7 @@ export async function removeConfig(kind: ChannelKey, id: string): Promise<boolea
   if (idx < 0) return false;
   // #1315：先 await 删密钥，失败则不改 UI（此前先 splice 再 void 删，失败时 UI 已删但密钥仍在）
   try {
-    await tauri.writeApiSecrets({ [id]: "" });
+    await writeSecretsEntry({ [id]: "" });
   } catch (error) {
     configPersistenceError.value = t("删除系统凭据失败：{error}", { error: error instanceof Error ? error.message : String(error) });
     return false;
@@ -390,7 +455,7 @@ export async function removePreset(id: string): Promise<boolean> {
   );
   // #1315：同 removeConfig，先落密钥删除再改 UI
   try {
-    await tauri.writeApiSecrets(removedSecrets);
+    await writeSecretsEntry(removedSecrets);
   } catch (error) {
     configPersistenceError.value = t("删除系统凭据失败：{error}", { error: error instanceof Error ? error.message : String(error) });
     return false;
