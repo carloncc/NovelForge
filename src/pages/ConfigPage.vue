@@ -23,7 +23,7 @@ import { currentLang, t } from "../i18n";
 import PageHead from "../components/PageHead.vue";
 import { knownImageModelCapabilities, isImageCapabilityConflict } from "../api/providers";
 import { checkCustomTemplate } from "../api/templates";
-import { resolveContextLength, inputCharBudget, sanitizeContextLengthInput } from "../api/providers";
+import { resolveContextLength, inputCharBudget, sanitizeContextLengthInput, resolveMaxOutputTokens } from "../api/providers";
 import { DEFAULT_CONCURRENCY_BY_CHANNEL, type CutoutMode } from "../stores/configMigration";
 import type { ApiConfig, ChannelKey, ImageModelCapabilities } from "../core/types";
 import type { DiscoveredModel } from "../api/providers";
@@ -649,6 +649,16 @@ watch(
             <div v-if="ch.key === 'llm'" class="cfg-row mt-2">
               <label class="check"><input type="checkbox" :checked="allowLanOf(cfg)" @change="(e: any) => setAllowLan(cfg, (e.target as HTMLInputElement).checked)" /> {{ t("允许局域网目标（默认关，有 SSRF 风险）") }}</label>
             </div>
+            <div v-if="ch.key === 'llm'" class="cfg-row">
+              <label class="check">
+                <input
+                  type="checkbox"
+                  :checked="cfg.extra!.disableThinking === true"
+                  @change="(e: any) => { cfg.extra!.disableThinking = (e.target as HTMLInputElement).checked || undefined; }"
+                />
+                {{ t("关闭深度思考（thinking.type=disabled）") }}
+              </label>
+            </div>
             <div v-if="ch.key === 'llm' || ch.key === 'vision'" class="cfg-row">
               <label class="field grow-2">
                 <span>{{ t("上下文长度 token（留空 = 自动探测，探测失败时回退 128000）") }}</span>
@@ -675,6 +685,37 @@ watch(
                   <span class="cfg-context-budget">{{ t("输入预算") }}：{{ fmtNumber(inputCharBudget(cfg)) }} {{ t("字符") }}</span>
                 </div>
                 <span class="hint">{{ t("留空时自动探测（/models），探测不到回退 128000；手动填写优先") }}</span>
+              </label>
+            </div>
+            <div v-if="ch.key === 'llm' || ch.key === 'vision'" class="cfg-row">
+              <label class="field grow-2">
+                <span>{{ t("最大输出 token（留空 = 32768）") }}</span>
+                <input
+                  type="number"
+                  min="512"
+                  step="1024"
+                  :value="(cfg.extra!.maxOutputTokens as number | undefined) ?? ''"
+                  :placeholder="t('例如 128000')"
+                  @change="
+                    (e: any) => {
+                      const el = (e.target as HTMLInputElement);
+                      if (el.value.trim() === '') {
+                        cfg.extra!.maxOutputTokens = undefined;
+                        return;
+                      }
+                      const next = Math.max(512, Math.min(131072, Number(el.value) || 32768));
+                      cfg.extra!.maxOutputTokens = next;
+                      el.value = String(next);
+                    }
+                  "
+                />
+              </label>
+              <label class="field">
+                <span>{{ t("当前解析值") }}</span>
+                <div class="cfg-context-resolved">
+                  <code>{{ fmtNumber(resolveMaxOutputTokens(cfg)) }}</code>
+                </div>
+                <span class="hint">{{ t("思考与回答共享该预算；留空按「已核实模型目录 → 默认 32768」解析，未知模型被厂商拒绝后会自动学习上限") }}</span>
               </label>
             </div>
           </details>

@@ -105,3 +105,91 @@ export function scriptCacheFileName(
 ): string {
   return `${cacheDir}/${demo ? "script_demo" : "script"}_ch${chapterIndex + 1}_${scriptCacheRest(title, text, styleFrag)}.json`;
 }
+
+/**
+ * 段缓存 rest（P1 分段落盘/断点续跑）：整章 rest 口径 + 意见指纹。
+ * 带意见重写必须换键——否则会复用上一版提示词跑出的旧段（与整章缓存「有意见时跳过缓存」的口径对齐）。
+ */
+export function scriptPartRest(title: string, text: string, styleFrag: string, feedback?: string): string {
+  const fb = (feedback ?? "").trim();
+  return scriptCacheRest(title, text, `${styleFrag}${fb ? `_fb${titleHash(fb)}` : ""}`);
+}
+
+/** 段缓存文件名：沿用整章缓存的目录与命名习惯，插入 part<K>of<T> 段标记 */
+export function scriptPartFileName(
+  cacheDir: string,
+  demo: boolean,
+  chapterIndex: number,
+  title: string,
+  text: string,
+  styleFrag: string,
+  feedback: string | undefined,
+  part: number,
+  total: number,
+): string {
+  return `${cacheDir}/${demo ? "script_demo" : "script"}_ch${chapterIndex + 1}_part${part}of${total}_${scriptPartRest(title, text, styleFrag, feedback)}.json`;
+}
+
+/** 是否为段缓存文件（整章缓存扫描必须排除它：它的 rest 带 part 前缀，按整章口径必判 stale，会误删断点） */
+export function isScriptPartFileName(name: string): boolean {
+  return /^script(_demo)?_ch\d+_part\d+of\d+_.+\.json$/.test(name || "");
+}
+
+/** 解析段缓存文件名（纯函数，供单测与断点扫描）：失败返回 null */
+export function parseScriptPartFileName(name: string): {
+  demo: boolean;
+  chapterPos: number;
+  part: number;
+  total: number;
+  rest: string;
+} | null {
+  const m = /^script(_demo)?_ch(\d+)_part(\d+)of(\d+)_(.+)\.json$/.exec(name || "");
+  if (!m) return null;
+  return {
+    demo: !!m[1],
+    chapterPos: parseInt(m[2], 10) - 1,
+    part: parseInt(m[3], 10),
+    total: parseInt(m[4], 10),
+    rest: m[5],
+  };
+}
+
+export interface ScriptPartScanResult {
+  /** 段号(1-based) → 文件路径：rest 与总数都匹配、可直接复用 */
+  hits: Map<number, string>;
+  /** 同章同模式但 rest/总数失配的旧段文件路径：调用方删除（只删本章的段文件） */
+  stale: string[];
+}
+
+/**
+ * 段缓存扫描（纯函数，供单测）：按章序号+模式隔离，按 rest+总数判定命中/过期。
+ * 非段文件、别章文件直接忽略（不断言、不删除）。
+ */
+export function scanScriptPartCache(
+  entries: { name: string; path: string }[],
+  chapterIndex: number,
+  demo: boolean,
+  expectedRest: string,
+  expectedTotal: number,
+): ScriptPartScanResult {
+  const hits = new Map<number, string>();
+  const stale: string[] = [];
+  for (const e of entries) {
+    const p = parseScriptPartFileName(e.name);
+    if (!p) continue;
+    if (p.chapterPos !== chapterIndex || p.demo !== demo) continue;
+    if (
+      p.rest === expectedRest
+      && p.total === expectedTotal
+      && Number.isInteger(p.part)
+      && p.part >= 1
+      && p.part <= expectedTotal
+      && !hits.has(p.part)
+    ) {
+      hits.set(p.part, e.path);
+    } else {
+      stale.push(e.path);
+    }
+  }
+  return { hits, stale };
+}

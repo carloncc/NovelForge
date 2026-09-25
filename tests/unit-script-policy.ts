@@ -57,14 +57,22 @@ assert(parts.length > 1, `小上下文 + 长章节应分块，实际 ${parts.len
 assert(parts.join("") === longChapter.text, "剧本分块必须无损覆盖原文");
 assert(parts.every((p) => p.length <= 4000), `每块体量应显著小于整章（实际最大 ${Math.max(...parts.map((p) => p.length))}）`);
 
-// 大上下文模型：约 3 万字长章**仍要按单次输出预算切块**——思考型模型会先思考数万 token
-// （实测 mimo-v2.6-flash：3 万字章节思考 3.8 万 token 后 JSON 被截断，续写只补 274 字就 stop，
-// 拼接解析失败），必须让每块的正文量与「一次能给多少 JSON」匹配，才能在一次响应里产出完整 JSON。
+// 大上下文模型：约 3 万字长章**也必须切成小段逐段生成**（像 agent 分段读取那样）。
+// 整章一次喂进去，思考型模型会失控：实测 MiMo 单次思考数万 token、一次 6~57 分钟不产出正文，
+// 而且整章 JSON 一次写不完必被截断（续写补残 JSON 不可靠）。切小段后每块输入小、JSON 小且能一次写完。
 const longZh = { index: 0, title: "第1部分", text: "林澈拔剑。".repeat(6000), charCount: 0 } as never; // 约 3 万字
 const bigParts = planScriptChunks(bigCtx, longZh, "sys", [], emptyCards);
-assert(bigParts.length > 1, `大上下文下 3 万字长章也必须按输出预算切块，实际 ${bigParts.length}`);
+assert(bigParts.length >= 4, `大上下文下 3 万字长章也必须切成小段（每段 ≤8000 字），实际 ${bigParts.length} 段`);
 assert(bigParts.join("") === longZh.text, "剧本分块必须无损覆盖原文");
-const maxPart = Math.max(...bigParts.map((p) => p.length));
-assert(maxPart <= 20000, `每块体量应与「一次能给的 JSON」匹配（实际最大 ${maxPart}）`);
+assert(
+  bigParts.every((p) => p.length <= 8000),
+  `每段不应超过单次生成上限 8000 字（实际最大 ${Math.max(...bigParts.map((p) => p.length))}）`,
+);
+
+// 但输入侧仍要切：超过上下文能容纳的正文量时必须分块
+const hugeZh = { index: 0, title: "超长章", text: "林澈拔剑。".repeat(40000), charCount: 0 } as never; // 约 20 万字
+const hugeParts = planScriptChunks(bigCtx, hugeZh, "sys", [], emptyCards);
+assert(hugeParts.length > 1, `超过输入上下文的超长章仍必须分块，实际 ${hugeParts.length}`);
+assert(hugeParts.join("") === hugeZh.text, "超长章分块必须无损覆盖原文");
 
 console.log("=== 保真策略与单章预算测试通过 ===");

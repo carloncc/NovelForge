@@ -2,7 +2,7 @@
  * SSE 增量解析（剧本路径「已生成 N 字」进度）：正常多 chunk、跨 chunk 半行、keep-alive 注释、
  * [DONE]、usage 块、非 SSE 回退、reasoning_content 计数。
  */
-import { initialSseState, parseSseChunks, type SseStreamState } from "../src/api/openaiCompatible";
+import { initialSseState, parseSseChunks, reasoningFallbackContent, type SseStreamState } from "../src/api/openaiCompatible";
 
 function assert(cond: boolean, msg: string): void {
   if (!cond) throw new Error(msg);
@@ -112,6 +112,19 @@ function feed(state: SseStreamState, chunks: string[]): SseStreamState {
   const after = parseSseChunks(before, 'data: {"choices":[{"delta":{"content":"z"}}]}\n\n');
   assert(before.content === "" && before.sawData === false, "不得就地修改入参状态");
   assert(after.content === "z" && after.sawData, "应返回新状态");
+}
+
+/* ---------- 思考回退：json 模式只接受真抠出 JSON，绝不整段思考当正文 ---------- */
+{
+  // 实测事故形态：MiMo 深度思考 6 分钟只出思考（"Let me analyze this chapter..."）、正文为空。
+  // 旧行为会把整段思考当 content 回填 → 报「JSON 解析失败」→ 再花 6 分钟「修复」。
+  const thinkingOnly = "Let me analyze this chapter carefully. It's a long chapter with multiple sections. ".repeat(500);
+  assert(reasoningFallbackContent(thinkingOnly, true) === "", "思考里没有 JSON 时必须返回空串（不得把思考当正文）");
+  // 思考末尾带完整 JSON：应只取 JSON 部分
+  const mixed = `${thinkingOnly}\n{"chapter":"第一章","scenes":[]}`;
+  assert(reasoningFallbackContent(mixed, true).startsWith('{"chapter"'), "思考末尾的 JSON 应被抠出");
+  // 非 json 模式维持旧行为
+  assert(reasoningFallbackContent(thinkingOnly, false) === thinkingOnly, "非 json 模式仍整段回退");
 }
 
 console.log("SSE 流式解析测试通过");

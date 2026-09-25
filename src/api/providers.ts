@@ -268,6 +268,8 @@ export interface DiscoveredModel {
   capabilities: ModelCapability[];
   /** 模型上下文窗口大小（token 数），由 /models 探测到的字段 */
   contextLength?: number;
+  /** 模型最大输出 token 数，由 /models 探测到的字段（如 max_output_tokens） */
+  maxOutputTokens?: number;
 }
 
 /**
@@ -311,9 +313,50 @@ function extractContextLength(record: Record<string, unknown>): number | undefin
   return undefined;
 }
 
+/** 从 /models 单项里尽量抽出「最大输出 token」；找不到返回 undefined（不猜、只认探测字段） */
+function extractMaxOutputTokens(record: Record<string, unknown>): number | undefined {
+  const candidates = [
+    record.max_output_tokens,
+    record.max_completion_tokens,
+    (record.limits as Record<string, unknown> | undefined)?.max_output_tokens,
+    (record.top_provider as Record<string, unknown> | undefined)?.max_completion_tokens,
+  ];
+  for (const raw of candidates) {
+    const n = typeof raw === "string" ? Number(raw) : (raw as number | undefined);
+    if (typeof n === "number" && Number.isFinite(n) && n > 0) return n;
+  }
+  return undefined;
+}
+
+/**
+ * 已核实的内置模型目录（未核实的型号一律不写，宁可回落默认值 + 运行期自动学习）。
+ * 背景：很多网关的 /models 只返回 `{id, object, created, owned_by}`（如 OpenCode Go），
+ * 拿不到上下文/最大输出字段；按模型 id 模式匹配给「已核实的型号」自动带上正确参数，
+ * 用户换任意模型都不必手改配置。
+ * 匹配前先归一化（取 `/` 最后一段、小写、去 `:tag`/`@snapshot`），所以带前缀的 id
+ * （`opencode/mimo-v2.6-flash`、`opencode-go/mimo-v2.6-flash`）也能命中。
+ *
+ * 每条 note 记录官方文档来源与核实日期。请勿凭猜测新增条目（上一轮猜数字出过问题）。
+ */
+const MODEL_SPECS: { match: RegExp; contextLength: number; maxOutputTokens?: number; note: string }[] = [
+  // 小米 MiMo 官方文档 2026-09-22：v2.5 / v2.6（含 pro / flash / ultraspeed）上下文 1M、最大输出 128K
+  { match: /^mimo-v2\.[56](-|$)/i, contextLength: 1_024_000, maxOutputTokens: 128_000, note: "小米 MiMo 官方文档 2026-09-22" },
+];
+
+/**
+ * 按模型 id 查内置规格（纯函数，供 resolveContextLength / resolveMaxOutputTokens 与单测共用）。
+ * 未命中返回 undefined，由调用方回落 /models 探测值或默认值。
+ */
+export function modelSpecFor(model?: string): { contextLength: number; maxOutputTokens?: number } | undefined {
+  const normalized = normalizeModelId(model);
+  if (!normalized) return undefined;
+  const hit = MODEL_SPECS.find((spec) => spec.match.test(normalized));
+  return hit ? { contextLength: hit.contextLength, maxOutputTokens: hit.maxOutputTokens } : undefined;
+}
+
 /**
  * 解析一个 API 配置的最终上下文 token 数。
- * 优先级：手动覆盖 (cfg.extra.contextLength) > /models 探测 > 默认 128K
+ * 优先级：手动覆盖 (cfg.extra.contextLength) > /models 探测 > 内置模型目录 > 默认 128K
  * #1149：/models 探测结果与配置里的模型名都要归一化后比较（网关加前缀/后缀/`:free` 时
  * 仍能命中，否则会静默回退 128K 导致长章超限报错）。
  */
@@ -335,12 +378,68 @@ export function resolveContextLength(cfg: { model?: string; extra?: Record<strin
       // 前缀命中：探测列表里是完整 id（`Qwen/Qwen3-235B-A22B-Instruct`），配置里填的是族名
       ?? usable.find((m) => normalizeModelId(m.id).startsWith(normalized) || normalized.startsWith(normalizeModelId(m.id)));
     if (hit?.contextLength) return hit.contextLength;
+    // 内置目录（已核实型号）：/models 不返回规格时也能自动带上正确上下文
+    const spec = modelSpecFor(cfg.model);
+    if (spec) return spec.contextLength;
   }
   // 回退默认值也记一条 warn：便于定位「为什么长章被截断/超上下文」
   if (discovered.length) {
     console.warn(`[providers] 未能从 /models 探测结果匹配模型「${cfg.model ?? ""}」的上下文长度，回退默认 ${DEFAULT_CONTEXT_LENGTH} token`);
   }
   return DEFAULT_CONTEXT_LENGTH;
+}
+
+/**
+ * 默认最大输出 token（32768）：与旧版 SCRIPT_PART_OUTPUT_TOKENS 一致，
+ * 缺失/非法 extra.maxOutputTokens 时回退此值（行为不变）。
+ */
+export const DEFAULT_MAX_OUTPUT_TOKENS = 32_768;
+
+/** 最大输出 token 合法区间下限（512，多数模型可接受的最小输出） */
+export const MIN_MAX_OUTPUT_TOKENS = 512;
+
+/**
+ * 最大输出 token 合法区间上限（131072 = 128K）。
+ * 注意：这是 UI/配置侧的安全上限，实际能不能给到由模型决定；
+ * 服务端 400 会由 openaiCompatible 追加「调小最大输出 token」的提示。
+ */
+export const MAX_MAX_OUTPUT_TOKENS = 131_072;
+
+/** 把任意最大输出 token 值 clamp 到 [MIN_MAX_OUTPUT_TOKENS, MAX_MAX_OUTPUT_TOKENS]（向下取整） */
+function clampMaxOutputTokens(n: number): number {
+  return Math.max(MIN_MAX_OUTPUT_TOKENS, Math.min(MAX_MAX_OUTPUT_TOKENS, Math.floor(n)));
+}
+
+/**
+ * 解析通道级最大输出 token：
+ * 优先级：手动覆盖 (extra.maxOutputTokens) > /models 探测 > 内置模型目录 > 默认 32768。
+ * - 非法/缺失（undefined/0/负数/NaN/Infinity/非数字）继续走后续优先级；
+ * - 命中值向下取整后 clamp 到 [MIN_MAX_OUTPUT_TOKENS, MAX_MAX_OUTPUT_TOKENS]。
+ *
+ * 背景：小米 MiMo 等思考型模型把「思考内容 + 最终回答」一起计入 max_tokens，
+ * 3 万字章节光思考就能吃掉约 3.8 万 token，默认 32768 会导致正文被 finish_reason=length 截断。
+ * 目录里没有 maxOutputTokens 时用默认 32768；未知模型的上限由 openaiCompatible 在
+ * 被厂商 400 拒绝后自动学习并记住。
+ */
+export function resolveMaxOutputTokens(cfg: { model?: string; extra?: Record<string, unknown> } | undefined): number {
+  const raw = cfg?.extra?.maxOutputTokens;
+  const n = typeof raw === "string" ? Number(raw) : (raw as number | undefined);
+  if (typeof n === "number" && Number.isFinite(n) && n > 0) return clampMaxOutputTokens(n);
+  const discovered = Array.isArray(cfg?.extra?.discoveredModels)
+    ? (cfg!.extra!.discoveredModels as DiscoveredModel[])
+    : [];
+  const normalized = normalizeModelId(cfg?.model);
+  if (normalized) {
+    const usable = discovered.filter((m) => typeof m.maxOutputTokens === "number");
+    const hit = usable.find((m) => m.id === cfg?.model)
+      ?? usable.find((m) => normalizeModelId(m.id) === normalized)
+      ?? usable.find((m) => normalizeModelId(m.id).startsWith(normalized) || normalized.startsWith(normalizeModelId(m.id)));
+    if (hit?.maxOutputTokens) return clampMaxOutputTokens(hit.maxOutputTokens);
+    // 内置目录（已核实型号）的最大输出
+    const spec = modelSpecFor(cfg?.model);
+    if (spec?.maxOutputTokens) return clampMaxOutputTokens(spec.maxOutputTokens);
+  }
+  return DEFAULT_MAX_OUTPUT_TOKENS;
 }
 
 /**
@@ -370,13 +469,14 @@ export function inputCharBudgetForText(cfg: { model?: string; extra?: Record<str
 
 /**
  * 单次请求的输出 token 预算：从上下文里扣掉输入估算与固定余量。
+ * 默认上限使用通道配置解析值；调用方可传 cap 为某个任务保留更低预算。
  * 旧实现直接用 min(context, 32768) 不扣输入，小上下文模型 input+maxTokens 直接超上下文，
  * 请求报错或输出被截断（翻译 #781 / 提取补全 #637 共用）。
  */
 export function outputTokensForText(
   cfg: { model?: string; extra?: Record<string, unknown> } | undefined,
   text: string,
-  cap = 32_768,
+  cap = resolveMaxOutputTokens(cfg),
 ): number {
   const context = resolveContextLength(cfg);
   const inputTokens = Math.ceil(text.length / Math.max(0.1, estimateCharsPerToken(text)));
@@ -526,8 +626,10 @@ export function parseModelList(payload: unknown, providerId: ProviderId): Discov
       continue;
     }
     const contextLength = extractContextLength(record);
+    const maxOutputTokens = extractMaxOutputTokens(record);
     const model: DiscoveredModel = { id: id.trim(), capabilities: classifyModelCapabilities(record, providerId) };
     if (contextLength) model.contextLength = contextLength;
+    if (maxOutputTokens) model.maxOutputTokens = maxOutputTokens;
     models.push(model);
   }
   if (!models.length) throw new Error("模型列表无有效条目");

@@ -27,6 +27,7 @@ const {
   failedTasks,
   liveProgress,
   livePct,
+  scriptPartProgress,
   costText,
   visualBibleReviewNeeded,
   loadAssetMapNow,
@@ -95,6 +96,9 @@ function goEmptyFull(): void {
       <div class="progress-bar"><div class="progress-fill" :style="{ width: livePct + '%' }"></div></div>
       <p style="color: var(--text-dim); font-size: 12px; margin-top: var(--space-2)">
         {{ liveProgress.step }} · {{ t("当前：") }}{{ liveProgress.label }}
+      </p>
+      <p v-if="scriptPartProgress && scriptPartProgress.total > 1" style="color: var(--text-dim); font-size: 12px; margin-top: 2px">
+        {{ t("第 {ch} 章第 {part}/{total} 段", { ch: scriptPartProgress.chapter + 1, part: scriptPartProgress.part, total: scriptPartProgress.total }) }}
       </p>
     </div>
     <div class="card mt-4 mb-0" v-if="costText">

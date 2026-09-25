@@ -12,23 +12,26 @@ import type {
   SceneJSON,
   Shot,
 } from "./types";
-import { chatJson, type LlmProgressEvent } from "../api/openaiCompatible";
+import { chatJson, EmptyContentError, type LlmProgressEvent } from "../api/openaiCompatible";
 import { estimateCharsPerToken, inputCharBudgetForText, outputTokensForText } from "../api/providers";
 import { splitNovelForAgent } from "./textSplit";
 import { log as logger } from "../utils/logger";
 import { tauri } from "../utils/tauri";
-import { scriptCacheRest } from "./cache";
+import { scriptCacheRest, scriptPartFileName, scriptPartRest, scanScriptPartCache } from "./cache";
 import { loreContextForScript } from "./cards";
 import type { ApiConfig } from "./types";
 
 /**
- * 剧本单次请求的输出 token 上限（32768，与旧版一致）。
- * 思考型模型的思维链计入 max_tokens：预算太小（8K）会被思考整段吃光、正文一个字都出不来，
- * 于是每轮都「空输出→放大预算→再空」地空转。给足预算让模型「思考多少、正文写多少」，
- * 超出部分由续写循环「生成多少、下轮接着往后补」分段取回。
- * planScriptChunks 只按输入上下文切块（与输出预算无关），不预先按输出预算切章。
+ * 剧本单次请求的输出 token 上限不再写死：由通道级配置解析
+ * （`resolveMaxOutputTokens(cfg)`，默认 32768，可在「API 配置 > 该通道 > 最大输出 token」调大），
+ * 再经 `outputTokensForText` 按输入估算与上下文余量 clamp（保证 input + max_tokens 不超上下文）。
+ *
+ * 关键事实（小米 MiMo 官方文档 2026-09-22）：`max_completion_tokens`（即 max_tokens）
+ * 限制的是「思考内容 + 最终回答」的总长度，且深度思考默认开启。
+ * 所以思考型模型会在正文之前先吃掉一大截预算（实测 mimo-v2.6-flash 生成 3 万字章节前先思考约 3.8 万 token）。
+ * 整章一次生成时思考只发生一次；若预先按输出预算把章节切成多块，每块都会各自思考一次
+ * （3.8 万 token × 块数），更慢更贵。因此 planScriptChunks 只按「输入上下文」切块，不按输出预算切。
  */
-const SCRIPT_PART_OUTPUT_TOKENS = 32768;
 
 interface ScriptModel {
   title: string;
@@ -101,6 +104,11 @@ C. 每个 shot 字段：
 D. 一张图覆盖的连续对话应属于同一画面（同一地点/时间/氛围）；画面切换点放在场景转换、情绪转折、时间跳跃处。
 E. lines 的说话人、台词保真与上文规则一致（对话逐句保留，旁白按「旁白处理策略」）。`;
 
+// 规则 14 为提示词层思考约束（一句话）：Anthropic 官方 overthinking 建议明确写过
+// 「思考失控膨胀时可用提示词显式约束」，示例原话 "When you're deciding how to approach a
+// problem, choose an approach and commit to it... If you're weighing two approaches, pick
+// one and see it through."（来源：https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/claude-prompting-best-practices
+// 「Overthinking and excessive thoroughness」节）。只加提示词约束，不碰 thinking 开关语义，不改 JSON schema。
 const SYSTEM_PROMPT = `你是视觉小说编剧。根据小说章节文本与角色卡、物品卡，将该章改编为视觉小说分镜 JSON。
 
 规则：
@@ -140,11 +148,12 @@ const SYSTEM_PROMPT = `你是视觉小说编剧。根据小说章节文本与角
     - 禁止改写对话文字（仅允许统一标点）；
     - 内心独白按原文比例保留，不要机械砍到只剩 2 条；
     - 旁白/心理/环境/氛围描写按用户消息中的「旁白处理策略」执行。
-12. 说话人判定（硬约束）：
-    - 每个 dialogue 的 characterId 必须能在上下文中找到依据（引号前后的人名＋说/道/问/喊等动词，或明确的行为主体）；
-    - 引用中的第三人称点名不能倒置（例如台词含"对优斗来说"时，说话人绝不能是优斗本人）；
-    - 实在无法确定说话人时，写成 narration，禁止猜一个角色。
-13. 日记/书信/日志体章节：按日期条目顺序逐段改编，不得跨日期合并场景，不得打乱时间顺序。`;
+ 12. 说话人判定（硬约束）：
+     - 每个 dialogue 的 characterId 必须能在上下文中找到依据（引号前后的人名＋说/道/问/喊等动词，或明确的行为主体）；
+     - 引用中的第三人称点名不能倒置（例如台词含"对优斗来说"时，说话人绝不能是优斗本人）；
+     - 实在无法确定说话人时，写成 narration，禁止猜一个角色。
+ 13. 日记/书信/日志体章节：按日期条目顺序逐段改编，不得跨日期合并场景，不得打乱时间顺序。
+ 14. 动笔前选定一种改编做法就执行下去，不要反复权衡多种方案；先完整产出本部分的场景与台词，不要在中途来回推翻重来。`;
 
 function buildCharacterContext(chars: CharacterCard[]): string {
   return chars
@@ -178,12 +187,9 @@ export interface ScriptChapterOptions {
   /** 图片小说：每场景分镜张数目标（0/缺省=不限，按剧情需要；仅图片小说模式生效） */
   shotsPerScene?: number;
   /** 分块进度回调（长章节分 N 部分生成时逐段上报；调用方可据此打日志/进度，避免长调用期间无输出） */
-  onPart?: (info: { part: number; total: number; phase: "start" | "done"; elapsedMs: number }) => void;
+  onPart?: (info: { part: number; total: number; phase: "start" | "done"; elapsedMs: number; cached?: boolean }) => void;
   /** 请求级日志回调（续写/修复/重试/预算升级等模型请求事件；调用方接到后打面向用户的日志） */
   onLog?: (message: string) => void;
-  /** 流式生成进度（真实字符数）：桌面端剧本路径开启 SSE 后随增量上报
-   *  （每次新请求开始先归零），供调用方心跳日志显示「已生成 N 字」；网页版/非流式不会触发。 */
-  onProgress?: (p: { contentChars: number; reasoningChars: number }) => void;
   /** 视频推荐位开关（#1135）：false=提示词不再要求 videoPoints（省 token、不挤占台词篇幅）；
    *  缺省 undefined=保持原行为（要求 1-3 个），避免已上线调用方行为突变 */
   useVideoPoints?: boolean;
@@ -192,6 +198,14 @@ export interface ScriptChapterOptions {
   /** 每章 CG 数上限（#1136：0/缺省=不限即提示词默认 3 个；>0 时覆盖规则 5 的数量并参与映射裁剪。
    *  只改 core 侧语义与注释，不碰设置页 UI） */
   cgMax?: number;
+  /**
+   * 分段落盘/断点续跑（P1）：传了才启用。
+   * cacheDir/demo/styleFrag 与调用方整章缓存同键（styleFrag 即整章文件名用的那一份），
+   * rest 内部再按反馈追加意见指纹。单段章节（parts.length===1）不写任何段文件。
+   */
+  partCache?: { cacheDir: string; demo?: boolean; styleFrag: string };
+  /** 中止检查（管线 stop 时）：每段开始前检查，已中止即抛"已中止"，不再派发新的付费请求 */
+  isAborted?: () => boolean;
 }
 
 /** CG 每章默认上限（#1136）：设置页 0=不限制时仍受提示词默认 3 个约束（与既有行为一致） */
@@ -248,18 +262,77 @@ export function narrationPolicyText(compressNarration?: boolean): string {
     : "旁白处理策略（忠实全文，硬约束）：必须完整保留原文全部旁白与心理/环境/氛围描写，只可合并同义重复句，禁止删减任何带信息量/情绪/伏笔的句子；原文每个自然段至少要产出一条 line（narration 或 dialogue）。";
 }
 
-/**
- * 单次输出预算里留给正文 JSON 的比例：思考型模型会把大量预算/上下文用于思维链
- * （实测 mimo-v2.6-flash 生成 3 万字章节前先思考约 3.8 万 token、耗时 6 分钟），
- * 只按输出预算反推正文量会让「一次要的 JSON」超过模型实际能给 → 截断。
- */
-const SCRIPT_CHUNK_OUTPUT_RATIO = 1 / 3;
+/** 段间衔接默认取的结尾行数（P2）：8~12 行，默认 10，太长会挤占本段输出预算 */
+export const PREV_PART_TAIL_LINES = 10;
 
-/** 剧本分块（纯函数，供单测）：按「单次请求能产出多少 JSON」反推每次喂多少正文。
- *  为什么不只按上下文切：整章一次喂进去要 4~6 万字的 JSON，思考型模型在上下文耗尽时把 JSON 截断，
- *  而**续写补残 JSON 并不可靠**——实测截断后模型只补 274 字就 finish=stop，拼接结果解析失败，
- *  随后「修复」还要再烧一次 6 分钟的思考。按输出预算（留 1/3 给思考）切块，每块都能在一次响应里产出完整 JSON。
- *  上限取「输出侧」与「输入侧（上下文能容纳的正文量）」的较小者。 */
+/**
+ * 上一段结尾提取（纯函数，供单测）：取已映射场景最后 N 行台词/旁白原文（对话带说话人 id）。
+ * 只做文本搬运不改写，保证模型拿到的衔接上下文与上一段产出逐字一致。
+ */
+export function extractPrevPartTail(
+  scenes: { lines: { type: string; characterId?: string; text: string }[] }[],
+  maxLines = PREV_PART_TAIL_LINES,
+): string[] {
+  const n = Math.max(8, Math.min(12, Math.floor(maxLines) || PREV_PART_TAIL_LINES));
+  const lines = (scenes ?? []).flatMap((s) => s?.lines ?? []);
+  return lines.slice(-n).map((l) =>
+    l.type === "dialogue" ? `${l.characterId || "？"}：${l.text}` : `旁白：${l.text}`,
+  );
+}
+
+/** 已用 id 收集（纯函数，供单测）：场景 id 列表 + 本章已出场角色 id（主线 lines 与分支 lines 都算） */
+export function collectPrevPartIds(scenes: SceneJSON[]): { sceneIds: string[]; characterIds: string[] } {
+  const sceneIds: string[] = [];
+  const chars = new Set<string>();
+  for (const s of scenes ?? []) {
+    if (s?.id) sceneIds.push(s.id);
+    for (const l of s?.lines ?? []) {
+      if (l.type === "dialogue" && l.characterId) chars.add(l.characterId);
+    }
+    for (const c of s?.choices ?? []) {
+      for (const l of c?.lines ?? []) {
+        if (l.type === "dialogue" && l.characterId) chars.add(l.characterId);
+      }
+    }
+  }
+  return { sceneIds, characterIds: [...chars] };
+}
+
+/**
+ * 段间衔接后缀（纯函数，供单测）：拼在 buildScriptUser 末尾，只在多段 k>1 时附加。
+ * scene id 唯一性不靠模型自觉——已用 id 只作提示，真正的去重仍由 resolveSceneId 机制保证。
+ */
+export function buildPrevPartNote(tailLines: string[], sceneIds: string[], characterIds: string[]): string {
+  if (!tailLines.length) return "";
+  return [
+    "",
+    "",
+    "【上一段结尾（只用于衔接，不要复述）】",
+    ...tailLines.map((t) => `- ${t}`),
+    `已用场景 id：${sceneIds.length ? sceneIds.join("、") : "无"}`,
+    `本章已出场角色 id：${characterIds.length ? characterIds.join("、") : "无"}`,
+    "要求：本段场景 id 不得与上述已用 id 重复；人物口吻与上段保持连贯，从上一段结尾处继续往下改编。",
+  ].join("\n");
+}
+
+/**
+ * 单次生成承载的正文上限（字符）。**这是「分段生成」的核心旋钮**：
+ *  - 不设上限 = 整章一次喂进去、要求一次吐出整章 JSON，实测在思考型模型上必然出事：
+ *    思考会失控（MiMo 单次思考数万 token、一次 6~57 分钟不产出正文），
+ *    而且输出的 JSON 一旦超过单次上限就被截断；续写补残 JSON 又不可靠。
+ *  - 切成小块逐段生成（像 agent 分段读取那样）：每块的输入小 → 思考短、输出 JSON 小且能一次写完，
+ *    单块失败只影响一小段（可重试/可重跑），进度按块可见。
+ *  - 8K 正文 ≈ 5~8K 字 JSON，实测该体量 MiMo 能在一次响应内完整产出。
+ */
+const SCRIPT_BLOCK_MAX_CHARS = 8000;
+
+/**
+ * 剧本分块（纯函数，供单测）：把章节切成「能在一次响应里完整产出 JSON」的小段。
+ *  上限取三者最小：① 固定分块上限 SCRIPT_BLOCK_MAX_CHARS（保证输出可完整产出）；
+ *  ② 输入上下文能容纳的正文量（超长正文一次塞入会 500/超时、质量下降）；
+ *  ③ 按单次输出预算反推的正文量（输出预算小的模型要切得更碎）。
+ *  下限 3000 字，避免碎到无法维持上下文连贯。
+ */
 export function planScriptChunks(
   cfg: ApiConfig,
   chapter: ChapterInfo,
@@ -267,15 +340,16 @@ export function planScriptChunks(
   extra: string[],
   cards: ExtractionResult,
 ): string[] {
+  const feedChars = inputCharBudgetForText(cfg, chapter.text);
+  const overhead = systemPrompt.length + buildScriptUser(chapter, cards, extra, "").length;
+  const byInput = feedChars - overhead;
+  // 输出侧：期望 JSON 约占正文 0.6~1 倍，按单次输出预算的 1/3 留思考余量反推
   const probeTokens = outputTokensForText(
     cfg,
     `${systemPrompt}\n${buildScriptUser(chapter, cards, extra, chapter.text.slice(0, 4000))}`,
   );
-  const cpt = estimateCharsPerToken(chapter.text);
-  const byOutput = Math.max(3000, Math.floor(probeTokens * SCRIPT_CHUNK_OUTPUT_RATIO * cpt));
-  const feedChars = inputCharBudgetForText(cfg, chapter.text);
-  const overhead = systemPrompt.length + buildScriptUser(chapter, cards, extra, "").length;
-  const chunkBudget = Math.max(3000, Math.min(byOutput, feedChars - overhead));
+  const byOutput = Math.floor(probeTokens * (1 / 3) * estimateCharsPerToken(chapter.text));
+  const chunkBudget = Math.max(3000, Math.min(byInput, byOutput, SCRIPT_BLOCK_MAX_CHARS));
   return chapter.text.length <= chunkBudget ? [chapter.text] : splitNovelForAgent(chapter.text, chunkBudget);
 }
 
@@ -538,6 +612,54 @@ export function isServerClassFailure(e: unknown): boolean {
   return /\b429\b|\b50[0-4]\b|HTTP (429|50[0-4])|status.?(429|50[0-4])|timed out|timeout|error sending request|socket|econnreset|econnaborted|reset by peer|overload|capacity/i.test(failureText(e));
 }
 
+/**
+ * 「只思考未产出正文」的受控重试次数（独立于 chatJson 的 requestBudget 计数）：
+ * 原样重发同一请求（不放大预算、不改 prompt、不关深度思考），最多重试这么多次；
+ * 仍失败才走降级拆分。设 2 是为了在偶发「思考过长/流被截」时救回，又不至于对必然失败的模型无限烧钱。
+ */
+export const SCRIPT_THINKING_RETRY = 2;
+
+/**
+ * 「只思考未产出正文」判定（纯函数，供单测）：
+ * - chatJson 抛出的 EmptyContentError（content 为空、只有 reasoning_content）；或
+ * - 预算被思考耗尽、正文为空的失败（chatCompletion 侧历史文案兜底）。
+ * 鉴权/参数/审查/空 scenes 类不在此列。
+ */
+export function isThinkingOnlyFailure(e: unknown): boolean {
+  if (e instanceof EmptyContentError) return true;
+  return /只产生了思考|没有输出任何正文|全部输出预算用于思考|正文一个字都没出|思考耗尽/.test(failureText(e));
+}
+
+/** 「只思考未产出正文」重试与拆分都失败后的最终错误文案（中文直出，不教用户关深度思考）。 */
+function thinkingOnlyExhaustedMessage(chapterIndex: number, tag: string): string {
+  return `第 ${chapterIndex + 1} 章${tag ? `（${tag}）` : ""}该模型本轮持续只思考未产出正文，已自动重试与拆分仍未成功；可稍后重试或换一个模型`;
+}
+
+/** 段缓存文件载荷（P1）：存模型原始回执，不存映射后场景。
+ * 恢复时按段顺序重走 mapScriptScenes，CG/视频位配额与 scene id 去重状态才能与一次跑完完全一致。 */
+interface ScriptPartFile {
+  version: 1;
+  chapterIndex: number;
+  part: number;
+  total: number;
+  rest: string;
+  model: ScriptModel;
+}
+
+/** 读取段缓存并做形状校验（损坏/版本不对按缺失处理，调用方删文件后重新生成） */
+async function readScriptPartFile(path: string): Promise<ScriptModel | null> {
+  try {
+    const { text } = await tauri.readTextFile(path);
+    const parsed = JSON.parse(text) as Partial<ScriptPartFile>;
+    if (!parsed || parsed.version !== 1) return null;
+    const model = parsed.model as ScriptModel | undefined;
+    if (!model || !Array.isArray(model.scenes) || !model.scenes.length) return null;
+    return model;
+  } catch {
+    return null;
+  }
+}
+
 export async function scriptChapter(
   cfg: ApiConfig,
   chapter: ChapterInfo,
@@ -589,8 +711,46 @@ export async function scriptChapter(
   };
 
   const scenes: SceneJSON[] = [];
+  // P1 分段落盘/断点续跑：多段且调用方给了 partCache 才启用。
+  // 开始时扫描已有段缓存（rest 匹配即复用，失配即清理）；单段章节不写任何段文件，
+  // 但会顺手清理本章残留的旧段文件（保持干净）。段缓存不可用不阻断生成。
+  const multiPart = parts.length > 1;
+  const pc = opts.partCache;
+  const usePartCache = !!pc && multiPart;
+  const partRest = pc ? scriptPartRest(chapter.title, chapter.text, pc.styleFrag, opts.feedback) : "";
+  const cachedModels = new Map<number, ScriptModel>();
+  if (pc) {
+    try {
+      await tauri.mkdirAll(pc.cacheDir);
+      const entries = await tauri.listDir(pc.cacheDir).catch(() => []);
+      const scan = scanScriptPartCache(
+        entries.filter((e) => !e.isDir).map((e) => ({ name: e.name, path: e.path })),
+        chapter.index,
+        !!pc.demo,
+        multiPart ? partRest : "",
+        parts.length,
+      );
+      for (const p of scan.stale) await tauri.removePath(p).catch(() => {});
+      if (scan.stale.length && multiPart) {
+        opts.onLog?.(`第 ${chapter.index + 1} 章段缓存已失效（正文/卡片/意见变化），已清理 ${scan.stale.length} 个旧段文件`);
+      }
+      if (multiPart) {
+        for (const [partNo, path] of scan.hits) {
+          const m = await readScriptPartFile(path);
+          if (m) cachedModels.set(partNo, m);
+          else await tauri.removePath(path).catch(() => {});
+        }
+      }
+    } catch {
+      /* 段缓存不可用：退化为全量逐段生成，不阻断 */
+    }
+  }
+
+  const partScenes: SceneJSON[][] = [];
   let title = chapter.title;
   for (let i = 0; i < parts.length; i++) {
+    // 中止只拦新段派发：在途请求由传输层中断后抛错；这里拦住下一段不再发起新的付费请求
+    if (opts.isAborted?.()) throw new Error("已中止");
     const partStart = Date.now();
     opts.onPart?.({ part: i + 1, total: parts.length, phase: "start", elapsedMs: 0 });
     const partTag = parts.length > 1 ? `第 ${i + 1}/${parts.length} 部分` : "";
@@ -598,6 +758,44 @@ export async function scriptChapter(
       total > 1
         ? `\n\n【本章分 ${total} 部分生成】这是${label}：只输出这部分正文对应的场景与台词；不要在本部分结尾写章节收束、不要写 end；不要把其它部分的内容补进来。`
         : "";
+    // P2 段间连贯：k>1 且多段时给模型带上 compact 的上一段结尾（只拼可选后缀，buildScriptUser 签名不变）
+    let prevNote = "";
+    if (multiPart && i > 0) {
+      const ids = collectPrevPartIds(partScenes.flat());
+      prevNote = buildPrevPartNote(extractPrevPartTail(partScenes[i - 1] ?? []), ids.sceneIds, ids.characterIds);
+    }
+    const note = noteFor(`第 ${i + 1}/${parts.length} 部分`, parts.length) + prevNote;
+    // 段落盘（P1）：校验通过后才写盘。先写 tmp 再 rename（与 visualBible 原子写同习惯），
+    // rename 不可用时直写兜底；写失败只告警不阻断（内存结果完整，整章缓存照常最后写入）。
+    const persistPartModel = async (partNo: number, model: ScriptModel): Promise<void> => {
+      if (!pc) return;
+      const path = scriptPartFileName(
+        pc.cacheDir,
+        !!pc.demo,
+        chapter.index,
+        chapter.title,
+        chapter.text,
+        pc.styleFrag,
+        opts.feedback,
+        partNo,
+        parts.length,
+      );
+      const text = JSON.stringify({ version: 1, chapterIndex: chapter.index, part: partNo, total: parts.length, rest: partRest, model } as ScriptPartFile);
+      try {
+        const tmp = `${path}.tmp`;
+        await tauri.writeTextFile(tmp, text);
+        try {
+          await tauri.replacePath(tmp, path);
+        } catch {
+          await tauri.writeTextFile(path, text);
+          await tauri.removePath(tmp).catch(() => {});
+        }
+      } catch (e) {
+        logger.warn("script", `第 ${chapter.index + 1} 章第 ${partNo}/${parts.length} 段缓存写入失败（不影响本次生成）`, {
+          error: failureText(e).slice(0, 200),
+        });
+      }
+    };
     // 请求级事件翻译成分块上下文日志：续写/修复/重试/预算升级全部可见（否则单请求 300s 超时 ×N 次重试全程静默）
     const llmEventFor = (tag: string) => (e: LlmProgressEvent): void => {
       if (!opts.onLog) return;
@@ -619,19 +817,23 @@ export async function scriptChapter(
         opts.onLog(`${where}${base}${hint}…`);
       }
     };
+    // 本部分的流式进度（真实字符数）：onDelta 写入、90s 心跳读取；每次模型请求开始归零，
+    // 避免上一块/上一次请求的计数串到下一块。
+    const genProgress = { contentChars: 0, reasoningChars: 0 };
     // 单个子块生成（含空结果带提示重试一次；无场景即抛错，由外层决定是否降级拆分）
     const genOnePart = async (bodyText: string, note: string, tag: string): Promise<{ model: ScriptModel; scenes: SceneJSON[] }> => {
       const user = buildScriptUser(chapter, cards, extra, bodyText, note);
-      // 单次输出预算给足（32K，同旧版）：思考型模型的思维链计入 max_tokens，
-      // 预算太小会被思考整段吃光、正文一个字都出不来（8K 预算下实测 8K→18K→28K→35K 连续空转）。
-      // 整章正文一次喂进去，输出长度由续写循环「生成多少、下轮接着往后补」补完，不预先切章。
-      const maxTokens = outputTokensForText(cfg, `${systemPrompt}\n${user}`, SCRIPT_PART_OUTPUT_TOKENS);
+      // 单次输出预算：由通道级「最大输出 token」配置解析（默认 32768），再按输入上下文 clamp。
+      // 思考型模型把「思考内容 + 最终回答」一起计入 max_tokens（MiMo 文档），
+      // 预算太小会被思考整段吃光、正文一个字都出不来；给足后由续写循环补完超出部分。
+      const maxTokens = outputTokensForText(cfg, `${systemPrompt}\n${user}`);
       const llmEvent = llmEventFor(tag);
       // 流式进度（桌面端 SSE）：首字/首次思考到达时打一条日志（之后不再逐条打，由 90s 心跳显示计数）；
-      // 计数同时透出给调用方（pipeline 心跳「已生成 N 字」）。每次模型请求开始时计数归零。
+      // 计数写入本部分共享的 genProgress，供心跳日志显示「已生成 N 字」。每次模型请求开始时计数归零。
       let deltaLogged = false;
       const onDelta = (d: { contentChars: number; reasoningChars: number }): void => {
-        opts.onProgress?.(d);
+        genProgress.contentChars = d.contentChars;
+        genProgress.reasoningChars = d.reasoningChars;
         if (deltaLogged || (d.contentChars <= 0 && d.reasoningChars <= 0)) return;
         deltaLogged = true;
         const detail =
@@ -654,16 +856,34 @@ export async function scriptChapter(
         minContinueProgress: 500,
         requestBudget: { used: 0, max: 16 },
       };
-      let model = await chatJson<ScriptModel>(cfg, systemPrompt, user, chatOpts);
+      // 「只思考未产出正文」受控重试：原样重发同一请求（不放大预算、不改 prompt、保持深度思考开启），
+      // 重试次数独立于 requestBudget 计数，最多 SCRIPT_THINKING_RETRY 次；每次都有可见日志。
+      // 仍失败则抛回外层，由降级拆分接住。
+      const chatJsonWithThinkingRetry = async (userText: string): Promise<ScriptModel> => {
+        for (let attempt = 0; ; attempt++) {
+          genProgress.contentChars = 0;
+          genProgress.reasoningChars = 0;
+          try {
+            return await chatJson<ScriptModel>(cfg, systemPrompt, userText, chatOpts);
+          } catch (e) {
+            if (!isThinkingOnlyFailure(e) || attempt >= SCRIPT_THINKING_RETRY) throw e;
+            const remain = SCRIPT_THINKING_RETRY - attempt;
+            logger.warn("script", `第 ${chapter.index + 1} 章${tag}模型本次只思考未产出正文，自动重试`, {
+              attempt: attempt + 1,
+              remain,
+            });
+            opts.onLog?.(`第 ${chapter.index + 1} 章${tag}模型这次只思考未产出正文，正在自动重试（剩余 ${remain} 次）…`);
+            continue;
+          }
+        }
+      };
+      let model = await chatJsonWithThinkingRetry(user);
       let subScenes = mapScriptScenes(model, mapCtx);
       if (!subScenes.length) {
         logger.warn("script", `第 ${chapter.index + 1} 章${tag}未产出场景，带提示重试一次`, {});
         opts.onLog?.(`第 ${chapter.index + 1} 章${tag}未产出场景，带提示重试一次…`);
-        model = await chatJson<ScriptModel>(
-          cfg,
-          systemPrompt,
+        model = await chatJsonWithThinkingRetry(
           `${user}\n\n注意：上一次回复没有 scenes 数组或 scenes 为空。请输出严格 JSON，且 scenes 至少包含本部分正文的第一个场景（含完整的 lines 台词）。`,
-          chatOpts,
         );
         subScenes = mapScriptScenes(model, mapCtx);
       }
@@ -675,31 +895,115 @@ export async function scriptChapter(
       return { model, scenes: subScenes };
     };
 
+    // 长调用心跳：本部分生成可能持续数分钟（分块多轮/续写/重试），每 90s 报一次存活，避免看起来卡死。
+    // 桌面端剧本已开 SSE 流式：有真实计数时显示「已生成 N 字」；网页版/首字未到保持原文案。
+    // 计数来自本部分 genProgress（每次模型请求开始时归零），因此心跳只在「真的在生成」期间存在。
+    const hbStart = Date.now();
+    const heartbeat = setInterval(() => {
+      const waited = Math.round((Date.now() - hbStart) / 1000);
+      const counted = genProgress.contentChars > 0 || genProgress.reasoningChars > 0;
+      opts.onLog?.(
+        counted
+          ? `第 ${chapter.index + 1} 章仍在生成中：已生成 ${genProgress.contentChars} 字（思考 ${genProgress.reasoningChars} 字），已等待 ${waited}s…`
+          : `第 ${chapter.index + 1} 章仍在生成中（已等待 ${waited}s，模型输出较长请继续等待）…`,
+      );
+    }, 90000);
     let firstModel: ScriptModel | null = null;
-    try {
-      const r = await genOnePart(parts[i], noteFor(`第 ${i + 1}/${parts.length} 部分`, parts.length), partTag);
-      firstModel = r.model;
-      scenes.push(...r.scenes);
-    } catch (e) {
-      // 自适应降级：服务端过载/超时 + 文本还够大 → 按段落对半拆成小块分别生成
-      // （小请求更容易在超时前完成；鉴权/参数/审查/空结果类错误直接抛出，不拆）
-      const halves = parts[i].length > 8000 ? splitForDegrade(parts[i]) : [];
-      if (!isServerClassFailure(e) || halves.length < 2) throw e;
-      const reason = /429/.test(failureText(e)) ? "后端限流" : "后端过载/超时";
-      opts.onLog?.(`第 ${chapter.index + 1} 章${partTag}请求过大（${reason}），已拆成 ${halves.length} 块分别生成…`);
-      logger.warn("script", `第 ${chapter.index + 1} 章${partTag}服务端失败，降级拆分重试`, { error: failureText(e).slice(0, 200) });
-      for (let h = 0; h < halves.length; h++) {
-        const subTag = `${partTag ? `${partTag}之` : ""}第 ${h + 1}/${halves.length} 块`;
-        const r = await genOnePart(halves[h], noteFor(subTag, halves.length), subTag);
-        if (!firstModel) firstModel = r.model;
-        scenes.push(...r.scenes);
+    let fromCache = false;
+    // 单段生成 + 自适应降级（返回原始回执与映射后场景；落盘与合并由调用方做，保证只映射一次）：
+    // 降级拆分的多块回执拼成一个 combined model 再返回，段缓存按段整体存取。
+    const genPartWithDegrade = async (
+      bodyText: string,
+      partNote: string,
+      tag: string,
+      prevTailNote: string,
+    ): Promise<{ model: ScriptModel; scenes: SceneJSON[] }> => {
+      try {
+        return await genOnePart(bodyText, partNote, tag);
+      } catch (e) {
+        // 自适应降级：服务端过载/超时，或「只思考未产出正文（重试后仍失败）+ 本节够大」
+        // → 按段落对半拆成小块分别生成（小请求更容易在超时前完成，思考量也更容易被预算容纳；
+        //   深度思考保持开启）。鉴权/参数/审查/空结果类错误直接抛出，不拆。
+        const thinkingOnly = isThinkingOnlyFailure(e);
+        // 本节还能再对半拆才拆（阈值取分块上限的一半，与 planScriptChunks 的块大小对齐）：
+        // 块本身已 ≤ SCRIPT_BLOCK_MAX_CHARS，若阈值仍写 8000 会导致降级拆分永远不触发。
+        const halves = bodyText.length > SCRIPT_BLOCK_MAX_CHARS / 2 ? splitForDegrade(bodyText) : [];
+        if (!thinkingOnly && !isServerClassFailure(e)) throw e;
+        if (halves.length < 2) {
+          // 已到最小拆分粒度（本节 <= 分块上限的一半，或拆不出两块）：给出明确结论，不再教用户关思考。
+          if (thinkingOnly) throw new Error(thinkingOnlyExhaustedMessage(chapter.index, partTag));
+          throw e;
+        }
+        const reason = thinkingOnly
+          ? "模型只思考未产出正文"
+          : /429/.test(failureText(e))
+            ? "后端限流"
+            : "后端过载/超时";
+        opts.onLog?.(`第 ${chapter.index + 1} 章${tag}${reason}，已拆成 ${halves.length} 块分别生成…`);
+        logger.warn("script", `第 ${chapter.index + 1} 章${tag}${thinkingOnly ? "只思考未产出正文" : "服务端失败"}，降级拆分重试`, {
+          error: failureText(e).slice(0, 200),
+        });
+        try {
+          const halfModels: ScriptModel[] = [];
+          const halfScenes: SceneJSON[][] = [];
+          for (let h = 0; h < halves.length; h++) {
+            const subTag = `${tag ? `${tag}之` : ""}第 ${h + 1}/${halves.length} 块`;
+            const r = await genOnePart(halves[h], noteFor(subTag, halves.length) + prevTailNote, subTag);
+            halfModels.push(r.model);
+            halfScenes.push(r.scenes);
+          }
+          const combined: ScriptModel = {
+            title: halfModels[0]?.title ?? "",
+            scenes: halfModels.flatMap((m) => m.scenes ?? []),
+          };
+          return { model: combined, scenes: halfScenes.flat() };
+        } catch (subE) {
+          // 拆分后仍有子块持续只思考不产出：给出与「最小粒度」一致的最终结论。
+          if (isThinkingOnlyFailure(subE)) throw new Error(thinkingOnlyExhaustedMessage(chapter.index, partTag));
+          throw subE;
+        }
       }
+    };
+    try {
+      let partModel: ScriptModel | null = cachedModels.get(i + 1) ?? null;
+      let partSubScenes: SceneJSON[] = [];
+      fromCache = false;
+      if (partModel) {
+        // 断点续跑：rest 命中的段直接复用，但仍按段顺序重走映射——
+        // CG/视频配额与 scene id 去重是跨段累计状态，重放才能与一次跑完的结果一致
+        partSubScenes = mapScriptScenes(partModel, mapCtx);
+        if (!partSubScenes.length) {
+          // 缓存的原始回执映射后无场景（正常路径不可能）：删掉坏文件，按缺失重新生成
+          logger.warn("script", `第 ${chapter.index + 1} 章${partTag}段缓存映射后无场景，已删除并重新生成`, {});
+          const badPath = pc
+            ? scriptPartFileName(pc.cacheDir, !!pc.demo, chapter.index, chapter.title, chapter.text, pc.styleFrag, opts.feedback, i + 1, parts.length)
+            : "";
+          if (badPath) await tauri.removePath(badPath).catch(() => {});
+          partModel = null;
+        } else {
+          fromCache = true;
+          opts.onLog?.(`第 ${chapter.index + 1} 章第 ${i + 1}/${parts.length} 段：命中缓存，跳过`);
+        }
+      }
+      if (!partModel) {
+        const r = await genPartWithDegrade(parts[i], note, partTag, prevNote);
+        partModel = r.model;
+        partSubScenes = r.scenes;
+        // genOnePart 已保证映射后场景非空：无场景的回执永远不进段缓存（不写脏文件）
+        if (usePartCache) await persistPartModel(i + 1, partModel);
+      }
+      firstModel = partModel;
+      scenes.push(...partSubScenes);
+      partScenes.push(partSubScenes);
+    } finally {
+      // 本部分生成结束（含成功/异常/中止）都必须清心跳定时器，避免泄漏与跨块串扰
+      clearInterval(heartbeat);
     }
     if (parts.length > 1 && i === 0 && firstModel) {
       const partTitle = (firstModel as { title?: unknown }).title;
       if (typeof partTitle === "string" && partTitle.trim()) title = partTitle.trim();
     }
-    opts.onPart?.({ part: i + 1, total: parts.length, phase: "done", elapsedMs: Date.now() - partStart });
+    opts.onPart?.({ part: i + 1, total: parts.length, phase: "done", elapsedMs: Date.now() - partStart, cached: fromCache });
   }
 
   return {

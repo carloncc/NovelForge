@@ -725,6 +725,9 @@ async function runScriptStage(llm: NonNullable<ReturnType<typeof activeConfig>>,
         compressNarration: false,
         style: imageStoryState.options.imageStyle || undefined,
         onLog: (message) => pushLog("剧本", message),
+        // 分段落盘/断点续跑（P1）：与上方整章 file 同键；k/N 进度走既有 onPart 日志，页面不再另接
+        partCache: { cacheDir, demo: false, styleFrag: fp },
+        isAborted: () => abortFlag,
         onPart: ({ part, total, phase, elapsedMs }) => {
           if (total <= 1) return;
           if (phase === "start" && part === 1) {

@@ -302,6 +302,8 @@ const failedSteps = ref<number[]>([]);
 
 // 实时进度：最近一条带 progress 的管线事件（图片 12/45 · 当前任务）
 const liveProgress = ref<{ step: string; done: number; total: number; label: string } | null>(null);
+// 剧本分段进度（P1）：最近一条带 scriptPart 的管线事件（第 k/N 段），与章节级 liveProgress 各管各的
+const scriptPartProgress = ref<{ chapter: number; part: number; total: number } | null>(null);
 
 /**
  * 本次运行包含的阶段名（中文 step 名，与 STAGE_LABELS 一致）。
@@ -319,6 +321,7 @@ function clearRunLabels(): void {
   activeRunLabels.value = [];
   currentStep.value = -1;
   failedSteps.value = [];
+  scriptPartProgress.value = null;
 }
 
 watch(
@@ -335,6 +338,7 @@ watch(
       if (idx >= 0 && last.level !== "error" && inRun) currentStep.value = Math.max(currentStep.value, idx);
       if (last.level === "error" && idx >= 0 && !failedSteps.value.includes(idx)) failedSteps.value.push(idx);
       if (last.progress && inRun) liveProgress.value = { step: last.step, ...last.progress };
+      if (last.scriptPart && inRun) scriptPartProgress.value = { ...last.scriptPart };
     }
     await nextTick();
     if (wasAtBottom && logPanelRef.value) logPanelRef.value.scrollTop = logPanelRef.value.scrollHeight;
@@ -4514,6 +4518,7 @@ export const generateStore = {
   currentStep,
   failedSteps,
   liveProgress,
+  scriptPartProgress,
   activeRunLabels,
   clearRunLabels,
   activeStepIndexes,

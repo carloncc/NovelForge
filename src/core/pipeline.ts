@@ -30,7 +30,7 @@ import type { AiSplitOptions, SplitStats } from "./split";
 import { generateImages } from "./images";
 import { generateVoice, vocalKeysForChapters } from "./voice";
 import { assembleProject, gameKeyFor } from "./project";
-import { cacheDirFor, titleHash, scriptCacheRest, scriptCacheFileName, scriptFingerprint, cardsFingerprint } from "./cache";
+import { cacheDirFor, titleHash, scriptCacheRest, scriptCacheFileName, scriptFingerprint, cardsFingerprint, isScriptPartFileName } from "./cache";
 import { resolveProjectTitle } from "./title";
 export { titleHash, scriptCacheRest, scriptCacheFileName };
 import { normalizeNovelText } from "./chapters";
@@ -645,6 +645,9 @@ export class Pipeline {
     expectedByIndex: Map<number, string>,
     demo?: boolean,
   ): { kind: "valid" | "legacy" | "stale" | "ignore"; chapterPos: number } {
+    // 段缓存文件（script_chN_partKofT_*.json）由剧本分段落盘自管（命中/过期/清理）：
+    // 这里一律 ignore，否则它的 rest 按整章口径必判 stale，会误删断点
+    if (isScriptPartFileName(name)) return { kind: "ignore", chapterPos: -1 };
     const m = name.match(/^script(_demo)?_ch(\d+)_(.+)\.json$/);
     if (!m) return { kind: "ignore", chapterPos: -1 };
     const n = parseInt(m[2], 10) - 1;
@@ -675,7 +678,7 @@ export class Pipeline {
     try {
       const entries = await tauri.listDir(this.cacheRoot);
       const files = entries
-        .filter((e) => !e.isDir && /^script(_demo)?_ch\d+_/.test(e.name))
+        .filter((e) => !e.isDir && /^script(_demo)?_ch\d+_/.test(e.name) && !isScriptPartFileName(e.name))
         .sort((a, b) => a.name.localeCompare(b.name));
       // 同一 chapter 多文件：valid 优先，其次 legacy（字典序最新）；stale 直接忽略
       const picked = new Map<number, { path: string; legacy: boolean }>();
@@ -746,6 +749,8 @@ export class Pipeline {
       const entries = await tauri.listDir(this.cacheRoot);
       for (const e of entries) {
         if (e.isDir || !/^script(_demo)?_ch\d+_/.test(e.name)) continue;
+        // 段缓存由剧本阶段自管（失配自清），这里只清整章过期文件，别碰断点
+        if (isScriptPartFileName(e.name)) continue;
         if (this.classifyScriptCache(e.name, expectedByIndex, demo).kind === "stale") {
           await tauri.removePath(e.path).catch(() => {});
           deleted++;
@@ -1894,6 +1899,40 @@ export class Pipeline {
         for (let pos = 0; pos < activeChapters.length; pos++) pendingPos.push(pos);
       }
       let scriptIdx = 0;
+      // 分段进度上报（P1）：长章节分 N 段逐段生成时，每段开始/完成都带 scriptPart 事件，
+      // 页面据此显示「第 k/N 段」（存量 liveProgress 章节级进度条不受影响，各管各的）。
+      const reportScriptPart = (chapter: { index: number; title: string }) =>
+        ({ part, total, phase, elapsedMs, cached }: { part: number; total: number; phase: "start" | "done"; elapsedMs: number; cached?: boolean }): void => {
+          if (total <= 1) return;
+          const scriptPart = { chapter: chapter.index, part, total };
+          if (phase === "start") {
+            if (part === 1) {
+              log({
+                step: "剧本",
+                message: `第 ${chapter.index + 1} 章较长，将分 ${total} 部分逐段生成（请稍候，每部分约 1–3 分钟）…`,
+                level: "info",
+                at: Date.now(),
+                scriptPart,
+              });
+            } else {
+              log({
+                step: "剧本",
+                message: `第 ${chapter.index + 1} 章第 ${part}/${total} 部分开始生成…`,
+                level: "info",
+                at: Date.now(),
+                scriptPart,
+              });
+            }
+          } else {
+            log({
+              step: "剧本",
+              message: `第 ${chapter.index + 1} 章第 ${part}/${total} 部分完成${cached ? "（命中缓存）" : ""}（${Math.round(elapsedMs / 1000)}s）`,
+              level: "info",
+              at: Date.now(),
+              scriptPart,
+            });
+          }
+        };
       const scriptWorker = async (): Promise<void> => {
         while (scriptIdx < pendingPos.length) {
           const pos = pendingPos[scriptIdx++];
@@ -1940,69 +1979,31 @@ export class Pipeline {
                 at: Date.now(),
               });
               try {
-                // 长调用心跳：单章生成可能持续数分钟（分块多轮 LLM），每 90s 报一次存活，避免看起来卡死。
-                // 桌面端剧本已开 SSE 流式：有真实计数时显示「已生成 N 字」；网页版/首字未到保持原文案。
-                const genStart = Date.now();
-                let genProgress: { contentChars: number; reasoningChars: number } | null = null;
-                const heartbeat = setInterval(() => {
-                  const waited = Math.round((Date.now() - genStart) / 1000);
-                  const p = genProgress;
-                  log({
-                    step: "剧本",
-                    message: p && (p.contentChars > 0 || p.reasoningChars > 0)
-                      ? `第 ${chapter.index + 1} 章仍在生成中：已生成 ${p.contentChars} 字（思考 ${p.reasoningChars} 字），已等待 ${waited}s…`
-                      : `第 ${chapter.index + 1} 章仍在生成中（已等待 ${waited}s，模型输出较长请继续等待）…`,
-                    level: "info",
-                    at: Date.now(),
-                  });
-                }, 90000);
-                try {
-                  script = demo
-                    ? demoScriptAll([chapter], cards!)[0]
-                    : await withTextRetry(
-                      () => scriptChapter(input.llm!, chapter, cards!, onUsage, {
-                        style: style || undefined,
-                        compressNarration: this.options.compressNarration,
-                        feedback: this.feedback.script?.[chapter.index],
-                        onLog: (message) => log({ step: "剧本", message, level: "info", at: Date.now() }),
-                        // 流式进度（桌面端）：真实字符数透出给 90s 心跳日志显示「已生成 N 字」
-                        onProgress: (p) => {
-                          genProgress = p;
-                        },
-                        // 长章节会分 N 部分逐段生成（每部分约 1–3 分钟）：逐段打日志，否则看起来像卡死
-                        onPart: ({ part, total, phase, elapsedMs }) => {
-                          if (total <= 1) return;
-                          if (phase === "start" && part === 1) {
-                            log({
-                              step: "剧本",
-                              message: `第 ${chapter.index + 1} 章较长，将分 ${total} 部分逐段生成（请稍候，每部分约 1–3 分钟）…`,
-                              level: "info",
-                              at: Date.now(),
-                            });
-                          } else if (phase === "done") {
-                            log({
-                              step: "剧本",
-                              message: `第 ${chapter.index + 1} 章第 ${part}/${total} 部分完成（${Math.round(elapsedMs / 1000)}s）`,
-                              level: "info",
-                              at: Date.now(),
-                            });
-                          }
-                        },
-                      }),
-                      {
-                        isAborted: () => this.aborted,
-                        onRetry: (attempt, delay, e) =>
-                          log({
-                            step: "剧本",
-                            message: `第 ${chapter.index + 1} 章剧本生成失败，${delay / 1000}s 后重试（第 ${attempt} 次）：${errMsg(e).slice(0, 100)}`,
-                            level: "warn",
-                            at: Date.now(),
-                          }),
-                      },
-                    );
-                } finally {
-                  clearInterval(heartbeat);
-                }
+                script = demo
+                  ? demoScriptAll([chapter], cards!)[0]
+                  : await withTextRetry(
+                    () => scriptChapter(input.llm!, chapter, cards!, onUsage, {
+                      style: style || undefined,
+                      compressNarration: this.options.compressNarration,
+                      feedback: this.feedback.script?.[chapter.index],
+                      onLog: (message) => log({ step: "剧本", message, level: "info", at: Date.now() }),
+                      // 分段落盘/断点续跑（P1）：与上方整章 cacheFile 同键，由剧本层自管段文件
+                      partCache: { cacheDir, demo, styleFrag },
+                      isAborted: () => this.aborted,
+                      // 长章节会分 N 部分逐段生成（每部分约 1–3 分钟）：逐段打日志，否则看起来像卡死
+                      onPart: reportScriptPart(chapter),
+                    }),
+                    {
+                      isAborted: () => this.aborted,
+                      onRetry: (attempt, delay, e) =>
+                        log({
+                          step: "剧本",
+                          message: `第 ${chapter.index + 1} 章剧本生成失败，${delay / 1000}s 后重试（第 ${attempt} 次）：${errMsg(e).slice(0, 100)}`,
+                          level: "warn",
+                          at: Date.now(),
+                        }),
+                    },
+                  );
               } catch (e) {
                 this.recordFailure({
                   id: `chapter_${chapter.index + 1}`,
@@ -2087,6 +2088,10 @@ export class Pipeline {
                         compressNarration: this.options.compressNarration,
                         onLog: (message) => log({ step: "剧本", message, level: "info", at: Date.now() }),
                         feedback: `保真复核未通过：上一版引语覆盖率 ${Math.round(vr.keptRatio * 100)}%、段落覆盖率 ${Math.round(vr.narrationRatio * 100)}%。请逐段核对原文，把遗漏的对话与关键旁白/心理/环境描写全部补全（每个自然段至少一条 line），不要新增原文没有的台词，不要张冠李戴说话人。`,
+                        // 保真重写带意见：段 rest 自动换键，上一版的段文件会被清理后重跑，也支持断点续跑
+                        partCache: { cacheDir, demo, styleFrag },
+                        isAborted: () => this.aborted,
+                        onPart: reportScriptPart(chapter),
                       }),
                       {
                         isAborted: () => this.aborted,

@@ -56,7 +56,7 @@ fn ensure_appreciation_file(target: &std::path::Path) {
         Err(_) => true,
         Ok(existing) => template_stamp(&existing) != template_stamp(APPRECIATION_HTML),
     };
-    if (!outdated) {
+    if !outdated {
         return;
     }
     if dest.exists() {

@@ -1,6 +1,6 @@
 import type { CharacterAction, CharacterCard, CharacterCostume, ExtractionResult, ItemCard, SceneCard } from "./types";
 import { chatJson } from "../api/openaiCompatible";
-import { inputCharBudget, outputTokensForText } from "../api/providers";
+import { inputCharBudgetForText, outputTokensForText } from "../api/providers";
 import { voiceLibraryFor } from "../stores/config";
 import { pickVoiceForGender, voiceGenderOf } from "./minimaxVoices";
 import { normalizeEntityId } from "./ids";
@@ -240,7 +240,10 @@ export async function extractFromNovel(
       return `${id}${label}`;
     })
     .join(", ");
-  const user = `小说标题：${title}\n\n可用音色列表（已标注性别）：${genderedLib}\n\n请为每个角色挑选与其 gender 匹配性别的音色。${fb}\n\n以下是小说全文（按模型上下文动态截断，剩余部分将不被 LLM 看到）：\n${truncate(novelText, inputCharBudget(cfg))}`;
+  // 截断预算必须用「按文本语种估算 + 绝对上限」的变体：inputCharBudget 按 1 token≈1.5 字符（偏英文）
+  // 粗估且上限高达 1,000,000 字符，对中文正文会高估约 2.5 倍（中文实际约 0.6~1.0 字符/token），
+  // 上下文填大值时更会把近百万字符塞进一次请求（远超模型真实窗口）→ 网关截断/报错、提取质量崩。
+  const user = `小说标题：${title}\n\n可用音色列表（已标注性别）：${genderedLib}\n\n请为每个角色挑选与其 gender 匹配性别的音色。${fb}\n\n以下是小说全文（按模型上下文动态截断，剩余部分将不被 LLM 看到）：\n${truncate(novelText, inputCharBudgetForText(cfg, novelText))}`;
   // 输出预算必须扣除输入估算（旧实现 min(context,32768) 在小上下文模型上 input+output 超上下文）
   const outputTokens = outputTokensForText(cfg, `${SYSTEM_PROMPT}\n${user}`);
   const result = await chatJson<ExtractionResult>(cfg, SYSTEM_PROMPT, user, { maxTokens: outputTokens, onUsage });

@@ -6,6 +6,14 @@ export interface ApiConfig {
   model: string;
   /** 通用适配器模板 id（见 api/templates.ts）；空 = 兼容旧配置（OpenAI 兼容直连） */
   adapter?: string;
+  /**
+   * 通道级扩展配置（任意键，程序按需读取）。已使用键：
+   * - `contextLength?: number`：手动覆盖上下文窗口 token（见 resolveContextLength）
+   * - `maxOutputTokens?: number`：单次请求最大输出 token（默认 32768，见 resolveMaxOutputTokens）；
+   *   思考型模型把「思考 + 最终回答」一起计入该预算，需要生成超长章节时调大。
+   * - `disableThinking?: boolean`：关闭深度思考（请求体顶层 `thinking: { type: "disabled" }`）。
+   *   该字段非 OpenAI 标准，默认不发送，只对支持它的厂商（如小米 MiMo）生效。
+   */
   extra?: Record<string, unknown>;
   /** 该 API 的批量生成并发数（图像/配音等）；留空用通道默认值，各 API 互不影响 */
   concurrency?: number;
@@ -570,6 +578,9 @@ export interface PipelineEvent {
   taskKind?: "llm" | "image" | "tts" | "script";
   /** 实时进度（如 图片 12/45）：done/total + 当前生成内容 label */
   progress?: { done: number; total: number; label: string };
+  /** 剧本分段进度（P1）：长章节分 N 部分逐段生成时，调用方在 onPart 里透出，页面据此显示「第 k/N 段」；
+   *  与 progress 章节级进度条互不干扰 */
+  scriptPart?: { chapter: number; part: number; total: number };
 }
 
 export interface FailedTask {

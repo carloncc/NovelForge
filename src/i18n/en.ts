@@ -1210,4 +1210,8 @@ export const en: Record<string, string> = {
   "Web 密钥存储：发现损坏的旧密钥数据，已清除。": "Web key storage: corrupted legacy key data found and cleared.",
   "Web 密钥存储：加密数据无法解密（会话已更换），已清除，需重新输入密钥。": "Web key storage: encrypted data could not be decrypted (session changed) and was cleared; re-enter your keys.",
   "加载示例失败：{error}": "Failed to load the demo: {error}",
+  "最大输出 token（留空 = 32768）": "Max output tokens (blank = 32768)",
+  "思考与回答共享该预算；留空按「已核实模型目录 → 默认 32768」解析，未知模型被厂商拒绝后会自动学习上限": "Thinking and the answer share this budget; blank resolves via the verified model catalog, then defaults to 32768, and unknown models auto-learn their limit after a provider rejection",
+  "关闭深度思考（thinking.type=disabled）": "Disable deep thinking (thinking.type=disabled)",
+  "第 {ch} 章第 {part}/{total} 段": "Chapter {ch}, part {part}/{total}",
 };

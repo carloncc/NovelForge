@@ -575,7 +575,7 @@ async fn do_http_request(
 /// 返回值与 limited_response_bytes 完全一致（同样受 64MB 上限约束、同样的错误文案）；
 /// 任务被 abort 时整个 future 被丢弃，读取随之停止（取消语义由 http_request 的 AbortHandle 提供）。
 async fn read_streaming_bytes(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
     mut on_chunk: impl FnMut(&[u8]),
 ) -> Result<Vec<u8>, String> {
     use futures_util::StreamExt;

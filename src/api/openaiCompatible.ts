@@ -16,6 +16,8 @@ import {
   referenceDataUrl,
   resolveImageModelCapabilities,
   routeImageReferences,
+  MAX_MAX_OUTPUT_TOKENS,
+  MIN_MAX_OUTPUT_TOKENS,
   type DiscoveredModel,
   type ProviderId,
 } from "./providers";
@@ -426,6 +428,20 @@ class ChatRequestBudgetError extends Error {
 }
 
 /**
+ * 思考型模型「只思考、正文为空」的可判定错误。
+ * 不挂 HTTP status：避免被 classifyError 当 invalid_param 硬失败，从而无法在上层
+ * （script.ts genOnePart）做「原样重发 → 拆小」的受控重试。
+ * withRetry 与 chatJson 都不得自动重试它（重试一次就再经历一轮同样长的思考）；
+ * 由上层按其独立计数决定重试次数。
+ */
+export class EmptyContentError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "EmptyContentError";
+  }
+}
+
+/**
  * B93：可中止等待。重试退避最长 60s，用户点停止后不该继续空等；
  * 有 signal 时监听 abort 立即以「已中止」拒绝，无 signal 时保持旧行为。
  */
@@ -472,6 +488,9 @@ export async function withRetry<T>(
       }
       // chatJson 请求预算耗尽：重试也不会恢复，直接抛出（B91）
       if (e instanceof ChatRequestBudgetError) throw e;
+      // 「只思考未产出正文」：自动重试会再经历一轮同样长的思考，仍是硬失败；
+      // 由上层（剧本 genOnePart）按独立计数受控重试/拆分。
+      if (e instanceof EmptyContentError) throw e;
       const status = typeof (e as { status?: number }).status === "number" ? (e as { status?: number }).status : undefined;
       const cls = classifyError(e, status);
       if (cls === "auth" || cls === "invalid_param" || cls === "aborted" || cls === "content_moderation") {
@@ -515,6 +534,53 @@ export function requestTimeoutSecs(baseTimeout: number, budget: number, contentB
   const scaled = (baseTimeout * budget) / Math.max(1, contentBudget);
   const byThroughput = budget / MIN_GEN_TOKENS_PER_SEC;
   return Math.min(1_800, Math.max(baseTimeout, Math.round(Math.max(scaled, byThroughput))));
+}
+
+/* ============ 「匿名/未知模型」最大输出上限自动学习 ============ */
+
+/**
+ * 已学到的模型最大输出上限（内存缓存，键 = baseUrl|model）。
+ * 未知模型无法预知上限：先按默认预算发请求，被厂商 400 拒绝时从报错里解析出真实上限，
+ * 自动降级重试一次并记在这里；之后同一模型的请求在进入 chatCompletion 时先 clamp，
+ * 不再撞 400，也无需用户手改配置。仅影响 max_tokens，不改变 requestBudget/续写/升级计数。
+ */
+const learnedMaxTokensLimits = new Map<string, number>();
+
+/** 缓存键：baseUrl + model（与限流器口径一致的字符串拼接，避免多通道相互污染） */
+function maxTokensLimitKey(cfg: ApiConfig): string {
+  return `${cfg.baseUrl ?? ""}|${cfg.model ?? ""}`;
+}
+
+/** 只匹配明确描述输出 token 上限的措辞，避免把请求值或上下文长度误学成输出上限。 */
+const MAX_TOKENS_LIMIT_PATTERNS = [
+  /(?:less\s+than(?:\s+or\s+equal\s+to)?|no\s+more\s+than|at\s+most)[^\d]{0,40}(\d{2,7})/i,
+  /(?:<=|≤)[^\d]{0,12}(\d{2,7})/i,
+  /(?:maximum|max)\s+(?:allowed|output|completion|limit)(?:\s+tokens?)?[^\d]{0,40}(\d{2,7})/i,
+  /(?:allowed|limit)\s+(?:max_(?:completion_)?tokens|output(?:_tokens)?|completion(?:_tokens)?)[^\d]{0,40}(\d{2,7})/i,
+  /exceed\w*[^\d]{0,40}(?:maximum|allowed|limit)[^\d]{0,24}(\d{2,7})/i,
+  /(?:最大|上限|不能超过|不超过|至多|小于等于)[^\d]{0,40}(\d{2,7})/i,
+];
+
+/**
+ * 从厂商 400 报错文本里解析「最大输出 token 上限」（纯函数，供单测）。
+ * 只在报文同时提到 max_tokens / max_completion_tokens 且出现数字时生效：
+ * - 只接受明确描述输出上限的措辞（maximum allowed / less than / exceeds the limit / 最大 / ≤ …），
+ *   避免把「我们发出去的那个数」当成上限（如 `max_tokens: 131072 is greater than the maximum allowed 65536`）；
+ * - 不从模糊报文中猜数字，避免把请求值或上下文限制缓存成输出上限；
+ * - 结果 clamp 到 [MIN_MAX_OUTPUT_TOKENS, MAX_MAX_OUTPUT_TOKENS]，无法明确解析时返回 undefined。
+ */
+export function parseMaxTokensLimitFromError(bodyText: string): number | undefined {
+  const text = String(bodyText ?? "").slice(0, 4_000);
+  if (!/max_(?:completion_)?tokens/i.test(text)) return undefined;
+  const clamp = (n: number): number =>
+    Math.min(MAX_MAX_OUTPUT_TOKENS, Math.max(MIN_MAX_OUTPUT_TOKENS, Math.floor(n)));
+  for (const pattern of MAX_TOKENS_LIMIT_PATTERNS) {
+    const match = pattern.exec(text);
+    if (!match) continue;
+    const n = Number(match[1]);
+    if (Number.isFinite(n) && n >= 1) return clamp(n);
+  }
+  return undefined;
 }
 
 /* ============ SSE 流式解析（剧本路径「已生成 N 字」进度） ============ */
@@ -688,6 +754,13 @@ export async function chatCompletion(
     body.tools = opts.tools;
     body.tool_choice = opts.toolChoice ?? "auto";
   }
+  // 关闭深度思考（可选，通道级 extra.disableThinking）：
+  // `thinking` 不是 OpenAI 标准字段，只有支持它的厂商（如小米 MiMo）才认。
+  // 因此默认不发送，避免其他厂商/网关因未知字段报错；仅在开关为 true 时按厂商文档
+  // 放在请求体顶层（OpenAI 兼容 SDK 里对应 extra_body，落到原始 HTTP 就是顶层字段）。
+  if (cfg.extra?.disableThinking === true) {
+    body.thinking = { type: "disabled" };
+  }
   log.info("api", "LLM 请求发出", {
     url: redactUrl(url),
     model: cfg.model,
@@ -827,6 +900,21 @@ export async function chatCompletion(
       if (/requires explicit opt.?in|opt.?in.{0,30}(data|quality)|collects data/i.test(message)) {
         message += "（该模型要求先在服务商页面点同意「数据用于改进质量」才能调用：用浏览器打开报错里的链接完成 opt-in 后重试；或换一个不需要 opt-in 的模型/通道）";
       }
+      // max_tokens/max_completion_tokens 过大的 400（如 "max_tokens is too large"、
+      // "max_completion_tokens must be less than..."）：给出可执行的修复入口。
+      // 仅追加文案，不改错误分类（仍由 classifyError 按 invalid_param 硬失败）。
+      if (/max_(?:completion_)?tokens/i.test(message)
+        && /too large|too big|must be less|less than|exceed|maximum|allowed|too many|过大|超出|上限/i.test(message)) {
+        message += "（该模型的最大输出小于当前设置：请在「API 配置 > 该通道 > 最大输出 token」调小后重试）";
+      }
+      // 「匿名/未知模型」自动学习最大输出：厂商 400 报文常带出真实上限数字。
+      // 解析到就把上限挂到错误上，交由 runOnce 记录并降级重试一次（仅 4xx；5xx 已在上方抛出）。
+      const maxTokensLimit = parseMaxTokensLimitFromError(text);
+      if (maxTokensLimit !== undefined) {
+        const limitError = new Error(`LLM 返回错误 ${res.status}: ${message}`) as Error & { maxTokensLimit?: number };
+        limitError.maxTokensLimit = maxTokensLimit;
+        throw limitError;
+      }
       throw new Error(`LLM 返回错误 ${res.status}: ${message}`);
     }
 
@@ -858,6 +946,16 @@ export async function chatCompletion(
         finishReason: sse.finishReason ?? "?",
         done: sse.done,
       });
+      if (!sse.finishReason) {
+        // 网关只回 delta、不带 finish_reason 时，「截断/正常停止」就无从判定：
+        // 记一条 warn 并带上报文尾部，便于直接确认网关是否真的不发该字段。
+        log.warn("api", "流式响应未带 finish_reason（无法判定截断/停止）", {
+          done: sse.done,
+          contentLen: sse.content.length,
+          reasoningLen: sse.reasoning.length,
+          tail: text.slice(-400),
+        });
+      }
     } else {
       try {
         data = JSON.parse(text);
@@ -923,9 +1021,33 @@ export async function chatCompletion(
   };
   // 文本请求限流（按 API 隔离，默认 3、上限 8，见 llmLimiterFor；此前注释误写“并发 1 串行”已纠正）
   return llmLimiterFor(cfg).run(async () => {
-    const runOnce = (budget: number): Promise<Awaited<ReturnType<typeof perform>>> =>
-      withRetry(() => perform(budget), retryOpts);
-    let budget = contentBudget;
+    const cacheKey = maxTokensLimitKey(cfg);
+    // 已学到的上限只影响 max_tokens：进入时先 clamp，避免同一模型每次都撞 400。
+    const clampToKnownLimit = (value: number): number => {
+      const known = learnedMaxTokensLimits.get(cacheKey);
+      return known !== undefined ? Math.min(value, known) : value;
+    };
+    let degradedOnce = false;
+    const runOnce = async (budget: number): Promise<Awaited<ReturnType<typeof perform>>> => {
+      try {
+        return await withRetry(() => perform(budget), retryOpts);
+      } catch (e) {
+        // 「匿名/未知模型」：4xx 报文解析出上限且当前预算确实超了 → 记录并降级重试一次。
+        // 仍失败则原样抛出（degradedOnce 保证不无限重试）。
+        const limit = (e as { maxTokensLimit?: number }).maxTokensLimit;
+        if (typeof limit !== "number" || budget <= limit || degradedOnce) throw e;
+        degradedOnce = true;
+        learnedMaxTokensLimits.set(cacheKey, limit);
+        log.warn("api", "max_tokens 超限，按厂商上限自动降级重试", { from: budget, to: limit });
+        opts.onEvent?.({
+          kind: "escalate",
+          attempt: 1,
+          message: `max_tokens 超限，按厂商上限 ${limit} 自动降级重试`,
+        });
+        return await withRetry(() => perform(limit), retryOpts);
+      }
+    };
+    let budget = clampToKnownLimit(contentBudget);
     let response = await runOnce(budget);
     // 升级重试（仅 content 为空且 finishReason=length → 预算被推理思考耗尽时放大）：
     // 截断但非空的响应（含残缺 JSON）直接返回，由 chatJson 的续写循环分段取回——
@@ -951,7 +1073,7 @@ export async function chatCompletion(
         });
         break;
       }
-      const next = Math.min(MAX_OUTPUT_TOKENS, nextBudgetAfterThinking(budget, response, contentBudget));
+      const next = clampToKnownLimit(Math.min(MAX_OUTPUT_TOKENS, nextBudgetAfterThinking(budget, response, contentBudget)));
       if (next <= budget || seenBudgets.has(next)) break;
       seenBudgets.add(next);
       log.warn("api", "输出为空且被截断（思考耗尽输出预算），按思考量放大 max_tokens 重试", {
@@ -988,17 +1110,23 @@ export async function chatCompletion(
     let content = response.rawContent;
     // 推理型模型可能把答案写进 reasoning_content，content 为空时回退读取。
     if (!content.trim() && response.reasoning.trim()) {
-      log.warn("api", "message.content 为空，已回退使用 reasoning_content", {
-        reasoningLen: response.reasoning.length,
-        finishReason: response.finishReason ?? "?",
-      });
-      // JSON 模式下：reasoning_content 先是一大段"思考过程"，真正的 JSON 往往在末尾。
-      // 逐段尝试解析，取最后一个合法 JSON（而不是盲目取首个 { 到最后一个 }，避免思考里的伪 JSON 干扰）。
-      content = opts.json ? extractJsonFromMixed(response.reasoning) : response.reasoning;
-      if (content !== response.reasoning) {
+      const candidate = reasoningFallbackContent(response.reasoning, !!opts.json);
+      if (candidate) {
+        log.warn("api", "message.content 为空，已回退使用 reasoning_content", {
+          reasoningLen: response.reasoning.length,
+          finishReason: response.finishReason ?? "?",
+        });
+        content = candidate;
         log.info("api", "reasoning_content 中提取到 JSON", {
           reasoningLen: response.reasoning.length,
-          candidateLen: content.length,
+          candidateLen: candidate.length,
+        });
+      } else {
+        // 关键：绝不把整段思考当「正文」回填——那会把「模型只思考没产出」伪装成「JSON 解析失败」，
+        // 再触发一次昂贵的「修复」长思考（实测 MiMo 深度思考 6 分钟只出思考、正文为空）。
+        log.warn("api", "message.content 为空，且思考内容里没有可用的 JSON（模型只思考未产出正文）", {
+          reasoningLen: response.reasoning.length,
+          finishReason: response.finishReason ?? "?",
         });
       }
     }
@@ -1102,6 +1230,19 @@ export function nextBudgetAfterThinking(
   const reasoningUsed = reasoningTokensUsed(resp);
   const want = reasoningUsed + Math.max(1, contentBudget) + 1024;
   return Math.max(prevBudget + 8000, want);
+}
+
+/**
+ * 从思考内容里抠 JSON 作为回退正文（纯函数，供单测）。
+ * json 模式只接受「真的抠出 JSON」的情况；抠不到就返回空串——
+ * 把整段思考当正文回填只会把「模型只思考没产出」伪装成「JSON 解析失败」，
+ * 然后触发一轮同样昂贵的「修复」长思考（实测 MiMo 深度思考 6 分钟只出思考、正文为空）。
+ * 非 json 模式维持旧行为（整段思考即答复）。
+ */
+export function reasoningFallbackContent(reasoning: string, json: boolean): string {
+  if (!json) return reasoning;
+  const candidate = extractJsonFromMixed(reasoning);
+  return candidate === reasoning ? "" : candidate;
 }
 
 /** 本次响应实际用于思考的 token 数（纯函数，供单测）：优先取服务端报告，
@@ -1233,6 +1374,15 @@ export async function chatJson<T>(
         continueCount,
       });
       opts.onEvent?.({ kind: "escalate", attempt: continueCount, message: "输出仍被截断但新增过少，停止续写转解析" });
+    }
+
+    // 空产出（模型只思考/整体空响应）不要去「修复」：修复只会让它再想一遍（实测一次 6 分钟），
+    // 而且没有任何可解析的内容可修。抛可识别的 EmptyContentError（不挂 status）：
+    // 既不触发 chatJson 内部的续写/修复，也不被 withRetry 当 unknown 退避重试；
+    // 由上层（剧本 genOnePart）按独立计数原样重发，仍失败再拆小。
+    if (!accumulated.trim()) {
+      log.error("api", "模型没有输出任何正文内容", { finishReason: finishReason ?? "?", requestCount, continueCount });
+      throw new EmptyContentError("模型本次没有输出任何正文（只产生了思考内容，可能是思考过长或流被截断）");
     }
 
     try {

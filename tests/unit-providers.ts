@@ -5,6 +5,10 @@ import {
   inputCharBudgetForText,
   MAX_INPUT_CHUNK_CHARS,
   parseModelList,
+  resolveMaxOutputTokens,
+  DEFAULT_MAX_OUTPUT_TOKENS,
+  MIN_MAX_OUTPUT_TOKENS,
+  MAX_MAX_OUTPUT_TOKENS,
 } from "../src/api/providers";
 
 function assert(condition: boolean, message: string): void {
@@ -58,6 +62,20 @@ function main(): void {
   const cfg700k = { model: "m", extra: { contextLength: 700000 } };
   assert(inputCharBudgetForText(cfg700k, zh) === MAX_INPUT_CHUNK_CHARS, "超大上下文中文也应被硬上限截断");
   assert(inputCharBudgetForText(cfg700k, en) === MAX_INPUT_CHUNK_CHARS, "超大上下文英文也应被硬上限截断");
+
+  // 通道级最大输出 token（extra.maxOutputTokens）：缺失/非法回退 32768，合法值 clamp [512, 131072]
+  assert(resolveMaxOutputTokens(undefined) === DEFAULT_MAX_OUTPUT_TOKENS, "无配置应回退默认 32768");
+  assert(resolveMaxOutputTokens({ extra: {} }) === 32768, "extra 无该键应回退 32768");
+  assert(resolveMaxOutputTokens({ extra: { maxOutputTokens: 0 } }) === 32768, "0 视为非法，回退 32768");
+  assert(resolveMaxOutputTokens({ extra: { maxOutputTokens: -5 } }) === 32768, "负数视为非法，回退 32768");
+  assert(resolveMaxOutputTokens({ extra: { maxOutputTokens: NaN } }) === 32768, "NaN 视为非法，回退 32768");
+  assert(resolveMaxOutputTokens({ extra: { maxOutputTokens: Infinity } }) === 32768, "Infinity 视为非法，回退 32768");
+  assert(resolveMaxOutputTokens({ extra: { maxOutputTokens: "abc" } }) === 32768, "非数字字符串回退 32768");
+  assert(resolveMaxOutputTokens({ extra: { maxOutputTokens: 100 } }) === MIN_MAX_OUTPUT_TOKENS, "低于下限应 clamp 到 512");
+  assert(resolveMaxOutputTokens({ extra: { maxOutputTokens: 500000 } }) === MAX_MAX_OUTPUT_TOKENS, "高于上限应 clamp 到 131072");
+  assert(resolveMaxOutputTokens({ extra: { maxOutputTokens: 128000 } }) === 128000, "合法值原样采用（向下取整）");
+  assert(resolveMaxOutputTokens({ extra: { maxOutputTokens: 65536.9 } }) === 65536, "合法小数应向下取整");
+  assert(resolveMaxOutputTokens({ extra: { maxOutputTokens: "131072" } }) === 131072, "数字字符串应被解析");
 
   console.log("=== 供应商与模型能力测试通过 ===");
 }
