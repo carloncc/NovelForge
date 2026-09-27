@@ -5,7 +5,7 @@ import { readFile, readdir, mkdir, stat, rm } from "node:fs/promises";
 import { closeSync, createReadStream, mkdirSync, openSync, writeSync } from "node:fs";
 import { join, dirname, normalize, extname, relative, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createServer, type Server as HttpServer } from "node:http";
+import { createServer, type Server as HttpServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { installModel, installedModelFile, modelPath } from "./scripts/web-model-downloader.mjs";
@@ -80,7 +80,7 @@ function spawnModelInstall(modelId: string): void {
 
 /** 安全解析请求 URL：畸形请求目标（如原始 socket 发送非法绝对 URL）会抛 TypeError，
  * 不能让未捕获异常打死 dev/preview 进程（Node 15+ 未处理 rejection 默认终止进程）。 */
-function parseRequestUrl(req: Connect.IncomingMessage): URL | null {
+function parseRequestUrl(req: IncomingMessage): URL | null {
   try {
     return new URL(req.url ?? "/", "http://localhost");
   } catch {
@@ -90,8 +90,8 @@ function parseRequestUrl(req: Connect.IncomingMessage): URL | null {
 
 /** 中间件统一异常边界：async handler 的未捕获异常返回 500，而不是成为 unhandled rejection */
 function safeHandler(
-  handler: (req: Connect.IncomingMessage, res: Connect.ServerResponse) => Promise<void>,
-): (req: Connect.IncomingMessage, res: Connect.ServerResponse) => void {
+  handler: (req: IncomingMessage, res: ServerResponse) => Promise<void>,
+): (req: IncomingMessage, res: ServerResponse) => void {
   return (req, res) => {
     handler(req, res).catch((e: unknown) => {
       console.error("[novelforge] middleware handler error:", e);
@@ -104,7 +104,7 @@ function safeHandler(
   };
 }
 
-async function handleModelRequest(req: Connect.IncomingMessage, res: Connect.ServerResponse): Promise<void> {
+async function handleModelRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const u = parseRequestUrl(req);
   if (!u) {
     sendJson(res, 400, { error: "bad request" });
@@ -216,13 +216,13 @@ function previewCacheControl(ext: string): string {
     : "no-cache, max-age=0, must-revalidate";
 }
 
-function sendJson(res: Connect.ServerResponse, code: number, obj: unknown): void {
+function sendJson(res: ServerResponse, code: number, obj: unknown): void {
   res.statusCode = code;
   res.setHeader("Content-Type", "application/json");
   res.end(JSON.stringify(obj));
 }
 
-function readBody(req: Connect.IncomingMessage, maxBytes: number): Promise<string> {
+function readBody(req: IncomingMessage, maxBytes: number): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
@@ -304,10 +304,10 @@ export function validateProxyUrl(raw: string): URL {
   return url;
 }
 
-function isLocalHost(host: unknown): boolean { let h = String(host || "").toLowerCase(); if (h.startsWith("[")) { const end = h.indexOf("]"); h = end >= 0 ? h.slice(0, end + 1) : h.split(":")[0]; } else { h = h.split(":")[0]; } const name = h.replace(/^\[|\]$/g, ""); return name === "localhost" || name === "127.0.0.1" || name === "::1"; } function isSameOriginRequest(req: Connect.IncomingMessage): boolean { const host = req.headers.host; if (!host || !isLocalHost(host)) return false; const origin = req.headers.origin as string | undefined; const referer = req.headers.referer as string | undefined; const expectHttp = "http://" + host; const expectHttps = "https://" + host; if (origin && origin !== expectHttp && origin !== expectHttps) return false; if (!origin && referer) { try { const r = new URL(referer); if (r.host !== String(host)) return false; } catch { return false; } } return true; } /** B120：/file 的请求由 onnxruntime-web 内部 fetch 发出，无法附加 X-NovelForge-Token 头；
+function isLocalHost(host: unknown): boolean { let h = String(host || "").toLowerCase(); if (h.startsWith("[")) { const end = h.indexOf("]"); h = end >= 0 ? h.slice(0, end + 1) : h.split(":")[0]; } else { h = h.split(":")[0]; } const name = h.replace(/^\[|\]$/g, ""); return name === "localhost" || name === "127.0.0.1" || name === "::1"; } function isSameOriginRequest(req: IncomingMessage): boolean { const host = req.headers.host; if (!host || !isLocalHost(host)) return false; const origin = req.headers.origin as string | undefined; const referer = req.headers.referer as string | undefined; const expectHttp = "http://" + host; const expectHttps = "https://" + host; if (origin && origin !== expectHttp && origin !== expectHttps) return false; if (!origin && referer) { try { const r = new URL(referer); if (r.host !== String(host)) return false; } catch { return false; } } return true; } /** B120：/file 的请求由 onnxruntime-web 内部 fetch 发出，无法附加 X-NovelForge-Token 头；
  * 因此 /session 会额外下发 SameSite=Strict 会话 Cookie，这里作为等价凭据读取
  * （同源自动携带，跨站子请求不会发送）。 */
-function readSessionCookie(req: Connect.IncomingMessage): string | undefined {
+function readSessionCookie(req: IncomingMessage): string | undefined {
   const header = req.headers.cookie;
   if (!header) return undefined;
   for (const part of String(header).split(";")) {
@@ -316,7 +316,7 @@ function readSessionCookie(req: Connect.IncomingMessage): string | undefined {
   }
   return undefined;
 }
-function authorizeGet(req: Connect.IncomingMessage, res: Connect.ServerResponse, allowSessionCookie = false): boolean {
+function authorizeGet(req: IncomingMessage, res: ServerResponse, allowSessionCookie = false): boolean {
   if (!isLocalHost(req.headers.host)) { sendJson(res, 403, { error: "forbidden" }); return false; }
   const hasToken = req.headers["x-novelforge-token"] === SESSION_TOKEN
     || (allowSessionCookie && readSessionCookie(req) === SESSION_TOKEN);
@@ -324,7 +324,7 @@ function authorizeGet(req: Connect.IncomingMessage, res: Connect.ServerResponse,
   if (!isSameOriginRequest(req)) { sendJson(res, 403, { error: "invalid origin" }); return false; }
   return true;
 }
-function authorize(req: Connect.IncomingMessage, res: Connect.ServerResponse): boolean {
+function authorize(req: IncomingMessage, res: ServerResponse): boolean {
   if (!isLocalHost(req.headers.host)) { sendJson(res, 403, { error: "forbidden" }); return false; } if (req.headers["x-novelforge-token"] !== SESSION_TOKEN) {
     sendJson(res, 403, { error: "forbidden" });
     return false;
@@ -363,7 +363,7 @@ async function readLimitedResponse(resp: Response): Promise<Buffer> {
 }
 
 /** 代理转发：浏览器无法直连厂商 API（CORS），由 dev/preview 服务器中转 */
-async function handleProxy(req: Connect.IncomingMessage, res: Connect.ServerResponse): Promise<void> {
+async function handleProxy(req: IncomingMessage, res: ServerResponse): Promise<void> {
   let raw: string;
   try {
     raw = await readBody(req, PROXY_BODY_LIMIT);
@@ -415,7 +415,7 @@ async function handleProxy(req: Connect.IncomingMessage, res: Connect.ServerResp
 }
 
 /** 模板资源：浏览器按需从 dev server 拉取 WebGAL 引擎文件 */
-async function handleTemplate(req: Connect.IncomingMessage, res: Connect.ServerResponse): Promise<void> {
+async function handleTemplate(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const u = parseRequestUrl(req);
   if (!u) {
     sendJson(res, 400, { error: "bad request" });
@@ -554,7 +554,7 @@ async function extractPreviewZip(zipBase64: string, dest: string): Promise<void>
 }
 
 /** 预览：接收前端 zip 打包的游戏 → 解压到临时目录 → 返回访问 URL */
-async function handlePreviewUpload(req: Connect.IncomingMessage, res: Connect.ServerResponse): Promise<void> {
+async function handlePreviewUpload(req: IncomingMessage, res: ServerResponse): Promise<void> {
   let raw: string;
   try {
     raw = await readBody(req, PREVIEW_REQUEST_LIMIT);
@@ -596,7 +596,7 @@ async function handlePreviewUpload(req: Connect.IncomingMessage, res: Connect.Se
 }
 
 /** 预览静态资源服务 */
-async function handlePreviewStatic(req: Connect.IncomingMessage, res: Connect.ServerResponse): Promise<void> {
+async function handlePreviewStatic(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const u = parseRequestUrl(req);
   if (!u) {
     res.statusCode = 400;
@@ -660,7 +660,7 @@ function ensurePreviewServer(): Promise<void> {
  * ort 推理时会动态 import() /onnx/*.mjs 胶水模块；public 文件被当作模块加载时
  * vite dev 会报“public 文件不应从源码 import”。此中间件提前接管 /onnx/ 请求。
  * （生产构建仍走 public 目录拷贝后的静态托管，行为不变。） */
-async function handleOnnxAsset(req: Connect.IncomingMessage, res: Connect.ServerResponse): Promise<void> {
+async function handleOnnxAsset(req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (req.method !== "GET" && req.method !== "HEAD") {
     res.statusCode = 405;
     res.end();
@@ -697,7 +697,7 @@ async function handleOnnxAsset(req: Connect.IncomingMessage, res: Connect.Server
 }
 
 function webPlugin(): Plugin {
-  const mount = (server: { middlewares: Connect.Server }) => {
+  const mount = (server: { middlewares: Connect.Server; httpServer?: any }) => {
     server.middlewares.use("/onnx/", safeHandler(handleOnnxAsset));
     server.middlewares.use("/__novelforge/proxy", (req, res) => {
       if (req.method !== "POST") {

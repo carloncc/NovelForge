@@ -84,7 +84,6 @@ const OPTIONS: GenerationOptions = {
   imageBudgetPerChapter: 1,
   cgPerChapter: 0,
   skipCache: false,
-  maxConcurrent: 1,
   videoPointsPerChapter: 0,
   characterIntroCard: false,
   imageStyle: "",

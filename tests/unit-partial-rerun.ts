@@ -122,7 +122,7 @@ async function main(): Promise<void> {
     const templateDir = `${import.meta.dirname.replace(/\\/g, "/")}/../src-tauri/templates/webgal`;
     const runAll = (log: (ev: PipelineEvent) => void, extra: object = {}) => new Pipeline({
       novel, materials: [], outputDir: out, templateDir,
-      options: { useImage: false, useTts: false, skipCache: false, maxConcurrent: 2, ...(extra as object) },
+      options: { useImage: false, useTts: false, useVideoPoints: false, useBgm: false, figureEmotions: false, figureActions: false, characterPoses: false, imageSelfCheck: false, imageBudgetPerChapter: 0, cgPerChapter: 0, skipCache: false, videoPointsPerChapter: 0, characterIntroCard: false, ...(extra as object) },
       log,
     }).run();
     const logs1: PipelineEvent[] = [];
@@ -136,7 +136,7 @@ async function main(): Promise<void> {
     const logs2: PipelineEvent[] = [];
     const res2 = await new Pipeline({
       novel, materials: [], outputDir: out, templateDir,
-      options: { useImage: false, useTts: false, skipCache: false, maxConcurrent: 2, rerunChapters: [1] },
+      options: { useImage: false, useTts: false, useVideoPoints: false, useBgm: false, figureEmotions: false, figureActions: false, characterPoses: false, imageSelfCheck: false, imageBudgetPerChapter: 0, cgPerChapter: 0, skipCache: false, videoPointsPerChapter: 0, characterIntroCard: false, rerunChapters: [1] },
       stages: ["script"],
       feedback: { script: { [1]: "更燃一点" } },
       log: (e) => logs2.push(e),
@@ -153,7 +153,7 @@ async function main(): Promise<void> {
     const logs3: PipelineEvent[] = [];
     const res3 = await new Pipeline({
       novel, materials: [], outputDir: out, templateDir,
-      options: { useImage: false, useTts: false, skipCache: false, maxConcurrent: 2, rerunChapters: [1], rerunChaptersForce: [1] },
+      options: { useImage: false, useTts: false, useVideoPoints: false, useBgm: false, figureEmotions: false, figureActions: false, characterPoses: false, imageSelfCheck: false, imageBudgetPerChapter: 0, cgPerChapter: 0, skipCache: false, videoPointsPerChapter: 0, characterIntroCard: false, rerunChapters: [1], rerunChaptersForce: [1] },
       stages: ["script"],
       log: (e) => logs3.push(e),
     }).run();
@@ -219,7 +219,7 @@ async function main(): Promise<void> {
     const templateDir = `${import.meta.dirname.replace(/\\/g, "/")}/../src-tauri/templates/webgal`;
     const first = await new Pipeline({
       novel, materials: [], outputDir: out, templateDir,
-      options: { useImage: false, useTts: false, skipCache: false, maxConcurrent: 2 },
+      options: { useImage: false, useTts: false, useVideoPoints: false, useBgm: false, figureEmotions: false, figureActions: false, characterPoses: false, imageSelfCheck: false, imageBudgetPerChapter: 0, cgPerChapter: 0, skipCache: false, videoPointsPerChapter: 0, characterIntroCard: false },
       log: () => {},
     }).run();
     assert(first.chapters.length === 2, `首次应产出 2 章，实际 ${first.chapters.length}`);
@@ -230,7 +230,7 @@ async function main(): Promise<void> {
     const logs: PipelineEvent[] = [];
     const res = await new Pipeline({
       novel, materials: [], outputDir: out, templateDir,
-      options: { useImage: false, useTts: false, skipCache: false, maxConcurrent: 2, forceScriptChapters: [1] },
+      options: { useImage: false, useTts: false, useVideoPoints: false, useBgm: false, figureEmotions: false, figureActions: false, characterPoses: false, imageSelfCheck: false, imageBudgetPerChapter: 0, cgPerChapter: 0, skipCache: false, videoPointsPerChapter: 0, characterIntroCard: false, forceScriptChapters: [1] },
       stages: ["script"],
       log: (e) => logs.push(e),
     }).run();

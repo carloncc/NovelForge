@@ -5,6 +5,7 @@ import {
   verifyIssueKey,
   verifyScriptAgainstSource,
 } from "../src/core/script";
+import type { ChapterScript } from "../src/core/types";
 
 function assert(cond: boolean, msg: string): void {
   if (!cond) throw new Error(msg);
@@ -78,7 +79,7 @@ function main(): void {
   assert(verifyIssueKey(1, 10, "context-mismatch") === "1:10:context-mismatch", "存疑 key 格式异常");
 
   // 接受建议说话人：只改 characterId，不碰其它内容
-  const scriptForFix = {
+  const scriptForFix: ChapterScript = {
     chapter: 0,
     title: "第一章",
     scenes: [
@@ -90,7 +91,7 @@ function main(): void {
         ],
       },
     ],
-  } as never;
+  };
   const fixed = applySpeakerFix(scriptForFix, 0, 0, "yuto");
   assert((fixed.scenes[0].lines[0] as { characterId: string }).characterId === "yuto", "说话人应被改掉");
   assert((fixed.scenes[0].lines[1] as { text: string }).text === "旁白。", "其它行不应被动");

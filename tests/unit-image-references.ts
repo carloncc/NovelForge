@@ -603,7 +603,7 @@ async function testCacheBindingForcesOnlyChangedCharacter(): Promise<void> {
       title: "Book",
       characters: [character("alice"), character("bob")],
       scenes: [],
-      items: [{ id: "relic", name: "Relic", description: "", imagePrompt: "relic", importance: "major" }],
+      items: [{ id: "relic", name: "Relic", appearance: "", note: "", imagePrompt: "relic" }],
     }, [], cacheRoot, () => {}, 1, false, undefined, undefined, false, false, false, undefined, undefined, true, undefined, bible);
   } finally {
     tauri.http = originalHttp;
@@ -829,7 +829,7 @@ async function testApprovedBibleFingerprintPreventsOldCacheBypass(): Promise<voi
     title: "Book",
     characters: [],
     scenes: [],
-    items: [{ id: "relic", name: "Relic", description: "", imagePrompt: "ancient relic", importance: "major" as const }],
+    items: [{ id: "relic", name: "Relic", appearance: "", note: "", imagePrompt: "ancient relic" }],
   };
   let requestCount = 0;
   const originalHttp = tauri.http;
@@ -873,7 +873,7 @@ function testExactThreeViewCascadeWithPosesDisabled(): void {
   assert(tasks[0]?.id === "alice_threeview", "explicit regeneration should start with the exact target three-view");
   assert(tasks[1]?.id === "alice" && tasks[1].kind === "figure", "default figure should run immediately after the three-view");
   assert(tasks.slice(2, 6).every((task) => task.kind === "figure" && task.id.startsWith("alice_")), "expressions should run after the default figure");
-  assert(tasks.at(-1)?.id === "alice_act_wave", "actions should run last even when batch poses are disabled");
+  assert(tasks[tasks.length - 1]?.id === "alice_act_wave", "actions should run last even when batch poses are disabled");
   assert(tasks.every((task) => task.characterId === "alice"), "prefix-related characters must not enter the target cascade");
 }
 

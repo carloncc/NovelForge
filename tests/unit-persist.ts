@@ -30,10 +30,15 @@ async function main(): Promise<void> {
   const options = {
     useImage: true,
     useTts: false,
+    useVideoPoints: false,
+    useBgm: false,
+    figureEmotions: false,
+    figureActions: false,
+    characterPoses: false,
+    imageSelfCheck: false,
     imageBudgetPerChapter: 12,
     cgPerChapter: 3,
     skipCache: false,
-    maxConcurrent: 2,
     videoPointsPerChapter: 2,
     characterIntroCard: true,
   };
@@ -124,24 +129,24 @@ async function main(): Promise<void> {
     "legacy character references should restore as revisioned project-local paths",
   );
 
-  assert(restored.visualBible && restored.novel && restored.lastResult, "restored project should contain the inputs needed to approve its visual bible");
-  restored.visualBible.status = "approved";
-  restored.visualBible.approvedAt = "2026-08-08T00:00:00.000Z";
-  restored.visualBible.characters.alice.approved = true;
-  restored.visualBible.characters.alice.sheetSourceRevision = restored.visualBible.characters.alice.sourceRevision;
-  restored.visualBible.inputFingerprint = await computeProjectVisualBibleFingerprint(
+  assert(!!restored.visualBible && !!restored.novel && !!restored.lastResult, "restored project should contain the inputs needed to approve its visual bible");
+  restored.visualBible!.status = "approved";
+  restored.visualBible!.approvedAt = "2026-08-08T00:00:00.000Z";
+  restored.visualBible!.characters.alice.approved = true;
+  restored.visualBible!.characters.alice.sheetSourceRevision = restored.visualBible!.characters.alice.sourceRevision;
+  restored.visualBible!.inputFingerprint = await computeProjectVisualBibleFingerprint(
     DIR,
-    restored.visualBible,
-    restored.novel,
-    restored.lastResult.cards.characters,
+    restored.visualBible!,
+    restored.novel!,
+    restored.lastResult!.cards.characters,
   );
   await saveProjectState({
-    novel: restored.novel,
+    novel: restored.novel!,
     materials: restored.materials,
     outputDir: DIR,
     options: restored.options!,
-    lastResult: restored.lastResult,
-    visualBible: restored.visualBible,
+    lastResult: restored.lastResult!,
+    visualBible: restored.visualBible!,
   });
   await writeFile(novelPath, "changed chapter body after visual-bible approval", "utf-8");
   const staleRestore = await restoreProjectState(DIR);

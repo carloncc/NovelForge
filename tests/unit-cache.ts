@@ -18,7 +18,7 @@ function runPipeline(out: string, novelText: string, skipCache: boolean, log: (e
     materials: [],
     outputDir: out,
     templateDir: `${import.meta.dirname.replace(/\\/g, "/")}/../src-tauri/templates/webgal`,
-    options: { useImage: false, useTts: false, imageBudgetPerChapter: 6, cgPerChapter: 2, skipCache, maxConcurrent: 2 },
+    options: { useImage: false, useTts: false, useVideoPoints: false, useBgm: false, figureEmotions: false, figureActions: false, characterPoses: false, imageSelfCheck: false, imageBudgetPerChapter: 6, cgPerChapter: 2, skipCache, videoPointsPerChapter: 0, characterIntroCard: false },
     log,
   });
   return pipeline.run();

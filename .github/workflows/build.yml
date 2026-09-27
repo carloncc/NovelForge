@@ -45,11 +45,10 @@ jobs:
         run: pnpm exec vue-tsc --noEmit
         timeout-minutes: 10
 
-      # #1310：单测类型门（咨询性：历史单测存在类型腐烂，修完前不阻塞构建；变绿后可去掉 continue-on-error）
-      - name: Typecheck tests (advisory)
+      # 单测类型门：历史类型腐烂已清零（2026-09-27），现为硬门禁
+      - name: Typecheck tests
         run: pnpm typecheck:tests
         timeout-minutes: 10
-        continue-on-error: true
 
       - name: i18n dictionary check
         run: pnpm check:i18n

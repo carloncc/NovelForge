@@ -55,6 +55,7 @@
 - 逐章工作台新增旧缓存提示：仍有章节只能退回旧版无指纹剧本时，明确写出「共 N 章」并说明图像数是按旧剧本估算、建议先重跑这些章的「剧本」
 - CI（GitHub Actions）在新检出上 `Frontend unit tests` 挂掉：`tests/unit-nb-np-final.ts` 断言模板 `index.html` 含 file:// 协议探测提示，但该探测是之前直接手改 gitignored 的模板文件加的、`pnpm prepare:template` 从不生成它——新机器/CI 拉到的新模板没有这段，测试必挂。现把探测块收敛为版本库内的 `scripts/file-protocol-probe.html`，由 `prepare:template` 幂等注入（已含标记则跳过），新检出与 CI 自动带上
 - CI 的 `Rust tests` 在 Linux 上编译失败（`error[E0277]`：`if *canon == Path::new("/")` 中 `Path == &Path` 没有 PartialEq 实现）：该分支在 `#[cfg(not(target_os = "windows"))]` 里，Windows 本地构建根本看不到这个错误。改为直接比较引用（另：CI 日志需登录才能下载，排查时用 Docker 在本地 Ubuntu 容器复现并验证通过）
+- CI 的单测类型门（`typecheck:tests`，此前 `continue-on-error` 咨询性）报 76 个历史类型腐烂（GitHub 只显示前 10 条）：`RenderAssets` 已搬到 `render.ts`、`RenderOptions` 无 `title/gameKey`、`GenerationOptions` 无 `maxConcurrent`、`ItemCard/CharacterCard/SceneJSON/CostStats` 缺字段、`.at()` 超出 lib、`check-template.mjs` 无声明、`vite.config.ts` 的 `Connect.ServerResponse` 等。已逐文件按现类型修齐（只改测试类型层，不改运行时语义，每个文件改后单跑确认输出不变），类型门现已变绿并去掉 `continue-on-error` 转为硬门禁
 
 ### 修复（立绘改为全身构图 2026-09-18）
 - 立绘/表情/服装/动作从「半身（thighs-up）」改回「全身 head to feet」：此前代码为追求舞台人物更大而强制半身，导致角色卡生成半身照片；现提示词明确要求全身、含鞋子、不裁切

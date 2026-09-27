@@ -1,5 +1,6 @@
 import { renderChapter, renderConfig, sanitizeId } from "../src/core/render";
-import type { ChapterScript, ExtractionResult, RenderAssets } from "../src/core/types";
+import type { ChapterScript, ExtractionResult } from "../src/core/types";
+import type { RenderAssets } from "../src/core/render";
 
 function makeScript(overrides: Partial<ChapterScript> = {}): ChapterScript {
   return {
@@ -52,7 +53,7 @@ function main(): void {
   const evilText = "第一句;带分号\n第二行:带半角冒号 `反引号` \\反斜杠";
   const s1 = makeScript();
   s1.scenes[0].lines[0] = { type: "dialogue", characterId: "linche", text: evilText, emotion: "normal" };
-  const out1 = renderChapter(s1, { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets, introCard: false }, 1);
+  const out1 = renderChapter(s1, { characters: cards.characters, items: cards.items, assets, introCard: false }, 1);
   const lines1 = nonCommentLines(out1);
   for (const l of lines1) {
     assert(l.endsWith(";"), `行应以分号结尾: ${l}`);
@@ -68,7 +69,7 @@ function main(): void {
   // 2) 恶意角色名 → 不产生裸分号注入
   const s2 = makeScript();
   const evilChars = cards.characters.map((c) => ({ ...c, name: "林;澈:evil`\n" }));
-  const out2 = renderChapter(s2, { title: "t", gameKey: "k", characters: evilChars, items: cards.items, assets, introCard: false }, 1);
+  const out2 = renderChapter(s2, { characters: evilChars, items: cards.items, assets, introCard: false }, 1);
   const line2 = nonCommentLines(out2).find((l) => l.includes("evil"))!;
   assert(line2.startsWith("林\\;澈：evil\\` :"), `角色名未正确转义（#1457：姓名内冒号转全角「：」避免被引擎拆成说话人分隔符）: ${line2}`);
 
@@ -87,7 +88,7 @@ function main(): void {
   });
   const evilItems = cards.items.concat([{ id: "../../etc/passwd;bgm:evil", name: "邪物", appearance: "外观", note: "", imagePrompt: "" }]);
   const evilAssets: RenderAssets = { ...assets, item: { "../../etc/passwd;bgm:evil": "/x/item_evil.png" } };
-  const out3 = renderChapter(s3, { title: "t", gameKey: "k", characters: cards.characters, items: evilItems, assets: evilAssets, introCard: false }, 1);
+  const out3 = renderChapter(s3, { characters: cards.characters, items: evilItems, assets: evilAssets, introCard: false }, 1);
   const idLine = out3.split("\n").find((l) => l.includes("-id=item_"))!;
   assert(idLine.includes("-id=item_"), `缺少物品 id 参数: ${idLine}`);
   const idParam = idLine.slice(idLine.indexOf("-id=item_") + "-id=item_".length).split(" ")[0];
@@ -98,7 +99,7 @@ function main(): void {
 
   // 4) 章节标题含换行 → 注释行保持单行，不注入可执行语句
   const s4 = makeScript({ title: "第一章\nchangeBg:evil.jpg -next;" });
-  const out4 = renderChapter(s4, { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets, introCard: false }, 1);
+  const out4 = renderChapter(s4, { characters: cards.characters, items: cards.items, assets, introCard: false }, 1);
   assert(!nonCommentLines(out4).join("\n").includes("changeBg:evil.jpg"), "标题换行注入了指令");
 
   // 5) config.txt 标题清洗
@@ -125,7 +126,7 @@ function main(): void {
     }],
   });
   const cgAssets: RenderAssets = { ...assets, cg: { "0_s1": "/x/cg_0_s1.png" } };
-  const out6 = renderChapter(s6, { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets: cgAssets, introCard: false }, 1);
+  const out6 = renderChapter(s6, { characters: cards.characters, items: cards.items, assets: cgAssets, introCard: false }, 1);
   assert(out6.includes("changeBg:cg_0_s1.png"), "CG 未按 章节_sceneId key 播放");
   assert(out6.includes("unlockCg:game/background/cg_0_s1.png"), "CG 未解锁（unlockCg 缺失；#1460 需带 game/background/ 目录，否则引擎鉴赏室缩略图 404）");
   const s7 = makeScript({
@@ -142,7 +143,7 @@ function main(): void {
       figures: [],
     }],
   });
-  const out7 = renderChapter(s7, { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets, introCard: false }, 1);
+  const out7 = renderChapter(s7, { characters: cards.characters, items: cards.items, assets, introCard: false }, 1);
   assert(out7.includes("changeBg:cg_scene_shortcut.png"), "scene.cgFile 捷径未生效");
 
   // 8) 换装：标注 costume 即切换服装立绘并记住，后续句沿用；未知服装 id 回退默认
@@ -159,7 +160,7 @@ function main(): void {
     { type: "dialogue", characterId: "linche", text: "再来一句。", emotion: "happy" },
     { type: "dialogue", characterId: "linche", text: "幻之服装？", emotion: "normal", costume: "ghost" },
   ];
-  const out8 = renderChapter(s8, { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets: assetsCt, introCard: false }, 1);
+  const out8 = renderChapter(s8, { characters: cards.characters, items: cards.items, assets: assetsCt, introCard: false }, 1);
   assert(out8.includes("changeFigure:f_linche_battle.png"), "换装句应切服装立绘");
   // 第二句 emotion=happy 但已换装：优先找该服装的表情差分（未生成）→ 回退默认服装的表情差分。
   // 旧行为换装期间完全放弃表情（哭泣/大笑只有平静脸）；现在有表情胜过无表情，服装表情差分建议后续补齐
@@ -172,7 +173,7 @@ function main(): void {
   s9.scenes[0].lines = [
     { type: "narration", text: "城门前，守夜人林澈握着佩剑，目光如鹰隼般扫视着官道上渐行渐远的人流。他已经在城门口站了整整六个时辰。" },
   ];
-  const out9 = renderChapter(s9, { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets, introCard: false }, 1);
+  const out9 = renderChapter(s9, { characters: cards.characters, items: cards.items, assets, introCard: false }, 1);
   const nar9 = nonCommentLines(out9).filter((l) => l.startsWith(":"));
   // #1458：分页阈值下调到与文本框实际容量对齐（MESSAGE_MAX 32 / TEXTBOX_PAGE 64），
   // 长句拆成多屏（此处 3 屏）；去掉消息前缀后拼接必须与原文逐字一致（不得静默裁掉）。
@@ -186,7 +187,7 @@ function main(): void {
     { type: "narration", text: "林澈叹了口气：" },
     { type: "dialogue", characterId: "linche", text: "你和你爹一样，认死理。", emotion: "normal" },
   ];
-  const out10 = renderChapter(s10, { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets, introCard: false }, 1);
+  const out10 = renderChapter(s10, { characters: cards.characters, items: cards.items, assets, introCard: false }, 1);
   assert(!out10.includes("林澈叹了口气"), "动作标签旁白不应独立成行");
   assert(out10.includes("林澈:你和你爹一样"), "动作标签后的对话应保留");
 
@@ -196,7 +197,7 @@ function main(): void {
     { type: "narration", text: "林澈冷冷道：" },
     { type: "dialogue", characterId: "narrator", text: "苏小姐消息灵通。", emotion: "normal" },
   ];
-  const out11 = renderChapter(s11, { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets, introCard: false }, 1);
+  const out11 = renderChapter(s11, { characters: cards.characters, items: cards.items, assets, introCard: false }, 1);
   assert(out11.includes("林澈:苏小姐消息灵通。"), "动作标签应推断说话人（冷冷道→angry 情绪）");
 
   // 12) 内心独白用「」包裹区分
@@ -204,7 +205,7 @@ function main(): void {
   s12.scenes[0].lines = [
     { type: "narration", text: "我该不该相信她呢……", monologue: true },
   ];
-  const out12 = renderChapter(s12, { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets, introCard: false }, 1);
+  const out12 = renderChapter(s12, { characters: cards.characters, items: cards.items, assets, introCard: false }, 1);
   assert(out12.includes(":「我该不该相信她呢……」;"), "独白应用「」包裹");
 
   // 13) 有配音的台词不拆分：保持单条，避免换页掐断语音
@@ -213,7 +214,7 @@ function main(): void {
     { type: "dialogue", characterId: "linche", text: "城门前，守夜人林澈握着佩剑，目光如鹰隼般扫视着官道上渐行渐远的人流。他已经在城门口站了整整六个时辰。", emotion: "normal" },
   ];
   const vocalAssets: RenderAssets = { ...assets, vocal: { ch0_s1_0: "/x/v_ch0_s1_0.mp3" } };
-  const out13 = renderChapter(s13, { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets: vocalAssets, introCard: false }, 1);
+  const out13 = renderChapter(s13, { characters: cards.characters, items: cards.items, assets: vocalAssets, introCard: false }, 1);
   const dia13 = nonCommentLines(out13).filter((l) => l.startsWith("林澈:"));
   assert(dia13.length === 1, `有配音的长台词应保持单条，实际 ${dia13.length}`);
   assert(dia13[0].includes("v_ch0_s1_0.mp3"), "配音应挂在唯一一条消息上");
@@ -232,7 +233,7 @@ function main(): void {
     }],
   });
   const battleAssets: RenderAssets = { ...assets, bgm: { s1: "/x/bgm_battle.mp3" } };
-  const outCh1 = renderChapter(ch1, { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets: battleAssets, introCard: false }, 1);
+  const outCh1 = renderChapter(ch1, { characters: cards.characters, items: cards.items, assets: battleAssets, introCard: false }, 1);
   // #1459：filmMode 经核实不是「电影黑边」而是替换整个对话框（丢名牌/底板、文字 250%），
   // 改为仅「本场景确有视频播放」时启用；紧张氛围改走 godrayFilm 滤镜。
   assert(outCh1.includes("filmMode:none;"), "紧张场景不应再开 filmMode（#1459：改用滤镜）");
@@ -254,7 +255,7 @@ function main(): void {
     }],
   });
   const quietAssets: RenderAssets = { bg: { s2: "/x/bg_s2.png" }, cg: {}, figure: {}, item: {}, vocal: {} };
-  const outCh2 = renderChapter(ch2, { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets: quietAssets, introCard: false }, 2);
+  const outCh2 = renderChapter(ch2, { characters: cards.characters, items: cards.items, assets: quietAssets, introCard: false }, 2);
   assert(outCh2.includes("bgm:none -enter=0"), "章首应显式停止上一章残留的 BGM");
   assert(outCh2.includes("filmMode:none;"), "章首应显式关闭上一章残留的电影黑边");
   assert(outCh2.includes('setTransform:{"oldFilm":0}'), "章首应复位 oldFilm 滤镜");

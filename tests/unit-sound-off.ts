@@ -6,7 +6,8 @@
  *  3) 项目恢复时用 DEFAULT_OPTIONS 兜底：老 project_state.json 缺字段时按新默认（开启）恢复
  */
 import { renderChapter } from "../src/core/render";
-import type { ChapterScript, CharacterCard, ExtractionResult, RenderAssets } from "../src/core/types";
+import type { ChapterScript, CharacterCard, ExtractionResult } from "../src/core/types";
+import type { RenderAssets } from "../src/core/render";
 import { projectState } from "../src/stores/project";
 
 function assert(cond: boolean, msg: string): void {
@@ -40,7 +41,7 @@ function rainyScript(): ChapterScript {
 }
 
 function renderWith(useSe: boolean | undefined): string {
-  const opts = { title: "t", gameKey: "k", characters, items: cards.items, assets, introCard: false };
+  const opts = { characters, items: cards.items, assets, introCard: false };
   return renderChapter(rainyScript(), useSe === undefined ? opts : { ...opts, useSe }, 1);
 }
 

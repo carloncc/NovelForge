@@ -47,24 +47,24 @@ const line = (text: string, characterId = "c1") => ({ type: "dialogue" as const,
       ],
     },
   ];
-  const assets = {
+  const assets: { bg: Record<string, string>; cg: Record<string, string>; vocal: Record<string, string> } = {
     bg: { s1: "/p/bg_s1.png", sold: "/p/bg_sold.png" },
     cg: { s2: "/p/cg_s2.png", "0_s2": "/p/cg_0_s2.png", "5_sgone": "/p/cg_5_sgone.png" },
     vocal: { ch0_s1_0: "/p/a.mp3", ch9_sx_0: "/p/b.mp3" },
   };
   const stat = pruneAssetRefs(assets, chapters);
-  assert(!("sold" in assets.bg) && assets.bg.s1, "过期背景应剪、现存应留");
+  assert(!("sold" in assets.bg) && !!assets.bg["s1"], "过期背景应剪、现存应留");
   assert(!("5_sgone" in assets.cg), "场景已死的旧 CG 键应删");
   assert(!("0_s2" in assets.cg), "旧 CG 键迁移后应删除旧键");
-  assert(assets.cg.s2 === "/p/cg_s2.png", "新 CG 键已有值时不应被旧值覆盖");
+  assert(assets.cg["s2"] === "/p/cg_s2.png", "新 CG 键已有值时不应被旧值覆盖");
   assert(stat.cgMigrated === 0, "新键已存在时不计迁移");
-  assert(!("ch9_sx_0" in assets.vocal) && assets.vocal.ch0_s1_0, "过期配音键应剪");
+  assert(!("ch9_sx_0" in assets.vocal) && !!assets.vocal["ch0_s1_0"], "过期配音键应剪");
   assert(stat.bg === 1 && stat.cg === 1 && stat.vocal === 1, `剪枝计数异常：${JSON.stringify(stat)}`);
 
   // 旧 CG 键在场景仍存在且新键缺失时迁移
-  const assets2 = { bg: {}, cg: { "3_s2": "/p/cg_3_s2.png" }, vocal: {} };
+  const assets2: { bg: Record<string, string>; cg: Record<string, string>; vocal: Record<string, string> } = { bg: {}, cg: { "3_s2": "/p/cg_3_s2.png" }, vocal: {} };
   const stat2 = pruneAssetRefs(assets2, chapters);
-  assert(assets2.cg.s2 === "/p/cg_3_s2.png", "旧 CG 键应迁移为新键");
+  assert(assets2.cg["s2"] === "/p/cg_3_s2.png", "旧 CG 键应迁移为新键");
   assert(stat2.cgMigrated === 1, "应计 1 次迁移");
 }
 

@@ -3,7 +3,8 @@
  * 立绘版输出不受影响（回归由 unit-render 覆盖）。
  */
 import { renderChapter } from "../src/core/render";
-import type { ChapterScript, ExtractionResult, RenderAssets } from "../src/core/types";
+import type { ChapterScript, ExtractionResult } from "../src/core/types";
+import type { RenderAssets } from "../src/core/render";
 
 function assert(cond: boolean, msg: string): void {
   if (!cond) throw new Error(msg);

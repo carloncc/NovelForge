@@ -117,7 +117,7 @@ async function testDraftAutoAlign(): Promise<void> {
 
 async function testApprovedStillRejects(): Promise<void> {
   await reset();
-  const value = { ...bible(), status: "approved" as const, approvedAt: "2026-08-07T00:00:00.000Z" };
+  const value: ProjectVisualBible = { ...bible(), status: "approved" as const, approvedAt: "2026-08-07T00:00:00.000Z" };
   const cards = [character("alice")];
   await writeArtifacts(value);
   await saveVisualBible(ROOT, value);

@@ -226,7 +226,7 @@ async function main(): Promise<void> {
 
   // ---------- 9. getByPath ----------
   assert(getByPath({ a: { b: [{ c: 42 }] } }, "a.b[0].c") === 42, "getByPath 数组路径失败");
-  assert(getByPath({ data: { image_urls: ["x"] } }, "data.image_urls")?.[0] === "x", "getByPath 失败");
+  assert((getByPath({ data: { image_urls: ["x"] } }, "data.image_urls") as unknown[] | undefined)?.[0] === "x", "getByPath 失败");
 
   // ---------- 10. Gemini：endpoint {model} 占位 + 数组路径构造 + inlineData 提取 ----------
   routes.length = 0;

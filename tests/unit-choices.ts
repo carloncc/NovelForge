@@ -1,6 +1,7 @@
 import { renderChapter, sceneVocalKey } from "../src/core/render";
 import { buildVoiceJobs } from "../src/core/voice";
-import type { ChapterScript, ExtractionResult, RenderAssets } from "../src/core/types";
+import type { ChapterScript, ExtractionResult } from "../src/core/types";
+import type { RenderAssets } from "../src/core/render";
 import type { ApiConfig } from "../src/core/types";
 
 function assert(cond: boolean, msg: string): void {
@@ -64,7 +65,7 @@ function chapterWithChoice(): ChapterScript {
 }
 
 function main(): void {
-  const out = renderChapter(chapterWithChoice(), { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets, introCard: false }, 1);
+  const out = renderChapter(chapterWithChoice(), { characters: cards.characters, items: cards.items, assets, introCard: false }, 1);
 
   // #1462：分支 label 现在带 4 位稳定哈希前缀（区分 sanitizeId 有损折叠后的撞名场景），
   // 因此先从输出里取出实际前缀，再用它断言同一套 label/choose/jumpLabel。
@@ -100,7 +101,7 @@ function main(): void {
   assert(branchKeys.includes(sceneVocalKey(0, "s1", 2 + 1000 * 2 + 0)), "分支 2 语音键缺失");
 
   // 5) 无 choices 时正常渲染，不产生 choose/label
-  const noChoice = renderChapter({ ...chapterWithChoice(), scenes: [{ ...chapterWithChoice().scenes[0], choices: undefined }] }, { title: "t", gameKey: "k", characters: cards.characters, items: cards.items, assets, introCard: false }, 1);
+  const noChoice = renderChapter({ ...chapterWithChoice(), scenes: [{ ...chapterWithChoice().scenes[0], choices: undefined }] }, { characters: cards.characters, items: cards.items, assets, introCard: false }, 1);
   assert(!noChoice.includes("choose:"), "无分支不应输出 choose");
 
   console.log("=== 分支选择渲染/语音键测试通过 ===");

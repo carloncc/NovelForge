@@ -209,6 +209,7 @@ async function testRegenerateCascadeStopsAfterAbort(): Promise<void> {
     status: "approved",
     styleSource: "novel_analysis",
     styleDescription: "ink wash",
+    styleReferencePath: "style.png",
     characters: {
       alice: { sourceReferencePath: "alice-source.png", threeViewPath: "alice-threeview.png", prompt: "alice", approved: true, revision: 1 },
     },

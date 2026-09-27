@@ -44,7 +44,7 @@ async function main(): Promise<void> {
     const chapter = {
       chapter: 0,
       title: "one",
-      scenes: [{ id: "scene-one", title: "scene", summary: "", lines: [], itemEvents: [] }],
+      scenes: [{ id: "scene-one", location: "", atmosphere: "", time: "", bgPrompt: "", lines: [], itemEvents: [], figures: [] }],
     };
     const cards = { title: "test", characters: [], scenes: [], items: [] };
 
@@ -70,7 +70,7 @@ async function main(): Promise<void> {
         cards,
         chapters: [chapter],
         assets: {},
-        cost: { inputTokens: 0, outputTokens: 0, imageCount: 0, ttsChars: 0, llmCostYuan: 0, imageCostYuan: 0, ttsCostYuan: 0, totalYuan: 0 },
+        cost: { llmTokens: 0, imageCount: 0, ttsChars: 0, llmCostYuan: 0, imageCostYuan: 0, ttsCostYuan: 0 },
         failedTasks: [],
       }),
       getOptions: () => options,

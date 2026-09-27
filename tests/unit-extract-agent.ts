@@ -91,7 +91,7 @@ async function main(): Promise<void> {
     const state = freshState();
     let step = 0;
     const chat: AgentChatFn = async (messages, tools, opts) => {
-      assert(opts.toolCalls === undefined, "工具协议不应走 JSON 模式");
+      assert((opts as { toolCalls?: unknown }).toolCalls === undefined, "工具协议不应走 JSON 模式");
       void messages; void tools; void opts;
       if (step === 0) {
         step++;

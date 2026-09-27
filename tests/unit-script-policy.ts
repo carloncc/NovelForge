@@ -5,6 +5,7 @@
  */
 import { narrationPolicyText, planScriptChunks } from "../src/core/script";
 import { chapterCharBudget } from "../src/core/split";
+import type { ChapterInfo } from "../src/core/types";
 
 function assert(cond: boolean, msg: string): void {
   if (!cond) throw new Error(msg);
@@ -47,8 +48,8 @@ assert(chapterCharBudget(smallCtx, zh) === 6000, "极小上下文模型保底 60
 
 /* ---------- 3) 剧本分块（忠实全文回归修复：长章输出截断 → scenes 为空） ---------- */
 const emptyCards = { title: "t", characters: [], scenes: [], items: [] } as never;
-const shortChapter = { index: 0, title: "第一章", text: "短章节内容。".repeat(30), charCount: 0 } as never;
-const longChapter = { index: 0, title: "第一章", text: "林澈拔剑。".repeat(4000), charCount: 0 } as never; // 约 2 万字
+const shortChapter: ChapterInfo = { index: 0, title: "第一章", text: "短章节内容。".repeat(30), charCount: 0 };
+const longChapter: ChapterInfo = { index: 0, title: "第一章", text: "林澈拔剑。".repeat(4000), charCount: 0 }; // 约 2 万字
 const tinyCtx = { model: "m", extra: { contextLength: 8192 } } as never;
 
 assert(planScriptChunks(bigCtx, shortChapter, "sys", [], emptyCards).length === 1, "短章节不应分块");
@@ -60,7 +61,7 @@ assert(parts.every((p) => p.length <= 4000), `每块体量应显著小于整章�
 // 大上下文模型：约 3 万字长章**也必须切成小段逐段生成**（像 agent 分段读取那样）。
 // 整章一次喂进去，思考型模型会失控：实测 MiMo 单次思考数万 token、一次 6~57 分钟不产出正文，
 // 而且整章 JSON 一次写不完必被截断（续写补残 JSON 不可靠）。切小段后每块输入小、JSON 小且能一次写完。
-const longZh = { index: 0, title: "第1部分", text: "林澈拔剑。".repeat(6000), charCount: 0 } as never; // 约 3 万字
+const longZh: ChapterInfo = { index: 0, title: "第1部分", text: "林澈拔剑。".repeat(6000), charCount: 0 }; // 约 3 万字
 const bigParts = planScriptChunks(bigCtx, longZh, "sys", [], emptyCards);
 assert(bigParts.length >= 4, `大上下文下 3 万字长章也必须切成小段（每段 ≤8000 字），实际 ${bigParts.length} 段`);
 assert(bigParts.join("") === longZh.text, "剧本分块必须无损覆盖原文");
@@ -70,7 +71,7 @@ assert(
 );
 
 // 但输入侧仍要切：超过上下文能容纳的正文量时必须分块
-const hugeZh = { index: 0, title: "超长章", text: "林澈拔剑。".repeat(40000), charCount: 0 } as never; // 约 20 万字
+const hugeZh: ChapterInfo = { index: 0, title: "超长章", text: "林澈拔剑。".repeat(40000), charCount: 0 }; // 约 20 万字
 const hugeParts = planScriptChunks(bigCtx, hugeZh, "sys", [], emptyCards);
 assert(hugeParts.length > 1, `超过输入上下文的超长章仍必须分块，实际 ${hugeParts.length}`);
 assert(hugeParts.join("") === hugeZh.text, "超长章分块必须无损覆盖原文");

@@ -27,14 +27,16 @@ if ((kindsOn.action || 0) !== actionsTotal) throw new Error("动作任务数不�
 // 默认每角色生成 2 个动作；手动重生成路径可显式放开上限。
 {
   const many = buildImageTasks([], {
-    characters: [{ id: "hero", name: "主角", imagePrompt: "anime girl", actions: Array.from({ length: 6 }, (_, i) => ({ id: `a${i}`, name: `动作${i}`, prompt: `pose ${i}` })) }],
+    title: "",
+    characters: [{ id: "hero", name: "主角", appearance: "", clothing: "", personality: "", voiceDesc: "", color: "", imagePrompt: "anime girl", actions: Array.from({ length: 6 }, (_, i) => ({ id: `a${i}`, name: `动作${i}`, prompt: `pose ${i}` })) }],
     items: [],
     scenes: [],
   }, {});
   const actionCount = many.filter((t) => t.kind === "action").length;
   if (actionCount !== 2) throw new Error(`默认动作应限制为 2 个，实际 ${actionCount}`);
   const allActions = buildImageTasks([], {
-    characters: [{ id: "hero", name: "主角", imagePrompt: "anime girl", actions: Array.from({ length: 6 }, (_, i) => ({ id: `a${i}`, name: `动作${i}`, prompt: `pose ${i}` })) }],
+    title: "",
+    characters: [{ id: "hero", name: "主角", appearance: "", clothing: "", personality: "", voiceDesc: "", color: "", imagePrompt: "anime girl", actions: Array.from({ length: 6 }, (_, i) => ({ id: `a${i}`, name: `动作${i}`, prompt: `pose ${i}` })) }],
     items: [],
     scenes: [],
   }, { maxActionsPerCharacter: 0 });
@@ -76,7 +78,7 @@ for (let i = 0; i < againSeeded.length; i++) {
 // 顺序无关：只取第一章子集构建，既有任务种子不变（旧 baseSeed+i 语义下会全漂移）
 // （同 id 多次出现时按出现次序配对比较）
 const subsetSeeded = buildImageTasks([scripts[0]], cards, { baseSeed: 12345 });
-const pool = new Map<string, { seed: number | undefined }[]>();
+const pool = new Map<string, { seed?: number }[]>();
 for (const o of tasksSeeded) {
   const k = `${o.kind}:${o.id}:${o.fileName}`;
   if (!pool.has(k)) pool.set(k, []);
@@ -116,7 +118,7 @@ if (!actionTask || actionTask.refFromTask !== "linche_threeview") throw new Erro
 // 立绘/物品/三视图 prompt 强制纯绿幕背景（色度键抠图前提）；人物提示词里的背景词应被剥除
 {
   const check = (c: boolean, m: string) => { if (!c) throw new Error(m); };
-  const tasks = buildImageTasks([], { characters: [{ id: "hero", name: "主角", imagePrompt: "anime girl, full body, plain white background, clean illustration" }], items: [{ id: "sword", name: "剑", imagePrompt: "a sword, white background" }] }, {});
+  const tasks = buildImageTasks([], { title: "", scenes: [], characters: [{ id: "hero", name: "主角", appearance: "", clothing: "", personality: "", voiceDesc: "", color: "", imagePrompt: "anime girl, full body, plain white background, clean illustration" }], items: [{ id: "sword", name: "剑", appearance: "", note: "", imagePrompt: "a sword, white background" }] }, {});
   const figure = tasks.find((t) => t.kind === "figure");
   const item = tasks.find((t) => t.kind === "item");
   const tv = tasks.find((t) => t.kind === "threeview");
@@ -148,8 +150,9 @@ if (!actionTask || actionTask.refFromTask !== "linche_threeview") throw new Erro
 // 深色物品需要与人物立绘相同强度的绿幕约束，避免黑色主体在抠图时进入羽化区。
 {
   const item = buildImageTasks([], {
+    title: "",
     characters: [],
-    items: [{ id: "black-sword", name: "黑剑", imagePrompt: "black sword" }],
+    items: [{ id: "black-sword", name: "黑剑", appearance: "", note: "", imagePrompt: "black sword" }],
     scenes: [],
   }, {}).find((task) => task.kind === "item");
   if (!item?.prompt.includes("dark and black parts of the object remain fully opaque")) {

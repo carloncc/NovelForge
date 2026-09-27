@@ -34,7 +34,7 @@ async function main(): Promise<void> {
   await vfsWriteFileBase64("/app/project/img.png", Buffer.from(raw).toString("base64"));
   assert((await vfsReadFileBase64("/app/project/img.png")) === Buffer.from(raw).toString("base64"), "base64 读写失败");
   const buf = await vfsReadFile("/app/project/img.png");
-  assert(buf && new TextDecoder().decode(buf) === raw, "二进制读取失败");
+  assert(!!buf && new TextDecoder().decode(buf) === raw, "二进制读取失败");
 
   // listDir 含目录/文件/大小
   const entries = await vfsListDir("/app/project");

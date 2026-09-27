@@ -443,7 +443,7 @@ async function testApprovalRequiresAcceptedExistingSheets(): Promise<void> {
 
 async function testApprovalRejectsUntrustedFingerprintAndPersistsStaleState(): Promise<void> {
   await reset();
-  const value = { ...bible(), status: "approved" as const, approvedAt: "2026-08-07T00:00:00.000Z" };
+  const value: ProjectVisualBible = { ...bible(), status: "approved" as const, approvedAt: "2026-08-07T00:00:00.000Z" };
   const cards = [character("alice"), character("bob")];
   await writeRequiredArtifacts(value);
   value.inputFingerprint = "caller-controlled";
@@ -512,7 +512,7 @@ async function testConcurrentApprovalAndReferenceReplacementSerialize(): Promise
 
 async function testScopedInvalidation(): Promise<void> {
   await reset();
-  const value = { ...bible(), status: "approved" as const };
+  const value: ProjectVisualBible = { ...bible(), status: "approved" as const };
   const imageDir = `${ROOT}/.novel2vn/cache/images`;
   await tauri.writeFileBase64(`${imageDir}/figure_alice_normal.png`, PNG_B64);
   await tauri.writeFileBase64(`${imageDir}/figure_alice_happy.png`, PNG_B64);
@@ -1102,7 +1102,7 @@ async function testBatchRegenerationRebuildsCostumeSheets(): Promise<void> {
 
 async function testLifecycleOperationsRequireFreshReview(): Promise<void> {
   await reset();
-  const value = { ...bible(), status: "approved" as const, approvedAt: "2026-08-07T00:00:00.000Z" };
+  const value: ProjectVisualBible = { ...bible(), status: "approved" as const, approvedAt: "2026-08-07T00:00:00.000Z" };
   await writeRequiredArtifacts(value);
   const dependencies: VisualBibleServiceDependencies = {
     chatText: async () => "hand-painted cel animation, moss and crimson palette, textured inks, low-key lighting",

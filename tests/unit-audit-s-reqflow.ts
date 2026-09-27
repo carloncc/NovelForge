@@ -60,7 +60,7 @@ async function main(): Promise<void> {
     makeIds(),
     visionDefault,
   );
-  assert(dup.config.projects.length === 1 && dup.config.projects[0].name === "A", "重复目录保留首条");
+  assert(dup.config.projects?.length === 1 && dup.config.projects?.[0]?.name === "A", "重复目录保留首条");
   assert(dup.warnings.some((w) => w.includes("D:/x")), "重复目录应警告");
 
   // #1308：坏音色条只丢坏条、好条保留
