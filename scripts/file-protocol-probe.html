@@ -1,0 +1,28 @@
+<!-- file:// 协议探测（#1451）：引擎以 ES module 加载，file:// 下文档 origin 为不透明 null，
+         浏览器按 CORS 模式拦截，引擎代码根本不执行 —— 用户只会看到空白开始页。
+         这里在解析阶段直接给出可操作提示，避免用户对着 CORS 报错无从下手。 -->
+    <script>
+      (() => {
+        if (window.location.protocol !== 'file:') return;
+        const center = document.querySelector('.title-enter-container__center-text');
+        if (center) {
+          center.innerHTML =
+            '<div style="max-width:840px;line-height:1.9;">' +
+            '<div style="font-size:1.25em;font-weight:700;margin-bottom:0.6em;">无法直接双击打开本游戏</div>' +
+            '<div>本游戏是网页游戏，浏览器安全策略禁止在 file:// 下加载引擎模块。</div>' +
+            '<div style="margin-top:0.8em;">请用以下任一方式打开：</div>' +
+            '<div style="margin-top:0.4em;text-align:left;display:inline-block;">' +
+            '· 双击随包的 <b>start_game.bat</b>（Windows）/ <b>start_game.command</b>（macOS）<br>' +
+            '· 或在本目录执行 <code>python -m http.server 8080</code>，<br>' +
+            '&nbsp;&nbsp;&nbsp;再打开 <b>http://localhost:8080/index.html</b><br>' +
+            '· 或把整个文件夹部署到任意静态托管后访问' +
+            '</div>' +
+            '</div>';
+        }
+        const titleEnter = document.querySelector('.html-body__title-enter');
+        if (titleEnter) {
+          titleEnter.onclick = null;
+          titleEnter.style.cursor = 'default';
+        }
+      })();
+    </script>

@@ -182,6 +182,39 @@ async function ensureVoiceInterruptionPatch() {
   }
 }
 
+// file:// 协议探测（#1451）：模板 index.html 是 ES module 入口，file:// 下文档 origin 为不透明 null，
+// 浏览器直接拦截模块加载，引擎不执行、页面卡在空白开始页。这里在 </body> 前注入一段探测脚本：
+// file:// 打开时直接替换标题区文案，告诉用户用随包启动脚本 / http.server 打开。
+// 幂等：已含标记（无法直接双击打开本游戏）则跳过；找不到 </body> 时显式警告（模板结构变化时要跟着调整）。
+// 注入体见 scripts/file-protocol-probe.html（与代码分离，避免转义/编码问题）。
+const FILE_PROTOCOL_PROBE_MARKER = "无法直接双击打开本游戏";
+async function ensureFileProtocolProbe() {
+  const index = join(TARGET, "index.html");
+  let text;
+  try {
+    text = await readFile(index, "utf8");
+  } catch {
+    console.warn("[novelforge] 警告: 模板缺少 index.html，跳过 file:// 协议探测注入");
+    return;
+  }
+  if (text.includes(FILE_PROTOCOL_PROBE_MARKER)) return;
+  let probe;
+  try {
+    probe = await readFile(join(ROOT, "scripts", "file-protocol-probe.html"), "utf8");
+  } catch {
+    console.warn("[novelforge] 警告: 缺少 scripts/file-protocol-probe.html，跳过 file:// 协议探测注入");
+    return;
+  }
+  const closeBody = text.lastIndexOf("</body>");
+  if (closeBody < 0) {
+    console.warn("[novelforge] 警告: index.html 没有 </body>，跳过 file:// 协议探测注入（模板结构可能已变化）");
+    return;
+  }
+  text = text.slice(0, closeBody) + probe + "\n" + text.slice(closeBody);
+  await writeFile(index, text, "utf8");
+  console.log("file:// 协议探测已注入 index.html");
+}
+
 async function main() {
   const index = join(TARGET, "index.html");
   if (await exists(index)) {
@@ -189,6 +222,7 @@ async function main() {
     await ensureGameUi();
     await ensureBuiltinSe();
     await ensureVoiceInterruptionPatch();
+    await ensureFileProtocolProbe();
     console.log(`引擎模板已存在：${TARGET}`);
     return;
   }
@@ -259,6 +293,7 @@ async function main() {
   await ensureGameUi();
   await ensureBuiltinSe();
   await ensureVoiceInterruptionPatch();
+  await ensureFileProtocolProbe();
   console.log(`引擎模板就绪：${TARGET}`);
 }
 
