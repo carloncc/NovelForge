@@ -61,7 +61,7 @@ export function visualBibleErrorMessage(error: unknown, context: VisualBibleErro
     return `视觉参考文件缺失或不可读。请重新上传对应图片后重试。详情：${error.message}`;
   }
   if (error instanceof VisionApiError) {
-    return `图片识别模型「${context.visionModel || "未配置"}」无法完成分析。请在「API 配置 > 图片识别」中选择支持 image_url 的视觉模型。详情：${error.message}`;
+    return `图像识别模型「${context.visionModel || "未配置"}」无法完成分析。请在「API 配置 > 图像识别」中选择支持 image_url 的视觉模型。详情：${error.message}`;
   }
   if (error instanceof VisualBibleApprovalRequiredError) return error.message;
   return error instanceof Error ? error.message : String(error);

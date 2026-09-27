@@ -332,7 +332,7 @@ async function createDraft(): Promise<void> {
     return;
   }
   if (styleSource.value === "reference_image" && !configIsUsable(activeConfig("vision"), "vision")) {
-    createError.value = t("参考图模式需要配置可用的图片识别（vision）API");
+    createError.value = t("参考图模式需要配置可用的图像识别（vision）API");
     return;
   }
 
@@ -517,7 +517,7 @@ async function replaceStyleFromUpload(): Promise<void> {
   const visionCfg = activeConfig("vision");
   if (!current || !outputDir.value || !pendingStyleImage.value) return;
   if (!configIsUsable(visionCfg, "vision")) {
-    styleError.value = t("替换参考图需要配置可用的图片识别（vision）API");
+    styleError.value = t("替换参考图需要配置可用的图像识别（vision）API");
     return;
   }
   busyKey.value = "style-replace";
@@ -577,7 +577,7 @@ async function regenerateCharacter(characterId: string): Promise<void> {
   const imageCfg = activeConfig("image");
   const character = characters.value.find((candidate) => candidate.id === characterId);
   if (!current || !outputDir.value || !character) {
-    pushLog({ step: "视觉守门", message: "三视图重生成未执行：视觉守门数据或输出目录不可用，请先创建草稿", level: "warn", at: Date.now() });
+    pushLog({ step: "视觉守门", message: "三视图重新生成未执行：视觉守门数据或输出目录不可用，请先创建草稿", level: "warn", at: Date.now() });
     return;
   }
   if (!imageCfg?.apiKey) {
@@ -590,7 +590,7 @@ async function regenerateCharacter(characterId: string): Promise<void> {
     busyKey.value = "";
     return;
   }
-  pushLog({ step: "视觉守门", message: `角色「${character.name}」三视图重生成开始…`, level: "info", at: Date.now() });
+  pushLog({ step: "视觉守门", message: `角色「${character.name}」三视图重新生成开始…`, level: "info", at: Date.now() });
   try {
     await regenerateCharacterSheet(outputDir.value, current, { character, imageCfg });
     await refreshApprovalValidation();
@@ -616,7 +616,7 @@ async function regenerateCharacterDesc(characterId: string): Promise<void> {
   const current = bible.value;
   const character = characters.value.find((candidate) => candidate.id === characterId);
   if (!current || !outputDir.value || !character) {
-    pushLog({ step: "视觉守门", message: "角色描述重生成未执行：视觉守门数据或输出目录不可用，请先创建草稿", level: "warn", at: Date.now() });
+    pushLog({ step: "视觉守门", message: "角色描述重新生成未执行：视觉守门数据或输出目录不可用，请先创建草稿", level: "warn", at: Date.now() });
     return;
   }
   const visionCfg = activeConfig("vision") ?? activeConfig("llm");
@@ -626,7 +626,7 @@ async function regenerateCharacterDesc(characterId: string): Promise<void> {
   }
   busyKey.value = `char-desc:${characterId}`;
   charErrors.value[characterId] = "";
-  pushLog({ step: "视觉守门", message: `角色「${character.name}」描述重生成开始…`, level: "info", at: Date.now() });
+  pushLog({ step: "视觉守门", message: `角色「${character.name}」描述重新生成开始…`, level: "info", at: Date.now() });
   try {
     const { imagePrompt, threeViewPrompt } = await regenerateCharacterDescription(visionCfg, character);
     const { card: updatedCard } = await persistRegeneratedCharacterDescription(
@@ -921,11 +921,11 @@ async function regenCostumeSheet(characterId: string, costumeId: string): Promis
   const imageCfg = activeConfig("image");
   const character = characters.value.find((candidate) => candidate.id === characterId);
   if (!current || !outputDir.value || !character) {
-    pushLog({ step: "视觉守门", message: "服装三视图重生成未执行：视觉守门数据或输出目录不可用，请先创建草稿", level: "warn", at: Date.now() });
+    pushLog({ step: "视觉守门", message: "服装三视图重新生成未执行：视觉守门数据或输出目录不可用，请先创建草稿", level: "warn", at: Date.now() });
     return;
   }
   if (!imageCfg?.apiKey) {
-    charErrors.value[characterId] = t("重生成服装三视图需要配置图像生成 API");
+    charErrors.value[characterId] = t("重新生成服装三视图需要配置图像生成 API");
     return;
   }
   const costumeName = character.costumes?.find((ct) => ct.id === costumeId)?.name ?? costumeId;
@@ -938,7 +938,7 @@ async function regenCostumeSheet(characterId: string, costumeId: string): Promis
     busyKey.value = "";
     return;
   }
-  pushLog({ step: "视觉守门", message: `角色「${character.name}」服装「${costumeName}」三视图重生成开始…`, level: "info", at: Date.now() });
+  pushLog({ step: "视觉守门", message: `角色「${character.name}」服装「${costumeName}」三视图重新生成开始…`, level: "info", at: Date.now() });
   try {
     await regenerateCostumeSheetApi(outputDir.value, current, { character, imageCfg, costumeId });
     // #1406：服装锚点 revision/prompt 计入指纹，刷新后批准才不会撞 stale
@@ -984,7 +984,7 @@ async function regenCostumeSheet(characterId: string, costumeId: string): Promis
             <label class="vb-source-option" :class="{ active: styleSource === 'reference_image' }">
               <input type="radio" v-model="styleSource" value="reference_image" />
               <span class="vb-source-name">{{ t("上传参考图") }}</span>
-              <span class="vb-source-desc">{{ t("由图片识别分析，并直接作为全局风格参考") }}</span>
+              <span class="vb-source-desc">{{ t("由图像识别分析，并直接作为全局风格参考") }}</span>
             </label>
             <label class="vb-source-option" :class="{ active: styleSource === 'novel_analysis' }">
               <input type="radio" v-model="styleSource" value="novel_analysis" />
@@ -1157,7 +1157,7 @@ async function regenCostumeSheet(characterId: string, costumeId: string): Promis
                     <span v-if="!cs.sheet" class="tag warn">{{ t("未生成") }}</span>
                     <button v-if="cs.inCard" class="btn ghost small" :disabled="runLocked" @click="regenCostumeSheet(row.id, cs.costumeId)">
                       <span v-if="busyKey === `char-sheet-ct:${row.id}:${cs.costumeId}`" class="spinner" />
-                      {{ cs.sheet ? t("重生成") : t("生成") }}
+                      {{ cs.sheet ? t("重新生成") : t("生成") }}
                     </button>
                   </div>
                 </div>

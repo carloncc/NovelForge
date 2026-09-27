@@ -132,9 +132,9 @@ function migratedVisionConfig(
   const usableLlm = selectedLlm ?? llmConfigs.find((config) => config.baseUrl.trim() && config.model.trim());
   const vision = usableLlm
     ? cloneConfig(usableLlm)
-    : normalizedConfig(createVisionDefault(), createId, "图片识别模型")!;
+    : normalizedConfig(createVisionDefault(), createId, "图像识别模型")!;
   vision.id = createId();
-  vision.name = usableLlm ? `${usableLlm.name}（图片识别）` : vision.name;
+  vision.name = usableLlm ? `${usableLlm.name}（图像识别）` : vision.name;
   vision.extra ??= {};
   return vision;
 }
@@ -150,7 +150,7 @@ function normalizePreset(
   const channels = recordOrEmpty(preset.channels);
   const active = recordOrEmpty(preset.active);
   const llm = configArray(channels.llm, createId, "文本模型");
-  let vision = configArray(channels.vision, createId, "图片识别模型");
+  let vision = configArray(channels.vision, createId, "图像识别模型");
   const image = configArray(channels.image, createId, "图像模型");
   const tts = configArray(channels.tts, createId, "语音模型");
   let visionId = activeId(active, "vision");
@@ -160,7 +160,7 @@ function normalizePreset(
     vision = [migratedVision];
     visionId = migratedVision.id;
     // #1308：回填需可见（尤其 v2 升级路径）
-    warnings?.push(t("已自动补齐图片识别通道（沿用文本模型配置）"));
+    warnings?.push(t("已自动补齐图像识别通道（沿用文本模型配置）"));
   } else if (!vision.some((config) => config.id === visionId)) {
     visionId = vision[0]?.id ?? "";
   }

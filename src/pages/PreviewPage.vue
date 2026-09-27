@@ -163,7 +163,7 @@ onBeforeUnmount(() => {
         <button class="btn mt-3" :disabled="starting" @click="startPreview">{{ t("启动预览") }}</button>
       </template>
       <template v-else>
-        <p class="hint">{{ t("还没有生成结果：先在生成页跑一次生成，再回来这里试玩。") }}</p>
+        <p class="hint">{{ t("还没有生成结果：请先在生成页执行一次生成，然后返回这里试玩。") }}</p>
         <button class="btn mt-3" @click="goPage('generate')">{{ t("去生成项目") }}</button>
       </template>
     </div>

@@ -35,7 +35,7 @@ function legacyPreset(): Record<string, unknown> {
 function config(overrides: Partial<ApiConfig> = {}): ApiConfig {
   return {
     id: "vision-1",
-    name: "图片识别",
+    name: "图像识别",
     baseUrl: "https://vision.example/v1",
     apiKey: "sk-vision",
     model: "vision-model",
@@ -57,22 +57,22 @@ async function main(): Promise<void> {
   assert(firstMigration.migrated, "旧配置应迁移到 schema v3");
   assert(firstMigration.config.configSchemaVersion === 3, "迁移后应写入 schema v3");
   const migratedPreset = firstMigration.config.presets[0];
-  assert(migratedPreset.channels.vision.length === 1, "每个旧配置组应创建一个图片识别配置");
-  assert(migratedPreset.active.vision === "vision-new", "新图片识别配置应成为当前配置");
+  assert(migratedPreset.channels.vision.length === 1, "每个旧配置组应创建一个图像识别配置");
+  assert(migratedPreset.active.vision === "vision-new", "新图像识别配置应成为当前配置");
   assert(migratedPreset.channels.vision[0].model === "text-model", "迁移应复制当前文本模型");
   assert(migratedPreset.channels.vision[0].apiKey === "sk-text", "迁移应保留文本配置凭据");
   assert(migratedPreset.active.llm === "llm-active", "迁移应保留原文本模型选择");
   assert(migratedPreset.channels.vision[0].name !== migratedPreset.channels.llm[0].name, "视觉配置应使用独立名称");
   assert(migratedPreset.channels.image[0].model === "old-image", "迁移不得改写已有图片模型");
-  assert(migratedPreset.channels.vision[0] !== migratedPreset.channels.llm[0], "图片识别配置不能与文本配置共享对象");
+  assert(migratedPreset.channels.vision[0] !== migratedPreset.channels.llm[0], "图像识别配置不能与文本配置共享对象");
   assert(migratedPreset.channels.vision[0].extra !== migratedPreset.channels.llm[0].extra, "extra 必须深拷贝");
   (migratedPreset.channels.vision[0].extra!.nested as { timeout: number }).timeout = 90;
-  assert((migratedPreset.channels.llm[0].extra!.nested as { timeout: number }).timeout === 30, "修改图片识别 extra 不应影响文本配置");
+  assert((migratedPreset.channels.llm[0].extra!.nested as { timeout: number }).timeout === 30, "修改图像识别 extra 不应影响文本配置");
 
   const secondMigration = migrateConfigFile(firstMigration.config, () => "should-not-run", () => defaultApiConfig("vision"));
   assert(!secondMigration.migrated, "schema v3 配置不应重复迁移");
-  assert(secondMigration.config.presets[0].channels.vision.length === 1, "重复加载不得再次克隆图片识别配置");
-  assert(secondMigration.config.presets[0].active.vision === "vision-new", "重复加载应保留当前图片识别配置");
+  assert(secondMigration.config.presets[0].channels.vision.length === 1, "重复加载不得再次克隆图像识别配置");
+  assert(secondMigration.config.presets[0].active.vision === "vision-new", "重复加载应保留当前图像识别配置");
 
   const malformedMigration = migrateConfigFile({ presets: [{ id: "broken", name: "缺损配置", channels: {}, active: {} }] }, () => "fallback-vision", () => defaultApiConfig("vision"));
   const repairedPreset = malformedMigration.config.presets[0];

@@ -104,7 +104,10 @@ C. 每个 shot 字段：
    - characters：画面中出现的角色卡 id 数组。本场景只要有任何角色实体（即使只作为背景人物、路人或一闪而过），就把能辨认的角色 id 填上；只有画面内确实一个角色都没有时才留空数组——留空会让这张分镜拿不到该角色的人物参考图，人物一致性无法保证。
    - note：可选，10 字内中文短标题（如「城门对峙」）
 D. 一张图覆盖的连续对话应属于同一画面（同一地点/时间/氛围）；画面切换点放在场景转换、情绪转折、时间跳跃处。
-E. lines 的说话人、台词保真与上文规则一致（对话逐句保留，旁白按「旁白处理策略」）。`;
+E. lines 的说话人、台词保真与上文规则一致（对话逐句保留，旁白按「旁白处理策略」）。
+F. 台词为画面让路（本条覆盖上文规则 11 与 E 段的"逐句保留"，仅限以下两类，其余台词仍逐句保真、一字不改）：
+   - 纯语气/标点行不许单独成句：去掉标点符号后无实质文字的行（如！！！、……、？！），必须拼入同一说话人紧邻的一句台词（拼在句末或句首），不许独立成一条 line；单字感叹单独成句（啊/嗯/诶/哦等）同样拼入相邻的同人台词。信息不丢，只是换个位置——无声图片书里单独一个"！！！"只能干看，拼入台词才有语气。
+   - 画面已表达的不重复说：分镜（shots）已明确呈现的动作过程、场景陈设、人物表情情绪，台词/旁白不再复述，只保留推进剧情的句子（新信息、决定、转折、人物关系变化）；被省掉的内容必须已体现在对应 shot 的 prompt/note 里，不得凭空丢失剧情。`;
 
 // 规则 14 为提示词层思考约束（一句话）：Anthropic 官方 overthinking 建议明确写过
 // 「思考失控膨胀时可用提示词显式约束」，示例原话 "When you're deciding how to approach a
@@ -408,6 +411,70 @@ function mapScriptLine(l: ScriptModel["scenes"][number]["lines"][number], cards:
   };
 }
 
+/** 纯标点/符号行判定（图片小说专用）：去掉标点/符号/空白后无实质文字，如！！！、……？！。
+ *  单字感叹（啊/嗯/诶）含实质字符，不算——由 IMAGE_ONLY_RULES 规则 F 要求模型在生成侧合并。 */
+export function isPunctuationOnlyText(text: string): boolean {
+  const t = (text ?? "").trim();
+  if (!t) return false;
+  return /^[\p{P}\p{S}\s]*$/u.test(t);
+}
+
+export interface MergePunctuationResult {
+  lines: Line[];
+  /** 并入相邻行的句数 */
+  merged: number;
+  /** 被合并的原文样本（日志用，最多 3 条） */
+  samples: string[];
+}
+
+/** 纯标点行合并（纯函数，图片小说专用）：
+ *  无声图片书里单独成句的"！！！"只能干看，并入相邻行保留语气。上一行优先（缀尾），
+ *  首行无处可并时缀到下一行行首；全段无一句正常台词时标点行互相合并成一句（不丢信息）。
+ *  输入输出均为新数组，不改动入参。 */
+export function mergePunctuationOnlyLines(lines: Line[]): MergePunctuationResult {
+  const out: Line[] = [];
+  const pending: Line[] = [];
+  let merged = 0;
+  const samples: string[] = [];
+  const note = (text: string): void => {
+    if (samples.length < 3) samples.push(text);
+  };
+  for (const l of lines ?? []) {
+    if (isPunctuationOnlyText(l.text)) {
+      if (out.length > 0) {
+        const host = out[out.length - 1];
+        out[out.length - 1] = { ...host, text: `${host.text}${l.text}` };
+        merged++;
+        note(l.text);
+      } else {
+        pending.push(l);
+      }
+      continue;
+    }
+    let cur = l;
+    if (pending.length > 0) {
+      const head = pending.map((p) => p.text).join("");
+      cur = { ...cur, text: `${head}${cur.text}` };
+      for (const p of pending) {
+        merged++;
+        note(p.text);
+      }
+      pending.length = 0;
+    }
+    out.push(cur);
+  }
+  // 尾部悬空（如开头连续标点、且全段无一句正常台词）：互相合并成一句，不丢信息
+  if (pending.length > 0) {
+    const [first, ...rest] = pending;
+    out.push({ ...first, text: `${first.text}${rest.map((p) => p.text).join("")}` });
+    for (const p of rest) {
+      merged++;
+      note(p.text);
+    }
+  }
+  return { lines: out, merged, samples };
+}
+
 /** 剧本场景映射上下文（跨分块共享：场景 id 去重与 CG/视频位配额按整章累计） */
 interface ScriptSceneContext {
   chapter: ChapterInfo;
@@ -464,10 +531,21 @@ function mapScriptScenes(model: ScriptModel, ctx: ScriptSceneContext): SceneJSON
   const CHOICES_PER_SCENE_MAX = 4;
   const CHOICE_LINES_SOFT_MAX = 12;
   return (model.scenes || []).map((s, i) => {
-    const lines: Line[] = (s.lines || [])
+    const mappedLines: Line[] = (s.lines || [])
       // 过滤空文本行：LLM 可能输出无 text 的 narration/dialogue，会令渲染阶段 esc(undefined) 崩溃
       .filter((l) => typeof l?.text === "string" && l.text.trim().length > 0)
       .map((l) => mapScriptLine(l, ctx.cards));
+    // 图片小说：纯标点行（"！！！"单独成句）并入相邻台词——提示词规则 F 的映射侧兜底
+    // （老提示词产物/漏网输出同样在载入修复里处理，见 stores/imageStory repairShotTriggers）。
+    // 必须在 itemEvents/shots 配额之前合并：触发行号按合并后的行数计算，否则分镜可能指向不存在的行。
+    let lines = mappedLines;
+    if (ctx.imageOnly) {
+      const r = mergePunctuationOnlyLines(mappedLines);
+      if (r.merged > 0) {
+        logger.warn("script", `第 ${ctx.chapter.index + 1} 章场景 ${s.id || `#${i + 1}`}：${r.merged} 句纯标点/语气行（如"${r.samples.join(" / ")}"）已并入相邻台词（图片小说不单独成句）`);
+      }
+      lines = r.lines;
+    }
 
     const rawItemEvents = s.itemEvents || [];
     const itemEvents: ItemEvent[] = rawItemEvents.map((ie, j) => ({
@@ -515,10 +593,13 @@ function mapScriptScenes(model: ScriptModel, ctx: ScriptSceneContext): SceneJSON
         if (branchLines.length > CHOICE_LINES_SOFT_MAX) {
           logger.warn("script", `分支台词较长（${branchLines.length} 句），已全部保留`, { scene: s.id || i, choice: k });
         }
+        const mappedBranch = branchLines.map((l) => mapScriptLine(l, ctx.cards));
+        // 分支台词同口径：图片小说下纯标点行并入相邻行（分支内独立成段，不跨分支合并）
+        const finalBranch = ctx.imageOnly ? mergePunctuationOnlyLines(mappedBranch).lines : mappedBranch;
         return {
           id: c.id || `choice_${s.id || i}_${k}`,
           prompt: (c.prompt || "继续").slice(0, 20),
-          lines: branchLines.map((l) => mapScriptLine(l, ctx.cards)),
+          lines: finalBranch,
         };
       });
     }

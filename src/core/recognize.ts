@@ -63,7 +63,7 @@ export async function recognizeStyle(
 ): Promise<string> {
   const reply = await chatVision(cfg, STYLE_SYSTEM, "请识别这张图的画风。", imageB64, { maxTokens: 300, onUsage });
   const clean = (reply || "").trim().replace(/^画风[:：]?\s*/i, "");
-  if (!clean) throw new Error("图片识别 API 未返回画风描述");
+  if (!clean) throw new Error("图像识别 API 未返回画风描述");
   return clean;
 }
 
@@ -103,7 +103,7 @@ async function describeReferenceImage(
   });
   const data = extractJson(reply) as { prompt?: unknown };
   const prompt = typeof data?.prompt === "string" ? data.prompt.trim() : "";
-  if (!prompt) throw new Error("图片识别 API 未返回参考图描述");
+  if (!prompt) throw new Error("图像识别 API 未返回参考图描述");
   return prompt;
 }
 

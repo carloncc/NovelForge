@@ -183,7 +183,7 @@ watch(assetTab, () => {
               <span class="thumb-label">{{ EMOTION_LABELS[e.emo] ?? e.emo }}</span>
               <!-- #1122：同上，「重生成/抠图」收进折叠菜单 -->
               <details class="thumb-ops" @click.stop><summary>{{ t("操作") }}</summary>
-                <button class="btn ghost small" :disabled="regenLocked" @click.stop="regenFigureEmotion(row.id, e.emo)">{{ t("重生成") }}</button>
+                <button class="btn ghost small" :disabled="regenLocked" @click.stop="regenFigureEmotion(row.id, e.emo)">{{ t("重新生成") }}</button>
                 <button v-if="e.file" class="btn ghost small" :disabled="regenLocked" @click.stop="reCutout('figure', e.emo === 'normal' ? row.id : `${row.id}_${e.emo}`, e.file)">{{ t("抠图") }}</button>
               </details>
             </div>
@@ -196,7 +196,7 @@ watch(assetTab, () => {
                 <span class="thumb-label">{{ ct.name }}</span>
                 <!-- #1122：同上，「重生成/抠图」收进折叠菜单 -->
                 <details class="thumb-ops" @click.stop><summary>{{ t("操作") }}</summary>
-                  <button class="btn ghost small" :disabled="regenLocked" @click.stop="regenCostume(row.id, ct.id, ct.name)">{{ t("重生成") }}</button>
+                  <button class="btn ghost small" :disabled="regenLocked" @click.stop="regenCostume(row.id, ct.id, ct.name)">{{ t("重新生成") }}</button>
                   <button v-if="ct.file" class="btn ghost small" :disabled="regenLocked" @click.stop="reCutout('figure', `${row.id}_ct_${ct.id}`, ct.file)">{{ t("抠图") }}</button>
                 </details>
               </div>
@@ -210,7 +210,7 @@ watch(assetTab, () => {
                 <span class="thumb-label">{{ a.name }}</span>
                 <!-- #1122：同上，「重生成/抠图」收进折叠菜单 -->
                 <details class="thumb-ops" @click.stop><summary>{{ t("操作") }}</summary>
-                  <button class="btn ghost small" :disabled="regenLocked" @click.stop="regenAction(row.id, a.id, a.name)">{{ t("重生成") }}</button>
+                  <button class="btn ghost small" :disabled="regenLocked" @click.stop="regenAction(row.id, a.id, a.name)">{{ t("重新生成") }}</button>
                   <button v-if="a.file" class="btn ghost small" :disabled="regenLocked" @click.stop="reCutout('figure', `${row.id}_act_${a.id}`, a.file)">{{ t("抠图") }}</button>
                 </details>
               </div>

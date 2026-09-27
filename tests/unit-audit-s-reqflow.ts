@@ -44,7 +44,7 @@ async function main(): Promise<void> {
   assert(canTransferAssetToRun({ busy: false, assetBusy: "voice:1", queueRunning: true }) === false, "队列中不交接");
 
   // #1308：vision 回填放宽到 v2
-  const visionDefault = () => ({ id: "v0", name: "图片识别模型", baseUrl: "https://v.test", apiKey: "", model: "m", extra: {} }) as never;
+  const visionDefault = () => ({ id: "v0", name: "图像识别模型", baseUrl: "https://v.test", apiKey: "", model: "m", extra: {} }) as never;
   const v2input = {
     configSchemaVersion: 2,
     presets: [{ id: "p1", name: "g", channels: { llm: [{ id: "l1", name: "t", baseUrl: "https://a", apiKey: "k", model: "m", extra: {} }], vision: [], image: [], tts: [] }, active: { llm: "l1", vision: "", image: "", tts: "" } }],

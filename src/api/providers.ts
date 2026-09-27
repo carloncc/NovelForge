@@ -569,7 +569,7 @@ export const PROVIDERS: ProviderPreset[] = [
 
 const IMAGE_MODEL = /(?:flux|stable[-_ ]?diffusion|sdxl|kolors|qwen[-_/]?image|wanx|dall-e|gpt-image|seedream|imagen)/i;
 const VISION_MODEL = /(?:vision|visual|qwen[^/]*[-_]vl|glm[-\w.]*v\b|llava|minicpm[-_]v)/i;
-/** 可同时用于文本对话与图片理解的多模态聊天模型（既出现在 LLM 通道也出现在图片识别通道） */
+/** 可同时用于文本对话与图片理解的多模态聊天模型（既出现在 LLM 通道也出现在图像识别通道） */
 const MULTIMODAL_CHAT_MODEL = /^mini[-_ ]?max[-_ ]?m3$/i;
 const TTS_MODEL = /(?:tts|text[-_ ]?to[-_ ]?speech|cosyvoice|fish[-_ ]?speech|fishaudio|chattts|kokoro|bark)/i;
 const NON_CHAT_MODEL = /(?:embedding|rerank|re-rank|moderation|whisper|speech[-_ ]?to[-_ ]?text|sensevoice)/i;

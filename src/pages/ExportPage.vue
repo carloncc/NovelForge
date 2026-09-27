@@ -447,7 +447,7 @@ async function openExternal(url: string): Promise<void> {
       <p class="hint" style="margin-top: 4px"><code>{{ projectState.lastResult.meta.outputDir }}</code></p>
     </div>
     <div v-else class="card empty-next">
-      <p class="hint">{{ t("还没有生成结果：先去生成页跑一次整书生成，再回来打包分发。") }}</p>
+      <p class="hint">{{ t("还没有生成结果：请先去生成页执行一次整书生成，然后返回打包分发。") }}</p>
       <button class="btn small" @click="goPage('generate')">{{ t("去生成项目") }}</button>
     </div>
 

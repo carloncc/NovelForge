@@ -96,7 +96,7 @@ const notice = computed<{ kind: string; title: string; text: string; action: str
     return {
       kind: "vb-banner",
       title: t("图像生成前需要确认视觉守门"),
-      text: t("统一风格与角色三视图尚未批准，图像阶段会先停在这里。"),
+      text: t("统一风格与角色三视图尚未批准，图像阶段将在此等待批准后继续。"),
       action: t("去确认"),
       run: () => {
         tab.value = "settings";
@@ -122,7 +122,7 @@ const notice = computed<{ kind: string; title: string; text: string; action: str
 
 <template>
   <div class="inner">
-    <PageHead :title="t('生成项目')" :sub="t('选范围 → 生成 → 试玩 → 导出：每章状态一眼可见，主按钮只做下一步')" />
+    <PageHead :title="t('生成项目')" :sub="t('选范围 → 生成 → 试玩 → 导出：每章状态一眼可见，主按钮执行当前所选范围')" />
 
     <!-- 状态横幅：同一时刻最多一条（失败 > 守门 > 续跑），每个最多一个入口 -->
     <div v-if="notice" class="vb-banner" :class="notice.kind">

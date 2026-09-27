@@ -444,7 +444,7 @@ async function guardNovelDir(doc: { fileName: string; chapters: { title: string 
       </div>
       <p class="hint mb-4">
         {{ t("人物参考图 / 物品图 / 背景图。文件名含「人/角色/char/figure/hero」归人物、「物/item/道具/剑/sword/weapon/jade」归物品、其余归背景（英文大小写不限）。") }}
-        {{ t("管线优先使用你的素材，缺失才由 AI 生成；可在下方手动改类型与映射。") }}
+        {{ t("生成时优先使用你的素材，缺失才由 AI 生成；可在素材列表中手动修改类型与映射。") }}
       </p>
       <div v-if="projectState.materials.length" class="mat-grid">
         <div v-for="m in projectState.materials" :key="m.path" class="mat-card">
@@ -484,7 +484,7 @@ async function guardNovelDir(doc: { fileName: string; chapters: { title: string 
           <button class="btn secondary small" @click="newProject">{{ t("新建项目…") }}</button>
         </div>
       </div>
-      <p class="hint">{{ t("每个项目独立输出目录：切换项目自动换目录和全部状态；导入不同小说会提示分目录，避免缓存串味。") }}</p>
+      <p class="hint">{{ t("每个项目独立输出目录：切换项目自动换目录和全部状态；导入不同小说会提示分目录，避免不同项目缓存混淆。") }}</p>
       <div class="flex-col gap-2" v-if="projectRows.length">
         <div v-for="row in projectRows" :key="row.key" class="recent-item">
           <span class="grow small text-ellipsis" @click="openProject(row.dir)" :title="row.dir">
@@ -498,7 +498,7 @@ async function guardNovelDir(doc: { fileName: string; chapters: { title: string 
           <button v-else class="btn ghost small" :title="t('只从列表移除记录，不删除磁盘文件')" @click="removeRecent(row.dir)">{{ t("移除记录") }}</button>
         </div>
       </div>
-      <p v-else class="faint small">{{ t("暂无项目：导入小说后点生成即自动建档，或点右上新建项目") }}</p>
+      <p v-else class="faint small">{{ t("暂无项目：导入小说后前往生成页会自动创建，或点本卡右上角“新建项目…”") }}</p>
     </div>
 
     <AssetPreview

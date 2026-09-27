@@ -592,12 +592,12 @@ const splitMetaText = computed(() => {
   switch (m.method) {
     case "ai":
       return m.stale
-        ? t("分章：AI（已过期，小说内容已变，建议重切）")
+        ? t("分章：AI（已过时，小说内容已变，建议重新分章）")
         : `${t("分章：AI")}${m.count ? `（${m.count}${t("章")}` : ""}${m.discarded > 0 ? `${t("，已丢弃")} ${m.discarded} ${t("杂项")}` : ""}${t("）")}`;
     case "fallback":
-      return t("分章：规则回退（未配置文本 API，机械切分，建议配置后重切）");
+      return t("分章：规则回退（未配置文本 API，机械切分，建议配置后重新分章）");
     case "legacy":
-      return t("分章：旧版缓存（建议用 AI 重切一次）");
+      return t("分章：旧版缓存（建议用 AI 重新分章一次）");
     case "import":
       return t("分章：导入规则切分（原文标题机械切块，未跑 AI 分章）");
     default:
@@ -1126,7 +1126,7 @@ function cancelStyleRecognize(): void {
 async function recognizeStyleAndApply(b64: string): Promise<void> {
   const cfg = activeConfig("vision");
   if (!configIsUsable(cfg, "vision")) {
-    pushLog({ step: "画风", message: t("图片识别 API 未配置或不可用，无法识别画风；请先在「API 配置」页配置"), level: "warn", at: Date.now() });
+    pushLog({ step: "画风", message: t("图像识别 API 未配置或不可用，无法识别画风；请先在「API 配置」页配置"), level: "warn", at: Date.now() });
     return;
   }
   styleRecognizing.value = true;
@@ -3037,8 +3037,8 @@ async function regenCtx(): Promise<RegenContext | null> {
   const llmCfg = activeConfig("llm");
   if (projectState.options.imageSelfCheck && !configIsUsable(visionCfg, "vision")) {
     pushLog({
-      step: "图片识别",
-      message: t("图像自检已启用，但图片识别 API 未配置或不可用；请先在「API 配置」页完成配置"),
+      step: "图像识别",
+      message: t("图像自检已启用，但图像识别 API 未配置或不可用；请先在「API 配置」页完成配置"),
       level: "error",
       at: Date.now(),
     });

@@ -64,10 +64,10 @@ async function recognizeChar(c: CharacterCard): Promise<void> {
   }
   const cfg = activeConfig("vision");
   if (!configIsUsable(cfg, "vision")) {
-    setSavedMsg(t("图片识别 API 未配置或不可用，请先在「API 配置」页配置"), "err");
+    setSavedMsg(t("图像识别 API 未配置或不可用，请先在「API 配置」页配置"), "err");
     return;
   }
-  if (!window.confirm(t("将调用图片识别 API 生成「{name}」的设定与提示词（计费）。继续吗？", { name: c.name }))) return;
+  if (!window.confirm(t("将调用图像识别 API 生成「{name}」的设定与提示词（计费）。继续吗？", { name: c.name }))) return;
   charRecognizing.value = c.id;
   setSavedMsg("");
   try {

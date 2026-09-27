@@ -90,6 +90,6 @@ export async function verifyImage(
     if (e instanceof VisionApiError) throw e;
     const message = e instanceof Error ? e.message : String((e as { message?: unknown })?.message ?? e);
     log.error("selfcheck", "图像自检服务不可用", { error: message });
-    throw new VisionApiError(`图片识别 API 暂时不可用：${message}`, "VISION_UNAVAILABLE");
+    throw new VisionApiError(`图像识别 API 暂时不可用：${message}`, "VISION_UNAVAILABLE");
   }
 }

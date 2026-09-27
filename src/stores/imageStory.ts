@@ -27,7 +27,7 @@ import { log as logger } from "../utils/logger";
 import { readAssetMap, updateAssetMap, backupAssetMap, emptyAssetMap } from "../core/assetMap";
 import { parseChapterScript } from "../core/dataValidation";
 import { scriptCacheFileName, scriptFingerprint, titleHash, cardsFingerprint } from "../core/cache";
-import { scriptChapter } from "../core/script";
+import { scriptChapter, mergePunctuationOnlyLines } from "../core/script";
 import { extractFromNovelChunked } from "../core/extractAgent";
 import { translateChapter } from "../core/translate";
 import {
@@ -497,11 +497,12 @@ const scriptFp = (cards?: Pick<ExtractionResult, "characters" | "items" | "scene
     cardsFp: cards ? cardsFingerprint(cards) : undefined,
   });
 
-/** #1134：分镜触发行号兜底（缺失/重复/非递增 → 按剧情均匀铺开）；有修正时写回缓存，保证游戏内演出与缓存一致 */
+/** #1134：分镜触发行号兜底（缺失/重复/非递增 → 按剧情均匀铺开）；有修正时写回缓存，保证游戏内演出与缓存一致
+ *  + 纯标点行合并（图片小说载入修复）：老提示词产物里单独成句的"！！！"类，并入相邻台词后写回——
+ *  已生成的章节不用重跑（不花钱），打开/刷新即看顺。与生成映射侧（core/script mapScriptScenes）同口径。 */
 async function repairShotTriggers(script: ChapterScript, cacheFile: string): Promise<ChapterScript> {
   const { chapters, repairs } = normalizeShotTriggers([script]);
-  if (!repairs.length) return script;
-  const fixed = chapters[0];
+  let fixed = chapters[0];
   for (const r of repairs) {
     pushLog(
       "剧本",
@@ -509,6 +510,37 @@ async function repairShotTriggers(script: ChapterScript, cacheFile: string): Pro
       "warn",
     );
   }
+  let mergedTotal = 0;
+  const mergedSamples: string[] = [];
+  const takeSamples = (samples: string[]): void => {
+    for (const s of samples) {
+      if (mergedSamples.length < 3) mergedSamples.push(s);
+    }
+  };
+  fixed = {
+    ...fixed,
+    scenes: fixed.scenes.map((s) => {
+      const lr = mergePunctuationOnlyLines(s.lines ?? []);
+      mergedTotal += lr.merged;
+      takeSamples(lr.samples);
+      const choices = (s.choices ?? []).map((c) => {
+        const cr = mergePunctuationOnlyLines(c.lines ?? []);
+        mergedTotal += cr.merged;
+        takeSamples(cr.samples);
+        return cr.merged > 0 ? { ...c, lines: cr.lines } : c;
+      });
+      if (lr.merged === 0 && !choices.some((c, k) => c !== (s.choices ?? [])[k])) return s;
+      return { ...s, lines: lr.lines, choices };
+    }),
+  };
+  if (mergedTotal > 0) {
+    pushLog(
+      "剧本",
+      `第 ${fixed.chapter + 1} 章：${mergedTotal} 句纯标点/语气行（如"${mergedSamples.join(" / ")}"）已并入相邻台词并写回缓存（图片小说不单独成句）`,
+      "warn",
+    );
+  }
+  if (!repairs.length && mergedTotal === 0) return script;
   try {
     await tauri.writeTextFile(cacheFile, JSON.stringify(fixed, null, 2));
   } catch {

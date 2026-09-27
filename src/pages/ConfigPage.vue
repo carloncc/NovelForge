@@ -239,7 +239,7 @@ async function fetchVoicesFor(cfg: ApiConfig): Promise<void> {
 
 const channels = computed<{ key: ChannelKey; label: string; desc: string; icon: string }[]>(() => [
   { key: "llm", label: t("文本 LLM"), desc: t("角色/场景/物品提取与剧本生成"), icon: "M12 5v14M5 12h14" },
-  { key: "vision", label: t("图片识别 API"), desc: t("参考图分析、角色识别与生成图自检"), icon: "M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z M12 9a3 3 0 1 1 0 6 3 3 0 0 1 0-6Z" },
+  { key: "vision", label: t("图像识别 API"), desc: t("参考图分析、角色识别与生成图自检"), icon: "M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z M12 9a3 3 0 1 1 0 6 3 3 0 0 1 0-6Z" },
   { key: "image", label: t("图像 API"), desc: t("立绘 / 背景 / CG / 物品图生成"), icon: "M4 17L9 12L13 16L17 12L20 15M4 5H20V19H4V5Z" },
   { key: "tts", label: t("TTS 配音"), desc: t("逐句配音（可选），音色可控"), icon: "M12 6V18M8 9V15M16 9V15M5 11V13M19 11V13" },
 ]);
@@ -527,7 +527,7 @@ watch(
     <div v-if="configPersistenceError" class="notice danger mb-4">
       {{ configPersistenceError }}。{{ t("为保护原配置，问题解决前不会自动覆盖配置文件。") }}
     </div>
-    <PageHead :title="t('API 配置')" :sub="t('文本、图片识别、图片生成、语音四通道独立配置，可保存多套配置切换')">
+    <PageHead :title="t('API 配置')" :sub="t('文本、图像识别、图像生成、语音四通道独立配置，可保存多套配置切换')">
       <button class="btn secondary" @click="addPreset">{{ t("＋ 新建配置组") }}</button>
     </PageHead>
 
@@ -628,15 +628,15 @@ watch(
             </label>
             <label class="field">
               <span>{{ t("路径前缀（可选）") }}</span>
-              <input type="text" v-model="cfg.extra!.pathPrefix" :placeholder="t('留空自动 /v1')" @input="invalidateTest(cfg)" />
+              <input type="text" v-model="cfg.extra!.pathPrefix" :placeholder="t('留空则自动补 /v1')" @input="invalidateTest(cfg)" />
             </label>
           </div>
 
           <details class="cfg-details">
             <summary>{{ t("高级参数") }}</summary>
             <div v-if="ch.key === 'llm' || ch.key === 'vision' || ch.key === 'image' || ch.key === 'tts'" class="cfg-row mt-2">
-              <label class="field cfg-narrow mb-0" :title="ch.key === 'vision' ? t('图片识别与生成自检批量任务同时执行的请求数。每个 API 独立配置，互不影响。') : t('该 API 批量生成任务同时执行的请求数。每个 API 独立配置，互不影响。')">
-                <span>{{ ch.key === 'vision' ? t("并发数（图片识别与生成自检）") : t("并发数（该 API 批量生成）") }}</span>
+              <label class="field cfg-narrow mb-0" :title="ch.key === 'vision' ? t('图像识别与生成自检批量任务同时执行的请求数。每个 API 独立配置，互不影响。') : t('该 API 批量生成任务同时执行的请求数。每个 API 独立配置，互不影响。')">
+                <span>{{ ch.key === 'vision' ? t("并发数（图像识别与生成自检）") : t("并发数（该 API 批量生成）") }}</span>
                 <input
                   type="number"
                   min="1"
@@ -843,7 +843,7 @@ watch(
             <p class="hint">{{ t("这些参数会应用到所有使用该 TTS 配置生成的台词配音；模型列表与官网同步。") }}</p>
           </details>
           <details v-if="ch.key === 'image'" class="cfg-details">
-            <summary>{{ t("图片模型能力") }}</summary>
+            <summary>{{ t("图像模型能力") }}</summary>
             <div v-if="knownImageModelCapabilities(cfg.model)" class="notice mt-2">
               {{ t("已知模型能力：最多") }} {{ knownImageModelCapabilities(cfg.model)!.maxReferenceImages }} {{ t("张参考图，编码") }} {{ knownImageModelCapabilities(cfg.model)!.referenceEncoding }}
             </div>

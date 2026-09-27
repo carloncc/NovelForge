@@ -64,7 +64,7 @@ export function defaultApiConfig(kind: ChannelKey): ApiConfig {
   const d = defaults[kind]!;
   return {
     id: makeId(),
-    name: kind === "llm" ? t("文本模型") : kind === "vision" ? t("图片识别模型") : kind === "image" ? t("图像模型") : t("语音模型"),
+    name: kind === "llm" ? t("文本模型") : kind === "vision" ? t("图像识别模型") : kind === "image" ? t("图像模型") : t("语音模型"),
     baseUrl: d.baseUrl,
     apiKey: "",
     model: d.model,

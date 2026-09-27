@@ -2164,6 +2164,7 @@ details.card[open] > summary.card-head h3::before {
 .vb-costume-meta .tag,
 .vb-costume-meta .btn {
   flex-shrink: 0;
+  white-space: nowrap;
 }
 
 .vb-approval-bar {

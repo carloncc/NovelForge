@@ -1,6 +1,6 @@
 ﻿import { ref } from "vue";
 
-/** 页面路由（App.vue 侧边栏与页面内「去某处」动作共用同一来源） */
+/** 页面路由（App.vue 侧边栏与页面内「去某处」动作共用同一来源；顺序=流程顺序：准备→制作→发布） */
 export type PageId = "import" | "config" | "generate" | "settings" | "imageStory" | "preview" | "export";
 
 export const currentPage = ref<PageId>("import");

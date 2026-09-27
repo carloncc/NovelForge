@@ -16,12 +16,25 @@ import { runIsBusy, runAssetLabel, runIsQueue, runIsStopping, runFailedCount, re
 const pages: { id: PageId; labelKey: string; comp: Component }[] = [
   { id: "import", labelKey: "导入小说", comp: ImportPage },
   { id: "config", labelKey: "API 配置", comp: defineAsyncComponent(() => import("./pages/ConfigPage.vue")) },
-  { id: "generate", labelKey: "生成项目", comp: defineAsyncComponent(() => import("./pages/GeneratePage.vue")) },
   { id: "settings", labelKey: "生成设置", comp: defineAsyncComponent(() => import("./pages/SettingsPage.vue")) },
+  { id: "generate", labelKey: "生成项目", comp: defineAsyncComponent(() => import("./pages/GeneratePage.vue")) },
   { id: "imageStory", labelKey: "图片小说", comp: defineAsyncComponent(() => import("./pages/ImageStoryPage.vue")) },
   { id: "preview", labelKey: "预览", comp: defineAsyncComponent(() => import("./pages/PreviewPage.vue")) },
   { id: "export", labelKey: "导出", comp: defineAsyncComponent(() => import("./pages/ExportPage.vue")) },
 ];
+// 按流程分组：准备(1-3) → 制作(4-5) → 发布(6-7)，渲染时连续编号
+const navGroups: { labelKey: string; ids: PageId[] }[] = [
+  { labelKey: "准备", ids: ["import", "config", "settings"] },
+  { labelKey: "制作", ids: ["generate", "imageStory"] },
+  { labelKey: "发布", ids: ["preview", "export"] },
+];
+const flatPages = pages;
+function pageOf(id: PageId): (typeof pages)[number] {
+  return pages.find((p) => p.id === id)!;
+}
+function stepOf(id: PageId): number {
+  return flatPages.findIndex((p) => p.id === id) + 1;
+}
 const current = currentPage;
 const aboutOpen = ref(false);
 
@@ -125,20 +138,23 @@ onMounted(async () => {
         <span class="tagline">{{ t("AI 视觉小说工坊") }}</span>
       </div>
     </div>
-    <div class="nav-group-label">{{ t("导航") }}</div>
-    <button
-      v-for="p in pages"
-      :key="p.id"
-      class="nav-item"
-      :class="{ active: current === p.id }"
-      @click="current = p.id"
-    >
-      <svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-        <path :d="icons[p.id]" />
-      </svg>
-      <span>{{ t(p.labelKey) }}</span>
-      <span v-if="p.id === 'generate' && runFailedCount" class="nav-badge" :title="t('有失败任务未处理（点开生成页 → 失败项）')">{{ runFailedCount }}</span>
-    </button>
+    <template v-for="g in navGroups" :key="g.labelKey">
+      <div class="nav-group-label">{{ t(g.labelKey) }}</div>
+      <button
+        v-for="id in g.ids"
+        :key="id"
+        class="nav-item"
+        :class="{ active: current === id }"
+        @click="current = id"
+      >
+        <span class="nav-step">{{ stepOf(id) }}</span>
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path :d="icons[id]" />
+        </svg>
+        <span>{{ t(pageOf(id).labelKey) }}</span>
+        <span v-if="id === 'generate' && runFailedCount" class="nav-badge" :title="t('有失败任务未处理（点开生成页 → 失败项）')">{{ runFailedCount }}</span>
+      </button>
+    </template>
     <div v-if="runActive" class="run-indicator">
       <span class="spinner" style="width: 12px; height: 12px" />
       <span class="run-text">{{ runAssetLabel ? `${t("素材")}：${runAssetLabel}` : t("生成中…") }}</span>
@@ -179,6 +195,29 @@ onMounted(async () => {
 .notice-text {
   flex: 1;
   min-width: 0;
+}
+.sidebar .nav-group-label {
+  /* 首组紧贴 logo，第二组起留出分隔间距（global已有padding，这里只补margin覆盖） */
+  margin-top: 4px;
+}
+.sidebar .nav-item + .nav-group-label {
+  margin-top: 10px;
+}
+.sidebar .nav-step {
+  flex-shrink: 0;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 4px;
+  border-radius: 9px;
+  border: 1px solid currentColor;
+  opacity: 0.65;
+  font-size: 11px;
+  line-height: 16px;
+  text-align: center;
+}
+.sidebar .nav-item.active .nav-step {
+  border-color: rgba(255, 255, 255, 0.8);
+  opacity: 1;
 }
 .nav-badge {
   margin-left: auto;

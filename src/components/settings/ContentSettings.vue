@@ -140,7 +140,7 @@ function clearStyleRef(): void {
             <button v-if="styleRefSrc" class="btn small" @click="clearStyleRef">{{ t("清除") }}</button>
             <input ref="styleRefInput" type="file" accept="image/*" style="display: none" @change="onStyleRefFile" />
           </div>
-          <span class="hint">{{ t("识别结果写入上方「统一画风」；识别失败请检查「API 配置」的视觉模型") }}</span>
+          <span class="hint">{{ t("识别结果写入上方「统一画风」；识别失败请检查「API 配置」的图像识别模型") }}</span>
         </div>
       </div>
 

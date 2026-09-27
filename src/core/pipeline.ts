@@ -281,6 +281,14 @@ export function pruneAssetRefs(
   return stat;
 }
 
+/** 剪枝保留集：启用章剧本 + 停用章缓存剧本（只贡献 scene/cg/vocal 键，不参与组装）。
+ * 停用章不进 chapters（防组装写回），但其映射必须保留——否则重启用后只跑组装，背景/配音缺失。 */
+export function buildPruneKeepChapters(chapters: ChapterScript[], disabledScripts: ChapterScript[]): ChapterScript[] {
+  if (!disabledScripts.length) return chapters;
+  const seen = new Set(chapters.map((c) => c.chapter));
+  return [...chapters, ...disabledScripts.filter((c) => !seen.has(c.chapter))];
+}
+
 /** 重提 id 对齐（纯函数）：新卡片按归一化姓名认领老 id，避免视觉守门/人物图/配音因 id  churn 全废。
  * 同名只认领一次（多 Claim  protection：第二个同名新人保留自己的 id，不硬并）；
  * 场景按 location、物品按 name 同样认领老 id（背景/物品图按 id 存，id 漂移会导致重复出图与死映射）。
@@ -734,6 +742,23 @@ export class Pipeline {
       return { chapters: chapters.filter(Boolean), rawCount, staleCount, legacyCount };
     } catch {
       return { chapters: [], rawCount, staleCount, legacyCount };
+    }
+  }
+
+  /** 剪枝保留集补全：读回停用章的缓存剧本（只读 scene/cg/vocal 键，不参与组装）。
+   * 停用章剧本不在 chapters 里，不补则其 bg/cg/vocal 映射被当过期删掉（重启用后只跑组装即缺背景/配音）。
+   * 读失败返回 null（未知即不剪，宁可误留——剪前有备份 + 素材页一键清理可收尾）。 */
+  private async loadDisabledScriptsForPrune(
+    working: { index: number; title: string; text: string; enabled?: boolean }[],
+    demo: boolean,
+  ): Promise<ChapterScript[] | null> {
+    const disabledIdx = new Set(working.filter((c) => c.enabled === false).map((c) => c.index));
+    if (!disabledIdx.size) return [];
+    try {
+      const loaded = await this.loadChaptersFiltered(working, this.scriptStyleFrag(), demo);
+      return loaded.chapters.filter((c) => disabledIdx.has(c.chapter));
+    } catch {
+      return null;
     }
   }
 
@@ -2239,21 +2264,28 @@ export class Pipeline {
       if (!repopulates) {
         logger.debug("pipeline", "跳过映射剪枝：本次不含图像/配音阶段（剪完无人补回）", {});
       } else if (existingAssets && chapters.length > 0 && chapters.length >= activeCount && this.skippedScriptChapters.length === 0) {
-        const stat = pruneAssetRefs(assets, chapters);
-        const total = stat.bg + stat.cg + stat.vocal;
-        if (total > 0 || stat.cgMigrated > 0) {
-          const backupName = await backupAssetMap(input.outputDir);
-          await updateAssetMap(input.outputDir, (m) => {
-            m.bg = assets.bg;
-            m.cg = assets.cg;
-            m.vocal = assets.vocal;
-          });
-          log({
-            step: "组装",
-            message: `素材映射已剪枝：清理过期引用 ${total} 项（背景 ${stat.bg}、CG ${stat.cg}、配音 ${stat.vocal}）${stat.cgMigrated > 0 ? `，迁移旧版 CG 键 ${stat.cgMigrated} 项` : ""}${backupName ? `（已备份 ${backupName}，误删可从素材页恢复）` : ""}；孤儿文件可用素材页「清理无效素材」删除`,
-            level: "info",
-            at: Date.now(),
-          });
+        // 停用章不进 chapters：剪枝保留集必须补回其缓存剧本，否则停用章 bg/cg/vocal 映射被静默剪除，
+        // 重启用后只跑组装即背景/配音缺失。补读失败则跳过本次剪枝（未知即不剪）。
+        const disabledScripts = await this.loadDisabledScriptsForPrune(workingChapters, !input.llm?.apiKey);
+        if (disabledScripts === null) {
+          logger.debug("pipeline", "跳过映射剪枝：停用章缓存读取失败，未知即不剪", {});
+        } else {
+          const stat = pruneAssetRefs(assets, buildPruneKeepChapters(chapters, disabledScripts));
+          const total = stat.bg + stat.cg + stat.vocal;
+          if (total > 0 || stat.cgMigrated > 0) {
+            const backupName = await backupAssetMap(input.outputDir);
+            await updateAssetMap(input.outputDir, (m) => {
+              m.bg = assets.bg;
+              m.cg = assets.cg;
+              m.vocal = assets.vocal;
+            });
+            log({
+              step: "组装",
+              message: `素材映射已剪枝：清理过期引用 ${total} 项（背景 ${stat.bg}、CG ${stat.cg}、配音 ${stat.vocal}）${stat.cgMigrated > 0 ? `，迁移旧版 CG 键 ${stat.cgMigrated} 项` : ""}${backupName ? `（已备份 ${backupName}，误删可从素材页恢复）` : ""}；孤儿文件可用素材页「清理无效素材」删除`,
+              level: "info",
+              at: Date.now(),
+            });
+          }
         }
       }
     }
@@ -2263,7 +2295,7 @@ export class Pipeline {
       if (this.options.useImage) {
         await assertVisualBibleReadyForImages(input.outputDir, input.visualBible, workingNovel, cards!.characters);
         if (this.options.imageSelfCheck && !configIsUsable(input.vision, "vision")) {
-          throw new Error("图像自检已启用，但图片识别 API 未配置或不可用；请先在 API 配置页完成配置");
+          throw new Error("图像自检已启用，但图像识别 API 未配置或不可用；请先在 API 配置页完成配置");
         }
         log({ step: "图像", message: "开始处理图像素材…", level: "info", at: Date.now() });
         const imageFeedback = this.feedback.image;

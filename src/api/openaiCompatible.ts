@@ -396,12 +396,12 @@ function imageDataUrl(image: string, mime?: string): string {
 
 function visionHttpError(status: number, raw: string): Error {
   if (VISION_REFUSAL.test(raw) || /(?:image_url|multimodal|vision).{0,40}(?:not supported|unsupported|not accept)/i.test(raw)) {
-    return new VisionApiError(`当前模型不支持图片识别：${raw.slice(0, 200)}`, "VISION_CAPABILITY_UNSUPPORTED");
+    return new VisionApiError(`当前模型不支持图像识别：${raw.slice(0, 200)}`, "VISION_CAPABILITY_UNSUPPORTED");
   }
   if ([400, 401, 403, 404].includes(status)) {
-    return new VisionApiError(`图片识别 API 配置错误 ${status}: ${raw.slice(0, 200)}`, "VISION_CONFIGURATION_INVALID");
+    return new VisionApiError(`图像识别 API 配置错误 ${status}: ${raw.slice(0, 200)}`, "VISION_CONFIGURATION_INVALID");
   }
-  return new Error(`图片识别 API 返回错误 ${status}: ${raw.slice(0, 300)}`);
+  return new Error(`图像识别 API 返回错误 ${status}: ${raw.slice(0, 300)}`);
 }
 
 /** MiniMax 等厂商会把错误放进 HTTP 200 响应体的 base_resp 字段，这里提取成可读信息 */
@@ -1431,7 +1431,7 @@ export async function chatVision(
   references: ImageReference[] = [],
 ): Promise<string> {
   if (!configIsUsable(cfg, "vision")) {
-    throw new VisionApiError("图片识别 API 未配置或不可用", "VISION_CONFIGURATION_INVALID");
+    throw new VisionApiError("图像识别 API 未配置或不可用", "VISION_CONFIGURATION_INVALID");
   }
   // B93：中止信号优先——已中止不再构造请求（视觉请求同样按次计费）
   if (opts.signal?.aborted) throw new Error("已中止");
@@ -1503,16 +1503,16 @@ export async function chatVision(
       data = JSON.parse(text);
     } catch {
       log.error("api", "chatVision 响应不是合法 JSON", { model: cfg.model, textHead: text.slice(0, 400) });
-      throw new VisionApiError(`图片识别 API 响应不是合法 JSON: ${text.slice(0, 300)}`, "VISION_RESPONSE_INVALID");
+      throw new VisionApiError(`图像识别 API 响应不是合法 JSON: ${text.slice(0, 300)}`, "VISION_RESPONSE_INVALID");
     }
     const providerError = extractProviderBaseError(data);
     if (providerError) {
       log.error("api", "chatVision 厂商返回业务错误", { model: cfg.model, providerError, raw: text.slice(0, 400) });
-      throw new VisionApiError(`图片识别 API 返回错误：${providerError}`, "VISION_CONFIGURATION_INVALID");
+      throw new VisionApiError(`图像识别 API 返回错误：${providerError}`, "VISION_CONFIGURATION_INVALID");
     }
     if (!data.choices || !data.choices.length) {
       log.error("api", "chatVision 响应缺少 choices", { model: cfg.model, raw: text.slice(0, 500) });
-      throw new VisionApiError(`图片识别 API 响应缺少 choices: ${JSON.stringify(data).slice(0, 400)}`, "VISION_RESPONSE_INVALID");
+      throw new VisionApiError(`图像识别 API 响应缺少 choices: ${JSON.stringify(data).slice(0, 400)}`, "VISION_RESPONSE_INVALID");
     }
     // 1317：choices[0] 可能为 null，?. 守卫避免 TypeError→unknown→无谓重试。
     const c = (data.choices[0] as { message?: { content?: unknown } } | null | undefined)?.message?.content ?? "";
@@ -1521,7 +1521,7 @@ export async function chatVision(
     const reply = typeof c === "string" ? c : JSON.stringify(c);
     if (!reply.trim()) {
       log.error("api", "chatVision 返回空白内容", { model: cfg.model, raw: text.slice(0, 300) });
-      throw new VisionApiError("图片识别 API 返回了空白内容", "VISION_RESPONSE_INVALID");
+      throw new VisionApiError("图像识别 API 返回了空白内容", "VISION_RESPONSE_INVALID");
     }
     if (VISION_REFUSAL.test(reply)) {
       log.error("api", "chatVision 模型拒绝看图", { model: cfg.model, reply: reply.slice(0, 300) });
@@ -1725,11 +1725,11 @@ export async function testVision(cfg: ApiConfig): Promise<string> {
   )).trim();
   if (!description) {
     log.error("api", "testVision 未返回视觉描述", { model: cfg.model });
-    throw new VisionApiError("图片识别 API 未返回视觉描述", "VISION_RESPONSE_INVALID");
+    throw new VisionApiError("图像识别 API 未返回视觉描述", "VISION_RESPONSE_INVALID");
   }
   if (!VISION_GROUNDED.test(description) || VISION_NOT_GROUNDED.test(description)) {
     log.error("api", "testVision 未给出可验证的视觉描述", { model: cfg.model, description });
-    throw new VisionApiError(`图片识别未能给出可验证的视觉描述（模型可能没有真正看到图片）：${description.slice(0, 120)}`, "VISION_RESPONSE_INVALID");
+    throw new VisionApiError(`图像识别未能给出可验证的视觉描述（模型可能没有真正看到图片）：${description.slice(0, 120)}`, "VISION_RESPONSE_INVALID");
   }
   log.info("api", "testVision 通过", { model: cfg.model, description: description.slice(0, 160) });
   return description;

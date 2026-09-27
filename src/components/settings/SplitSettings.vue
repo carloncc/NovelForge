@@ -55,12 +55,12 @@ function onSplitMinCharsChange(e: Event): void {
 
     <div class="field-grid mt-3">
       <div class="field">
-        <span>{{ t("碎章合并阈值") }}</span>
+        <span>{{ t("碎章（短章）合并阈值") }}</span>
         <div class="row num-row">
           <input type="number" min="0" :value="projectState.options.splitMinChapterChars" @change="onSplitMinCharsChange" />
           <span>{{ t("字") }}</span>
         </div>
-        <span class="hint">{{ t("小于该字数的碎章并入相邻章；0 = 不合并") }}</span>
+        <span class="hint">{{ t("小于该字数的碎章（短章）并入相邻章；0 = 不合并") }}</span>
       </div>
       <label class="opt-item opt-stack">
         <input type="checkbox" v-model="projectState.options.splitKeepSpecials" />

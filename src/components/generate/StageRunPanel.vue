@@ -56,7 +56,7 @@ const { busy, stageStatus, failedCounts, stageFeedback, stageForce, runStageRege
       </p>
     </div>
     <div v-else class="card empty-next">
-      <p class="hint">{{ t("还没有生成结果：先跑一次整书生成，再回来单独重跑某个阶段。") }}</p>
+      <p class="hint">{{ t("还没有生成结果：请先执行一次整书生成，然后返回单独重跑某个阶段。") }}</p>
       <button class="btn small" @click="goFullMode">{{ t("去整书生成") }}</button>
     </div>
 </template>

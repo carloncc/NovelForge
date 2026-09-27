@@ -182,7 +182,7 @@ async function testActionableErrors(): Promise<void> {
     new VisionApiError("model rejected image_url", "VISION_CAPABILITY_UNSUPPORTED"),
     { imageModel: "image-model", visionModel: "text-only-model" },
   );
-  assert(vision.includes("text-only-model") && vision.includes("图片识别"), "vision errors must name the independent vision channel");
+  assert(vision.includes("text-only-model") && vision.includes("图像识别"), "vision errors must name the independent vision channel");
 }
 
 async function main(): Promise<void> {
