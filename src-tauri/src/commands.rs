@@ -198,7 +198,10 @@ fn is_sensitive_system_path(canon: &Path) -> bool {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        if *canon == Path::new("/") {
+        // 注意：canon: &Path，Path::new("/") -> &Path，直接比较引用（不要 *canon，
+        // Path == &Path 没有 PartialEq 实现，会 E0277；且该分支只在非 Windows 编译，
+        // Windows 本地构建完全看不到这个错误）。
+        if canon == Path::new("/") {
             return true;
         }
     }
