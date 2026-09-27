@@ -15,7 +15,7 @@ import type {
 import type { ApiConfig } from "./types";
 import { generateImage, ReferenceImageError, VisionApiError, setImageConcurrency, chatCompletion } from "../api/openaiCompatible";
 import { referenceRouteRejection, resolveImageModelCapabilities } from "../api/providers";
-import { editImageVariant, supportsImageEdits } from "../api/imageEdits";
+import { editImageVariant, editImageWithReferences, supportsImageEdits } from "../api/imageEdits";
 import { verifyImage } from "./selfcheck";
 import { runFaceCompositeTask } from "./faceComposite";
 import { isExpressionDiffTask, verifyExpressionFiles } from "./spriteVerify";
@@ -90,6 +90,113 @@ export function chapterItemIds(chapter: ChapterScript): Set<string> {
   for (const scene of chapter.scenes) {
     for (const ev of scene.itemEvents ?? []) {
       if (ev.itemId) out.add(ev.itemId);
+    }
+  }
+  return out;
+}
+
+/** 分镜出场角色命中的是哪一层：declared=分镜自报，scene-figures=场景出场表，scene-inferred=场景级推断，none=查不到 */
+export type ShotCharacterSource = "declared" | "scene-figures" | "scene-inferred" | "none";
+
+export interface ShotCharacterResolution {
+  /** 有效角色 id（已过滤无效 id；顺序稳定：声明序 → 场景表序 → 同场分镜序 → 说话人序） */
+  ids: string[];
+  source: ShotCharacterSource;
+}
+
+/** 兜底推断可用的场景结构（结构化类型，纯函数单测可直接喂字面量） */
+export interface ShotCharacterScene {
+  figures?: string[];
+  shots?: { characters?: string[] }[];
+  lines?: { type?: string; characterId?: string }[];
+  choices?: { lines?: { type?: string; characterId?: string }[] }[];
+}
+
+/**
+ * 场景级候选角色：同场景**其它分镜已声明**的角色（按分镜序）＋ 本场景台词说话人（含分支，按台词序）。
+ * 去重保序，只保留角色卡里存在的 id；"narrator" 不算人。
+ * 与 chapterCharacterIds 同为场景/台词级口径，但这里只当**候选集**，正确性由调用方的门控保证。
+ */
+function sceneCastCandidates(scene: ShotCharacterScene, validIds: Set<string>): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (id: string | undefined): void => {
+    if (!id || id === "narrator" || seen.has(id) || !validIds.has(id)) return;
+    seen.add(id);
+    out.push(id);
+  };
+  for (const shot of scene.shots ?? []) for (const id of shot.characters ?? []) add(id);
+  const groups: { type?: string; characterId?: string }[][] = [scene.lines ?? []];
+  for (const choice of scene.choices ?? []) groups.push(choice.lines ?? []);
+  for (const lines of groups) {
+    for (const line of lines) if (line?.type === "dialogue") add(line.characterId);
+  }
+  return out;
+}
+
+/**
+ * 单个分镜的出场角色（图片小说），分层兜底且**完全确定性**（同输入必得同输出，便于缓存与单测）：
+ *   1. declared      —— 分镜自己声明的 characters（权威口径）
+ *   2. scene-figures —— 场景出场表 scene.figures（模型自己在场景级给出的口径）
+ *   3. scene-inferred—— allowSceneInference=true 时才走：同场景其它分镜声明的角色 ＋ 场景台词说话人
+ *   4. none          —— 查不到，留空（调用方必须显式告警：这类分镜只能纯文本生图）
+ *
+ * 第 3 层为什么默认关闭（allowSceneInference 默认 false，实测数据支撑，见下）：
+ * 线上项目 4256-图片版（4 章 / 219 张分镜）里 characters 为空的 17 张逐张核过——12 张是
+ * 真正的无人物镜头（赛马场全景/赛马冲刺/古民宅外景/游乐园全景/火箭发射/作者后记书桌，其中 5 张
+ * 提示词里直接写了 "no characters"），模型留空是**对的**；无条件兜底会把主角的脸硬塞进这些
+ * 空镜，比"漂移"更刺眼。同场景其它分镜/台词说话人只能证明"这个场景有这些人"，不能证明
+ * "这张画面里有这个人"。故第 3 层做成显式开关（buildImageTasks 的 shotCharacterFallback:"scene"），
+ * 由要"宁可多参考也不留白"的项目显式打开。
+ */
+export function resolveShotCharacters(
+  shot: { characters?: string[] },
+  scene: ShotCharacterScene,
+  validIds: Set<string>,
+  opts: { allowSceneInference?: boolean } = {},
+): ShotCharacterResolution {
+  const declared = (shot.characters ?? []).filter((id) => validIds.has(id));
+  if (declared.length) return { ids: declared, source: "declared" };
+  const figures = (scene.figures ?? []).filter((id) => validIds.has(id));
+  if (figures.length) return { ids: figures, source: "scene-figures" };
+  if (opts.allowSceneInference) {
+    const inferred = sceneCastCandidates(scene, validIds);
+    if (inferred.length) return { ids: inferred, source: "scene-inferred" };
+  }
+  return { ids: [], source: "none" };
+}
+
+/**
+ * 单个分镜的出场角色（旧签名，只做「声明 → scene.figures」两层兜底，等价于
+ * resolveShotCharacters(..., { allowSceneInference: false }).ids）。保留给只需要 id 列表的调用方/单测。
+ */
+export function shotCharacterIdsOfTask(
+  shot: { characters?: string[] },
+  scene: ShotCharacterScene,
+  validIds: Set<string>,
+): string[] {
+  return resolveShotCharacters(shot, scene, validIds).ids;
+}
+
+/**
+ * 图片小说需要「角色基准图」的角色 id 集合：只算**真正有分镜**的角色。
+ * 旧实现给全部角色都出基准图——不出场的角色纯属白花钱（#809 省成本的口径）。
+ * 口径与分镜任务构建完全一致（resolveShotCharacters，含同一份 allowSceneInference 开关），
+ * 否则会出现"分镜要参考、基准图没建"的断链。
+ */
+export function imageOnlyBaselineCharacterIds(
+  chapters: ChapterScript[],
+  validIds: Set<string>,
+  chapterIndexes?: Set<number>,
+  allowSceneInference = false,
+): Set<string> {
+  const out = new Set<string>();
+  for (const chapter of chapters) {
+    if (chapterIndexes && !chapterIndexes.has(chapter.chapter)) continue;
+    for (const scene of chapter.scenes) {
+      for (const shot of scene.shots ?? []) {
+        for (const id of resolveShotCharacters(shot, scene, validIds, { allowSceneInference }).ids) out.add(id);
+      }
     }
   }
   return out;
@@ -197,6 +304,27 @@ const REF_HINT =
 const THREEVIEW_REF_HINT =
   ", based on the reference image: keep the exact same character (hair, eyes, clothing, colors, proportions, art style), generate a clean three-view character sheet";
 
+/**
+ * 图片小说的「角色基准图」后缀（仅 imageOnly 模式用它替代三视图）：
+ * 官方一致性两步法的第 ① 步是"为每个角色生成**一张**可复用的角色参考图"，逐帧再用 images.edit 带它出图。
+ * 旧实现给分镜喂的是三视图转面稿（一张图里三个视角并排），图生图模型会连版式一起学，
+ * 于是分镜被画成设定稿（线上实测产物）。所以图片小说的基准图改成**单人正视全身**：
+ * ① 版式干净，不会把"三视图"传染给分镜；② 正是 edit 端点最吃的输入形态；③ 张数不变、不额外计费。
+ * 绿幕底与三视图保持一致（同一套抠图/引用链路，imageOnly 下不做抠图，仅作参考图输入）。
+ */
+const CHARACTER_BASELINE_SUFFIX =
+  ", single character reference portrait, one character only, front view facing the viewer, neutral standing pose, calm neutral expression, "
+  + "full body visible from head to feet, centered with the whole figure inside the frame, plain uncluttered composition, "
+  + "no other characters, no panels, no multiple views, no inset close-ups, no text, no labels, no watermark, "
+  + "on a solid chroma key green #00FF00 background filling 100% of every exposed area including all gaps between hair strands, between fingers, between clothing folds, and around every body contour edge, "
+  + "the background is the exact same pure #00FF00 green, absolutely no volumetric shadow, no self-shadow, no ambient occlusion, no contact shadow on the background, "
+  + "the background is pure #00FF00 green, completely uniform flat color filling 100% of the background area, every pixel of the background area is exactly the same green, "
+  + "no gradient, no pattern, no texture, no other colors, no white, no black, no gray, no shadow";
+
+/** 角色基准图基于用户参考图生成时的措辞（与 THREEVIEW_REF_HINT 同口径，只是产物是单人正视全身） */
+const CHARACTER_BASELINE_REF_HINT =
+  ", based on the reference image: keep the exact same character (hair, eyes, clothing, colors, proportions, art style), single front-facing full-body character reference portrait";
+
 /** 背景/CG 风格锚定提示：参考图为画风基准，内容必须全新 */
 const STYLE_ANCHOR_HINT =
   ", same exact art style, line rendering, color palette, lighting and texture quality as the reference image, but an entirely different scene with different content";
@@ -263,6 +391,160 @@ export function stripBackground(prompt: string): string {
     .trim();
 }
 
+/* ==================== 分镜（kind:"shot"）提示词硬约束 + 人物一致性 ====================
+ *
+ * 线上问题（图片小说/纯图片模式实测）：分镜被画成「角色设定稿」（左立绘+右三视图+脸部特写+配色圆点），
+ * 且同一角色在不同分镜里脸型/发色/服装明显不同。两条根因：
+ *  ① shot.prompt 由剧本 LLM 自由撰写，没有「单幅场景插画」的硬约束与负面约束，模型按"设定图"理解就画设定稿；
+ *  ② 人物一致性只靠"参考图"一个杠杆：参考图缺失时静默纯文生图，每张各画各的。
+ *     官方 GPT Image 提示指南给的是两步法——先生成一张可复用的角色参考图，之后每张插画用 images.edit
+ *     把该参考图作为输入，并在提示词里**重复**角色的固定外貌描述
+ *     （https://developers.openai.com/api/docs/guides/image-prompting 「Keep a character consistent」：
+ *      "Repeat the appearance constraints" / "Same facial features, proportions, and color palette" /
+ *      "Do not redesign the character"；两步法示例见
+ *      https://developers.openai.com/cookbook/examples/multimodal/image-gen-models-prompting-guide
+ *      「Children's Book Art with Character Consistency (multi-image workflow)」：
+ *      先生成参考图，再 client.images.edit(image=[参考图], prompt=...) 逐帧续画）。
+ *     所以这里同时做三件事：提示词重复外貌约束（不依赖参考图也生效）+ 参考图走 edit 端点（依赖参考图时更强）+
+ *     无参考图时显式告警（不再静默纯文生图）。
+ */
+
+/** 会把「整幅分镜插画」诱变成「角色设定稿」的措辞：短语级删除，命中即从 shot.prompt 里抹掉。
+ *  只删这些词本身（如 "character sheet" / "三视图" / "配色板"），不碰同子句里的剧情描述。 */
+const CHARACTER_SHEET_PHRASES: RegExp[] = [
+  /\bthree[\s-]?views?\b/gi,
+  /\bturn[\s-]?arounds?\b/gi,
+  /\bcharacter\s+(?:design\s+|reference\s+|model\s+|style\s+)?(?:sheets?|boards?|charts?|profiles?|specs?)\b/gi,
+  /\breference\s+sheets?\b/gi,
+  /\bmodel\s+sheets?\b/gi,
+  /\bdesign\s+sheets?\b/gi,
+  /\bexpression\s+sheets?\b/gi,
+  /\bcolor\s+(?:chart|swatches?|palette\s+chart)\b/gi,
+  /\bexploded\s+views?\b/gi,
+  /\bmulti[\s-]?panel\b/gi,
+  /\bmultiple\s+(?:views|panels|vignettes|character\s+poses)\b/gi,
+  /\bsplit[\s-]?screen\b/gi,
+  /\bfront\s*,?\s*side\s*,?\s*(?:and\s*)?back\s+views?\b/gi,
+  /\b(?:front|side|back)\s+views?\s*\/\s*(?:front|side|back)\s+views?\b/gi,
+  /三视图|三视圖|三面图/g,
+  // 「正/侧/背」整段都可能不带"视图"三字（LLM 常写「正侧背」），视图部分必须可省，否则会留下残句
+  /正[侧側]背(?:三)?(?:[视視][图圖]?)?/g,
+  // 只在「设定/设计/参考 + 卡/稿/图/表/板」组合时删：单说"角色卡"可能是剧情道具（手里拿着一张角色卡），不能误伤
+  /(?:角色|人物)(?:设定|設定|设计|設計|参考|參考)(?:卡|稿|图|圖|表|板)?/g,
+  /(?:设定|設定|设计|設計)(?:稿|图|圖|表|板|册)/g,
+  /配色(?:板|表|卡|圆点|圓點)|色卡/g,
+  /多格(?:拼图|画面|畫面|分镜|漫畫)|拼图|拼圖/g,
+  /转面图|轉面圖/g,
+  /(?:鞋子|鞋|背包|配饰|配飾|服装|服裝)(?:分解|拆解)(?:[图圖]|表)?/g,
+];
+
+/** 子句里至少要有一点实质内容（字母/数字/中日韩文字）才算保留：否则删完措辞会留下 ":" "-" 这类残渣 */
+const HAS_MEANINGFUL_TEXT = /[A-Za-z0-9\u3040-\u30ff\u4e00-\u9fff]/;
+
+/** 短语删完后仍带这些结构词的子句整条丢弃（避免留下 "front view" 之类半截残句诱发设定稿布局） */
+const CHARACTER_SHEET_STRUCTURE =
+  /\b(?:front|side|back)\s+views?\b|\bpanels?\b|\bgrid\b|\b\d+\s*(?:poses?|views?|angles?)\b|\bclose[\s-]?ups?\s+of\s+the\s+(?:face|character|head)\b|\bcolor\s+(?:chart|swatches?)\b|\bexpression\s+grid\b/i;
+
+/**
+ * 剥掉提示词里会诱发「角色设定稿」的措辞（纯函数，单测直接覆盖）：
+ * ① 短语级删除上述措辞；② 剩余子句若仍是设定稿结构，整条丢掉。
+ * 正常剧情描述（人物/场景/动作/光线）不在删除范围内，原样保留。
+ */
+export function stripCharacterSheetWording(prompt: string): string {
+  if (!prompt) return "";
+  const phrasesRemoved = CHARACTER_SHEET_PHRASES.reduce((acc, re) => acc.replace(re, " "), prompt);
+  const kept = phrasesRemoved
+    .split(/[,，;；\n]/)
+    .map((clause) => clause.replace(/\s{2,}/g, " ").trim())
+    .filter((clause) => clause && HAS_MEANINGFUL_TEXT.test(clause) && !CHARACTER_SHEET_STRUCTURE.test(clause))
+    .join(", ");
+  const normalized = kept.replace(/[,，;；\s]+$/, "").trim();
+  // 极端情况：整段都被判为设定稿结构 → 至少保留"删掉设定稿措辞后"的文本，不要返回空提示词
+  return normalized || phrasesRemoved.replace(/\s{2,}/g, " ").replace(/[,，;；\s]+$/, "").trim();
+}
+
+/** fitImagePrompt 识别的分镜硬约束段起始标记（压缩超长提示词时该段必须整段保留） */
+const SHOT_ILLUSTRATION_MARKER = ", single scene illustration";
+
+/** fitImagePrompt 识别的外貌锁定段起始标记（排在硬约束段之前，压缩时一起保留） */
+const SHOT_APPEARANCE_LOCK_PREFIX = ", character appearance lock (must stay identical in every shot):";
+
+/** 分镜（kind:"shot"）的最终硬约束（纯函数）：只作用于分镜，立绘/三视图/物品不受影响。
+ *  明确「单幅整屏插画」并逐项排除设定稿特征（多视图/多格/配色板/分解图/文字水印）与绿幕平底。 */
+export function shotConsistencySuffix(): string {
+  return `${SHOT_ILLUSTRATION_MARKER}, one single full-frame story illustration of the described moment filling the whole canvas, `
+    + "not a character reference sheet and not a design document: no three-view or turnaround layout, no front/side/back view row, "
+    + "no multi-panel or grid or comic layout, no split screen, no character stats or data panel, no color palette chart, no color swatches, "
+    + "no facial close-up insets, no expression grid, no costume or prop breakdown, never render character card information as picture content, "
+    + "no text, no letters, no captions, no watermark, no signature, no logo, no UI elements, "
+    + "the background is the described scene environment with real depth, perspective and lighting (no flat solid-color backdrop, no chroma key green screen, no white void), "
+    + "16:9 widescreen composition, single cohesive anime illustration";
+}
+
+/** 角色固定外貌锚点（纯函数）：优先用角色卡的 imagePrompt（英文标准外貌描述），
+ *  缺省时退回 appearance + clothing；统一剥掉绿幕/设定稿措辞，只留"这个角色长什么样"。 */
+export function characterAppearanceAnchor(card: CharacterCard): string {
+  const base = (card.imagePrompt || "").trim() || [card.appearance, card.clothing].filter((s) => s && s.trim()).join(", ");
+  return stripBackground(stripCharacterSheetWording(base)).replace(/[,，;；\s]+$/, "").trim();
+}
+
+/** 分镜里重复一遍每个出场角色的固定外貌（官方指南要求 "Repeat the appearance constraints"）：
+ *  参考图在不在都生效——参考图缺失/线路不支持图生图时，这段文字是唯一还能锁住人物的杠杆。
+ *  刻意不写角色名：提示词里出现名字会诱发模型把名字当成画面文字渲染。 */
+export function shotAppearanceLock(characters: CharacterCard[]): string {
+  const seen = new Set<string>();
+  const parts: string[] = [];
+  for (const card of characters) {
+    const anchor = characterAppearanceAnchor(card);
+    if (!anchor || seen.has(anchor)) continue;
+    seen.add(anchor);
+    parts.push(anchor);
+  }
+  return parts.length ? `${SHOT_APPEARANCE_LOCK_PREFIX} ${parts.join("; ")}` : "";
+}
+
+/** 场景类插画最终提示词的共用实现（分镜 kind:"shot" 与立绘版 CG kind:"cg" 同一套）：
+ *  剧情描述 + 画风 + 外貌锁定段 + 单幅插画硬约束。
+ *  顺序有意为之：外貌锁定与硬约束都排在尾部，fitImagePrompt 压缩超长提示词时会优先保住这两段。 */
+function buildSceneIllustrationPrompt(scenePrompt: string, style: string, characters: CharacterCard[]): string {
+  return [stripCharacterSheetWording(scenePrompt), style, shotAppearanceLock(characters), shotConsistencySuffix()]
+    .filter((part) => part && part.trim())
+    .join("");
+}
+
+/** 分镜最终提示词（纯函数）：剧情描述 + 画风 + 外貌锁定段 + 单幅插画硬约束。
+ *  顺序有意为之：外貌锁定与硬约束都排在尾部，fitImagePrompt 压缩超长提示词时会优先保住这两段。 */
+export function buildShotPrompt(shotPrompt: string, style: string, characters: CharacterCard[]): string {
+  return buildSceneIllustrationPrompt(shotPrompt, style, characters);
+}
+
+/** 立绘版 CG 最终提示词（纯函数）：与 buildShotPrompt 同一套外貌锁定 + 反设定稿硬约束。
+ *  调用方把风格锚点提示并入 style 段传入（如 `style + STYLE_ANCHOR_HINT`），此处不再单独处理锚点。 */
+export function buildCgPrompt(cgPrompt: string, style: string, characters: CharacterCard[]): string {
+  return buildSceneIllustrationPrompt(cgPrompt, style, characters);
+}
+
+/** 场景类插画走 images.edit 时的共用指令（纯函数）：参考图只作身份基准，画面内容全新。
+ *  官方两步法的第 ② 步措辞：把身份约束与"不要重新设计角色"显式重复一遍。 */
+function sceneIllustrationEditPrompt(task: ImageTask): string {
+  return [
+    "Draw a brand new scene illustration that follows the scene description below; use the reference image only as the identity reference for the character(s) in it.",
+    "Character consistency, highest priority: the same character as the reference image — same facial features, same face shape, same hairstyle and hair color, same eye color, same skin tone, same facial proportions, same outfit, same accessories, same color palette. Do not redesign the character. Do not reuse the reference image's pose, framing, plain or green-screen backdrop.",
+    task.prompt,
+  ].join(" ");
+}
+
+/** 分镜走 images.edit 时的指令（纯函数）：参考图只作身份基准，画面内容全新。
+ *  官方两步法的第 ② 步措辞：把身份约束与"不要重新设计角色"显式重复一遍。 */
+export function shotEditPrompt(task: ImageTask): string {
+  return sceneIllustrationEditPrompt(task);
+}
+
+/** 立绘版 CG 走 images.edit 时的指令（纯函数）：与 shotEditPrompt 共用同一实现。 */
+export function sceneEditPrompt(task: ImageTask): string {
+  return sceneIllustrationEditPrompt(task);
+}
+
 const SAFE_REWRITE_SYSTEM = `你是 AI 绘图提示词安全改写器。图像模型因提示词疑似涉及裸露/色情/情色/未成年等内容返回审查拒绝。
 任务：在保持角色身份、服装款式、姿态、画风、构图完全一致的前提下，把提示词改写成可安全通过审查的版本。
 规则：
@@ -318,7 +600,7 @@ export interface BuildImageTaskOptions {
   chapterIndexes?: Set<number>;
   /**
    * 视觉模式（#806/#809）：sprite=立绘版（默认）；imageOnly=图片小说——
-   * 只产出「角色三视图（identity 参考）＋ 每场景分镜（kind:"shot"）＋（可选）物品图」，
+   * 只产出「角色基准图（identity 参考，仅为有分镜的角色）＋ 每场景分镜（kind:"shot"）＋（可选）物品图」，
    * 不产出立绘/表情/动作/服装差分，也不做抠图（透明需求由渲染侧规避）。
    */
   mode?: "sprite" | "imageOnly";
@@ -331,12 +613,33 @@ export interface BuildImageTaskOptions {
   /** 图片小说：是否生成物品图（默认 false，与 #814 的「图片必须含角色」口径一致）
    *  注意：#1099 起 imageOnly 模式一律跳过物品图（渲染端不展示物品图标），该开关只在立绘版生效 */
   includeItems?: boolean;
+  /**
+   * 图片小说：characters 为空的分镜是否允许**场景级推断**兜底身份（默认 "none"=不推断）。
+   * "scene" 会把「同场景其它分镜声明的角色 ＋ 场景台词说话人」当作该分镜的参考图/外貌锁定来源。
+   *
+   * 默认关闭是有实测依据的（详见 resolveShotCharacters 注释）：空 characters 的分镜里
+   * 绝大多数是真正的无人物空镜（全景/外景/桌面），无条件兜底等于把主角的脸硬塞进空镜。
+   * 确认自己的项目里"漏标"多于"本来就无人"时再显式打开。
+   *
+   * 只影响参考图与外貌锁定，**不改写剧本数据**（shot.characters 原样不动）。
+   * 注意：打开后这些分镜的提示词会多出外貌锁定段，但 promptVersion 不变（不全局作废存量分镜缓存）；
+   * 想让它们重画请用"强制重画/修复"入口。
+   */
+  shotCharacterFallback?: "none" | "scene";
 }
 
-/** 图片小说分镜任务的附加字段（#1133）：多人同框时除主身份外的其余角色三视图作追加 identity 参考 */
+/** 图片小说分镜任务的附加字段（#1133）：多人同框时除主身份外的其余角色基准图作追加 identity 参考 */
 export interface ShotImageTask extends ImageTask {
   /** 该分镜的全部出场角色卡片 id（按剧本顺序，已过滤无效 id）：守卫与日志用 */
   shotCharacterIds?: string[];
+  /** 除主身份外还需追加基准图参考的任务 id（`<角色id>_threeview`，按顺序） */
+  refFromTasks?: string[];
+}
+
+/** 立绘版 CG 任务的附加字段：与分镜同口径（主身份 + 追加身份），身份来源见 resolveShotCharacters 空声明复用 */
+export interface CgImageTask extends ImageTask {
+  /** 该 CG 场景的全部出场角色卡片 id（按 scene.figures 顺序，已过滤无效 id）：守卫与日志用 */
+  cgCharacterIds?: string[];
   /** 除主身份外还需追加三视图参考的任务 id（`<角色id>_threeview`，按顺序） */
   refFromTasks?: string[];
 }
@@ -344,6 +647,13 @@ export interface ShotImageTask extends ImageTask {
 /** 分镜任务的全部出场角色：优先取构建时写入的全量列表，兼容旧字段单角色 */
 export function shotCharacterIdsOf(task: ImageTask): string[] {
   const all = (task as ShotImageTask).shotCharacterIds;
+  if (Array.isArray(all) && all.length) return all.filter((id) => typeof id === "string" && id);
+  return task.characterId ? [task.characterId] : [];
+}
+
+/** CG 任务的全部出场角色：优先取构建时写入的全量列表，兼容旧字段单角色 */
+export function cgCharacterIdsOf(task: ImageTask): string[] {
+  const all = (task as CgImageTask).cgCharacterIds;
   if (Array.isArray(all) && all.length) return all.filter((id) => typeof id === "string" && id);
   return task.characterId ? [task.characterId] : [];
 }
@@ -374,6 +684,12 @@ export function buildImageTasks(
   const shotsTotal = opts.shotsTotal ?? 0;
   let shotTotalCount = 0;
   let shotTotalReached = false;
+  const cardById = new Map(cards.characters.map((c) => [c.id, c]));
+  const cardIds = new Set(cardById.keys());
+  // 空 characters 的分镜是否允许场景级推断兜底（默认否：空镜被硬塞人脸比漂移更刺眼，详见 resolveShotCharacters）
+  const allowSceneInference = opts.shotCharacterFallback === "scene";
+  // 图片小说：只为**真正有分镜**的角色建基准图（不出场的角色不花钱），口径与分镜任务构建完全一致
+  const baselineIds = imageOnly ? imageOnlyBaselineCharacterIds(chapters, cardIds, opts.chapterIndexes, allowSceneInference) : null;
 
   // ① 全项目画风锚点：一张无人物场景基准图，作为所有背景/CG 的画风参考
   if (useAnchor) {
@@ -389,24 +705,52 @@ export function buildImageTasks(
   }
 
   for (const char of cards.characters) {
+    // 图片小说：该角色没有分镜 → 不建基准图（不出场就不花钱；旧实现给全部角色出图）
+    if (imageOnly && baselineIds && !baselineIds.has(char.id)) continue;
     // ① 三视图参考图（正/侧/背），作为该角色所有图像的图生图基准；
     //    若用户为角色设置了参考图，则以参考图为基准生成三视图（保持人物一致）
+    // 图片小说：该任务改作「角色基准图」（单人正视全身，文件/映射键沿用 <id>_threeview）
     if (threeView) {
-      tasks.push({
-        kind: "threeview",
-        id: `${char.id}_threeview`,
-        characterId: char.id,
-        prompt:
-          stripBackground(char.threeViewPrompt || threeViewFallback(char.imagePrompt)) +
-          figureStyle +
-          (char.referenceImage ? THREEVIEW_REF_HINT : "") +
-          THREEVIEW_GREEN_SUFFIX,
-        ...(char.referenceImage ? { references: [inlineIdentityReference(char.referenceImage)] } : {}),
-        fileName: `threeview_${sanitizeId(char.id)}.png`,
-        width: 1024,
-        height: 1024,
-        usage: `三视图-${char.name}`,
-      });
+      if (!imageOnly) {
+        tasks.push({
+          kind: "threeview",
+          id: `${char.id}_threeview`,
+          characterId: char.id,
+          prompt:
+            stripBackground(char.threeViewPrompt || threeViewFallback(char.imagePrompt)) +
+            figureStyle +
+            (char.referenceImage ? THREEVIEW_REF_HINT : "") +
+            THREEVIEW_GREEN_SUFFIX,
+          ...(char.referenceImage ? { references: [inlineIdentityReference(char.referenceImage)] } : {}),
+          fileName: `threeview_${sanitizeId(char.id)}.png`,
+          width: 1024,
+          height: 1024,
+          usage: `三视图-${char.name}`,
+        });
+      } else {
+        // 基准图主体：角色固定外貌（剥掉绿幕/设定稿措辞）；极端情况下（角色卡无任何外貌描述）退回三视图主体
+        const baselineBody = characterAppearanceAnchor(char)
+          || stripCharacterSheetWording(stripBackground(char.threeViewPrompt || ""));
+        if (!baselineBody) {
+          logger.warn("images", `角色「${char.name}」没有可用的外貌描述，已跳过其基准图：该角色出场的分镜将无参考图、人物一致性无法保证`, { characterId: char.id });
+        } else {
+          tasks.push({
+            kind: "threeview",
+            id: `${char.id}_threeview`,
+            characterId: char.id,
+            prompt: baselineBody
+              + figureStyle
+              + (char.referenceImage ? CHARACTER_BASELINE_REF_HINT : "")
+              + CHARACTER_BASELINE_SUFFIX,
+            ...(char.referenceImage ? { references: [inlineIdentityReference(char.referenceImage)] } : {}),
+            fileName: `threeview_${sanitizeId(char.id)}.png`,
+            width: 1024,
+            height: 1024,
+            promptVersion: CHARACTER_BASELINE_PROMPT_VERSION,
+            usage: `角色基准图-${char.name}`,
+          });
+        }
+      }
     }
     // ② 立绘/表情/动作/服装差分：图片小说模式一律不产出（#809：无立绘、无人物演出 UI）
     if (!imageOnly) {
@@ -503,6 +847,14 @@ export function buildImageTasks(
     }
   }
 
+  // 空 characters 的分镜统计（构建期聚合告警，不逐张刷屏；运行期 runImageTask 还会按张再提示一次）：
+  // inferred = 兜底推断出了身份（已挂参考图）；unresolved = 三层都查不到（只能纯文生图，人物一致性无保证）
+  let shotsWithInferredCharacters = 0;
+  let shotsWithoutCharacters = 0;
+  // 立绘版 CG 统计（构建期聚合告警，不逐张刷屏）：有角色=挂三视图参考 + 外貌锁定 + edit；
+  // 无角色（scene.figures 为空）= 保持纯文本生图
+  let cgWithoutCharacters = 0;
+
   for (const chapter of chapters) {
     // 图片小说（#809）：只构建分镜任务（kind:"shot"）——画面由 shot 承担，
     // 不产出背景/CG 任务；无 shot 的场景在渲染侧保留上一张图（不会出现黑屏）。
@@ -524,13 +876,18 @@ export function buildImageTasks(
             break;
           }
           const shot = shots[si];
-          // #1133：多人同框是常态——主身份取第一个有效角色，其余角色三视图作为追加 identity 参考，
-          // 并把全部出场角色写进任务（守卫「任一角色三视图失败即不为该分镜付费生成」依赖它）。
-          const shotCharacters = (shot.characters ?? []).filter((id) => cards.characters.some((c) => c.id === id));
+          // #1133：多人同框是常态——主身份取第一个有效角色，其余角色基准图作为追加 identity 参考，
+          // 并把全部出场角色写进任务（守卫「任一角色基准图失败即不为该分镜付费生成」依赖它）。
+          // 分镜没声明 characters 时按 resolveShotCharacters 分层兜底：scene.figures →（可选）同场分镜/说话人。
+          // 漏标=无参考图=静默纯文生图=人物跨图漂移；但空镜被硬塞人脸更糟，故场景级推断默认关闭。
+          const resolvedShot = resolveShotCharacters(shot, scene, cardIds, { allowSceneInference });
+          const shotCharacters = resolvedShot.ids;
+          if (resolvedShot.source === "scene-inferred") shotsWithInferredCharacters++;
+          else if (!shotCharacters.length) shotsWithoutCharacters++;
           const identity = shotCharacters[0];
           const extraIdentities = shotCharacters.slice(1);
           const characterNames = shotCharacters
-            .map((id) => cards.characters.find((c) => c.id === id)?.name || id)
+            .map((id) => cardById.get(id)?.name || id)
             .join("/");
           const shotTask: ShotImageTask = {
             kind: "shot",
@@ -541,7 +898,16 @@ export function buildImageTasks(
             ...(identity ? { characterId: identity, refFromTask: `${identity}_threeview` } : {}),
             ...(extraIdentities.length ? { refFromTasks: extraIdentities.map((id) => `${id}_threeview`) } : {}),
             ...(shotCharacters.length ? { shotCharacterIds: shotCharacters } : {}),
-            prompt: shot.prompt + style,
+            // 有角色才可能走参考图编辑（editVariant=shot）；无角色时只能是纯文生图
+            ...(shotCharacters.length ? { editVariant: "shot" as const } : {}),
+            // 提示词约束版本：存量项目的旧分镜缓存判失效重画（否则修复对已有项目不生效）
+            promptVersion: SHOT_PROMPT_VERSION,
+            // 单幅整屏插画硬约束 + 每个出场角色的固定外貌重复（官方「Repeat the appearance constraints」）
+            prompt: buildShotPrompt(
+              shot.prompt,
+              style,
+              shotCharacters.map((id) => cardById.get(id)!).filter(Boolean),
+            ),
             fileName: `shot_ch${chapter.chapter + 1}_${sanitizeId(scene.id)}_${si + 1}.png`,
             width: 1536,
             height: 1024,
@@ -578,19 +944,68 @@ export function buildImageTasks(
       if (scene.cgEvent) {
         // CG 键只用 scene.id（scene.id 已跨章唯一化）：旧键 cg_<章节号>_<scene> 导致
         // 光章节重编号就全作废、全重生成；旧版文件/映射由 repairImageAssets 与分区兜底迁移。
-        tasks.push({
+        // 立绘版 CG 的人物一致性：复用分镜同一身份口径 resolveShotCharacters——给空声明
+        // `{ characters: [] }` 让它落到 `scene.figures` 层（CgEvent 本身无角色字段，不另写推断规则，
+        // 也不开场景级推断：空 figures 的 CG 多是无人物空镜，硬塞人脸比漂移更糟）。
+        const resolvedCg = resolveShotCharacters({ characters: [] }, scene, cardIds);
+        const cgCharacters = resolvedCg.ids;
+        if (!cgCharacters.length) cgWithoutCharacters++;
+        const cgIdentity = cgCharacters[0];
+        const cgExtraIdentities = cgCharacters.slice(1);
+        const cgCards = cgCharacters.map((id) => cardById.get(id)!).filter(Boolean);
+        const cgStyle = style + (useAnchor ? STYLE_ANCHOR_HINT : "");
+        const cgTask: CgImageTask = {
           kind: "cg",
           id: scene.id,
           chapter: chapter.chapter,
-          prompt: scene.cgEvent.imagePrompt + style + (useAnchor ? STYLE_ANCHOR_HINT : ""),
+          ...(cgIdentity ? { characterId: cgIdentity, refFromTask: `${cgIdentity}_threeview` } : {}),
+          ...(cgExtraIdentities.length ? { refFromTasks: cgExtraIdentities.map((id) => `${id}_threeview`) } : {}),
+          ...(cgCharacters.length ? { cgCharacterIds: cgCharacters } : {}),
+          // 有角色才可能走三视图编辑（editVariant=scene）；无角色时只能是纯文生图
+          ...(cgCharacters.length ? { editVariant: "scene" as const } : {}),
+          // 提示词约束版本：只作用于有角色的 CG（存量旧 CG 缓存判失效重画一次）；
+          // 无角色 CG 提示词逐字不变，缓存继续复用
+          ...(cgCharacters.length ? { promptVersion: CG_PROMPT_VERSION } : {}),
+          // 有角色=同一套外貌锁定 + 反设定稿硬约束；无角色=沿用旧纯文本生图口径（逐字不变）
+          prompt: cgCharacters.length
+            ? buildCgPrompt(scene.cgEvent.imagePrompt, cgStyle, cgCards)
+            : scene.cgEvent.imagePrompt + style + (useAnchor ? STYLE_ANCHOR_HINT : ""),
           fileName: `cg_${sanitizeId(scene.id)}.png`,
           width: 1536,
           height: 1024,
           usage: `CG-${scene.cgEvent.title}`,
-        });
+        };
+        tasks.push(cgTask);
         cgCount++;
       }
     }
+  }
+
+  // 构建期聚合告警：每章/每次构建最多两条，不逐张刷屏
+  if (imageOnly && shotsWithInferredCharacters > 0) {
+    logger.warn(
+      "images",
+      `有 ${shotsWithInferredCharacters} 张分镜未声明 characters，已尝试用场景出场角色兜底（按同场景其它分镜声明的角色＋场景台词说话人推断）：这些分镜已挂上参考图与外貌锁定，但推断可能与画面实际不符（空镜会被硬塞人脸）`,
+      { shots: shotsWithInferredCharacters, fallback: opts.shotCharacterFallback },
+    );
+  }
+  if (imageOnly && shotsWithoutCharacters > 0) {
+    logger.warn(
+      "images",
+      `有 ${shotsWithoutCharacters} 张分镜未声明角色，且无法推断（scene.figures 为空、也没有同场分镜/说话人可依据）：将退化为纯文本生图，人物一致性无法保证${
+        allowSceneInference ? "" : "（如确认这些分镜确有角色，可开启 shotCharacterFallback:\"scene\" 强制用场景角色兜底）"
+      }`,
+      { shots: shotsWithoutCharacters, fallback: opts.shotCharacterFallback },
+    );
+  }
+  // 立绘版 CG 聚合告警（只在产出 CG 的立绘版生效；imageOnly 不产出 CG）：scene.figures 为空的 CG
+  // 保持纯文本生图（提示词逐字不变、缓存复用），这里聚合一条，不逐张刷屏
+  if (!imageOnly && cgWithoutCharacters > 0) {
+    logger.warn(
+      "images",
+      `有 ${cgWithoutCharacters} 张 CG 未能确定出场角色（scene.figures 为空）：将保持纯文本生图，人物一致性无法保证（如确认这些 CG 确有角色，请补齐对应场景的 figures）`,
+      { cg: cgWithoutCharacters },
+    );
   }
 
   // B77：figure 键唯一性断言。threeview/figure/action 都会写 result.figure，同 id 会互相覆盖——
@@ -889,9 +1304,9 @@ export async function resolveImageTaskReferences(
         "REFERENCE_MISSING",
       );
     }
-    // #1133：多人分镜的其余出场角色三视图作为追加 identity 参考（非必需——模型参考图上限不足时
+    // #1133：多人分镜/多人 CG 的其余出场角色三视图作为追加 identity 参考（非必需——模型参考图上限不足时
     // 由 routeImageReferences 按序截断，避免 3 人以上同框直接 REFERENCE_UNSUPPORTED 硬失败）。
-    for (const refTask of (task as ShotImageTask).refFromTasks ?? []) {
+    for (const refTask of (task as ShotImageTask & CgImageTask).refFromTasks ?? []) {
       const extraPath = context.figureBase?.[refTask];
       if (!extraPath) continue;
       try {
@@ -997,13 +1412,14 @@ export function promptLimitFromError(message: string): number {
 
 /**
  * 把超长绘图提示词压缩到 maxChars 以内：
- * 1. 绿幕/三视图/无人背景等「背景约束后缀」整段优先保留（生成质量依赖，头部给它让预算）；
+ * 1. 绿幕/三视图/无人背景/分镜外貌锁定等「背景约束后缀」整段优先保留（生成质量依赖，头部给它让预算）；
  * 2. 头部（主体描述）按逗号短语边界截断，去掉中间的风格长句；
  * 3. 极端受限（后缀都放不下）时只保留后缀尾部。
+ * 分镜提示词里「外貌锁定段」排在「单幅插画硬约束段」之前，两者都在尾部，一起保住。
  */
 export function fitImagePrompt(prompt: string, maxChars: number): string {
   if (prompt.length <= maxChars) return prompt;
-  const constraintIdx = prompt.search(/, solid chroma key green|, on a solid chroma key green|, three-view character reference sheet|, environment-only background plate/i);
+  const constraintIdx = prompt.search(/, solid chroma key green|, on a solid chroma key green|, three-view character reference sheet|, environment-only background plate|, single character reference portrait|, character appearance lock/i);
   let tail = "";
   let headLimit = maxChars;
   if (constraintIdx >= 0) {
@@ -1030,9 +1446,24 @@ interface ImageArtifactMeta {
   model: string | null;
   seed: number | null;
   negativePrompt: string | null;
+  /** 提示词版本（图片小说分镜/角色基准图）：与当前任务不一致即视为旧缓存、重新生成。
+   *  缺失=0（存量缓存），`imageMetaMatches` 里按 ?? 0 兜底。 */
+  promptVersion: number;
   width: number;
   height: number;
 }
+
+/** 分镜提示词约束版本：① 单幅整屏插画硬约束 ② 重复角色固定外貌 ③ 走参考图 edit。
+ *  +1 会让存量项目的旧分镜缓存判失效重画——修复必须对已有项目生效（旧分镜正是有问题的那些）。 */
+const SHOT_PROMPT_VERSION = 2;
+
+/** 图片小说角色基准图提示词版本：① 由三视图转面稿改为单人正视全身（避免版式传染给分镜）。
+ *  同上，仅影响 imageOnly 的基准图任务；立绘版三视图不带此版本号，缓存照旧复用。 */
+const CHARACTER_BASELINE_PROMPT_VERSION = 2;
+
+/** 立绘版 CG 提示词约束版本：① 复用分镜同一套外貌锁定 + 反设定稿硬约束 ② 走三视图 edit。
+ *  只写在有角色的 CG 任务上（无角色 CG 提示词逐字不变、不带版本号）：存量有角色 CG 缓存判失效重画一次。 */
+export const CG_PROMPT_VERSION = 1;
 
 /** 本次任务对应的生成参数摘要（不写入 prompt：调用方可能只改反馈词，内容复用由调用方决定） */
 function imageMetaForTask(task: ImageTask, cfg: ApiConfig | undefined, negativePrompt: string | undefined): ImageArtifactMeta {
@@ -1042,6 +1473,7 @@ function imageMetaForTask(task: ImageTask, cfg: ApiConfig | undefined, negativeP
     model: cfg?.model ?? null,
     seed: typeof task.seed === "number" ? task.seed : null,
     negativePrompt: negativePrompt?.trim() ? negativePrompt : null,
+    promptVersion: task.promptVersion ?? 0,
     width: task.width,
     height: task.height,
   };
@@ -1052,6 +1484,9 @@ function imageMetaMatches(meta: ImageArtifactMeta, expected: ImageArtifactMeta):
     && meta.adapter === expected.adapter
     && meta.model === expected.model
     && meta.seed === expected.seed
+    // 提示词版本：只有任务自己带版本号时才比较——分镜/角色基准图升级提示词约束后必须重画，
+    // 其余任务（无版本号）存量 meta 缺该字段，按 0 兜底后与期望一致，缓存继续复用（不额外计费）。
+    && (expected.promptVersion === 0 || (meta.promptVersion ?? 0) === expected.promptVersion)
     // 期望值没有负面词（如背景/CG，且用户未配置）时不比较，避免单素材重生成后的旧缓存被误判参数不符而重复付费；
     // 期望值有负面词时必须一致：人物任务现在带「防半身/裁切」构图负面词，旧的无负面词记录必须视为未命中重画。
     && (expected.negativePrompt === null || meta.negativePrompt === expected.negativePrompt)
@@ -1221,6 +1656,28 @@ export async function runImageTask(
         figureBase: opts.figureBase,
         styleAnchorPath: opts.styleAnchorPath,
       });
+      // 分镜无人物参考图时必须显式告警：静默纯文生图是"人物跨图漂移"的最差结果，
+      // 用户只会看到"人物怎么每张都不一样"，看不到任何提示（图片小说里三视图/基准图缺失最常见）。
+      // 覆盖两种成因：① 构建期三层兜底都没推出角色（构建期已聚合告警过）；
+      //             ② 推出了角色但基准图没生成/读不到（refFromTask 存在却拿不到 identity）。
+      if (task.kind === "shot" && !resolvedReferences.some((reference) => reference.role === "identity")) {
+        const missing = shotCharacterIdsOf(task);
+        logger.warn("images", "分镜没有可用的人物参考图，将退化为纯文本生图（人物一致性无法保证）", {
+          id: task.id,
+          characters: missing,
+          cause: missing.length ? "baseline-missing" : "no-cast-resolved",
+        });
+        log({
+          step: "图像",
+          message: `该分镜没有人物参考图（${
+            missing.length
+              ? `出场角色 ${missing.join("、")} 的基准图缺失或未生成`
+              : "构建期未能确定出场角色：分镜未标注 characters，场景出场表也为空"
+          }），已退化为纯文本生图，人物一致性无法保证：${task.usage}`,
+          level: "warn",
+          at: Date.now(),
+        });
+      }
       const capabilities = resolveImageModelCapabilities(cfg);
       if (capabilities.maxReferenceImages === 1
         && resolvedReferences.some((reference) => reference.role === "identity")
@@ -1352,6 +1809,48 @@ export async function runImageTask(
             });
           } catch (e) {
             logger.warn("images", "表情差分编辑模式失败，回退参考图生图", { id: task.id, error: errMsg(e).slice(0, 200) });
+            log({
+              step: "图像",
+              message: `编辑模式不可用，改用参考图生图：${task.usage}（${errMsg(e).slice(0, 80)}）`,
+              level: "warn",
+              at: Date.now(),
+            });
+          }
+        }
+      }
+      // 分镜/CG 参考图编辑模式（仅 GPT-Image 系）：以角色三视图/基准图作输入走 /images/edits，按场景提示词画**新场景**。
+      // 官方一致性两步法第 ② 步（先 generate 一张角色参考图，之后每张用 images.edit 带它出画）——这是锁人物最有效的通道：
+      // ① /images/generations 官方不接受参考图（universal.ts 已拦截），edit 是唯一能带图出画的端点；
+      // ② 提示词里已重复角色固定外貌（buildShotPrompt/buildCgPrompt 的 appearance lock）+ shotEditPrompt/sceneEditPrompt 的「不要重新设计角色」。
+      // 不支持编辑端点的线路/编辑失败 → 回退参考图生图（人物一致性由提示词外貌锁定兜底），不影响出图。
+      // editVariant "shot"（分镜）与 "scene"（立绘版 CG）共用同一实现，仅日志文案区分。
+      if ((task.editVariant === "shot" || task.editVariant === "scene") && !composited && supportsImageEdits(cfg?.model) && !aborted()) {
+        const identityReferences = resolvedReferences.filter((reference) => reference.role === "identity");
+        if (identityReferences.length) {
+          try {
+            img = await editImageWithReferences(
+              cfg!,
+              { prompt: task.editVariant === "scene" ? sceneEditPrompt(task) : shotEditPrompt(task), width: task.width, height: task.height },
+              identityReferences,
+            );
+            edited = true;
+            if (task.editVariant === "scene") {
+              log({
+                step: "图像",
+                message: `CG 走参考图编辑模式（以角色三视图锁人物一致性，${identityReferences.length} 张参考图）：${task.usage}`,
+                level: "info",
+                at: Date.now(),
+              });
+            } else {
+              log({
+                step: "图像",
+                message: `分镜走参考图编辑模式（以角色基准图锁人物一致性，${identityReferences.length} 张参考图）：${task.usage}`,
+                level: "info",
+                at: Date.now(),
+              });
+            }
+          } catch (e) {
+            logger.warn("images", task.editVariant === "scene" ? "CG 编辑模式失败，回退参考图生图" : "分镜编辑模式失败，回退参考图生图", { id: task.id, error: errMsg(e).slice(0, 200) });
             log({
               step: "图像",
               message: `编辑模式不可用，改用参考图生图：${task.usage}（${errMsg(e).slice(0, 80)}）`,

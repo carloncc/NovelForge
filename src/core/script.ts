@@ -41,6 +41,8 @@ interface ScriptModel {
     atmosphere: string;
     time: string;
     bgPrompt: string;
+    /** 本场景出场的角色 id 数组（图像阶段据此锁定人物一致性；非数组/缺省按空处理） */
+    figures?: string[];
     bgm?: string;
     cg?: { title: string; description: string; imagePrompt: string };
     itemEvents: { itemId: string; action: "obtain" | "exchange" | "show" | "key"; description: string }[];
@@ -99,7 +101,7 @@ C. 每个 shot 字段：
    - id：场景内短标识（如 s1_1；可省略，系统会补）
    - prompt：英文整幅插画提示词，必须包含：出场角色（外貌/服装/表情/动作，与角色卡一致）+ 场景环境 + 构图 + 16:9 横构图；风格为动漫插画；不要绿幕/纯色背景描述（这是整幅画面，不是立绘）
    - triggerLineIndex：在第几句台词前切换到该图（0-based，必须落在本场景 lines 范围内；同一张图覆盖的连续对话应属于同一画面）
-   - characters：画面中出现的角色卡 id 数组（没有角色就留空数组）
+   - characters：画面中出现的角色卡 id 数组。本场景只要有任何角色实体（即使只作为背景人物、路人或一闪而过），就把能辨认的角色 id 填上；只有画面内确实一个角色都没有时才留空数组——留空会让这张分镜拿不到该角色的人物参考图，人物一致性无法保证。
    - note：可选，10 字内中文短标题（如「城门对峙」）
 D. 一张图覆盖的连续对话应属于同一画面（同一地点/时间/氛围）；画面切换点放在场景转换、情绪转折、时间跳跃处。
 E. lines 的说话人、台词保真与上文规则一致（对话逐句保留，旁白按「旁白处理策略」）。`;
@@ -118,6 +120,7 @@ const SYSTEM_PROMPT = `你是视觉小说编剧。根据小说章节文本与角
    - id: 唯一标识（如 s1）
    - location / atmosphere / time: 对应场景卡，若不在场景卡中则新写
    - bgPrompt: 该场景背景图的英文 prompt，动漫背景风格，无人
+   - figures: 本场景出场的角色 id 数组（含只作为背景人物/路人/一闪而过但可辨认的角色）；场景内确实一个角色都没有时为空数组；必须如实标注，它决定图像阶段能否锁定人物一致性
    - bgm: 该场景氛围适合的背景音乐描述（中文，如"宁静的钢琴曲""肃杀的战鼓声"；没有合适氛围时留空字符串）
 4. lines 数组：按剧情顺序排列
    - dialogue: {type:"dialogue", characterId: 角色卡id, emotion:"normal|happy|sad|angry|surprised", text}
@@ -429,6 +432,26 @@ export function clampItemTriggerIndex(raw: number, lineCount: number): number {
   return Math.max(0, Math.min(lineCount, Math.floor(raw)));
 }
 
+/**
+ * 场景出场角色（figures）解析（纯函数，供单测）：只保留角色卡内合法 id、剔除 narrator、
+ * 去重且保持模型给出的原顺序；缺失/非数组/全非法 → []（不回退、不猜测）。
+ * 空数组是合法口径（本场景无任何可辨认角色），不得用手工 [] 覆盖模型给的值。
+ */
+export function normalizeSceneFigures(raw: unknown, cards: ExtractionResult): string[] {
+  if (!Array.isArray(raw)) return [];
+  const validIds = new Set(cards.characters.map((c) => c.id));
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    if (typeof item !== "string") continue;
+    const id = item.trim();
+    if (!id || id === "narrator" || seen.has(id) || !validIds.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}
+
 /** 把一次模型回执映射为场景数组（含分支/CG/物品/视频位/分镜清洗与配额） */
 function mapScriptScenes(model: ScriptModel, ctx: ScriptSceneContext): SceneJSON[] {
   // 分支/CG 配额：与 prompt 规则一致（#795/#798）。超出上限的只告警并放弃多余项，
@@ -572,7 +595,7 @@ function mapScriptScenes(model: ScriptModel, ctx: ScriptSceneContext): SceneJSON
         return kept;
       })(),
       lines,
-      figures: [],
+      figures: normalizeSceneFigures(s.figures, ctx.cards),
       choices: choices.length ? choices : undefined,
       ...(shots && shots.length ? { shots } : {}),
     };
@@ -818,8 +841,9 @@ export async function scriptChapter(
       }
     };
     // 本部分的流式进度（真实字符数）：onDelta 写入、90s 心跳读取；每次模型请求开始归零，
-    // 避免上一块/上一次请求的计数串到下一块。
-    const genProgress = { contentChars: 0, reasoningChars: 0 };
+    // 避免上一块/上一次请求的计数串到下一块。startMs 同样每次请求归零，
+    // 否则一次重试后心跳的「已等待」会把失败那次的耗时也算进来，误导为单次请求卡死。
+    const genProgress = { contentChars: 0, reasoningChars: 0, startMs: Date.now() };
     // 单个子块生成（含空结果带提示重试一次；无场景即抛错，由外层决定是否降级拆分）
     const genOnePart = async (bodyText: string, note: string, tag: string): Promise<{ model: ScriptModel; scenes: SceneJSON[] }> => {
       const user = buildScriptUser(chapter, cards, extra, bodyText, note);
@@ -863,6 +887,7 @@ export async function scriptChapter(
         for (let attempt = 0; ; attempt++) {
           genProgress.contentChars = 0;
           genProgress.reasoningChars = 0;
+          genProgress.startMs = Date.now();
           try {
             return await chatJson<ScriptModel>(cfg, systemPrompt, userText, chatOpts);
           } catch (e) {
@@ -898,9 +923,11 @@ export async function scriptChapter(
     // 长调用心跳：本部分生成可能持续数分钟（分块多轮/续写/重试），每 90s 报一次存活，避免看起来卡死。
     // 桌面端剧本已开 SSE 流式：有真实计数时显示「已生成 N 字」；网页版/首字未到保持原文案。
     // 计数来自本部分 genProgress（每次模型请求开始时归零），因此心跳只在「真的在生成」期间存在。
-    const hbStart = Date.now();
+    genProgress.contentChars = 0;
+    genProgress.reasoningChars = 0;
+    genProgress.startMs = Date.now();
     const heartbeat = setInterval(() => {
-      const waited = Math.round((Date.now() - hbStart) / 1000);
+      const waited = Math.round((Date.now() - genProgress.startMs) / 1000);
       const counted = genProgress.contentChars > 0 || genProgress.reasoningChars > 0;
       opts.onLog?.(
         counted
@@ -1128,6 +1155,25 @@ function bgmFor(atmosphere: string): string {
   return "";
 }
 
+/**
+ * demo 剧本场景出场角色派生（纯函数，供单测）：按台词出现顺序去重取说话人（含分支 choices.lines）。
+ * 无 API 演示路径没有模型给的 figures，用「本场谁开口」保证 demo 结果自洽（与图像阶段口径一致）。
+ */
+export function deriveDemoFigures(lines: Line[], choices?: Choice[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (l: Line): void => {
+    if (l.type !== "dialogue") return;
+    const id = l.characterId;
+    if (!id || id === "narrator" || seen.has(id)) return;
+    seen.add(id);
+    out.push(id);
+  };
+  for (const l of lines) add(l);
+  for (const c of choices ?? []) for (const l of c.lines) add(l);
+  return out;
+}
+
 function demoScriptChapter(chapter: ChapterInfo, cards: ExtractionResult): ChapterScript {
   const charMap = new Map<string, string>();
   for (const c of cards.characters) charMap.set(c.name, c.id);
@@ -1245,7 +1291,7 @@ function demoScriptChapter(chapter: ChapterInfo, cards: ExtractionResult): Chapt
       lines: s.lines,
       itemEvents: s.itemEvents,
       videoPoints: s.videoPoints,
-      figures: [],
+      figures: deriveDemoFigures(s.lines),
       cgEvent: s.cg,
     })),
   };

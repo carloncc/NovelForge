@@ -644,6 +644,7 @@ watch(
                   :value="cfg.concurrency ?? defaultConcurrency(ch.key)"
                   @change="(e: any) => { cfg.concurrency = Math.max(1, Math.min(100, Number((e.target as HTMLInputElement).value) || 1)); }"
                 />
+                <span v-if="ch.key === 'image'" class="hint">{{ t("图像批量生成单通道并发上限 8：填更大的值也按 8 生效（避免触发厂商 429）") }}</span>
               </label>
             </div>
             <div v-if="ch.key === 'llm'" class="cfg-row mt-2">

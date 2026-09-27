@@ -16,6 +16,7 @@ import { t } from "../i18n";
 import { activeConfig, voiceLibraryFor } from "./config";
 import { concurrencyFor } from "./configMigration";
 import { registerRunAbort, unregisterRunAbort } from "../api/abort";
+import { setLlmConcurrency } from "../api/openaiCompatible";
 import { runIsBusy, runStatusSyncSource, registerRunStopSource } from "./runStatus";
 import { previewOwner, claimPreview, releasePreview } from "./preview";
 import { projectState } from "./project";
@@ -38,6 +39,7 @@ import {
   planChapterContinuity,
   resolveImageStoryDirOnLoad,
   runImageStoryTasks,
+  runOrderedPool,
   shouldBlockAssembleOnZeroShots,
   shouldRunPostScriptStages,
 } from "../core/imageStory";
@@ -463,7 +465,7 @@ function refreshPlan(): void {
   const plan = buildImageStoryPlan(scripts, cards, imageStoryState.options);
   imageStoryState.plan = {
     shots: plan.shotCount,
-    threeviews: plan.threeviewCount,
+    threeviews: plan.characterBaselineCount,
     items: plan.itemCount,
     total: plan.tasks.length,
     yuan: plan.estimatedYuan,
@@ -699,25 +701,30 @@ async function runScriptStage(llm: NonNullable<ReturnType<typeof activeConfig>>,
   const cacheDir = CACHE_ROOT(dir);
   // #1341：剧本缓存键带 cardsFp——卡片重提后 id/名称变化时旧剧本自动失效。
   const fp = scriptFp(cards);
-  const out: ChapterScript[] = [];
   const chapters = enabledChapters.value;
-  for (let i = 0; i < chapters.length; i++) {
-    if (abortFlag) break;
-    const ch = chapters[i];
+  const total = chapters.length;
+  // #1447：剧本阶段按章并行，并发数取文本 API 配置（与主管线 pipeline 同口径），且不超过章节数；
+  // 结果按章节顺序预分配（runOrderedPool），单章失败/中止不连带打断其它章。
+  const concurrency = concurrencyFor(llm, "llm");
+  // 文本请求级限流跟随该 API 的并发配置（与主管线 pipeline 同口径）：否则按章并行的 5 会被
+  // API 层默认 3 的旧上限压住，配置的并发依然用不上。
+  setLlmConcurrency(llm, concurrency);
+  // 完成数用原子计数（成功/失败/缓存命中都算处理完一章），不再用下标以免并发乱序
+  let done = 0;
+  const runOne = async (ch: ChapterInfo): Promise<ChapterScript | undefined> => {
+    imageStoryState.stage = "剧本";
     // #1435：只有 run 阶段允许付费翻译（载入期已禁止），带阶段/进度/停止能力
     const eff = await effectiveChapterText(ch, { allowPaidTranslate: true });
-    imageStoryState.stage = "剧本";
-    imageStoryState.progress = { done: i, total: chapters.length };
     const file = scriptCacheFileName(cacheDir, false, ch.index, eff.title, eff.text, fp);
     try {
       const { text } = await tauri.readTextFile(file);
-      out.push(await repairShotTriggers(parseChapterScript(JSON.parse(text)), file));
+      const cached = await repairShotTriggers(parseChapterScript(JSON.parse(text)), file);
       pushLog("剧本", `第 ${ch.index + 1} 章分镜剧本命中缓存`);
-      continue;
+      return cached;
     } catch {
       /* 需要生成 */
     }
-    pushLog("剧本", `第 ${ch.index + 1}/${chapters.length} 章：生成分镜剧本…`);
+    pushLog("剧本", `第 ${ch.index + 1}/${total} 章：生成分镜剧本…`);
     try {
       const script = await scriptChapter(llm, { ...ch, title: eff.title, text: eff.text }, cards, undefined, {
         mode: "imageOnly",
@@ -728,27 +735,49 @@ async function runScriptStage(llm: NonNullable<ReturnType<typeof activeConfig>>,
         // 分段落盘/断点续跑（P1）：与上方整章 file 同键；k/N 进度走既有 onPart 日志，页面不再另接
         partCache: { cacheDir, demo: false, styleFrag: fp },
         isAborted: () => abortFlag,
-        onPart: ({ part, total, phase, elapsedMs }) => {
-          if (total <= 1) return;
+        onPart: ({ part, total: partTotal, phase, elapsedMs }) => {
+          if (partTotal <= 1) return;
           if (phase === "start" && part === 1) {
-            pushLog("剧本", `第 ${ch.index + 1} 章较长，将分 ${total} 部分逐段生成（每部分约 1–3 分钟）…`);
+            pushLog("剧本", `第 ${ch.index + 1} 章较长，将分 ${partTotal} 部分逐段生成（每部分约 1–3 分钟）…`);
           } else if (phase === "done") {
-            pushLog("剧本", `第 ${ch.index + 1} 章第 ${part}/${total} 部分完成（${Math.round(elapsedMs / 1000)}s）`);
+            pushLog("剧本", `第 ${ch.index + 1} 章第 ${part}/${partTotal} 部分完成（${Math.round(elapsedMs / 1000)}s）`);
           }
         },
       });
       await tauri.mkdirAll(cacheDir);
       await tauri.writeTextFile(file, JSON.stringify(script, null, 2));
-      out.push(await repairShotTriggers(script, file));
+      const fixed = await repairShotTriggers(script, file);
       const shots = script.scenes.reduce((n, s) => n + (s.shots?.length ?? 0), 0);
       pushLog("剧本", `第 ${ch.index + 1} 章完成：${script.scenes.length} 场景 / ${shots} 分镜`, "success");
+      return fixed;
     } catch (e) {
       pushLog("剧本", `第 ${ch.index + 1} 章分镜剧本失败：${errMsg(e).slice(0, 160)}`, "error");
       imageStoryState.failed.push({ key: `script_ch${ch.index + 1}`, label: `第 ${ch.index + 1} 章剧本`, message: errMsg(e).slice(0, 300) });
+      return undefined;
     }
-  }
+  };
+  const results = await runOrderedPool(
+    chapters,
+    concurrency,
+    async (ch) => {
+      try {
+        return await runOne(ch);
+      } finally {
+        done += 1;
+        imageStoryState.progress = { done, total };
+      }
+    },
+    {
+      isAborted: () => abortFlag,
+      // 未被 runOne 内部捕获的意外异常：隔离到本章，不连带打断其它章节
+      onError: (ch, _i, e) => {
+        pushLog("剧本", `第 ${ch.index + 1} 章分镜剧本异常：${errMsg(e).slice(0, 160)}`, "error");
+        imageStoryState.failed.push({ key: `script_ch${ch.index + 1}`, label: `第 ${ch.index + 1} 章剧本`, message: errMsg(e).slice(0, 300) });
+      },
+    },
+  );
   imageStoryState.progress = null;
-  return out.sort((a, b) => a.chapter - b.chapter);
+  return results.filter((c): c is ChapterScript => !!c).sort((a, b) => a.chapter - b.chapter);
 }
 
 async function runImageStage(cards: ExtractionResult, chapters: ChapterScript[]): Promise<void> {
@@ -766,9 +795,14 @@ async function runImageStage(cards: ExtractionResult, chapters: ChapterScript[])
     return;
   }
   // #1100/#1342：图像并发取该 API 配置并封顶 8（与主管线 pipeline 同公式，避免 429）。
-  const concurrency = Math.min(8, concurrencyFor(imageCfg, "image"));
-  imageStoryState.plan = { shots: plan.shotCount, threeviews: plan.threeviewCount, items: plan.itemCount, total: plan.tasks.length, yuan: plan.estimatedYuan };
-  pushLog("图片", `开始生成图片：分镜 ${plan.shotCount} 张 / 三视图 ${plan.threeviewCount} 张（预计最多 ¥${plan.estimatedYuan}，命中缓存不重复计费；并发 ${concurrency}，取自该图像 API 配置）`);
+  // #1447：配置值被上限钳制时如实告知（此前用户设 30 静默按 8 跑，日志/UI 都看不出来）。
+  const configuredConcurrency = concurrencyFor(imageCfg, "image");
+  const concurrency = Math.min(8, configuredConcurrency);
+  const concurrencyNote = configuredConcurrency > 8
+    ? `并发 ${concurrency}（你的配置 ${configuredConcurrency}，单通道上限 8）`
+    : `并发 ${concurrency}`;
+  imageStoryState.plan = { shots: plan.shotCount, threeviews: plan.characterBaselineCount, items: plan.itemCount, total: plan.tasks.length, yuan: plan.estimatedYuan };
+  pushLog("图片", `开始生成图片：分镜 ${plan.shotCount} 张 / 角色基准图 ${plan.characterBaselineCount} 张（分镜以基准图作参考锁定人物一致性，预计最多 ¥${plan.estimatedYuan}，命中缓存不重复计费；${concurrencyNote}，取自该图像 API 配置）`);
   const assets = await readAssetMap(dir);
   await backupAssetMap(dir).catch(() => null);
   let done = 0;
@@ -1100,11 +1134,11 @@ export async function regenerateShot(taskId: string): Promise<void> {
   const assets = await readAssetMap(dir);
   const figureBase: Record<string, string> = {};
   for (const [id, path] of Object.entries(assets.figure)) figureBase[id] = path;
-  // 依赖的三视图缺失时不单张重生成（避免静默降级为纯文生图导致人物不一致）
+  // 依赖的三视图（角色基准图）缺失时不单张重生成（避免静默降级为纯文生图导致人物不一致）
   // #1133：多人分镜对每个出场角色都校验，不再只看第一个角色
   const missingChars = shotCharacterIdsOf(task).filter((id) => !figureBase[`${id}_threeview`]);
   if (missingChars.length) {
-    pushLog("图片", `角色 ${missingChars.join("、")} 的三视图缺失：请先重跑图片阶段补齐三视图后再重生成该分镜`, "error");
+    pushLog("图片", `角色 ${missingChars.join("、")} 的基准图缺失：请先重跑图片阶段补齐角色基准图后再重生成该分镜`, "error");
     return;
   }
   imageStoryState.running = true;
@@ -1123,7 +1157,7 @@ export async function regenerateShot(taskId: string): Promise<void> {
       concurrency: 1,
       isAborted: () => abortFlag,
       force: true,
-      // 单张重生成不跑三视图任务：把已生成的三视图作为预置参考传入（#1133 多身份参考同样受益）
+      // 单张重生成不跑基准图任务：把已生成的角色基准图作为预置参考传入（#1133 多身份参考同样受益）
       figureBase,
       log: (ev) => pushLog(ev.step || "图片", ev.message, ev.level),
       verifyCfg: imageStoryState.options.imageSelfCheck ? activeConfig("vision") : undefined,

@@ -1381,8 +1381,18 @@ export async function chatJson<T>(
     // 既不触发 chatJson 内部的续写/修复，也不被 withRetry 当 unknown 退避重试；
     // 由上层（剧本 genOnePart）按独立计数原样重发，仍失败再拆小。
     if (!accumulated.trim()) {
-      log.error("api", "模型没有输出任何正文内容", { finishReason: finishReason ?? "?", requestCount, continueCount });
-      throw new EmptyContentError("模型本次没有输出任何正文（只产生了思考内容，可能是思考过长或流被截断）");
+      // repetition_truncation 是部分厂商在模型思考/输出陷入重复时给出的截断原因（OpenAI 兼容字段，
+      // 实测 opencode.ai 网关：思考 23 万字后输出被掐、正文 0 字）：不是"长度上限"，不能续写/放大预算，
+      // 重发同请求（思考具有随机性）或拆小任务才是正解。
+      const repetition = /repetition/i.test(finishReason ?? "");
+      log.error("api", repetition ? "模型输出陷入重复被截断" : "模型没有输出任何正文内容", {
+        finishReason: finishReason ?? "?",
+        requestCount,
+        continueCount,
+      });
+      throw repetition
+        ? new EmptyContentError("模型输出陷入重复被截断（repetition_truncation），正文为空")
+        : new EmptyContentError("模型本次没有输出任何正文（只产生了思考内容，可能是思考过长或流被截断）");
     }
 
     try {

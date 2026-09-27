@@ -1,9 +1,11 @@
 /**
  * 图片小说（纯图片模式）图片通道（#806/#809/#810）：
- * - 任务构建：角色三视图（identity 参考，必须先行）＋ 每场景分镜（kind:"shot"）＋（可选）物品图；
+ * - 任务构建：角色基准图（identity 参考，必须先行；只为**有分镜**的角色生成）＋ 每场景分镜（kind:"shot"）＋（可选）物品图；
  *   不产出立绘/表情/动作/服装差分，也不做抠图。
- * - 执行：按依赖分层（三视图 → 分镜/物品）并发执行，逐张回调结果供映射落盘；
- *   三视图失败的角色，其分镜不静默降级为纯文生图（#814 决策 7），直接记为失败并给出可执行提示。
+ * - 执行：按依赖分层（基准图 → 分镜/物品）并发执行，逐张回调结果供映射落盘；
+ *   基准图失败的角色，其分镜不静默降级为纯文生图（#814 决策 7），直接记为失败并给出可执行提示。
+ * - 分镜的人物一致性：基准图作 identity 参考 + 走 images.edit（GPT-Image 系）+ 提示词重复固定外貌
+ *   （见 images.ts buildShotPrompt / shotEditPrompt，官方依据注释在同处）。
  */
 import type { ApiConfig, ChapterScript, ExtractionResult, ImageStoryOptions, ImageTask, PipelineEvent } from "./types";
 import { buildImageTasks, runImageTask, shotCharacterIdsOf } from "./images";
@@ -62,6 +64,7 @@ export function estimateImageStoryPlan(
   // #1325/#1371：粗估与执行同口径——总张数上限封顶（buildImageTasks 到量即停，见 images.ts）。
   if (options.shotsTotal > 0) shots = Math.min(shots, options.shotsTotal);
   // #1340：imageOnly 下不生成风格锚点（buildImageStoryPlan 强制关闭），粗估也不计入锚点费用。
+  // 角色基准图按「全部角色数」计入：此时还没有剧本，无法知道谁有分镜，实际执行会按有分镜的角色收窄（≤ 此值），属上限。
   const total = shots + Math.max(0, Math.floor(characterCount));
   return {
     total,
@@ -138,7 +141,10 @@ export function planChapterContinuity(chapters: ChapterScript[], expectedChapter
 
 export interface ImageStoryTaskPlan {
   tasks: ImageTask[];
+  /** 角色基准图张数（imageOnly 下 kind:"threeview" 任务：单人正视全身，作分镜 identity 参考）。
+   *  与 threeviewCount 同值，单独给出是为了让费用/文案如实说明"这些图是干什么的"。 */
   threeviewCount: number;
+  characterBaselineCount: number;
   shotCount: number;
   itemCount: number;
   /** 预计费用（元，按全部任务计；命中缓存不重复计费，实际支出 ≤ 该值） */
@@ -161,6 +167,8 @@ export function buildImageStoryPlan(
     // #1340：imageOnly 下风格锚点是死开关（shot 任务既不拼锚点提示词也不挂锚点参考图，
     // 且 images.ts 的锚点只服务 background/cg）——强制关闭，不生成不计费；页面同步标注。
     styleAnchor: false,
+    // 角色基准图（identity 参考）：分镜人物一致性的前提，必须开。
+    // 成本口径：与改动前同为「每角色 1 张」，但只给**有分镜**的角色出图（不出场的不花钱），张数不会增加。
     threeView: true,
     actions: false,
     figureEmotions: false,
@@ -173,6 +181,7 @@ export function buildImageStoryPlan(
   return {
     tasks,
     threeviewCount,
+    characterBaselineCount: threeviewCount,
     shotCount,
     itemCount,
     estimatedYuan: Math.round(tasks.length * IMAGE_YUAN_EACH * 100) / 100,
@@ -190,6 +199,38 @@ async function pool<T>(items: T[], limit: number, fn: (item: T) => Promise<void>
     }
   });
   await Promise.all(workers);
+}
+
+/**
+ * 有序并发池（#1447 图片小说剧本阶段按章并行）：
+ * - 结果严格按 items 顺序返回（预分配 out[index]，不用 push），下游可直接按序合并/落盘；
+ * - 实际并发 = clamp(concurrency, 1, items.length)，绝不超章节数；
+ * - isAborted() 为真时不再派发新任务（已派发的等待自然结束）；
+ * - 单任务异常走 onError 隔离，不影响其它任务（Promise.all 只等待 worker 本身）。
+ */
+export async function runOrderedPool<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T, index: number) => Promise<R>,
+  opts: { isAborted: () => boolean; onError?: (item: T, index: number, error: unknown) => void },
+): Promise<(R | undefined)[]> {
+  const out: (R | undefined)[] = new Array(items.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      if (opts.isAborted()) return;
+      const index = next++;
+      if (index >= items.length) return;
+      try {
+        out[index] = await fn(items[index], index);
+      } catch (e) {
+        opts.onError?.(items[index], index, e);
+      }
+    }
+  };
+  const n = Math.max(1, Math.min(Math.floor(concurrency) || 1, items.length || 1));
+  await Promise.all(Array.from({ length: n }, () => worker()));
+  return out;
 }
 
 export interface ImageStoryRunArgs {
@@ -214,9 +255,9 @@ export interface ImageStoryRunArgs {
   figureBase?: Record<string, string>;
 }
 
-/** 执行图片小说任务：三视图先行，随后分镜/物品；返回成功与失败计数（中断时未派发的不计失败） */
+/** 执行图片小说任务：基准图先行，随后分镜/物品；返回成功与失败计数（中断时未派发的不计失败） */
 export async function runImageStoryTasks(args: ImageStoryRunArgs): Promise<{ produced: number; failed: number }> {
-  // 预置映射（单张重生成）优先：三视图任务完成后写入的路径会覆盖同名键
+  // 预置映射（单张重生成）优先：基准图任务完成后写入的路径会覆盖同名键
   const figureBase: Record<string, string> = { ...(args.figureBase ?? {}) };
   const failedThreeviews = new Set<string>();
   let produced = 0;
@@ -226,13 +267,13 @@ export async function runImageStoryTasks(args: ImageStoryRunArgs): Promise<{ pro
 
   const runOne = async (task: ImageTask): Promise<void> => {
     if (args.isAborted()) return;
-    // 三视图失败/缺失时不为该角色生成分镜：静默降级会导致跨分镜人物不一致（#814 决策 7）。
-    // #1133：守卫对分镜的每个出场角色生效——第二、第三个角色的三视图失败同样不生成、不付费。
+    // 基准图失败/缺失时不为该角色生成分镜：静默降级会导致跨分镜人物不一致（#814 决策 7）。
+    // #1133：守卫对分镜的每个出场角色生效——第二、第三个角色的基准图失败同样不生成、不付费。
     if (task.kind === "shot") {
       const missing = shotCharacterIdsOf(task).filter((id) => failedThreeviews.has(id) || !figureBase[`${id}_threeview`]);
       if (missing.length) {
         failed++;
-        args.onTaskFailed(task, `角色 ${missing.join("、")} 的三视图缺失或失败：为避免人物不一致，本分镜未生成（请先重试这些角色的三视图）`);
+        args.onTaskFailed(task, `角色 ${missing.join("、")} 的基准图缺失或失败：为避免人物不一致，本分镜未生成（请先重试这些角色的基准图）`);
         return;
       }
     }
@@ -259,7 +300,7 @@ export async function runImageStoryTasks(args: ImageStoryRunArgs): Promise<{ pro
     }
   };
 
-  // 依赖分层：先锚点/三视图（后续任务的画风/identity 参考），再分镜/物品
+  // 依赖分层：先锚点/基准图（后续任务的画风/identity 参考），再分镜/物品
   const first = args.tasks.filter((t) => t.kind === "anchor" || t.kind === "threeview");
   const rest = args.tasks.filter((t) => t.kind !== "anchor" && t.kind !== "threeview");
   await pool(first, args.concurrency, runOne);

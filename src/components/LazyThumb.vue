@@ -1,44 +1,46 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { useAssetThumbs } from "../composables/useAssetThumbs";
+import { requestThumbLoad, thumbInvalidationOf, useAssetThumbs } from "../composables/useAssetThumbs";
 
 const props = defineProps<{
   path: string;
   alt?: string;
 }>();
 
-const { thumbCache, loadAssetDataUrl } = useAssetThumbs();
+const { thumbCache } = useAssetThumbs();
 const containerEl = ref<HTMLElement | null>(null);
 const inView = ref(false);
 let observer: IntersectionObserver | null = null;
 
 const src = computed(() => (inView.value ? thumbCache.value[props.path] || "" : ""));
 
-function tryLoad(): void {
-  loadAssetDataUrl(props.path);
-}
-
-watch(() => props.path, () => {
-  if (inView.value) tryLoad();
+// 显式作废（素材覆盖重生成/映射刷新）→ 自动重新加载，
+// 避免出现「图生成了却全是占位符，必须点击才显示」。
+watch(() => thumbInvalidationOf(props.path), () => {
+  requestThumbLoad(props.path, "explicit", inView.value);
 });
 
-// 缩略图缓存条目被清除（素材覆盖重生成/映射刷新）→ 自动重新加载，
-// 避免出现「图生成了却全是占位符，必须点击才显示」。
+watch(() => props.path, () => {
+  requestThumbLoad(props.path, "path-change", inView.value);
+});
+
+// LRU 淘汰（条目变空但未显式作废）→ 绝不自动重读：否则「加载新图→淘汰旧图→旧图重读→再淘汰」
+// 会形成无限环路，表现为所有图片狂闪。淘汰的图只在重新进入视口时按节流恢复。
 watch(() => thumbCache.value[props.path], (value) => {
-  if (!value && inView.value) tryLoad();
+  if (!value) requestThumbLoad(props.path, "evicted", inView.value);
 });
 
 onMounted(() => {
   if (typeof IntersectionObserver === "undefined") {
     inView.value = true;
-    tryLoad();
+    requestThumbLoad(props.path, "entered-view", true);
     return;
   }
   observer = new IntersectionObserver(
     (entries) => {
       for (const entry of entries) {
         inView.value = entry.isIntersecting;
-        if (entry.isIntersecting) tryLoad();
+        if (entry.isIntersecting) requestThumbLoad(props.path, "entered-view", true);
       }
     },
     { rootMargin: "300px" },

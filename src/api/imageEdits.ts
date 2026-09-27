@@ -1,12 +1,20 @@
 /**
- * GPT-Image 系的「编辑模式」通道（表情差分专用，2026-09-21）：
- * - 走官方 `POST /v1/images/edits`（multipart/form-data）：把现有立绘当原图，只改表情、其余保持不变。
+ * GPT-Image 系的「编辑模式」通道（表情差分 / 图片小说分镜，2026-09-21）：
+ * - 走官方 `POST /v1/images/edits`（multipart/form-data）：把已有图片当输入，按提示词产出新图。
  * - 通过 `tauri.http` 的 bodyBase64 直发二进制 multipart，Tauri 与网页版两条传输通用（无需 Rust 改动）。
  * - 仅用于 GPT Image 模型（`gpt-image-*` / `chatgpt-image-*`）；其他线路 `supportsImageEdits` 返回 false，
  *   调用方继续走原来的「参考图生图」路径；本通道失败也由调用方回退旧路径，不影响出图。
+ *
+ * 官方依据（图片小说分镜的人物一致性两步法，见下方 editImageWithReferences 注释）：
+ * https://developers.openai.com/api/reference/resources/images/methods/edit
+ *   —— `image` 参数「The image(s) to edit. Must be a supported image file or an array of images…
+ *      You can provide up to 16 images」；curl 多图示例用重复的 `image[]` 字段
+ *      （`-F "image[]=@a.png" -F "image[]=@b.png"`），单图示例用 `image`。
+ *   故本实现：1 张 → `image`；多张 → 重复 `image[]`（两种写法都是官方文档里的形式）。
  */
-import type { ApiConfig } from "../core/types";
+import type { ApiConfig, ImageReference } from "../core/types";
 import { headersFor, runWithImageLimit } from "./openaiCompatible";
+import { rawReferenceBase64 } from "./providers";
 import { activeAbortSignal } from "./abort";
 import { joinApiPath, normalizeBaseUrl } from "./baseUrl";
 import { tauri } from "../utils/tauri";
@@ -47,26 +55,32 @@ export function makeBoundary(): string {
   return `----novelforge${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
 }
 
-/** 组装 multipart/form-data 请求体（导出供单测）：普通字段 + 一个 image 文件 part */
-export function buildEditMultipart(
+/** 组装 multipart/form-data 请求体（导出供单测）：普通字段 + 若干图片文件 part。
+ *  字段名：调用方显式给了 `name` 就用它；否则单图 `image`、多图重复 `image[]`
+ *  （官方 curl 示例的两种写法，见文件头注释）。 */
+export function buildEditMultipartFiles(
   boundary: string,
   fields: Record<string, string>,
-  file: { name: string; filename: string; mime: string; bytes: Uint8Array },
+  files: { name?: string; filename: string; mime: string; bytes: Uint8Array }[],
 ): Uint8Array {
   const parts: Uint8Array[] = [];
-  for (const [rawName, value] of Object.entries(fields)) {
+  const pushField = (rawName: string, value: string): void => {
     const name = escapeDispositionName(rawName);
     parts.push(textBytes(`--${boundary}${CRLF}Content-Disposition: form-data; name="${name}"${CRLF}${CRLF}${value}${CRLF}`));
+  };
+  for (const [rawName, value] of Object.entries(fields)) pushField(rawName, value);
+  for (const file of files) {
+    const safeFileName = escapeDispositionName(file.name ?? (files.length > 1 ? "image[]" : "image"));
+    const safeFilename = escapeDispositionName(file.filename);
+    parts.push(
+      textBytes(
+        `--${boundary}${CRLF}Content-Disposition: form-data; name="${safeFileName}"; filename="${safeFilename}"${CRLF}Content-Type: ${file.mime}${CRLF}${CRLF}`,
+      ),
+    );
+    parts.push(file.bytes);
+    parts.push(textBytes(CRLF));
   }
-  const safeFileName = escapeDispositionName(file.name);
-  const safeFilename = escapeDispositionName(file.filename);
-  parts.push(
-    textBytes(
-      `--${boundary}${CRLF}Content-Disposition: form-data; name="${safeFileName}"; filename="${safeFilename}"${CRLF}Content-Type: ${file.mime}${CRLF}${CRLF}`,
-    ),
-  );
-  parts.push(file.bytes);
-  parts.push(textBytes(`${CRLF}--${boundary}--${CRLF}`));
+  parts.push(textBytes(`--${boundary}--${CRLF}`));
   const total = parts.reduce((n, p) => n + p.byteLength, 0);
   const out = new Uint8Array(total);
   let offset = 0;
@@ -77,27 +91,24 @@ export function buildEditMultipart(
   return out;
 }
 
-/** 表情差分编辑：以现有立绘为原图，只改表情；返回编辑后的图片 base64 与 mime */
-export async function editImageVariant(
+/** 单图版（保持既有调用方/单测契约不变） */
+export function buildEditMultipart(
+  boundary: string,
+  fields: Record<string, string>,
+  file: { name: string; filename: string; mime: string; bytes: Uint8Array },
+): Uint8Array {
+  return buildEditMultipartFiles(boundary, fields, [{ name: file.name, filename: file.filename, mime: file.mime, bytes: file.bytes }]);
+}
+
+async function postEditMultipart(
   cfg: ApiConfig,
-  req: EditImageVariantRequest,
-  opts?: { signal?: AbortSignal },
+  boundary: string,
+  body: Uint8Array,
+  mime: string,
+  signal?: AbortSignal,
 ): Promise<{ dataB64: string; mime: string }> {
   const base = normalizeBaseUrl(cfg.baseUrl, (cfg.extra?.pathPrefix as string) || undefined);
   const url = joinApiPath(base, "/images/edits");
-  const format = req.outputFormat ?? "png";
-  const boundary = makeBoundary();
-  const body = buildEditMultipart(
-    boundary,
-    {
-      model: cfg.model,
-      prompt: req.prompt,
-      size: `${req.width}x${req.height}`,
-      n: "1",
-      output_format: format,
-    },
-    { name: "image", filename: `source.${format === "jpeg" ? "jpg" : format}`, mime: req.imageMime, bytes: b64decode(req.imageB64) },
-  );
   const res = await runWithImageLimit(cfg, () =>
     tauri.http({
       method: "POST",
@@ -105,7 +116,7 @@ export async function editImageVariant(
       headers: { ...headersFor(cfg), "Content-Type": `multipart/form-data; boundary=${boundary}` },
       bodyBase64: b64encode(body),
       timeoutSecs: 300,
-    }, opts?.signal ?? activeAbortSignal()),
+    }, signal ?? activeAbortSignal()),
   );
   const text = new TextDecoder().decode(b64decode(res.bodyBase64));
   let parsed: { data?: { b64_json?: string }[]; error?: { message?: string } } = {};
@@ -122,6 +133,79 @@ export async function editImageVariant(
   }
   const b64 = parsed.data?.[0]?.b64_json;
   if (!b64) throw new Error(`编辑端点未返回图片（响应 ${text.slice(0, 160)}）`);
-  const mime = format === "jpeg" ? "image/jpeg" : format === "webp" ? "image/webp" : "image/png";
   return { dataB64: b64, mime };
+}
+
+function outputMimeFor(format: "png" | "jpeg" | "webp"): string {
+  return format === "jpeg" ? "image/jpeg" : format === "webp" ? "image/webp" : "image/png";
+}
+
+/** 表情差分编辑：以现有立绘为原图，只改表情；返回编辑后的图片 base64 与 mime */
+export async function editImageVariant(
+  cfg: ApiConfig,
+  req: EditImageVariantRequest,
+  opts?: { signal?: AbortSignal },
+): Promise<{ dataB64: string; mime: string }> {
+  const format = req.outputFormat ?? "png";
+  const boundary = makeBoundary();
+  const body = buildEditMultipartFiles(
+    boundary,
+    {
+      model: cfg.model,
+      prompt: req.prompt,
+      size: `${req.width}x${req.height}`,
+      n: "1",
+      output_format: format,
+    },
+    [{ name: "image", filename: `source.${format === "jpeg" ? "jpg" : format}`, mime: req.imageMime, bytes: b64decode(req.imageB64) }],
+  );
+  const out = await postEditMultipart(cfg, boundary, body, outputMimeFor(format), opts?.signal);
+  return { dataB64: out.dataB64, mime: out.mime };
+}
+
+/** 官方图片小说一致性两步法的输入上限（远低于 16，够覆盖同框角色数；超出的角色只能靠提示词锁定） */
+const MAX_EDIT_REFERENCE_IMAGES = 3;
+
+/**
+ * 带参考图的编辑（图片小说分镜专用）：
+ * 把已解析好的 identity 参考图作为 `image` / `image[]` 输入送进 /images/edits，按提示词产出**新场景**画面。
+ *
+ * 官方依据（GPT Image 提示指南「Keep a character consistent」两步法）：
+ * ① 先用 images.generate 为每个角色生成一张可复用的角色参考图；
+ * ② 之后每张插画用 images.edit 把该参考图作为输入，并在提示词里重复角色固定外貌描述
+ *    （"Repeat the appearance constraints"、"Same facial features, proportions, and color palette"、
+ *      "Do not redesign the character"、"No text"）。
+ * 参考：https://developers.openai.com/api/docs/guides/image-prompting
+ *      https://developers.openai.com/cookbook/examples/multimodal/image-gen-models-prompting-guide
+ *      （"Children's Book Art with Character Consistency (multi-image workflow)"：`images.edit(image=[参考图], prompt=...)` 逐帧续画）
+ * 走 edit 而不是 generate 的第二个好处：官方 /images/generations 根本不接受参考图
+ *      （universal.ts isOfficialOpenAIImage 已按此拦截），edit 是官方唯一能带图出画的端点。
+ */
+export async function editImageWithReferences(
+  cfg: ApiConfig,
+  req: { prompt: string; width: number; height: number; outputFormat?: "png" | "jpeg" | "webp" },
+  references: ImageReference[],
+  opts?: { signal?: AbortSignal },
+): Promise<{ dataB64: string; mime: string }> {
+  const files = references.slice(0, MAX_EDIT_REFERENCE_IMAGES).map((reference, index) => ({
+    filename: `ref${index + 1}.png`,
+    mime: reference.mime || "image/png",
+    bytes: b64decode(rawReferenceBase64(reference)),
+  }));
+  if (!files.length) throw new Error("编辑端点至少需要一张输入图");
+  const format = req.outputFormat ?? "png";
+  const boundary = makeBoundary();
+  const body = buildEditMultipartFiles(
+    boundary,
+    {
+      model: cfg.model,
+      prompt: req.prompt,
+      size: `${req.width}x${req.height}`,
+      n: "1",
+      output_format: format,
+    },
+    files,
+  );
+  const out = await postEditMultipart(cfg, boundary, body, outputMimeFor(format), opts?.signal);
+  return { dataB64: out.dataB64, mime: out.mime };
 }

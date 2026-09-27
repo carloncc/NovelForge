@@ -297,6 +297,7 @@ export interface SceneJSON {
   chapterOf?: number;
   itemEvents: ItemEvent[];
   lines: Line[];
+  /** 本场景出场角色 id（角色卡 id，含背景人物/路人；不含 narrator）。图像阶段按此锁定人物一致性 */
   figures: string[];
   /** 剧情分支：场景末尾弹出选择，各选项进入独立小分支后合并 */
   choices?: Choice[];
@@ -365,13 +366,18 @@ export interface ImageTask {
   usage?: string;
   /** 确定性种子（用于同一项目多次生成保持风格稳定） */
   seed?: number;
+  /** 提示词版本（图片小说分镜/角色基准图用）：提示词约束升级后 +1，
+   *  写进旁路 meta 让旧缓存判失效重画（否则修复对存量项目不生效）；未标注=0。 */
+  promptVersion?: number;
   /** 图片小说分镜所属场景 id（仅 kind=shot） */
   sceneId?: string;
   /** 图片小说分镜在场景内的序号（0-based，仅 kind=shot） */
   shotIndex?: number;
-  /** 差分生成方式（仅表情差分）：expression=优先走 GPT-Image 编辑端点（只改表情、其余保持）；
-   *  其他模型/编辑失败时自动回退参考图生图 */
-  editVariant?: "expression";
+  /** 差分生成方式：expression=表情差分（只改表情、其余保持）；
+   *  shot=图片小说分镜（以角色参考图为输入走编辑端点，锁定人物一致性，见 images.ts shotEditPrompt）；
+   *  scene=立绘版 CG（与 shot 共用同一编辑实现，见 images.ts sceneEditPrompt）。
+   *  三者都只在模型支持官方编辑端点时生效，否则/失败时自动回退参考图生图 */
+  editVariant?: "expression" | "shot" | "scene";
   /** 脸部局部合成差分（#1086，默认关闭）：true=按 rig.crop 裁脸重绘表情并合成回原图
    * （身体/alpha 冻结，合成后过 #1084 核验）；缺省/false 走现有整张生成旧路径 */
   faceComposite?: boolean;
