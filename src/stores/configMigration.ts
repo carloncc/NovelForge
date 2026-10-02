@@ -340,13 +340,29 @@ export function configSecrets(config: ConfigFile): Record<string, string> {
   return Object.fromEntries(apiConfigs(config).map((apiConfig) => [apiConfig.id, apiConfig.apiKey ?? ""]));
 }
 
+/**
+ * 过滤掉空密钥（#1504）。
+ *
+ * 为什么必须有它：Rust 侧 `write_api_secrets` 把**空串解释为「删除该条系统凭据」**
+ * （commands.rs 的 delete_credential 分支，注释里写着"由 configMigration.nonEmptySecrets 保证"，
+ * 但那个函数此前**从不存在**）。而 `configSecrets` 会给每个没有内联 key 的配置填 ""，
+ * 于是"迁移后批量回写"＝把所有 keyring 条目删光：用户升级一次就发现 API Key 全空，只能重填。
+ *
+ * 显式删除走的是单条路径（removeConfig / removePreset 直接传 `{ [id]: "" }`），
+ * 不受这里影响——批量写只负责"把已知的密钥同步进凭据库"，不该承担删除语义。
+ */
+export function nonEmptySecrets(secrets: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(Object.entries(secrets).filter(([, value]) => !!value));
+}
+
 export async function loadConfigFile(raw: string, options: ConfigLoadOptions): Promise<ConfigLoadResult> {
   const parsed = JSON.parse(raw);
   const migration = migrateConfigFile(parsed, options.createId, options.createVisionDefault);
   let migrationSaveError: Error | undefined;
   if (migration.migrated || containsInlineApiKey(parsed)) {
     try {
-      await options.writeSecrets(configSecrets(migration.config));
+      // #1504：必须过滤空串——空串在 Rust 侧等于"删除凭据"，批量回写会把 keyring 清空
+      await options.writeSecrets(nonEmptySecrets(configSecrets(migration.config)));
       await options.writeConfig(serializeConfigFile(migration.config));
     } catch (error) {
       migrationSaveError = error instanceof Error ? error : new Error(String(error));

@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type { ChapterInfo } from "../../core/types";
 import type { ChapterLight } from "../../composables/useChapterStatus";
@@ -6,6 +6,7 @@ import { emptyChapterLight } from "../../composables/useChapterStatus";
 import { t } from "../../i18n";
 import { goPage } from "../../stores/nav";
 import { useGenerateController } from "../../stores/generate";
+import { confirmDialog } from "../../composables/useConfirmDialog";
 
 const props = defineProps<{
   chapters: ChapterInfo[];
@@ -52,7 +53,10 @@ function titleOf(c: ChapterInfo): string {
   const base = (c.title ?? "").trim() || t("未命名");
   return /^第\s*[0-9一二三四五六七八九十百千零〇两]+\s*[章回节话篇部幕卷]/.test(base)
     ? base
-    : `${t("第")}${c.index + 1}${t("章")} ${base}`;
+    // #1476：不能再用「第」+「章」两个碎片键拼句——t() 以中文原文为 key，而「章」在
+    // 计数语境（"3 章"）与序数语境（"第 3 章"）下需要不同译文，一个键只能给一个值：
+    // 英文界面会拼出 "Chapter 4chapters"。改用单条带占位符的整句键。
+    : t("第 {n} 章 {title}", { n: c.index + 1, title: base });
 }
 
 /**
@@ -193,7 +197,7 @@ async function regenSelectedPart(part: "script" | "image" | "voice"): Promise<vo
       : part === "image"
         ? "（剧本、配音不动）"
         : "（剧本、图像不动）";
-  if (!window.confirm(`将重跑第${idxs.map((i) => i + 1).join("、")}章的${label}${scopeNote}。取消则整批不执行，继续吗？`)) return;
+  if (!(await confirmDialog({ title: `将重跑第${idxs.map((i) => i + 1).join("、")}章的${label}${scopeNote}。取消则整批不执行，继续吗？`, tone: "danger" }))) return;
   batchBusy.value = true;
   closeMenu();
   try {
@@ -217,7 +221,7 @@ async function regenSelectedFull(): Promise<void> {
     : forced.length
       ? `（其中第${forced.map((i) => i + 1).join("、")}章勾选「全量」：剧本重写＋背景/CG 重画；其余只补缺失）`
       : "（只补缺失）";
-  if (!window.confirm(`将全量重跑 ${idxs.length} 章（${nameList(idxs)}）${forceNote}，scene 变化后配音需重配。取消则整批不执行，继续吗？`)) return;
+  if (!(await confirmDialog({ title: `将全量重跑 ${idxs.length} 章（${nameList(idxs)}）${forceNote}，scene 变化后配音需重配。取消则整批不执行，继续吗？`, tone: "danger" }))) return;
   batchBusy.value = true;
   closeMenu();
   try {
@@ -233,13 +237,15 @@ async function regenSelectedFull(): Promise<void> {
     batchBusy.value = false;
   }
 }
-function toggleSelected(): void {
+async function toggleSelected(): Promise<void> {
   closeMenu();
   // #1335：混选统一为一个目标态（全停用/全启用），一次确认——不再逐章 toggle 把已停用章反向启用
   const rows = selectedRows.value;
   if (!rows.length) return;
   const enable = rows.every((r) => r.isDisabled);
-  setNovelChaptersEnabled(
+  // #1487：setNovelChaptersEnabled 已改为 async（确认框要走无障碍弹层），这里必须 await，
+  // 否则未来的拒绝处理/异常会被吞成 unhandled rejection。
+  await setNovelChaptersEnabled(
     rows.map((r) => r.chapter.index),
     enable,
   );

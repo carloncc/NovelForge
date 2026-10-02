@@ -14,6 +14,7 @@ import { saveProjectState, restoreProjectState, readWorkingCards } from "../util
 import { tauri } from "../utils/tauri";
 import { log } from "../utils/logger";
 import { clearThumbCache } from "../composables/useAssetThumbs";
+import { activeConfig } from "./config";
 import { STEP_TO_STAGE, type StageKey } from "../core/types";
 import { parseChapterScript } from "../core/dataValidation";
 import { runStatusSetFailed } from "./runStatus";
@@ -243,7 +244,12 @@ export async function restoreProject(outputDir: string): Promise<void> {
     if (snapshot || workingCards) {
       const chapters = await loadCachedChapters(outputDir);
       const failedTasks = await loadFailedTasks(outputDir);
-      const meta = snapshot?.meta ?? (await loadDiskMeta(outputDir));
+      // #1509：没有状态快照时，persist 层会交回一个只含 cards 的空壳结果（meta 全空），
+      // 这里必须把它当作"没有 meta"来看待、回落到磁盘 meta.json，
+      // 否则界面上的作品标题/章节数会变成空白（看起来像项目坏了）。
+      const snapshotMeta = snapshot?.meta;
+      const metaHasContent = !!snapshotMeta && !!(snapshotMeta.title || snapshotMeta.gameKey || snapshotMeta.generatedAt);
+      const meta = metaHasContent ? snapshotMeta! : await loadDiskMeta(outputDir);
       log.debug("store", "恢复项目完成", {
         hasNovel: !!r.novel,
         materials: r.materials?.length ?? 0,
@@ -327,14 +333,38 @@ async function loadCachedChapters(outputDir: string): Promise<ChapterScript[]> {
   try {
     const cacheDir = `${outputDir}/.novel2vn/cache`;
     const entries = await tauri.listDir(cacheDir);
-    const latestByChapter = new Map<number, (typeof entries)[number]>();
+    // #1485：demo 与正式剧本必须按当前模式分开挑选。
+    // 旧实现用 /^script(?:_demo)?_ch(N)_/ 同时匹配两套，再按 name.localeCompare 取「最新」——
+    // 而 "script_demo_ch1_…" 的 'd' > "script_ch1_…" 的 'c'，**演示剧本恒胜**；又不校验指纹，
+    // 于是「未配置文本 API 时跑过一次演示」之后，重启恢复出的 lastResult.chapters 会整本变成
+    // 演示内容（管线侧 loadChaptersFiltered 本就有这层隔离，store 侧漏做）。
+    // 判定口径与管线一致：没有可用的文本 API key 才算演示模式。
+    const demo = !activeConfig("llm")?.apiKey;
+    // 每章分别记录两种变体，先按当前模式取，缺了才回退另一种（避免整章凭空消失）
+    const perChapter = new Map<number, { real?: (typeof entries)[number]; demo?: (typeof entries)[number] }>();
+    const keepNewest = (
+      slot: { real?: (typeof entries)[number]; demo?: (typeof entries)[number] },
+      key: "real" | "demo",
+      entry: (typeof entries)[number],
+    ): void => {
+      const current = slot[key];
+      if (!current || entry.name.localeCompare(current.name) > 0) slot[key] = entry;
+    };
     for (const entry of entries) {
       if (entry.isDir) continue;
-      const match = entry.name.match(/^script(?:_demo)?_ch(\d+)_/);
+      const match = entry.name.match(/^script(_demo)?_ch(\d+)_/);
       if (!match) continue;
-      const chapterNumber = Number(match[1]);
-      const current = latestByChapter.get(chapterNumber);
-      if (!current || entry.name.localeCompare(current.name) > 0) latestByChapter.set(chapterNumber, entry);
+      const chapterNumber = Number(match[2]);
+      const slot = perChapter.get(chapterNumber) ?? {};
+      keepNewest(slot, match[1] ? "demo" : "real", entry);
+      perChapter.set(chapterNumber, slot);
+    }
+    const latestByChapter = new Map<number, (typeof entries)[number]>();
+    for (const [chapterNumber, slot] of perChapter) {
+      // #1501：隔离是单向的——正式模式绝不允许用演示剧本兜底（演示剧本是"未配置文本 API 时的
+      // 占位内容"，灌进正式项目会让整本恢复成演示内容）；演示模式允许用正式缓存兜底。
+      const preferred = demo ? (slot.demo ?? slot.real) : slot.real;
+      if (preferred) latestByChapter.set(chapterNumber, preferred);
     }
     const loaded = await Promise.all([...latestByChapter.values()].map(async (file) => {
       try {

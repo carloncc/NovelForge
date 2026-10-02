@@ -749,7 +749,10 @@ export function joinUrl(base: string, endpoint: string): string {
   let e = endpoint;
   // base 已含版本段（/v1、/v4、/v1beta…）时丢掉 endpoint 自带的首个版本段：
   // 既避免 /v1/v1，也避免 zhipu 这类 base=/paas/v4 + endpoint=/v1/... 的双版本 404
-  if (/\/v\d+(?:alpha|beta|p\d+)?$/i.test(b) && /^\/v\d+(?:alpha|beta|p\d+)?\//i.test(e)) {
+  // #1491: 判定必须只看 pathname - B109 支持和法 base 带 query(如 /paas/v4?key=xxx),
+  // 而旧实现的正则跑在原始串上, 查询串让 "/v4$" 失配, 于是仍拼出 /paas/v4/v1/... 导致 404.
+  const basePath = b.split(/[?#]/)[0];
+  if (/\/v\d+(?:alpha|beta|p\d+)?$/i.test(basePath) && /^\/v\d+(?:alpha|beta|p\d+)?\//i.test(e)) {
     e = e.replace(/^\/v\d+(?:alpha|beta|p\d+)?/i, "");
   }
   // joinApiPath：base 带 query（?key=...）时接口路径必须拼进 pathname，不能落进 query（B109）

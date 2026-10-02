@@ -1,14 +1,15 @@
 <script setup lang="ts">
-import { computed, defineAsyncComponent, onMounted, ref, type Component } from "vue";
+import { computed, defineAsyncComponent, onMounted, ref, watch, type Component } from "vue";
 import ImportPage from "./pages/ImportPage.vue";
 import AboutDialog from "./components/AboutDialog.vue";
+import ConfirmDialogHost from "./components/ConfirmDialogHost.vue";
 import { configReady, configState, webSecretsMigrationWarning } from "./stores/config";
 import { projectState, restoreProject } from "./stores/project";
 import { tauri } from "./utils/tauri";
 import { installLogFileSink } from "./utils/logFile";
 import { log } from "./utils/logger";
 import { version } from "../package.json";
-import { t, LANGS, currentLang, setLang } from "./i18n";
+import { t, LANGS, currentLang, setLang, syncDocumentLocale } from "./i18n";
 import { currentPage, type PageId } from "./stores/nav";
 // 轻量运行状态模块：避免把 generate store（含管线核心）拉进主包
 import { runIsBusy, runAssetLabel, runIsQueue, runIsStopping, runFailedCount, requestRunStop } from "./stores/runStatus";
@@ -71,12 +72,16 @@ const versionText = `v${version}`;
 
 function onLangChange(e: Event): void {
   setLang((e.target as HTMLSelectElement).value as typeof currentLang.value);
-  // 同步 <html lang>（屏幕阅读器/拼写检查依赖）：i18n 模块不在本次修改范围，故在这里跟随切换更新
-  document.documentElement.lang = currentLang.value;
+  // 同步 <html lang> 与窗口标题（屏幕阅读器/拼写检查/任务栏都依赖）
+  syncDocumentLocale();
 }
 
+// #1477：语言切换要同时更新窗口标题——此前只有 <html lang> 跟随，标题一直是中文，
+// 英文/日文/韩文用户在任务栏与窗口标题栏看到的都是中文。
+watch(currentLang, () => syncDocumentLocale());
+
 onMounted(async () => {
-  document.documentElement.lang = currentLang.value;
+  syncDocumentLocale();
   const logPath = await installLogFileSink();
   log.info("app", "应用启动，日志已落盘", { logPath });
   await configReady;
@@ -176,6 +181,8 @@ onMounted(async () => {
     <component :is="pages.find((p) => p.id === current)!.comp" />
   </div>
   <AboutDialog :open="aboutOpen" @close="aboutOpen = false" />
+  <!-- 全局确认弹层宿主：替代 window.confirm（role=dialog + 焦点陷阱 + Esc + 主题化） -->
+  <ConfirmDialogHost />
 </template>
 
 <style scoped>
@@ -239,7 +246,8 @@ onMounted(async () => {
   margin: 0 0 6px;
   padding: 8px 10px;
   border: 1px solid var(--warn);
-  background: var(--err-soft);
+  /* #1481：此前底色用的是 --err-soft（红），与琥珀色描边/语义都不匹配，运行中看起来像失败态 */
+  background: var(--warn-soft);
   border-radius: 8px;
   font-size: 12px;
 }

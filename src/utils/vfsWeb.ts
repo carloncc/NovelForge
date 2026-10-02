@@ -1,4 +1,4 @@
-﻿import { dirname } from "./path";
+import { dirname } from "./path";
 import { log } from "./logger";
 
 /**
@@ -52,13 +52,27 @@ async function txGet(key: string): Promise<VfsNode | undefined> {
   });
 }
 
+/**
+ * #1505：写事务必须同时挂 abort 与 error。
+ *
+ * 旧实现只挂了 `onerror`。IndexedDB 事务在**没有 error 事件**的情况下也会中止——
+ * 配额耗尽时提交阶段直接 abort、或外部调用 `tx.abort()`——此时只触发 `abort`，
+ * `onerror` 不触发，于是这个 Promise **既不 resolve 也不 reject**：
+ * 调用方的 `await` 永久挂起（导入页的 `importing` 标志永不复位，界面看起来假死）。
+ * `txGetMany` 早已挂了 onabort，这里补齐写路径。
+ */
+export function watchTx(tx: IDBTransaction, resolve: () => void, reject: (reason?: unknown) => void): void {
+  tx.oncomplete = () => resolve();
+  tx.onerror = () => reject(tx.error ?? new Error("IndexedDB 事务失败"));
+  tx.onabort = () => reject(tx.error ?? new Error("IndexedDB 事务中止（可能是存储空间不足）"));
+}
+
 async function txPut(key: string, node: VfsNode): Promise<void> {
   const db = await openDb();
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE, "readwrite");
+    watchTx(tx, resolve, reject);
     tx.objectStore(STORE).put(node, key);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
   });
 }
 
@@ -66,9 +80,8 @@ async function txDelete(key: string): Promise<void> {
   const db = await openDb();
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE, "readwrite");
+    watchTx(tx, resolve, reject);
     tx.objectStore(STORE).delete(key);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
   });
 }
 

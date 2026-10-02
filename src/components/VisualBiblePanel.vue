@@ -10,6 +10,7 @@ import { errMsg } from "../utils/errors";
 import { fileToBase64 } from "../utils/file";
 import { configIsUsable } from "../api/providers";
 import { useAssetThumbs } from "../composables/useAssetThumbs";
+import { confirmDialog } from "../composables/useConfirmDialog";
 import LazyThumb from "./LazyThumb.vue";
 import AssetPreview from "./AssetPreview.vue";
 import type { CharacterCard, ProjectVisualBible, StyleSource } from "../core/types";
@@ -124,6 +125,26 @@ const resumeHint = computed(() => {
   if (!bible.value || bible.value.status === "approved") return "";
   return t("批准后将续跑已勾选的图像及后续阶段");
 });
+
+/**
+ * #1484：缩略图「点击放大」的键盘可达性。div + @click 对键盘/读屏用户等于不存在
+ * （项目在 styles.css 里把头部 div 换成原生 button 就是为了这个，缩略图当时漏了）。
+ * 缩略图内部嵌有按钮/复选框，不能整体换成 <button>（非法嵌套），故补 role/tabindex/键处理，
+ * 且只在确有图可预览时暴露为可操作。
+ */
+function thumbA11y(path: string | undefined, label: string): Record<string, unknown> {
+  if (!path) return {};
+  return {
+    role: "button",
+    tabindex: "0",
+    "aria-label": label,
+    onKeydown: (e: KeyboardEvent) => {
+      if (e.key !== "Enter" && e.key !== " ") return;
+      e.preventDefault();
+      openPreview(path, label);
+    },
+  };
+}
 
 function openPreview(path: string, label: string): void {
   if (path) preview.value = { path, label };
@@ -455,7 +476,7 @@ async function rewriteStyle(): Promise<void> {
   }
   busyKey.value = "style-rewrite";
   styleError.value = "";
-  if (!window.confirm(t("AI 重写将覆盖当前风格描述（含你的手改）。继续吗？"))) {
+  if (!(await confirmDialog({ title: t("AI 重写将覆盖当前风格描述（含你的手改）。继续吗？"), tone: "danger" }))) {
     busyKey.value = "";
     return;
   }
@@ -493,7 +514,7 @@ async function regenerateSample(): Promise<void> {
   }
   busyKey.value = "style-sample";
   styleError.value = "";
-  if (!window.confirm(t("重新生成风格示例图将覆盖旧图（角色需重新确认），并产生 1 张图片费用。继续吗？"))) {
+  if (!(await confirmDialog({ title: t("重新生成风格示例图将覆盖旧图（角色需重新确认），并产生 1 张图片费用。继续吗？"), tone: "danger" }))) {
     busyKey.value = "";
     return;
   }
@@ -586,7 +607,7 @@ async function regenerateCharacter(characterId: string): Promise<void> {
   }
   busyKey.value = `char-sheet:${characterId}`;
   charErrors.value[characterId] = "";
-  if (!window.confirm(t("重新生成「{name}」的三视图？将覆盖当前版本（已确认的打回待确认），并产生 1 张图片费用。", { name: character.name }))) {
+  if (!(await confirmDialog({ title: t("重新生成「{name}」的三视图？将覆盖当前版本（已确认的打回待确认），并产生 1 张图片费用。", { name: character.name }), tone: "danger" }))) {
     busyKey.value = "";
     return;
   }
@@ -685,13 +706,14 @@ async function syncCharactersWithCards(): Promise<void> {
   // 名单片段带中文顿号，单独拼好后再交给 t() 插值（保持原文案与格式不变）
   const missingNames = `${missing.slice(0, 5).map((c) => c.name || c.id).join("、")}${missing.length > 5 ? "…" : ""}`;
   const extraNames = `${extra.slice(0, 5).join("、")}${extra.length > 5 ? "…" : ""}`;
-  if (!window.confirm(
-    t("视觉守门与当前卡片不同步：缺失 {missing} 个角色条目（{missingNames}）{extraPart}。将按当前卡片补建三视图（调用图像 API）、移除多余条目，已确认项不受影响。继续吗？", {
+  if (!(await confirmDialog({
+    title: t("视觉守门与当前卡片不同步：缺失 {missing} 个角色条目（{missingNames}）{extraPart}。将按当前卡片补建三视图（调用图像 API）、移除多余条目，已确认项不受影响。继续吗？", {
       missing: missing.length,
       missingNames,
       extraPart: extra.length ? t("，多余 {extra} 个旧条目（{extraNames}）", { extra: extra.length, extraNames }) : "",
     }),
-  )) return;
+    tone: "danger",
+  }))) return;
   busyKey.value = "sync-cards";
   approvalError.value = "";
   vbAbort.value = false;
@@ -758,7 +780,7 @@ async function regenerateAllCharacters(): Promise<void> {
   vbAbort.value = false;
   const n = characters.value.length;
   const limit = Math.max(1, concurrencyFor(imageCfg, "image"));
-  if (!window.confirm(t("全局重新生成将为 {n} 个角色重写描述（LLM）＋重画三视图（图像），{limit} 个一组并行，覆盖现有版本并打回待确认，下游人物图同步作废。约 {n} 次文本调用＋{n} 张图片费用。继续吗？", { n, limit }))) {
+  if (!(await confirmDialog({ title: t("全局重新生成将为 {n} 个角色重写描述（LLM）＋重画三视图（图像），{limit} 个一组并行，覆盖现有版本并打回待确认，下游人物图同步作废。约 {n} 次文本调用＋{n} 张图片费用。继续吗？", { n, limit }), tone: "danger" }))) {
     busyKey.value = "";
     return;
   }
@@ -932,9 +954,12 @@ async function regenCostumeSheet(characterId: string, costumeId: string): Promis
   const hasSheet = !!current.characters[characterId]?.costumeSheets?.[costumeId];
   busyKey.value = `char-sheet-ct:${characterId}:${costumeId}`;
   charErrors.value[characterId] = "";
-  if (!window.confirm(hasSheet
-    ? t("重新生成「{name}」的「{costume}」三视图？将覆盖当前版本（角色打回待确认；仅作废该服装锚点图，不影响表情/动作/其它服装立绘），并产生 1 张图片费用。", { name: character.name, costume: costumeName })
-    : t("生成「{name}」的「{costume}」三视图？该服装暂无锚点（角色打回待确认；仅作废该服装锚点图，不影响表情/动作/其它服装立绘），并产生 1 张图片费用。", { name: character.name, costume: costumeName }))) {
+  if (!(await confirmDialog({
+    title: hasSheet
+      ? t("重新生成「{name}」的「{costume}」三视图？将覆盖当前版本（角色打回待确认；仅作废该服装锚点图，不影响表情/动作/其它服装立绘），并产生 1 张图片费用。", { name: character.name, costume: costumeName })
+      : t("生成「{name}」的「{costume}」三视图？该服装暂无锚点（角色打回待确认；仅作废该服装锚点图，不影响表情/动作/其它服装立绘），并产生 1 张图片费用。", { name: character.name, costume: costumeName }),
+    tone: "danger",
+  }))) {
     busyKey.value = "";
     return;
   }
@@ -1024,7 +1049,12 @@ async function regenCostumeSheet(characterId: string, costumeId: string): Promis
           <div class="vb-style-grid">
               <div class="vb-preview-block">
                 <div class="vb-preview-label">{{ t("风格参考 / 示例") }}</div>
-                <div class="vb-thumb" :class="{ missing: !stylePreviewSrc }" @click="stylePreviewSrc && openPreview(stylePreviewSrc, t('风格参考'))">
+                <div
+                  class="vb-thumb"
+                  :class="{ missing: !stylePreviewSrc }"
+                  v-bind="thumbA11y(stylePreviewSrc, t('风格参考'))"
+                  @click="stylePreviewSrc && openPreview(stylePreviewSrc, t('风格参考'))"
+                >
                   <img v-if="pendingStyleImage" :src="pendingStyleImage.dataUrl" :alt="t('待替换参考')" />
                   <LazyThumb v-else-if="stylePreviewSrc" :path="stylePreviewSrc" :alt="t('风格参考')" />
                   <span v-else>{{ t("未生成") }}</span>
@@ -1112,7 +1142,12 @@ async function regenCostumeSheet(characterId: string, costumeId: string): Promis
             <div class="vb-character-body vb-character-body--hero">
               <div class="vb-preview-block vb-hero">
                 <div class="vb-preview-label">{{ t("三视图") }}</div>
-                <div class="vb-thumb" :class="{ missing: !characterSheetPath(row.id) }" @click="characterSheetPath(row.id) && openPreview(characterSheetPath(row.id), `${row.name} · ${t('三视图')}`)">
+                <div
+                  class="vb-thumb"
+                  :class="{ missing: !characterSheetPath(row.id) }"
+                  v-bind="thumbA11y(characterSheetPath(row.id), `${row.name} · ${t('三视图')}`)"
+                  @click="characterSheetPath(row.id) && openPreview(characterSheetPath(row.id), `${row.name} · ${t('三视图')}`)"
+                >
                   <LazyThumb v-if="characterSheetPath(row.id)" :path="characterSheetPath(row.id)" :alt="t('三视图')" />
                   <span v-else>{{ t("未生成") }}</span>
                   <!-- 无图时不能再显示「点击放大」：点了没有反应会让人以为功能坏了 -->
@@ -1147,6 +1182,7 @@ async function regenCostumeSheet(characterId: string, costumeId: string): Promis
                   <div
                     class="vb-thumb"
                     :class="{ missing: !characterCostumeSheetPath(row.id, cs.costumeId) }"
+                    v-bind="thumbA11y(characterCostumeSheetPath(row.id, cs.costumeId), `${row.name} · ${cs.name} ${t('三视图')}`)"
                     @click="characterCostumeSheetPath(row.id, cs.costumeId) && openPreview(characterCostumeSheetPath(row.id, cs.costumeId), `${row.name} · ${cs.name} ${t('三视图')}`)"
                   >
                     <LazyThumb v-if="characterCostumeSheetPath(row.id, cs.costumeId)" :path="characterCostumeSheetPath(row.id, cs.costumeId)" :alt="`${cs.name} ${t('三视图')}`" />

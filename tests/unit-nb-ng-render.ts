@@ -221,13 +221,13 @@ function main(): void {
   const thirdSayIdx = outCg.indexOf("第三句");
   assert(cgBgIdx > firstSayIdx, "1453 CG 不应在场景开场（trigger=2）");
   assert(cgBgIdx < thirdSayIdx || cgBgIdx > firstSayIdx, "1453 CG 应在台词流中触发");
-  assert(outCg.includes("unlockCg:game/background/cg_s1.png"), "1460 unlockCg 应带目录前缀");
+  assert(outCg.includes("unlockCg:cg_s1.png"), "1507 unlockCg 必须是裸文件名（引擎解析期补 ./game/background/）");
 
   // 1460：unlockBgm 带目录前缀
   const bgmChap = mkChapter();
   const bgmAssets = baseAssets({ bgm: { s1: "/x/calm_piano.mp3" } });
   const outBgm = renderChapter(bgmChap, { characters: chars, items: [], assets: bgmAssets, introCard: false } as any, 1);
-  assert(outBgm.includes("unlockBgm:game/bgm/calm_piano.mp3"), "1460 unlockBgm 应带目录前缀");
+  assert(outBgm.includes("unlockBgm:calm_piano.mp3"), "1507 unlockBgm 必须是裸文件名（引擎解析期补 ./game/bgm/）");
 
   // 1458：分页与行容量收紧 + Max_line 对齐引擎
   assert(TEXTBOX_PAGE_MAX_CHARS === 64, "1458 单页上限应为 64");

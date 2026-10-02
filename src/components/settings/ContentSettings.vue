@@ -3,6 +3,7 @@ import { computed } from "vue";
 import { t } from "../../i18n";
 import { LANGUAGES } from "../../core/types";
 import { projectState } from "../../stores/project";
+import { confirmDialog } from "../../composables/useConfirmDialog";
 import { useGenerateController } from "../../stores/generate";
 
 const { styleRecognizing, pickStyleRef, styleRefSrc, onStyleRefFile, styleRefInput, cancelStyleRecognize } =
@@ -47,10 +48,10 @@ function onPresetChange(e: Event): void {
 
 /** #1363：清除风格参考图时，已写入「统一画风」的识别结果仍保留会误导用户以为已撤销。
  *  缩略图必清；统一画风非空时二次确认是否一并清空（保留用户手填画风的选择权）。 */
-function clearStyleRef(): void {
+async function clearStyleRef(): Promise<void> {
   styleRefSrc.value = "";
   if (projectState.options.imageStyle?.trim()) {
-    if (window.confirm(t("是否同时清空上方「统一画风」？（识别结果已写入该输入框，不清空则新图仍沿用该画风）"))) {
+    if (await confirmDialog({ title: t("是否同时清空上方「统一画风」？（识别结果已写入该输入框，不清空则新图仍沿用该画风）"), tone: "danger" })) {
       projectState.options.imageStyle = "";
     }
   }

@@ -127,21 +127,39 @@ fn preview_origin_allowed(value: Option<&str>, port: u16) -> bool {
         return true;
     };
     let v = raw.trim().to_ascii_lowercase();
-    v.starts_with(&format!("http://127.0.0.1:{port}"))
-        || v.starts_with(&format!("http://localhost:{port}"))
-        || v.starts_with(&format!("http://[::1]:{port}"))
+    // #1475：原实现用 starts_with("http://127.0.0.1:{port}") 做前缀比对，
+    // 端口 ≤6553 时 "http://127.0.0.1:50001" 会被误判为同源（17892 这类 5 位端口碰巧躲过）。
+    // 这里改为解析出 scheme/host/port 后精确比对。
+    for authority in ["127.0.0.1", "localhost", "[::1]"] {
+        let prefix = format!("http://{authority}");
+        let Some(rest) = v.strip_prefix(&prefix) else {
+            continue;
+        };
+        // origin 必须是 host:port，且端口与本实例一致（split 至少产出一段，unwrap_or 仅兜底）
+        let auth = rest.split(['/', '?', '#']).next().unwrap_or("");
+        return match auth.strip_prefix(':') {
+            Some(p) => p.parse::<u16>() == Ok(port),
+            None => false,
+        };
+    }
+    false
 }
 
 /// #1294：.novel2vn 工程目录（含原文与成本）与点文件一律不对外提供。
 fn is_preview_blocked(root: &Path, candidate: &Path) -> bool {
+    // #1474：原实现只拦「叶子是点文件」与「路径组件等于 .novel2vn」，于是子目录里的点目录
+    // （如 <root>/.cache/x.json、.bak/secret）能被同机任意进程 GET 出来，与本函数承诺的
+    // 「点文件一律不对外」不符。现在按相对路径的**任一组件**以 '.' 开头即拦截。
     if let Ok(rel) = candidate.strip_prefix(root) {
-        if rel
-            .components()
-            .any(|c| c.as_os_str() == ".novel2vn")
-        {
+        if rel.components().any(|c| {
+            c.as_os_str()
+                .to_str()
+                .is_some_and(|name| name.starts_with('.'))
+        }) {
             return true;
         }
     }
+    // 落在 root 之外（或 strip 失败）时退回叶子检查，保持原有兜底语义
     candidate
         .file_name()
         .and_then(|n| n.to_str())
@@ -658,8 +676,15 @@ mod tests {
         assert!(!preview_host_allowed(Some("attacker.example:17892"), 17892));
         assert!(preview_origin_allowed(None, 17892));
         assert!(preview_origin_allowed(Some("http://127.0.0.1:17892/game/scene/1.txt"), 17892));
+        assert!(preview_origin_allowed(Some("http://127.0.0.1:17892"), 17892));
+        assert!(preview_origin_allowed(Some("http://localhost:17892/x"), 17892));
         assert!(!preview_origin_allowed(Some("http://evil.com/"), 17892));
         assert!(!preview_origin_allowed(Some("http://127.0.0.1:9999/x"), 17892));
+        // #1475 回归：旧实现用 starts_with("http://127.0.0.1:{port}") 前缀比对，
+        // 小端口部署下 "…:50001" 会被当成同源。改为精确 host:port 比对后必须拒绝。
+        assert!(!preview_origin_allowed(Some("http://127.0.0.1:50001"), 5000));
+        assert!(!preview_origin_allowed(Some("http://127.0.0.1:5000.evil.com"), 5000));
+        assert!(preview_origin_allowed(Some("http://127.0.0.1:5000"), 5000));
     }
 
     /// #1294：.novel2vn 与点文件不对外
@@ -678,6 +703,14 @@ mod tests {
         assert!(is_preview_blocked(&canon, &hidden));
         let index = canon.join("index.html").canonicalize().unwrap();
         assert!(!is_preview_blocked(&canon, &index));
+        // #1474 回归：点目录不在叶子时也必须拦住（旧实现只查 file_name 与 .novel2vn）
+        fs::create_dir_all(root.join("game/.cache")).unwrap();
+        fs::write(root.join("game/.cache/token.json"), "secret").unwrap();
+        let nested = canon.join("game/.cache/token.json").canonicalize().unwrap();
+        assert!(
+            is_preview_blocked(&canon, &nested),
+            "子目录中的点目录必须一并拦截，否则同机任意进程可直接 GET 出来"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

@@ -17,6 +17,7 @@ import { ERROR_CLASS_ICON, ERROR_CLASS_LABEL, classifyError } from "../utils/err
 import { cutoutErrorHint } from "../utils/cutoutErrorHint";
 import { log as logger, dumpLogHistory } from "../utils/logger";
 import { useStageStatus } from "../composables/useStageStatus";
+import { confirmDialog } from "../composables/useConfirmDialog";
 import { runStatusSync, runStatusSetFailed, registerRunStop, isRunSourceBusy } from "./runStatus";
 import { useChapterStatus, isChapterContentComplete, emptyChapterLight } from "../composables/useChapterStatus";
 import type { AssetMap, ChapterInfo, FailedTask, ImageTask, PipelineEvent, StageFeedback, StageKey, VideoSuggestion } from "../core/types";
@@ -495,16 +496,19 @@ function imageBatchNote(indices: number[]): string {
 }
 
 /** 停用/启用章节（持久化；停用后管线跳过该章，编号会前移，配音 key 随之变化） */
-function toggleNovelChapter(novelIdx: number): void {
+async function toggleNovelChapter(novelIdx: number): Promise<void> {
   const ch = projectState.novel?.chapters.find((c) => c.index === novelIdx);
   if (!ch) return;
   const disabling = ch.enabled !== false;
   const laterEnabled = projectState.novel?.chapters.filter((c) => c.index > novelIdx && c.enabled !== false).length ?? 0;
   // 章节编号决定剧本/配音缓存的对齐：启停会让后续章节编号前移/后移，可能造成错位重配。执行前说明影响。
   if (disabling && laterEnabled > 0) {
-    if (!window.confirm(`停用第 ${novelIdx + 1} 章「${ch.title}」后，后续 ${laterEnabled} 个启用章节编号前移，已有剧本/配音缓存会按新编号重新对齐（可能触发重配）。继续吗？`)) return;
+    if (!(await confirmDialog({ title: `停用第 ${novelIdx + 1} 章「${ch.title}」后，后续 ${laterEnabled} 个启用章节编号前移，已有剧本/配音缓存会按新编号重新对齐（可能触发重配）。继续吗？` }))) return;
   } else if (!disabling) {
-    if (!window.confirm(`重新启用第 ${novelIdx + 1} 章「${ch.title}」？后续章节编号会依次后移，已有配音缓存可能因此对不上而重配。继续吗？`)) return;
+    if (!(await confirmDialog({
+      title: `重新启用第 ${novelIdx + 1} 章「${ch.title}」？`,
+      message: `后续章节编号会依次后移，已有配音缓存可能因此对不上而重配。继续吗？`,
+    }))) return;
   }
   ch.enabled = !disabling;
   // 停用章不能留在批量选择里：否则「已选 N」与「生成选中」的实际范围对不上
@@ -524,7 +528,7 @@ function toggleNovelChapter(novelIdx: number): void {
 
 /** 批量启停（#1335）：混选统一为一个目标态（要么全停用，要么全启用），一次确认——
  *  不再逐章 toggle（此前混选会把已停用章反向重新启用）+ 不再每章各弹一次确认（取消也停不下来）。 */
-function setNovelChaptersEnabled(indices: number[], enabled: boolean): void {
+async function setNovelChaptersEnabled(indices: number[], enabled: boolean): Promise<void> {
   const novel = projectState.novel;
   if (!novel || !indices.length) return;
   const byIndex = new Map(novel.chapters.map((c) => [c.index, c]));
@@ -532,9 +536,9 @@ function setNovelChaptersEnabled(indices: number[], enabled: boolean): void {
   if (!targets.length) return;
   const names = targets.map((c) => `第${c.index + 1}章「${c.title}」`).join("、");
   if (!enabled) {
-    if (!window.confirm(`将停用 ${targets.length} 章（${names}）：后续章节编号前移，已有剧本/配音缓存会按新编号重新对齐（可能触发重配）。取消则整批不执行，继续吗？`)) return;
+    if (!(await confirmDialog({ title: `将停用 ${targets.length} 章（${names}）：后续章节编号前移，已有剧本/配音缓存会按新编号重新对齐（可能触发重配）。取消则整批不执行，继续吗？` }))) return;
   } else {
-    if (!window.confirm(`将重新启用 ${targets.length} 章（${names}）：后续章节编号依次后移，已有配音缓存可能对不上而重配。取消则整批不执行，继续吗？`)) return;
+    if (!(await confirmDialog({ title: `将重新启用 ${targets.length} 章（${names}）：后续章节编号依次后移，已有配音缓存可能对不上而重配。取消则整批不执行，继续吗？` }))) return;
   }
   for (const c of targets) c.enabled = enabled;
   // 停用章不能留在批量选择里（与单章 toggle 同口径）
@@ -675,11 +679,15 @@ async function previewSplit(): Promise<void> {
   const fb = splitOpinion.value.trim();
   // 规则回退升级 AI 分章走显式确认（管线不再自动升级）：无意见但缓存是回退产物且有 LLM 时先问
   if (!fb && splitMeta.value?.method === "fallback" && !!activeConfig("llm")?.apiKey) {
-    if (!window.confirm("当前是旧规则回退分章（机械切分），是否升级为 AI 分章？升级后下游剧本/图像/配音缓存将作废重跑。")) return;
+    if (!(await confirmDialog({
+      title: `当前是旧规则回退分章（机械切分），是否升级为 AI 分章？`,
+      message: `升级后下游剧本/图像/配音缓存将作废重跑。`,
+      tone: "danger",
+    }))) return;
   }
   const upgrade = !fb && splitMeta.value?.method === "fallback" && !!activeConfig("llm")?.apiKey;
   // 带意见 = 强制全书 AI 重新分章 + 提取：计费且下游缓存作废，执行前显式确认
-  if (fb && !window.confirm("填写了分章意见：本次将强制全书 AI 重新分章（并自动带上提取，有 LLM 时计费）；重分章会使下游剧本/图像/配音缓存按指纹作废重跑。继续吗？")) return;
+  if (fb && !(await confirmDialog({ title: "填写了分章意见：本次将强制全书 AI 重新分章（并自动带上提取，有 LLM 时计费）；重分章会使下游剧本/图像/配音缓存按指纹作废重跑。继续吗？", tone: "danger" }))) return;
   // #1110/#1358：先判忙再打"开始"日志——否则 execute 因忙拒绝后，用户看到"已开始"但实际毫无反应
   if (busy.value || assetBusy.value || queueRunning.value) {
     error.value = t("已有任务正在运行，本次分章预览未执行：请等它完成，或先点「停止」再试");
@@ -779,7 +787,7 @@ async function runSelectedChapters(): Promise<void> {
 /** 就地补齐前置：没有卡片时先跑 分章＋提取，再让用户继续逐章生成 */
 async function prepareChapterCards(): Promise<void> {
   // 计费操作前置确认：有 LLM 时按全书调用（分章＋提取），且分章会按指纹作废下游缓存
-  if (!window.confirm("将执行「分章＋卡片提取」：有 LLM 时按全书调用（计费），分章结果变化会使下游剧本/图像/配音缓存按指纹作废。继续吗？")) return;
+  if (!(await confirmDialog({ title: "将执行「分章＋卡片提取」：有 LLM 时按全书调用（计费），分章结果变化会使下游剧本/图像/配音缓存按指纹作废。继续吗？", tone: "danger" }))) return;
   lastRunFailedTasks.value = [];
   await execute({ stages: ["split", "extract"], clearLogsFirst: false });
 }
@@ -843,7 +851,7 @@ async function runChapterBatch(indices: number[]): Promise<void> {
   // 计费批量操作前置确认：章节数 + 是否含配音 + 图片总账（剧本/图像按缓存只补缺失，但缺失部分会计费）
   const voiceNote = chapterIncludeVoice.value ? "，含配音（TTS 计费）" : "";
   const imageNote = imageBatchNote(indices);
-  if (!window.confirm(`将逐章生成 ${indices.length} 个章节${voiceNote}${imageNote}：剧本/图像按缓存只补缺失（已完成的不会重复计费）。继续吗？`)) return;
+  if (!(await confirmDialog({ title: `将逐章生成 ${indices.length} 个章节${voiceNote}${imageNote}：剧本/图像按缓存只补缺失（已完成的不会重复计费）。继续吗？` }))) return;
   const token = claimQueue();
   if (token === null) return;
   try {
@@ -980,7 +988,7 @@ async function runChapterQueue(): Promise<void> {
   }
   // 计费批量操作前置确认（逐章链可能跑图像/配音，只补缺失但缺失部分会计费）
   const imageNote = imageBatchNote(pending);
-  if (!window.confirm(`顺序补全：将依次生成 ${pending.length} 个未完成章节${imageNote}（逐章跑，按当前内容设置执行；图像/配音只补缺失但会计费）。继续吗？`)) return;
+  if (!(await confirmDialog({ title: `顺序补全：将依次生成 ${pending.length} 个未完成章节${imageNote}（逐章跑，按当前内容设置执行；图像/配音只补缺失但会计费）。继续吗？` }))) return;
   const token = claimQueue();
   if (token === null) return;
   try {
@@ -1317,7 +1325,7 @@ async function regenSelected(): Promise<void> {
   const ctx = await regenImageCtx();
   if (!ctx) return;
   // 计费批量操作前置确认
-  if (!window.confirm(`将重新生成已选 ${keys.length} 项（覆盖现有版本；图像 API 会计费）。继续吗？`)) return;
+  if (!(await confirmDialog({ title: `将重新生成已选 ${keys.length} 项（覆盖现有版本；图像 API 会计费）。继续吗？`, tone: "danger" }))) return;
   // 意见框只作用于「同分区」：跨分区批量应用会把 A 分区意见张冠李戴到 B 分区任务；
   // 跨分区时不消费也不清空（保留给对应分区的单项/同分区批量），仅明确提示
   const feedbackAreas = feedbackAreasForKeys(keys);
@@ -1431,7 +1439,10 @@ async function regenMissingImages(): Promise<void> {
       }
       if (found && t.width > 0 && t.height > 0) {
         try {
-          if (!(await tauri.imageSizeMatches(found, t.width, t.height).catch(() => true))) found = null;
+          // #1498：三态判定显式收窄；只有"确实解析出尺寸且不符"才算缺失（unknown 视为命中，
+          // 避免读不出文件头把已付费的图判成缺失并重画）。
+          const sizeState = await tauri.imageSizeMatches(found, t.width, t.height).catch((): "unknown" => "unknown");
+          if (sizeState === "mismatch") found = null;
         } catch {
           /* 查询失败视为命中 */
         }
@@ -1442,7 +1453,7 @@ async function regenMissingImages(): Promise<void> {
       pushLog({ step: "素材", message: "没有缺失的图片，无需补全", level: "info", at: Date.now() });
       return;
     }
-    if (!window.confirm(`发现 ${missingTaskKeys.size} 张缺失图片，将补齐生成（图像 API 计费；已存在的图不动）。继续吗？`)) return;
+    if (!(await confirmDialog({ title: `发现 ${missingTaskKeys.size} 张缺失图片，将补齐生成（图像 API 计费；已存在的图不动）。继续吗？` }))) return;
     assetBusy.value = `补全缺失图片（${missingTaskKeys.size} 张）`;
     const { signal, onProgress } = regenCtl();
     const predicate = (t: ImageTask) => missingTaskKeys.has(imageTaskIdentity(t));
@@ -1602,7 +1613,21 @@ const figureRows = computed(() => {
       name: c.name,
       hasRef: !!c.referenceImage,
       threeView: assetMap.value!.figure[`${c.id}_threeview`],
-      emotions: emos.map((emo) => ({ emo, file: assetMap.value!.figure[emo === "normal" ? c.id : `${c.id}_${emo}`] })),
+      // #1492：素材页必须按 buildImageTasks 的同一口径取 key —— 那边文件名用 sanitizeId(emo)，
+      // 这里旧实现直接用原始表情名，AI 返回中文表情（如「微笑」）时 key 永远对不上，
+      // 界面恒显示"缺图"，即使图已生成；且「微笑/大笑」这类长度相同的中文会被消毒成同一个 id，
+      // 因此这里也按 id 去重，避免同一张图渲染两行。raw 保留给标签显示。
+      emotions: (() => {
+        const rows: { emo: string; file: string | undefined }[] = [];
+        const seen = new Set<string>();
+        for (const emo of emos) {
+          const id = sanitizeId(String(emo)) || "normal";
+          if (seen.has(id)) continue;
+          seen.add(id);
+          rows.push({ emo: id, file: assetMap.value!.figure[id === "normal" ? c.id : `${c.id}_${id}`] });
+        }
+        return rows;
+      })(),
       actions: (c.actions || []).map((a) => ({ id: a.id, name: a.name, file: assetMap.value!.figure[`${c.id}_act_${a.id}`] })),
       costumes: core ? [] : (c.costumes || []).map((ct) => ({ id: ct.id, name: ct.name, file: assetMap.value!.figure[`${c.id}_ct_${ct.id}`] })),
     };
@@ -2215,10 +2240,10 @@ async function resumeAfterVisualApproval(): Promise<void> {
   const fullNote = scope?.forceStages?.length
     ? `；全量阶段：${scope.forceStages.map((s) => STAGE_LABELS[s]).join("、")}`
     : "";
-  if (!window.confirm(
-    `视觉守门已批准，继续跑：${stages.map((s) => STAGE_LABELS[s]).join(" → ")}\n范围：${scopeText}${fullNote}\n`
-    + "（复用已有缓存、只补缺失；守门里的风格/三视图有变化时，相关图片会重画，图像/配音会计费）\n继续吗？",
-  )) {
+  if (!(await confirmDialog({
+    title: `视觉守门已批准，继续跑：${stages.map((s) => STAGE_LABELS[s]).join(" → ")}`,
+    message: `范围：${scopeText}${fullNote}\n（复用已有缓存、只补缺失；守门里的风格/三视图有变化时，相关图片会重画，图像/配音会计费）\n继续吗？`,
+  }))) {
     pushLog({
       step: "视觉守门",
       message: `已取消续跑（${stages.map((s) => STAGE_LABELS[s]).join(" → ")}）；视觉守门已是批准状态，随时可单独点对应阶段补跑`,
@@ -2262,14 +2287,14 @@ function onVisualBibleChanged(): void {
  *   （见 cascadeDownstream）；组装为本地操作，不计费。
  * - 关闭「跑完自动补齐下游」即恢复旧的严格单阶段语义：下游需手动依次重跑。
  */
-function runStageRegen(stage: StageKey): void {
+async function runStageRegen(stage: StageKey): Promise<void> {
   const fb = stageFeedback.value[stage]?.trim() || "";
   const forceAll = !!stageForce.value[stage];
   // 全量路径（填意见或勾全量）执行前二次确认并明示影响（防"填一句意见烧掉全书"）；
   // 两者都无 = 安全的只补缺失
-  if (!confirmStageOpinion(stage, fb, forceAll)) return;
+  if (!(await confirmStageOpinion(stage, fb, forceAll))) return;
   // 分章点击即全书重分（有 LLM 时计费），与其它阶段的"补缺"语义不同：执行前显式确认，取消则不落开始日志
-  if (stage === "split" && !window.confirm("「分章」重新生成即全书重新分章（有 LLM 时计费；章节边界变化会使下游剧本/图像/配音缓存按指纹作废重跑）。继续吗？")) {
+  if (stage === "split" && !(await confirmDialog({ title: "「分章」重新生成即全书重新分章（有 LLM 时计费；章节边界变化会使下游剧本/图像/配音缓存按指纹作废重跑）。继续吗？", tone: "danger" }))) {
     pushLog({ step: "分章", message: "已取消重新分章：未执行任何操作", level: "info", at: Date.now() });
     return;
   }
@@ -2331,7 +2356,10 @@ function runStageRegen(stage: StageKey): void {
       plan.voices ? `配音 ${plan.voices} 句` : "",
       plan.stages.includes("assemble") ? "组装（本地刷新，免费）" : "",
     ].filter(Boolean).join("、");
-    if (!window.confirm(`下游还有内容没生成，是否现在补齐？\n将生成：${scale}\n（复用已有缓存，只补缺失项；图像/配音会计费）`)) {
+    if (!(await confirmDialog({
+      title: `下游还有内容没生成，是否现在补齐？`,
+      message: `将生成：${scale}\n（复用已有缓存，只补缺失项；图像/配音会计费）`,
+    }))) {
       pushLog({
         step: "级联",
         message: `已跳过下游自动补齐（${scale}）；可稍后再点对应阶段，或直接点「组装」刷新预览`,
@@ -2565,7 +2593,7 @@ async function runChapterFullRegen(novelIdx: number, opts?: { fromQueueBatch?: b
       canFillImages,
       includeVoice: chapterIncludeVoice.value,
     });
-    if (!window.confirm(msg)) return false;
+    if (!(await confirmDialog({ title: msg, tone: "danger" }))) return false;
   }
   chapterForce.value[novelIdx] = false;
   pushLog({
@@ -2708,7 +2736,7 @@ async function runChapterPartRegen(novelIdx: number, part: "script" | "image" | 
       ? `只重画第 ${novelIdx + 1} 章「${ch.title}」的背景/CG（剧本、配音不动）。继续吗？`
       : `只重配第 ${novelIdx + 1} 章「${ch.title}」的台词配音（剧本、图像不动）。继续吗？`;
   // #1334：同全量，批量入口已聚合确认，这里跳过
-  if (!opts?.skipConfirm && !window.confirm(ask)) return false;
+  if (!opts?.skipConfirm && !(await confirmDialog({ title: ask, tone: "danger" }))) return false;
 
   const exec: ExecuteOptions = {
     stages: [],
@@ -2786,7 +2814,7 @@ async function runChapterPartRegen(novelIdx: number, part: "script" | "image" | 
 }
 /** 全量重跑二次确认：明示全量影响（张数/句数/章数），防"填一句意见烧掉全书"。
  * 无意见且未勾全量返回 true（直接执行"继续/补缺"语义）。 */
-function confirmStageOpinion(stage: StageKey, fb: string, forceAll = false): boolean {
+async function confirmStageOpinion(stage: StageKey, fb: string, forceAll = false): Promise<boolean> {
   if (!fb && !forceAll) return true;
   const how = fb ? "意见" : "全量开关";
   const r = projectState.lastResult;
@@ -2811,28 +2839,32 @@ function confirmStageOpinion(stage: StageKey, fb: string, forceAll = false): boo
       }
       // 数字只按全书估算：部分章节范围时不要拿它冒充"范围内"的张数（人物/物品还是全书项目级资产）
       const partialScope = Array.isArray(rerunChapters.value) && rerunChapters.value.length > 0 && rerunChapters.value.length < Math.max(chapters.length, 1);
-      return window.confirm(
-        `「图像」${how}将强制重画${chapterScopeText(rerunChapters.value)}图片${total ? `（全书任务约 ${total} 张，含人物基础图约 ${figs} 张${partialScope ? "；人物/物品为项目级，不随章节范围收窄" : ""}）` : ""}，会产生图片费用。继续吗？\n（只想改单张图：去素材页点那张图的"重新生成"，意见填在那一区的意见框）`,
-      );
+      return await confirmDialog({
+        title: `「图像」${how}将强制重画${chapterScopeText(rerunChapters.value)}图片${total ? `（全书任务约 ${total} 张，含人物基础图约 ${figs} 张${partialScope ? "；人物/物品为项目级，不随章节范围收窄" : ""}）` : ""}，会产生图片费用。继续吗？`,
+        message: `（只想改单张图：去素材页点那张图的"重新生成"，意见填在那一区的意见框）`,
+        tone: "danger",
+      });
     }
     case "script": {
       // #1289：确认文案必须与实际执行范围一致（单阶段重跑继承整书面板勾选），不再写死全书章数
       const scope = chapterScopeText(rerunChapters.value);
       const n = enabledNovelCount || chapters.length;
-      return window.confirm(
-        `「剧本」${how}将重写${scope === "全书" ? `全书 ${n} 章` : scope}剧本（旧场景图/配音随之过期需重跑）。继续吗？\n（只改一章：去章节盘点那一章的重新生成，意见填在该章意见框）`,
-      );
+      return await confirmDialog({
+        title: `「剧本」${how}将重写${scope === "全书" ? `全书 ${n} 章` : scope}剧本（旧场景图/配音随之过期需重跑）。继续吗？`,
+        message: `（只改一章：去章节盘点那一章的重新生成，意见填在该章意见框）`,
+        tone: "danger",
+      });
     }
     case "extract":
-      return window.confirm(`「提取」${how}将重新提取全部卡片，并作废下游剧本缓存与人物/物品图（背景/CG/配音文件保留）。继续吗？`);
+      return await confirmDialog({ title: `「提取」${how}将重新提取全部卡片，并作废下游剧本缓存与人物/物品图（背景/CG/配音文件保留）。继续吗？`, tone: "danger" });
     case "translate": {
       // #1289：同剧本，确认文案按实际勾选范围
       const scope = chapterScopeText(rerunChapters.value);
       const n = enabledNovelCount || chapters.length;
-      return window.confirm(`「翻译」${how}将重翻${scope === "全书" ? `全书 ${n} 章` : scope}。继续吗？`);
+      return await confirmDialog({ title: `「翻译」${how}将重翻${scope === "全书" ? `全书 ${n} 章` : scope}。继续吗？`, tone: "danger" });
     }
     case "split":
-      return window.confirm(`将按${how}重新分章：分章变化会导致下游剧本/图像/配音缓存过期需重跑。继续吗？`);
+      return await confirmDialog({ title: `将按${how}重新分章：分章变化会导致下游剧本/图像/配音缓存过期需重跑。继续吗？`, tone: "danger" });
     case "voice": {
       let n = 0;
       for (const ch of chapters) {
@@ -2842,9 +2874,11 @@ function confirmStageOpinion(stage: StageKey, fb: string, forceAll = false): boo
         }
       }
       const partialScope = Array.isArray(rerunChapters.value) && rerunChapters.value.length > 0 && rerunChapters.value.length < Math.max(chapters.length, 1);
-      return window.confirm(
-        `「配音」${how}将${chapterScopeText(rerunChapters.value)}重配${n ? `（全书约 ${n} 句${partialScope ? "，部分章节范围时仅重配范围内台词" : ""}）` : ""}，会产生配音费用。继续吗？\n（只重配一句/一人：去素材页配音区点单句重配或整人重配）`,
-      );
+      return await confirmDialog({
+        title: `「配音」${how}将${chapterScopeText(rerunChapters.value)}重配${n ? `（全书约 ${n} 句${partialScope ? "，部分章节范围时仅重配范围内台词" : ""}）` : ""}，会产生配音费用。继续吗？`,
+        message: `（只重配一句/一人：去素材页配音区点单句重配或整人重配）`,
+        tone: "danger",
+      });
     }
     default:
       return true;
@@ -2908,11 +2942,12 @@ async function runAppend(tailRaw: string, label: string): Promise<void> {
     error.value = t("追加文件为空，已取消");
     return;
   }
-  if (tail.length < 500 && !window.confirm(`新增内容仅 ${tail.length} 字（不足半章），仍要追加吗？`)) return;
+  if (tail.length < 500 && !(await confirmDialog({ title: `新增内容仅 ${tail.length} 字（不足半章），仍要追加吗？` }))) return;
   const fileName = label.split(/[\\/]/).pop() || label;
-  if (!window.confirm(
-    `增量追加：在现有 ${novel.chapters.length} 章（约 ${novel.fullText.length} 字）后追加「${fileName}」（约 ${tail.length} 字）。\n旧章节、卡片与全部素材原样保留，只对新增部分分章→提取→生成新章；如有新角色将自动同步加入视觉守门（三视图走图像 API，需去视觉守门页确认）。继续吗？`,
-  )) return;
+  if (!(await confirmDialog({
+    title: `增量追加：在现有 ${novel.chapters.length} 章（约 ${novel.fullText.length} 字）后追加「${fileName}」（约 ${tail.length} 字）。`,
+    message: `旧章节、卡片与全部素材原样保留，只对新增部分分章→提取→生成新章；如有新角色将自动同步加入视觉守门（三视图走图像 API，需去视觉守门页确认）。继续吗？`,
+  }))) return;
   const stages: StageKey[] = ["split", "extract", "script", "image", "assemble"];
   if ((projectState.options.language ?? "").trim()) stages.splice(1, 0, "translate");
   const prevChapterCount = novel.chapters.length;
@@ -3105,7 +3140,7 @@ async function afterAssetRegen(label: string, resultsLength: number, stats?: Reg
   });
   // #1315：部分失败仍 assemble 会新旧混出——中断/有失败时先确认（默认仍组装，但用户可见风险）
   if ((aborted || failedCount > 0) && resultsLength > 0) {
-    if (!window.confirm(t("部分素材失败仍要重新组装吗？新旧混出可能导致预览不一致；取消则保留旧预览，可到「失败项」补跑后再组装。"))) {
+    if (!(await confirmDialog({ title: t("部分素材失败仍要重新组装吗？新旧混出可能导致预览不一致；取消则保留旧预览，可到「失败项」补跑后再组装。") }))) {
       pushLog({ step: "素材", message: `${label}：已取消自动组装（新旧混出风险）；失败项补跑后可手动点「组装」刷新（免费）`, level: "warn", at: Date.now() });
       await loadAssetMapNow(true);
       return;
@@ -3459,7 +3494,7 @@ async function regenSelectedVoices(): Promise<void> {
     pushLog({ step: "素材", message: t("配音（TTS）未启用或未配置 API，无法重配语音；请在「API 配置」页配置"), level: "warn", at: Date.now() });
     return;
   }
-  if (!window.confirm(`将重配已选 ${keys.length} 句配音（TTS 计费，逐句覆盖现有文件）。继续吗？`)) return;
+  if (!(await confirmDialog({ title: `将重配已选 ${keys.length} 句配音（TTS 计费，逐句覆盖现有文件）。继续吗？`, tone: "danger" }))) return;
   assetBusy.value = `voice-batch:${keys.length}`;
   resetRegenState();
   logAssetStart(`批量重配语音（${keys.length} 句）`);
@@ -3510,7 +3545,7 @@ async function regenMissingVoices(): Promise<void> {
     });
     return;
   }
-  if (!window.confirm("将逐句核对配音并按需重配缺失/错配语音（TTS 计费），并清理不再引用的孤儿音频文件。继续吗？")) return;
+  if (!(await confirmDialog({ title: "将逐句核对配音并按需重配缺失/错配语音（TTS 计费），并清理不再引用的孤儿音频文件。继续吗？", tone: "danger" }))) return;
   assetBusy.value = "repair-voice";
   resetRegenState();
   logAssetStart("补全缺失/错配语音：逐句核对剧本→映射→文件");
@@ -3565,9 +3600,12 @@ async function cleanupInvalidAssets(): Promise<void> {
   if (!ctx) return;
   const novelCount = projectState.novel?.chapters.filter((c) => c.enabled !== false).length ?? 0;
   const chaptersComplete = novelCount > 0 && ctx.chapters.length >= novelCount;
-  if (!window.confirm(chaptersComplete
-    ? "将清理无效图片素材：过期映射剪枝、旧版 CG 迁移、孤儿文件删除。缺失项稍后自动补生成，继续吗？"
-    : "当前剧本上下文不完整（素材页章节少于原文），本次只做文件级清理（删孤儿文件、迁移旧版 CG），不剪映射。继续吗？")) return;
+  if (!(await confirmDialog({
+    title: chaptersComplete
+      ? "将清理无效图片素材：过期映射剪枝、旧版 CG 迁移、孤儿文件删除。缺失项稍后自动补生成，继续吗？"
+      : "当前剧本上下文不完整（素材页章节少于原文），本次只做文件级清理（删孤儿文件、迁移旧版 CG），不剪映射。继续吗？",
+    tone: "danger",
+  }))) return;
   assetBusy.value = "cleanup-images";
   resetRegenState();
   pushLog({
@@ -3625,7 +3663,11 @@ async function restoreAssetBackupNow(): Promise<void> {
     return;
   }
   const latest = backups[0];
-  if (!window.confirm(`将素材映射恢复到备份 ${latest}？\n共 ${backups.length} 份备份：${backups.join("、")}\n当前映射将被覆盖。继续吗？`)) return;
+  if (!(await confirmDialog({
+    title: `将素材映射恢复到备份 ${latest}？`,
+    message: `共 ${backups.length} 份备份：${backups.join("、")}\n当前映射将被覆盖。继续吗？`,
+    tone: "danger",
+  }))) return;
   pushLog({ step: "素材", message: `从备份恢复映射开始：${latest}`, level: "info", at: Date.now() });
   // 恢复期间必须占用 assetBusy：否则并发点其它素材按钮会同时读写 assets.json（恢复读写的正是同一文件）
   assetBusy.value = "restore-map";
@@ -4114,7 +4156,11 @@ async function deleteVerifyLine(rep: VerifyReportRow, issue: SpeakerIssue & { ke
   if (verifyBusy.value) return;
   const out = projectState.outputDir;
   if (!out) return;
-  if (!window.confirm(`删除第 ${rep.chapterIndex + 1} 章场景${issue.sceneIndex + 1}#${issue.lineIndex + 1}「${issue.text}」？剧本缓存立即修改（重跑剧本会还原），该场景配音作废。`)) return;
+  if (!(await confirmDialog({
+    title: `删除第 ${rep.chapterIndex + 1} 章场景${issue.sceneIndex + 1}#${issue.lineIndex + 1}「${issue.text}」？`,
+    message: `剧本缓存立即修改（重跑剧本会还原），该场景配音作废。`,
+    tone: "danger",
+  }))) return;
   verifyBusy.value = issue.key;
   try {
     const hit = await verifyScriptCacheTarget(rep.chapterIndex);
@@ -4298,7 +4344,10 @@ async function retryFailedTask(f: FailedTask): Promise<void> {
       return;
     }
     const key = f.id.startsWith("vocal_") ? f.id.slice("vocal_".length) : f.id;
-    if (!window.confirm(`重试该句配音（TTS 计费）？\n${f.message.slice(0, 80)}`)) return;
+    if (!(await confirmDialog({
+      title: `重试该句配音（TTS 计费）？`,
+      message: `${f.message.slice(0, 80)}`,
+    }))) return;
     assetBusy.value = `voice:${key}`;
     resetRegenState();
     try {
@@ -4329,7 +4378,10 @@ async function retryFailedTask(f: FailedTask): Promise<void> {
   if (f.kind === "image") {
     const ctx = await regenImageCtx();
     if (!ctx) return;
-    if (!window.confirm(`重试该图像任务（图像 API 计费）？\n${f.message.slice(0, 80)}`)) return;
+    if (!(await confirmDialog({
+      title: `重试该图像任务（图像 API 计费）？`,
+      message: `${f.message.slice(0, 80)}`,
+    }))) return;
     assetBusy.value = `retry:${f.id}`;
     resetRegenState();
     try {

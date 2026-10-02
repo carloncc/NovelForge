@@ -1,4 +1,4 @@
-﻿import type { ChapterScript, CharacterCard, PipelineEvent, ApiConfig, FailedTask } from "./types";
+import type { ChapterScript, CharacterCard, PipelineEvent, ApiConfig, FailedTask } from "./types";
 import { ttsSpeech } from "../api/openaiCompatible";
 import { tauri } from "../utils/tauri";
 import { errMsg } from "../utils/errors";
@@ -126,6 +126,10 @@ export async function buildVocalContentIndex(vocalCacheDir: string): Promise<Map
 /** 配音文件名按「位置 key + 音色 + 文本 + 语速 + 情绪」内容寻址。
  * 之前只按 key+音色命名：剧本改文字后 key 不变，旧 mp3 被缓存命中，
  * 游戏里显示新台词、放出来却是旧语音。文本/参数任一变化都会落新文件，旧音频自然作废。 */
+/** 未标注 speed 时下游（universal.ts 的 ttsSpeech）会兜底成这个值——缓存 key 必须用同一个数字，
+ *  否则「没标注语速」与「显式标注 1.1」会算出两个不同的文件名、重复计费；而改动默认值也不会失效。 */
+const DEFAULT_SPEECH_SPEED = 1.1;
+
 function voiceFileName(
   key: string,
   voice: string,
@@ -134,7 +138,21 @@ function voiceFileName(
   speed?: number,
   ttsEmotion?: string,
 ): string {
-  return `v_${key}_${voiceFingerprint(voice, ttsConfigId)}_${fnv1a([text, speed, ttsEmotion])}.mp3`;
+  const effectiveSpeed = typeof speed === "number" ? speed : DEFAULT_SPEECH_SPEED;
+  return `v_${key}_${voiceFingerprint(voice, ttsConfigId)}_${fnv1a([text, effectiveSpeed, ttsEmotion])}.mp3`;
+}
+
+/** 本次实际要落盘的文件名。
+ *  #1488：回退音色时（job.voice 失败 → 改用 library[0]）必须换文件名。旧实现复用了
+ *  job.file（指纹按**原音色**算），于是回退产出的音频被写进「原音色」的缓存槽里，
+ *  下次 vocalHit(job.file) 直接命中——永久播放错误音色，且用户以为「回退生效了」。
+ *  文件名是 v_<key>_<voice指纹>_<内容hash>.<ext>，key 本身含下划线，故用 voiceFingerprint
+ *  的实际值精确替换中段，不依赖 split 下标。 */
+function actualVoiceFileName(job: VoiceJob, voice: string): string {
+  const from = voiceFingerprint(job.voice, job.ttsConfigId);
+  const to = voiceFingerprint(voice, voice === job.voice ? job.ttsConfigId : undefined);
+  if (from === to) return job.file;
+  return job.file.replace(`_${from}_`, `_${to}_`);
 }
 
 /** 按当前剧本算出全部配音 key（与 buildVoiceJobs 的 key 公式同源，供映射剪枝用）。
@@ -337,7 +355,8 @@ export async function runVoiceJob(
       ? await minimaxTtsThrottle(() => ttsSpeech(jobConfig, job.text, voice, 120, { speed: job.speed, ttsEmotion: job.ttsEmotion }))
       : await ttsSpeech(jobConfig, job.text, voice, 120, { speed: job.speed, ttsEmotion: job.ttsEmotion });
     const ext = res.mime.includes("ogg") ? "ogg" : res.mime.includes("opus") ? "opus" : res.mime.includes("wav") ? "wav" : res.mime.includes("flac") ? "flac" : "mp3";
-    const file = job.file.replace(/\.mp3$/, `.${ext}`);
+    // #1488：按本次实际使用的音色取文件名（回退音色不能占用原音色的缓存槽）
+    const file = actualVoiceFileName(job, voice).replace(/\.mp3$/, `.${ext}`);
     const path = `${cacheDir}/${file}`;
     await tauri.writeFileBase64(path, res.dataB64);
     return path;

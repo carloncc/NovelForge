@@ -5,11 +5,14 @@ import { projectState } from "../stores/project";
 import PageHead from "../components/PageHead.vue";
 import StepIndicator from "../components/StepIndicator.vue";
 import ScopeTabs from "../components/generate/ScopeTabs.vue";
+import ProjectBar from "../components/generate/ProjectBar.vue";
+import SplitPanel from "../components/generate/SplitPanel.vue";
 import ChapterWorkbench from "../components/generate/ChapterWorkbench.vue";
 import FullRunPanel from "../components/generate/FullRunPanel.vue";
 import StageRunPanel from "../components/generate/StageRunPanel.vue";
 import ResultSection from "../components/generate/ResultSection.vue";
 import { goPage } from "../stores/nav";
+import { scrollIntoView as smoothIntoView } from "../utils/motion";
 import { useGenerateController } from "../stores/generate";
 
 // 全部状态与行为集中在 useGenerateController：本页只做编排与模板映射。
@@ -63,11 +66,12 @@ function focusResults(anchor?: string): void {
     if (anchor && root) {
       const el = root.querySelector(anchor);
       if (el) {
-        el.scrollIntoView({ block: "start", behavior: "smooth" });
+        // #1482：统一走 reduce-motion 感知的滚动（原实现硬编码 smooth，前庭敏感用户无法关闭）
+        smoothIntoView(el);
         return;
       }
     }
-    root?.scrollIntoView({ block: "start", behavior: "smooth" });
+    smoothIntoView(root);
   });
 }
 
@@ -123,6 +127,39 @@ const notice = computed<{ kind: string; title: string; text: string; action: str
 <template>
   <div class="inner">
     <PageHead :title="t('生成项目')" :sub="t('选范围 → 生成 → 试玩 → 导出：每章状态一眼可见，主按钮执行当前所选范围')" />
+
+    <!-- #1510：项目目录与分章此前只存在于「生成设置」页的 tab 里，用户在生成页找不到，
+         必须翻半天。这里直出：目录选择器常驻可见，分章面板默认展开、其上直接显示分章状态。 -->
+    <div class="card gen-project-card">
+      <div class="card-head">
+        <h3>{{ t("项目与分章") }}</h3>
+        <span class="hint">{{ t("先选好项目目录，再把小说切成章节；两件事定了才谈逐章生成") }}</span>
+      </div>
+
+      <div class="gp-sub">
+        <strong>{{ t("项目目录") }}</strong>
+        <span class="tag" :class="projectState.novel ? 'ok' : 'warn'">
+          {{ projectState.novel ? t("已载入小说") : t("未载入小说") }}
+        </span>
+        <span v-if="projectState.lastResult" class="tag ok">{{ t("已有生成结果") }}</span>
+      </div>
+      <ProjectBar />
+
+      <div class="gp-sub mt-4">
+        <strong>{{ t("章节") }}</strong>
+        <span v-if="projectState.novel" class="tag" :class="splitConfirmed ? 'ok' : 'warn'">
+          {{ splitConfirmed ? t("分章已核对") : t("待核对分章") }}
+        </span>
+        <span v-if="projectState.novel" class="hint">{{ splitMetaText }}</span>
+      </div>
+      <p v-if="!projectState.novel" class="hint">{{ t("先在「导入小说」页导入小说，这里才能分章与逐章生成") }}</p>
+      <template v-else>
+        <SplitPanel />
+        <p class="hint mt-3 mb-0">
+          {{ t("想调整碎章合并阈值 / 保留特殊章节？到「生成设置 → 分章」；分章选项在生成页不用改。") }}
+        </p>
+      </template>
+    </div>
 
     <!-- 状态横幅：同一时刻最多一条（失败 > 守门 > 续跑），每个最多一个入口 -->
     <div v-if="notice" class="vb-banner" :class="notice.kind">
@@ -227,6 +264,17 @@ const notice = computed<{ kind: string; title: string; text: string; action: str
   }
 }
 /* 结果区：scrollIntoView 的落点，顶部留出吸顶进度卡的实际高度（约 120~200px）+ 余量 */
+/* #1510：项目与分章卡片的内部排版（两个小标题 + 各自内容） */
+.gen-project-card .gp-sub {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.gen-project-card .card-head h3 {
+  margin: 0;
+}
 .gen-results {
   margin-top: 12px;
   scroll-margin-top: 200px;

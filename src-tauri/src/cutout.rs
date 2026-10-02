@@ -352,15 +352,13 @@ pub fn cutout(data_b64: &str, threshold: f32) -> Result<String, String> {
     cutout_with_stats(data_b64, threshold).map(|(b64, _, _, _, _)| b64)
 }
 
-/// 同 `cutout`，但额外返回被置全透明的像素比例 + 背景是否为绿幕 + 背景是否为深色（黑）。
-/// - 绿幕背景 removed 偏高是“抠干净”的正常成功指标，调用方不得据此降级 AI；
-/// - 深色背景（黑/墨蓝等）色度键原理上无法区分“黑发/黑衣服”与“黑背景”（距离≈0 被误抠成
-///   半透明灰），调用方应保留原图而非继续抠。
-pub fn cutout_with_stats(
-    data_b64: &str,
-    threshold: f32,
-) -> Result<(String, f32, bool, bool, usize), String> {
-    // 解码前先做输入上限校验：先限 base64 长度，再限解码后的像素数
+/// 解码前的统一输入上限校验：先限 base64 长度，再限解码后的像素数。
+///
+/// #1471：这两个上限原先只写在 `cutout_with_stats` 里，姊妹入口 `has_transparency`
+/// （图像阶段判断素材是否已带透明通道时调用）完全没有校验——用户选入超大图时会
+/// 整图解码 + to_rgba8 分配双份大缓冲，在 4G 目标机上可 OOM 崩溃。抽成单一入口，
+/// 新增/复用的解码路径都从这里走，避免再次漏掉。
+fn decode_guarded(data_b64: &str) -> Result<image::DynamicImage, String> {
     if data_b64.len() > MAX_INPUT_B64_BYTES {
         return Err(format!(
             "图片数据过大（{} MB），超过 {} MB 上限，已拒绝",
@@ -382,6 +380,18 @@ pub fn cutout_with_stats(
             pixels / 10000
         ));
     }
+    Ok(img)
+}
+
+/// 同 `cutout`，但额外返回被置全透明的像素比例 + 背景是否为绿幕 + 背景是否为深色（黑）。
+/// - 绿幕背景 removed 偏高是“抠干净”的正常成功指标，调用方不得据此降级 AI；
+/// - 深色背景（黑/墨蓝等）色度键原理上无法区分“黑发/黑衣服”与“黑背景”（距离≈0 被误抠成
+///   半透明灰），调用方应保留原图而非继续抠。
+pub fn cutout_with_stats(
+    data_b64: &str,
+    threshold: f32,
+) -> Result<(String, f32, bool, bool, usize), String> {
+    let img = decode_guarded(data_b64)?;
     let mut rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
     let bg = sample_bg_color(&rgba).ok_or("无法采样背景色（图像过小或边缘全透明）")?;
@@ -539,10 +549,8 @@ fn count_transparent(rgba: &image::RgbaImage) -> u32 {
 
 /// 检查图片是否已经包含大范围透明区域（用户已抠好的素材则跳过抠图）
 pub fn has_transparency(data_b64: &str) -> Result<bool, String> {
-    let bytes = B64
-        .decode(data_b64)
-        .map_err(|e| format!("base64 解码失败: {e}"))?;
-    let img = image::load_from_memory(&bytes).map_err(|e| format!("图片解码失败: {e}"))?;
+    // 与 cutout_with_stats 走同一套输入上限（#1471）：此前这里无任何限制
+    let img = decode_guarded(data_b64)?;
     if img.color().has_alpha() {
         let rgba = img.to_rgba8();
         let total = rgba.pixels().count().max(1);
@@ -550,7 +558,12 @@ pub fn has_transparency(data_b64: &str) -> Result<bool, String> {
             .pixels()
             .filter(|p| p[3] < 16)
             .count();
-        return Ok(transparent * 100 / total > 5);
+        // #1495：用整数交叉相乘代替 "transparent * 100 / total > 5"。
+        // 后者是整数除法（先截断再比较），实际阈值变成「≥6%」；Web 端（webRuntime）用的是
+        // 浮点 low/total > 0.05，即精确 5%。5%～5.99% 的图会两端判定相反——同一张素材
+        // 桌面端跳过抠图、网页端不跳过（或反之），表现为绿幕残留/多余抠图。
+        // 交叉相乘是无损整数运算，两端现在都是精确的 "> 5%"。
+        return Ok(transparent * 100 > total * 5);
     }
     Ok(false)
 }
@@ -1253,5 +1266,66 @@ mod tests {
         img.write_to(&mut buf, ImageFormat::Png).unwrap();
         let err = cutout(&B64.encode(buf.into_inner()), 40.0).unwrap_err();
         assert!(err.contains("4096"), "超限输入应被拒绝并提示尺寸上限: {err}");
+    }
+
+    /// #1495 回归：透明判定阈值必须与 Web 端逐位一致（精确 "> 5%"）。
+    /// 旧实现 `transparent * 100 / total > 5` 是整数除法，实际阈值是 ≥6%，
+    /// 于是 5%～5.99% 的素材桌面端与网页端判定相反。
+    #[test]
+    fn transparency_threshold_matches_web_exactly() {
+        let make = |total: u32, low: u32| -> String {
+            let side = 100u32; // 100x100 = 10000 像素，便于构造精确百分比
+            assert_eq!(side * side, total, "构造尺寸与 total 必须一致");
+            let mut img = RgbaImage::new(side, side);
+            for (i, p) in img.pixels_mut().enumerate() {
+                let alpha = if (i as u32) < low { 0 } else { 255 };
+                *p = Rgba([10, 20, 30, alpha]);
+            }
+            let mut buf = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut buf, ImageFormat::Png).unwrap();
+            B64.encode(buf.into_inner())
+        };
+        // 恰好 5%：Web 端是 `> 0.05` → 假；Rust 端必须是假（旧实现也是假，但原因不同）
+        assert!(!has_transparency(&make(10000, 500)).unwrap(), "恰好 5% 不应判为已透明");
+        // 5.4%：Web 端为真；旧 Rust 整数除法得 5 > 5 为假 → 两端相反
+        assert!(has_transparency(&make(10000, 540)).unwrap(), "5.4% 必须判为已透明（与 Web 端一致）");
+        // 6%：两端都应为真
+        assert!(has_transparency(&make(10000, 600)).unwrap(), "6% 应判为已透明");
+        // 4.9%：两端都应为假
+        assert!(!has_transparency(&make(10000, 490)).unwrap(), "4.9% 不应判为已透明");
+    }
+
+    /// #1471 回归：has_transparency 与 cutout_with_stats 必须共用同一套输入上限。
+    /// 旧实现只在 cutout_with_stats 里校验，has_transparency 会无上限地整图解码
+    /// （图像阶段判断素材是否已带透明通道时调用），超大图可直接吃满内存。
+    #[test]
+    fn has_transparency_shares_the_same_input_limits() {
+        // 超尺寸：与 cutout_with_stats 同样的「4096」提示
+        let mut img = RgbaImage::new(4100, 4100);
+        img.put_pixel(0, 0, Rgba([1, 2, 3, 255]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, ImageFormat::Png).unwrap();
+        let b64 = B64.encode(buf.into_inner());
+        let err = has_transparency(&b64).unwrap_err();
+        assert!(err.contains("4096"), "has_transparency 也必须拦截超尺寸输入: {err}");
+        assert!(
+            cutout_with_stats(&b64, 40.0).is_err(),
+            "姊妹函数同样应拦截，确保两条路径口径一致"
+        );
+
+        // 超 base64 长度：连解码都不做
+        let huge = "A".repeat(MAX_INPUT_B64_BYTES + 1);
+        let err = has_transparency(&huge).unwrap_err();
+        assert!(err.contains("过大"), "has_transparency 也必须先拦 base64 长度: {err}");
+
+        // 正常尺寸：仍能正确判定（不因新增校验而误杀）
+        let mut ok = RgbaImage::new(16, 16);
+        for p in ok.pixels_mut() {
+            *p = Rgba([10, 20, 30, 255]);
+        }
+        let mut buf = std::io::Cursor::new(Vec::new());
+        ok.write_to(&mut buf, ImageFormat::Png).unwrap();
+        let out = has_transparency(&B64.encode(buf.into_inner())).expect("正常输入不应被拒绝");
+        assert!(!out, "不透明图不应被判为已带透明通道");
     }
 }

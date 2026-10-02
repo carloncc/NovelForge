@@ -18,6 +18,10 @@ const STREAM_EMIT_BYTES: usize = 8 * 1024;
 const STREAM_EMIT_INTERVAL: Duration = Duration::from_millis(200);
 /// read_file_header 允许读取的最大头部字节数：无论调用方传多大都不读取整文件
 const READ_FILE_HEADER_LIMIT: usize = 64 * 1024;
+/// 一次性整文件读入内存的上限（read_text_file / read_file_base64）。
+/// #1472：这两条命令此前完全没有上限，误选大音频/视频/超大文本时会在 Rust 侧
+/// 与 IPC base64 上各留一份完整副本，把主存与 IPC 通道一起吃满。与 HTTP 响应上限同口径。
+const READ_FILE_LIMIT: u64 = HTTP_BODY_LIMIT as u64;
 static ATOMIC_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// #1292 路径白名单：所有直接操作调用方传入路径的命令入口必须先经 resolve_safe_path
@@ -624,14 +628,33 @@ fn emit_stream_chunk(app: &tauri::AppHandle, request_id: u64, data: &[u8]) {
     }
 }
 
+/// 整文件读入前的体积检查（#1472）：超限直接拒绝，避免把几十 MB 拉进内存与 IPC。
+fn ensure_readable_size(path: &std::path::Path) -> Result<(), String> {
+    let len = std::fs::metadata(path)
+        .map_err(|e| format!("读取失败: {e}"))?
+        .len();
+    if len > READ_FILE_LIMIT {
+        return Err(format!(
+            "文件过大（{} MB），超过 {} MB 上限，已拒绝读取",
+            len / 1048576,
+            READ_FILE_LIMIT / 1048576
+        ));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn read_text_file(path: String) -> Result<Value, String> {
     // 文件读 + 编码探测是阻塞 IO/CPU，放阻塞线程池执行，避免卡住主线程（IPC 命令默认在主线程执行）
     let safe = resolve_safe_path(&path)?;
     tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
+        ensure_readable_size(&safe)?;
         let data = std::fs::read(&safe).map_err(|e| format!("读取失败: {e}"))?;
 
-        if let Ok(text) = String::from_utf8(data.clone()) {
+        // #1472：原实现用 data.clone() 走一次 UTF-8 校验，等于把整份文件复制一遍。
+        // 校验只需借用，命中后再把所有权整体转成 String（无额外拷贝）。
+        if std::str::from_utf8(&data).is_ok() {
+            let text = String::from_utf8(data).expect("已校验为合法 UTF-8");
             return Ok(serde_json::json!({ "text": text, "encoding": "UTF-8" }));
         }
 
@@ -674,11 +697,43 @@ pub async fn write_text_file(path: String, content: String) -> Result<(), String
         .map_err(|e| format!("写入任务执行失败: {e}"))?
 }
 
+/// 追加写入（#1502）。
+///
+/// 为什么需要它：日志落盘此前只能「读全量 + 拼新内容 + 写全量」——Tauri 没有 append API，
+/// 于是每次 flush（最多每秒一次、每 50 行一次）都要把整份日志读进来再整份写回去，
+/// 日志越大越慢，且会把整份内容在内存里复制一遍。有了 append，落盘成本与「新增行数」成正比。
+///
+/// 语义与 write_text_file 的区别：
+/// - 不做原子替换（追加本身在 O_APPEND 下是原子的），内容立即生效；
+/// - 目标不存在时创建（含父目录），符合日志场景；
+/// - 仍走 resolve_safe_path，保持与其它文件命令一致的路径授权闸门。
+#[tauri::command]
+pub async fn append_text_file(path: String, content: String) -> Result<(), String> {
+    let safe = resolve_safe_path(&path)?;
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        if let Some(parent) = safe.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
+        }
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&safe)
+            .map_err(|e| format!("打开文件失败: {e}"))?;
+        file.write_all(content.as_bytes())
+            .map_err(|e| format!("追加写入失败: {e}"))?;
+        // 显式 flush：日志场景下「写进去了」比吞吐更重要（进程被强杀时尽量少丢行）
+        file.flush().map_err(|e| format!("刷新失败: {e}"))
+    })
+    .await
+    .map_err(|e| format!("追加任务执行失败: {e}"))?
+}
 #[tauri::command]
 pub async fn read_file_base64(path: String) -> Result<String, String> {
     // 图片/音频等文件读取 + base64 编码是阻塞操作，放阻塞线程池（大素材读几十 MB）
     let safe = resolve_safe_path(&path)?;
     tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
+        ensure_readable_size(&safe)?;
         let data = std::fs::read(&safe).map_err(|e| format!("读取失败: {e}"))?;
         Ok(B64.encode(&data))
     })
@@ -966,16 +1021,22 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn remove_path(path: String) -> Result<(), String> {
+pub async fn remove_path(path: String) -> Result<(), String> {
+    // #1473：同步命令在 IPC 主线程执行，删目录时 remove_dir_all 会整窗冻结；同文件其它
+    // 阻塞 IO 命令早已按 #1413 走 spawn_blocking，这里补齐。
     let p = resolve_safe_path(&path)?;
-    guard_against_wipe(&p)?;
-    if p.is_dir() {
-        std::fs::remove_dir_all(&p).map_err(|e| format!("删除目录失败: {e}"))
-    } else if p.exists() {
-        std::fs::remove_file(&p).map_err(|e| format!("删除文件失败: {e}"))
-    } else {
-        Ok(())
-    }
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        guard_against_wipe(&p)?;
+        if p.is_dir() {
+            std::fs::remove_dir_all(&p).map_err(|e| format!("删除目录失败: {e}"))
+        } else if p.exists() {
+            std::fs::remove_file(&p).map_err(|e| format!("删除文件失败: {e}"))
+        } else {
+            Ok(())
+        }
+    })
+    .await
+    .map_err(|e| format!("删除任务执行失败: {e}"))?
 }
 
 #[tauri::command]
@@ -1044,29 +1105,42 @@ fn validate_secret_id(id: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn read_api_secrets(ids: Vec<String>) -> Result<HashMap<String, String>, String> {
-    let mut secrets = HashMap::new();
-    for id in ids {
-        validate_secret_id(&id)?;
-        let entry = keyring::Entry::new(API_SECRET_SERVICE, &id)
-            .map_err(|e| format!("创建系统凭据项失败（{id}）：{e}"))?;
-        match entry.get_password() {
-            Ok(secret) => {
-                secrets.insert(id, secret);
+pub async fn read_api_secrets(ids: Vec<String>) -> Result<HashMap<String, String>, String> {
+    // #1473：keyring 走系统凭据库（Linux 上可能弹解锁框/等 D-Bus），同步命令会冻住整个窗口。
+    tauri::async_runtime::spawn_blocking(move || -> Result<HashMap<String, String>, String> {
+        let mut secrets = HashMap::new();
+        for id in ids {
+            validate_secret_id(&id)?;
+            let entry = keyring::Entry::new(API_SECRET_SERVICE, &id)
+                .map_err(|e| format!("创建系统凭据项失败（{id}）：{e}"))?;
+            match entry.get_password() {
+                Ok(secret) => {
+                    secrets.insert(id, secret);
+                }
+                Err(keyring::Error::NoEntry) => {}
+                Err(e) => return Err(format!("读取系统凭据失败（{id}）：{e}")),
             }
-            Err(keyring::Error::NoEntry) => {}
-            Err(e) => return Err(format!("读取系统凭据失败（{id}）：{e}")),
         }
-    }
-    Ok(secrets)
+        Ok(secrets)
+    })
+    .await
+    .map_err(|e| format!("读取凭据任务执行失败: {e}"))?
 }
 
 #[tauri::command]
-pub fn write_api_secrets(secrets: HashMap<String, String>) -> Result<(), String> {
-    // #1441：先校验全部 id，再快照旧值，最后逐条应用；中途失败尽力回滚已处理条目，
-    // 杜绝“前几条已删/已写、后几条失败直接返回”的半表状态（“密钥已删但配置组仍在”不可恢复）。
-    // 空串仍表示删除（config.ts removeConfig/removePreset 的显式删除依赖此语义）；
-    // “无密钥≠删除”由前端只提交非空值保证（configMigration.nonEmptySecrets），迁移路径不再送空串。
+pub async fn write_api_secrets(secrets: HashMap<String, String>) -> Result<(), String> {
+    // #1473：见 read_api_secrets——keyring 是系统调用，且本函数还会先回读全部旧值，
+    // 留在 IPC 主线程上会让设置页保存密钥期间整窗无响应。
+    tauri::async_runtime::spawn_blocking(move || write_api_secrets_blocking(secrets))
+        .await
+        .map_err(|e| format!("写入凭据任务执行失败: {e}"))?
+}
+
+/// #1441：先校验全部 id，再快照旧值，最后逐条应用；中途失败尽力回滚已处理条目，
+/// 杜绝“前几条已删/已写、后几条失败直接返回”的半表状态（“密钥已删但配置组仍在”不可恢复）。
+/// 空串仍表示删除（config.ts removeConfig/removePreset 的显式删除依赖此语义）；
+/// “无密钥≠删除”由前端只提交非空值保证（configMigration.nonEmptySecrets），迁移路径不再送空串。
+fn write_api_secrets_blocking(secrets: HashMap<String, String>) -> Result<(), String> {
     for id in secrets.keys() {
         validate_secret_id(id)?;
     }
@@ -1162,50 +1236,66 @@ fn start_preview_server_blocking(root: &str) -> Result<Value, String> {
     }
     // 先释放旧实例再绑定端口（#782）：旧实现先 start 后 stop，连点「启动/刷新」时
     // 第二次绑定会在旧实例释放前失败，报「端口 17892 被占用」。
-    // take 出来的 handle 在 stop 后仍保留 root，可供绑定失败时回滚重启。
-    let old = {
+    //
+    // #1470：上一版虽已 stop，但把 ServerHandle 持有到了函数末尾（Err 分支回滚还要用它的
+    // root），而 ServerHandle 内含 Arc<Server>——tiny_http 的监听 socket 被 move 进它自己的
+    // accept 线程，只有最后一个 Arc<Server> 被 drop 时才会置 close 并真正关闭 socket。
+    // 于是 stop() 只停了我们自己的 recv 循环，17892 仍被自己占着，重新绑定必然
+    // os error 10048（实测）。现在 stop 后立刻 drop(handle)，只留下 root 供回滚。
+    let old_root = {
         let mut guard = preview()
             .running
             .lock()
             .map_err(|_| "锁获取失败".to_string())?;
-        guard.take()
+        guard.take().map(|handle| {
+            handle.stop();
+            let root = handle.preview_root().to_path_buf();
+            // 必须显式 drop：这是最后一个 Arc<Server>，drop 才会让 accept 线程退出并关闭监听 socket
+            drop(handle);
+            root
+        })
     };
-    if let Some(ref handle) = old {
-        handle.stop();
-    }
-    match server::start(root) {
-        Ok(handle) => {
-            let port = handle.port();
-            let url = format!("http://127.0.0.1:{port}/index.html");
-            preview()
-                .running
-                .lock()
-                .map_err(|_| "锁获取失败".to_string())?
-                .replace(handle);
-            // #1446：不再生成/回传装饰性 token（从未被校验，前端亦直接丢弃）。
-            // 生效的防线是 loopback 绑定 + Host/DNS-rebinding 校验，见 server.rs handle_request 注释。
-            Ok(serde_json::json!({ "url": url, "port": port }))
-        }
-        Err(error) => {
-            // 端口被外部进程占用时旧实例已被停掉：尽力用旧根重启恢复，
-            // 恢复也失败则如实返回双重错误，前端据此提示用户手动重试
-            if let Some(old_handle) = old {
-                let old_root = old_handle.preview_root().to_string_lossy().to_string();
-                match server::start(&old_root) {
-                    Ok(restored) => {
-                        if let Ok(mut guard) = preview().running.lock() {
-                            *guard = Some(restored);
-                        }
-                        return Err(format!("{error}（已恢复旧预览）"));
-                    }
-                    Err(restore_error) => {
-                        return Err(format!("{error}（旧预览恢复失败：{restore_error}）"));
-                    }
+    // drop 到 socket 真正关闭之间有几十毫秒窗口（实测：drop 后立即绑定仍 10048，
+    // 重试第 2 次即成功）。这里给 10 次 × 20ms 的重试预算，避免把「自己刚放开」误报成端口被占。
+    let mut last_error = String::new();
+    for attempt in 0..10 {
+        match server::start(root) {
+            Ok(handle) => return Ok(activate_preview(handle)),
+            Err(error) => {
+                last_error = error;
+                if attempt < 9 {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
                 }
             }
-            Err(error)
         }
     }
+    // 端口被外部进程占用时旧实例已被停掉：尽力用旧根重启恢复，
+    // 恢复也失败则如实返回双重错误，前端据此提示用户手动重试
+    if let Some(old_root) = old_root {
+        let old_root = old_root.to_string_lossy().to_string();
+        return match server::start(&old_root) {
+            Ok(restored) => {
+                if let Ok(mut guard) = preview().running.lock() {
+                    *guard = Some(restored);
+                }
+                Err(format!("{last_error}（已恢复旧预览）"))
+            }
+            Err(restore_error) => Err(format!("{last_error}（旧预览恢复失败：{restore_error}）")),
+        };
+    }
+    Err(last_error)
+}
+
+/// 把新实例登记为当前预览并回传前端所需的 url/port。
+fn activate_preview(handle: server::ServerHandle) -> serde_json::Value {
+    let port = handle.port();
+    let url = format!("http://127.0.0.1:{port}/index.html");
+    if let Ok(mut guard) = preview().running.lock() {
+        guard.replace(handle);
+    }
+    // #1446：不再生成/回传装饰性 token（从未被校验，前端亦直接丢弃）。
+    // 生效的防线是 loopback 绑定 + Host/DNS-rebinding 校验，见 server.rs handle_request 注释。
+    serde_json::json!({ "url": url, "port": port })
 }
 
 #[tauri::command]
@@ -1568,7 +1658,7 @@ fn write_zip_contents(
 
 #[cfg(test)]
 mod atomic_write_tests {
-    use super::{atomic_write, atomic_write_temp_path, bless_project_dir, cancel_http_request, cleanup_stale_dir, cleanup_stale_files, copy_file, display_path, guard_against_wipe, has_transparency, http_aborts, http_target, is_atomic_tmp_name, linux_open_args, linux_open_failed, list_dir, path_exists, path_within_home_credential_dir, reject_unsafe_path_syntax, replace_path, resolve_safe_path, ssrf_reject_reason, strip_verbatim_prefix, validate_secret_id, write_api_secrets, write_text_file, HttpRequestArgs};
+    use super::{append_text_file, atomic_write, atomic_write_temp_path, bless_project_dir, cancel_http_request, cleanup_stale_dir, write_api_secrets_blocking, cleanup_stale_files, copy_file, display_path, guard_against_wipe, has_transparency, http_aborts, http_target, is_atomic_tmp_name, linux_open_args, linux_open_failed, list_dir, path_exists, path_within_home_credential_dir, reject_unsafe_path_syntax, replace_path, resolve_safe_path, ssrf_reject_reason, strip_verbatim_prefix, validate_secret_id, write_api_secrets, write_text_file, HttpRequestArgs};
     use std::path::Path;
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use image::ImageEncoder as _;
@@ -1696,7 +1786,9 @@ mod atomic_write_tests {
         let mut secrets = HashMap::new();
         secrets.insert("valid-id-1".to_string(), "secret".to_string());
         secrets.insert("../evil".to_string(), "x".to_string());
-        assert!(write_api_secrets(secrets).is_err());
+        // #1473：命令体已改为 async + spawn_blocking；校验逻辑在同步内核里，直接测内核
+        // （无需 async 运行时，也避免测试真的去碰系统凭据库）
+        assert!(write_api_secrets_blocking(secrets).is_err());
     }
 
     #[test]
@@ -1889,6 +1981,36 @@ mod atomic_write_tests {
 
     /// #1413：阻塞文件命令改为 async + spawn_blocking 后的接线回归
     /// （临时目录在允许根内，resolve_safe_path 放行）。
+    /// #1502：append_text_file 必须真正追加（而不是覆盖），并且能创建缺失的文件与父目录。
+    /// 日志落盘改用它取代「读全量 + 写全量」，语义搞错会静默丢日志。
+    #[tokio::test]
+    async fn append_text_file_appends_and_creates() {
+        let dir = std::env::temp_dir().join("novelforge_append_cmd_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 父目录不存在
+        let log = dir.join("logs").join("novelforge.log");
+        append_text_file(log.to_string_lossy().to_string(), "first".to_string())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "first");
+        // 第二次追加必须是「追加」而不是覆盖
+        append_text_file(log.to_string_lossy().to_string(), "\nsecond".to_string())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "first\nsecond");
+        // 空内容不应报错、也不改变文件
+        append_text_file(log.to_string_lossy().to_string(), String::new())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "first\nsecond");
+        // 非法路径仍被路径闸门拒绝（与 write_text_file 同一套授权）
+        assert!(append_text_file("\\\\evil\\share\\x.log".to_string(), "x".to_string())
+            .await
+            .is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn blocking_file_commands_roundtrip() {
         let dir = std::env::temp_dir().join("novelforge_blocking_cmds_test");

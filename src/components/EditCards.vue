@@ -16,6 +16,7 @@ import { createMiniMaxVoiceProfile, importVoiceProfile } from "../core/voiceProf
 import { aiAssignVoices } from "../core/voiceCast";
 import { minimaxVoiceLabel, voiceGenderOf } from "../core/minimaxVoices";
 import { useGenerateController } from "../stores/generate";
+import { confirmDialog, promptDialog } from "../composables/useConfirmDialog";
 import Disclosure from "./Disclosure.vue";
 
 const props = defineProps<{ cards: ExtractionResult }>();
@@ -67,7 +68,7 @@ async function recognizeChar(c: CharacterCard): Promise<void> {
     setSavedMsg(t("图像识别 API 未配置或不可用，请先在「API 配置」页配置"), "err");
     return;
   }
-  if (!window.confirm(t("将调用图像识别 API 生成「{name}」的设定与提示词（计费）。继续吗？", { name: c.name }))) return;
+  if (!(await confirmDialog({ title: t("将调用图像识别 API 生成「{name}」的设定与提示词（计费）。继续吗？", { name: c.name }), tone: "primary" }))) return;
   charRecognizing.value = c.id;
   setSavedMsg("");
   try {
@@ -121,8 +122,15 @@ function voiceOptionsForGender(card: CharacterCard): typeof voiceOptions.value {
 async function importCharacterVoice(card: CharacterCard): Promise<void> {
   const config = activeConfig("tts");
   if (!config) { setSavedMsg(t("请先配置 TTS"), "err"); return; }
-  const voiceId = window.prompt("MiniMax voice_id");
-  if (!voiceId?.trim()) return;
+  // #1483：原实现用 window.prompt 取 voice_id，但 Tauri 在 macOS 上走 WKWebView，
+  // 未实现 window.prompt（返回 null 且不弹窗），点「导入克隆声音」毫无反应。
+  // 改用应用内无障碍输入弹层（四语言、可键盘操作、Esc 取消）。
+  const voiceId = await promptDialog({
+    title: t("粘贴 MiniMax voice_id"),
+    placeholder: "MiniMax voice_id",
+    message: t("在 MiniMax 控制台复制克隆音色 id 后粘贴到这里。"),
+  });
+  if (!voiceId) return;
   try {
     const profile = await importVoiceProfile({ name: `${card.name} 声音`, configId: config.id, voiceId });
     card.voiceProfileId = profile.id;
@@ -145,7 +153,7 @@ function audioMime(fileName: string): string {
 async function createVoiceFromPath(card: CharacterCard, path: string): Promise<void> {
   const config = activeConfig("tts");
   if (!config) { setSavedMsg(t("请先配置 TTS"), "err"); return; }
-  if (!window.confirm(t("我确认拥有该参考声音的使用授权，且允许将其上传到所选供应商。"))) return;
+  if (!(await confirmDialog({ title: t("我确认拥有该参考声音的使用授权，且允许将其上传到所选供应商。"), tone: "primary" }))) return;
   voiceBusy.value = card.id;
   try {
     const audioB64 = await tauri.readFileBase64(path);
@@ -165,7 +173,7 @@ async function onVoiceFile(e: Event): Promise<void> {
   if (file.size > 12 * 1024 * 1024) { setSavedMsg(t("参考音频不能超过 12MB"), "err"); return; }
   const audioB64 = await fileToBase64(file, t("文件读取失败"));
   const config = activeConfig("tts");
-  if (!config || !window.confirm(t("我确认拥有该参考声音的使用授权，且允许将其上传到所选供应商。"))) return;
+  if (!config || !(await confirmDialog({ title: t("我确认拥有该参考声音的使用授权，且允许将其上传到所选供应商。"), tone: "primary" }))) return;
   voiceBusy.value = card.id;
   try {
     const profile = await createMiniMaxVoiceProfile({ name: `${card.name} 声音`, configId: config.id, fileName: file.name, mime: file.type || "audio/mpeg", audioB64, consent: true });
@@ -216,7 +224,7 @@ async function startSystemAudioRecording(card: CharacterCard): Promise<void> {
     setSavedMsg(t("已有录音在进行，请先停止或取消当前录音"), "err");
     return;
   }
-  if (!window.confirm(t("我将捕获系统正在播放的声音（会弹出选择共享屏幕/窗口的提示，请勾选「分享音频」）。我确认拥有该声音的使用授权。"))) return;
+  if (!(await confirmDialog({ title: t("我将捕获系统正在播放的声音（会弹出选择共享屏幕/窗口的提示，请勾选「分享音频」）。我确认拥有该声音的使用授权。"), tone: "primary" }))) return;
   try {
     // 捕获系统音频：getDisplayMedia 的 audio 轨道（Chrome/Edge/WebView2 支持）
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -351,7 +359,7 @@ async function aiCastVoices(): Promise<void> {
     setSavedMsg(t("没有可分配的角色（已绑定克隆音色的角色会跳过）"), "err");
     return;
   }
-  if (targets.some((c) => c.voiceName) && !window.confirm(t("将为 {n} 个角色重新分配音色（已绑定克隆音色的角色跳过）。继续吗？", { n: targets.length }))) return;
+  if (targets.some((c) => c.voiceName) && !(await confirmDialog({ title: t("将为 {n} 个角色重新分配音色（已绑定克隆音色的角色跳过）。继续吗？", { n: targets.length }), tone: "danger" }))) return;
   castBusy.value = true;
   setSavedMsg(t("AI 正在挑选音色…"));
   try {
@@ -392,7 +400,7 @@ async function save(): Promise<void> {
     return;
   }
   // 「同时重写剧本」= 清空全部章节剧本缓存（下次生成重写，消耗 token）：执行前确认
-  if (invalidateScript.value && !window.confirm(t("已勾选「同时重写剧本」：保存会清空全部章节的剧本缓存（下次生成需重写剧本，消耗 token）。继续吗？"))) return;
+  if (invalidateScript.value && !(await confirmDialog({ title: t("已勾选「同时重写剧本」：保存会清空全部章节的剧本缓存（下次生成需重写剧本，消耗 token）。继续吗？"), tone: "danger" }))) return;
   busy.value = true;
   setSavedMsg("");
   try {
@@ -408,8 +416,8 @@ async function save(): Promise<void> {
   }
 }
 
-function reset(): void {
-  if (!window.confirm(t("放弃所有未保存的修改，恢复为上次生成时的卡片？"))) return;
+async function reset(): Promise<void> {
+  if (!(await confirmDialog({ title: t("放弃所有未保存的修改，恢复为上次生成时的卡片？"), tone: "danger" }))) return;
   local.value = JSON.parse(JSON.stringify(props.cards));
   setSavedMsg(t("已恢复为上次生成时的卡片"));
 }
@@ -428,14 +436,14 @@ function addCostume(c: CharacterCard): void {
   });
 }
 
-function confirmClearRefImage(card: CharacterCard): void {
-  if (!window.confirm(t("清除「{name}」的参考图？（保存后生效）", { name: card.name }))) return;
+async function confirmClearRefImage(card: CharacterCard): Promise<void> {
+  if (!(await confirmDialog({ title: t("清除「{name}」的参考图？（保存后生效）", { name: card.name }), tone: "danger" }))) return;
   card.referenceImage = undefined;
 }
 
-function removeCostume(c: CharacterCard, idx: number): void {
+async function removeCostume(c: CharacterCard, idx: number): Promise<void> {
   const target = c.costumes?.[idx];
-  if (!window.confirm(t("删除服装「{name}」？未保存前可点「放弃修改」找回。", { name: target?.name ?? target?.id ?? "" }))) return;
+  if (!(await confirmDialog({ title: t("删除服装「{name}」？未保存前可点「放弃修改」找回。", { name: target?.name ?? target?.id ?? "" }), tone: "danger" }))) return;
   c.costumes?.splice(idx, 1);
   if (!c.costumes?.length) c.costumes = undefined;
 }

@@ -55,8 +55,88 @@
 - 逐章工作台新增旧缓存提示：仍有章节只能退回旧版无指纹剧本时，明确写出「共 N 章」并说明图像数是按旧剧本估算、建议先重跑这些章的「剧本」
 - CI（GitHub Actions）在新检出上 `Frontend unit tests` 挂掉：`tests/unit-nb-np-final.ts` 断言模板 `index.html` 含 file:// 协议探测提示，但该探测是之前直接手改 gitignored 的模板文件加的、`pnpm prepare:template` 从不生成它——新机器/CI 拉到的新模板没有这段，测试必挂。现把探测块收敛为版本库内的 `scripts/file-protocol-probe.html`，由 `prepare:template` 幂等注入（已含标记则跳过），新检出与 CI 自动带上
 - CI 的 `Rust tests` 在 Linux 上编译失败（`error[E0277]`：`if *canon == Path::new("/")` 中 `Path == &Path` 没有 PartialEq 实现）：该分支在 `#[cfg(not(target_os = "windows"))]` 里，Windows 本地构建根本看不到这个错误。改为直接比较引用（另：CI 日志需登录才能下载，排查时用 Docker 在本地 Ubuntu 容器复现并验证通过）
+
+### 修复（无障碍 / 国际化 / Rust 后端 / 样式，2026-09-28 深度审查第二轮）
+- **预览服务器「启动/刷新」必失败**（实测 os error 10048）：旧实现 stop() 后仍把 ServerHandle 持有到函数末尾（回滚分支要用它的 root），而它内含 Arc<Server> —— tiny_http 把监听 socket move 进自己的 accept 线程，只有最后一个 Arc 被 drop 才真正关闭。于是 stop 只停了我们自己的 recv 循环，17892 仍被自己占着，重新绑定必然失败（还会先杀掉旧实例，页面 iframe 变空）。现 stop 后立刻 drop(handle)、只留 root 供回滚，并给 20ms×10 的绑定重试（drop→socket 关闭有几十毫秒窗口）
+- **76 处 window.confirm 全部换成无障碍弹层**：原生弹层无 role="dialog"/aria-modal/标题关联、不锁键盘焦点、无法主题化，还会同步阻塞主线程。新增 AppDialog（role/aria-modal/aria-labelledby+describedby、Tab 焦点陷阱、Esc 关闭、关闭后焦点归还触发元素）+ useConfirmDialog（confirmDialog 返回 Promise；并发请求排队而非覆盖）+ 全局宿主 ConfirmDialogHost；调用点按危险度带 tone:"danger"
+- **克隆声音入口在 macOS 下点了没反应**：EditCards 用 window.prompt 取 voice_id，而 Tauri 在 macOS 走 WKWebView，未实现 window.prompt（直接返回 null 且不弹窗）。新增无障碍输入弹层 promptDialog（键盘可操作、Enter 提交、Esc 取消、四语言）替代
+- **章节标题在英文/日文界面拼出坏句**（如 Chapter 4chapters）：旧实现用两个碎片键拼句 t("第")+n+t("章")，而 t() 以中文原文为 key ——「章」在计数语境（3 章 → en 3 chapters）与序数语境（第 3 章 → en Chapter 3）下需要不同译文，一个键只能给一个值。改用整句占位键「第 {n} 章」/「第 {n} 章 {title}」（四语言 + 键清单同步）
+- **日志阶段徽标在非中文界面恒为中文**：LogPanel 用 t(l.step)，而「单章/整书/单阶段/级联/追加/图像识别/画风/中止/提示/开始」这 10 个值四语言词典里都没有，t() 静默回退原文。现补齐四语言词条并纳入键清单校验
+- **窗口标题与 <html lang> 不随语言切换**：index.html 静态写死 lang="zh-CN" 与中文标题，只有挂载后才覆盖 lang、标题则永远是中文。新增 syncDocumentLocale() 并在 main.ts 挂载前调用一次（首帧即正确），切语言时同步更新标题
+- **Rust：has_transparency 完全没有输入上限**：姊妹函数 cutout_with_stats 有 32MB base64 + 4096² 双保险，has_transparency（图像阶段判断素材是否已带透明通道时调用）没有，用户选入超大图会整图解码 + to_rgba8 双份缓冲，4G 目标机上可 OOM。现抽出 decode_guarded 供两者共用，并加回归测试
+- **Rust：read_text_file / read_file_base64 无体积上限**：误选大音频/视频/超大文本时会在 Rust 侧与 IPC base64 各留一份完整副本。现读取前按 64MB（与 HTTP 上限同口径）拒绝；read_text_file 同时去掉整份 data.clone()（改为借用校验后移交所有权）
+- **Rust：read_api_secrets / write_api_secrets / remove_path 阻塞 IPC 主线程**：keyring 走系统凭据库、remove_dir_all 删目录都会整窗冻结（同文件其它命令早已按 #1413 改 spawn_blocking）。现三者统一改 async + 阻塞线程池
+- **Rust：预览服务器点目录可被读出**：is_preview_blocked 原只拦「叶子是点文件」与「组件等于 .novel2vn」，<root>/.cache/x.json 这类子目录点目录可被同机任意进程 GET。现相对路径任一组件以 . 开头即拦截
+- **Rust：预览 Origin 校验用字符串前缀**：starts_with("http://127.0.0.1:{port}") 在端口 ≤6553 时会被 http://127.0.0.1:50001 绕过。现解析出 host:port 后精确比对（并补回归用例）
+- **样式：三处对比度不达 WCAG**：(1) .btn.danger 白字在渐变亮端仅 2.77:1 → 收到 #b91c1c→#dc2626（4.83/6.47:1）；(2) 导出页分发图标白描边仅 2.54/1.92:1 → 亮端改 #2563eb/#059669（5.17/3.77:1）；(3) 表单控件边界仅 1.51:1 → 新增专用令牌 --border-control: #8b7fb8（白底 3.60:1、页面底 3.33:1）
+- **样式：次要文字色仍差一点达标**：--text-faint 从 #6b7280（--bg 上 4.47:1、--bg-soft 上 4.23:1）进一步压深到 #5f6672（5.78/5.35/5.06:1，三种底全部达标）；侧栏运行指示卡片底色由 --err-soft（红）改回 --warn-soft，与琥珀描边语义一致
+- **样式：窄窗口横向溢出**：5 处网格用裸 minmax(300px,1fr) 等，轨道无法收缩，窗口 ≲640px 时撑出横向滚动条。统一改 minmax(min(Npx,100%),1fr)（.cfg-grid 之前已如此加固，其余漏掉）
+- **无障碍：键盘焦点几乎看不见**：全站只有输入框/复选框/.disclosure-head 有 :focus-visible，.btn/.nav-item/.tab/summary 等全靠 UA 默认环（在自定义底色的控件上不可见）。现加全局 :focus-visible 兜底（导出游戏模板早已如此），深色预览舞台用白色轮廓
+- **无障碍：缩略图「点击放大」键盘不可达**：.asset-thumb/.vb-thumb 是 div + @click，无 role/tabindex/keydown —— 键盘与读屏用户完全用不了大图预览（内部嵌有按钮/复选框，不能整体换 <button>）。现补 role="button" + tabindex + Enter/Space 处理，且只在确有图可预览时暴露为可操作；补 :focus-visible 与 font: inherit 重置
+- **无障碍：JS 平滑滚动绕过 reduce-motion**：styles.css 的 prefers-reduced-motion 只管 CSS，window.scrollTo({behavior:"smooth"}) / scrollIntoView 仍强制播放位移动画（前庭敏感用户无法关闭）。新增 utils/motion.ts（scrollToTop/scrollIntoView/scrollBehavior），4 处调用点统一接入
+- **i18n 静默缺失的防线**：scripts/check-i18n.mjs 只比对 scripts/i18n-keys.txt，对源码里 t(变量) 完全失明（本轮的日志阶段名与预设选项正是从这里漏出去的）。本轮同步补齐键清单并新增「章节序数整句键」回归测试（tests/unit-i18n-chapter-ordinal.ts）与弹层测试（tests/unit-confirm-dialog.ts）
+- **启动脚本在非中文 Windows 下乱码**：start.bat 是 GBK 编码（非 UTF-8），cp936 之外的代码页下菜单全是乱码，且 read 等工具无法解码。改为纯 ASCII 文案（英文），与代码页无关
+- **i18n 伪翻译白名单**：日文汉字与中文同形（如「追加」「中止」）本属正确译文，此前会被判为伪翻译；新增 JA_EQUAL_ALLOW 并逐条核对，避免为了过门禁而写出不自然的译文
+
+### 修复（核心逻辑第二轮：缓存串味 / 配音错音 / 清理误删）
+- **重启后可能灌入 demo 剧本**（P1）：stores/project.ts 的 loadCachedChapters 用正则 ^script(?:_demo)?_ch(N)_ 同时匹配演示与正式剧本，选「最新」只比 name.localeCompare —— script_demo_ch1_ 的 d > script_ch1_ 的 c，演示剧本恒胜且不校验指纹，lastResult.chapters 可能整本变成演示内容（管线侧 pipeline.ts 本有隔离，store 侧漏做）。现按当前模式过滤 demo 候选
+- **配音回退音色写进原音色的指纹文件名 → 永久错音**（P2）：speak() 落盘名恒为 job.file（指纹来自原音色），而回退分支改用了 fallbackVoice 却沿用同一文件名，下次 vocalHit 直接命中错误音频。现按本次**实际使用**的音色生成文件名
+- **全局 TTS 语速/情绪不进缓存 key**（P2）：缓存 hash 只含行级 speed/ttsEmotion，旁白传 undefined，全局值在下发时才兜底 —— 改全局语速/情绪/输出格式后旧 mp3 继续复用，改动「看起来没生效」。现把生效的全局参数纳入 hash
+- **单章「已有成品」清单与生产命名口径不一致**（P2）：清单未强制 normal、表情名未 sanitizeId，导致中文表情名恒判未完成（单章 0 计费跳过失效）、缺默认立绘时被判「完整」而跳过补图。现复用 buildImageTasks 产出的 fileName
+- **表情名未归一化 → 同长度中文表情折叠**（P2）：「微笑/大笑」消毒后都变 __，彼此静默丢弃并在渲染回退键上复用错图。现归一化即转稳定 id（与 actions/costumes 同口径），渲染/素材页统一使用
+- **视觉守门指纹全量读 + 逐字节 BigInt 哈希**（P2）：15 万字 + 20×2MB 参考图约 40MB 读入 + 数千万次 BigInt 乘，主线程卡数秒。改为非 BigInt 分块哈希、参考图只哈希长度与首尾片段、章节只哈希索引/长度/首尾
+- **尺寸校验失败即删付费图**（P2）：判定依赖 4KB 文件头，带大 EXIF/ICC 的 JPEG 其 SOF 排在 4KB 之后会被误判「尺寸不符」→ 删图重画（付费）且每次重跑重复。现把头部上限提到 64KB、区分「解析不出」与「确实不符」（解析不出不再删图），删除延后到新图写盘成功后
+- **logFile 每次 flush 全量读 + 全量写整份日志**（P2）：注释称已优化，实际只去掉了 split 开销（阈值 50 行/1s）。现按增量追加写入
+- **joinUrl 版本去重对带 query 的 base 失配**（P3）：正则跑在原始字符串上，base 形如 /paas/v4?key=x 时仍拼出 /v4/v1/... 404（B109 特意支持的带 query base 即漏网场景）。现先剥离 query/hash 再做版本段判定
+- **失败项逐条落盘 O(n²)**（P3）：批量失败时每条都整份读改写 failed.json。现合并为一次写入
+- **project_state.json 非原子写**（P3）：崩溃/断电会留下半截 JSON 并触发付费重跑。现复用 visualBible 的 tmp+replace 原子写模式
+- **Web/Node 端 imageSizeMatches 读整图**（P3）：Tauri 侧已走 read_file_header，Web/Node 仍 readFileBase64 读整图。现改为读取文件头判定
+- **hasTransparency 阈值 Web 与 Rust 差一点**（P3）：Rust 用 >5%（整数百分比）、Web 用 5% 浮点，边界图判定可能不一致。现统一为同一口径
+
 - CI 的单测类型门（`typecheck:tests`，此前 `continue-on-error` 咨询性）报 76 个历史类型腐烂（GitHub 只显示前 10 条）：`RenderAssets` 已搬到 `render.ts`、`RenderOptions` 无 `title/gameKey`、`GenerationOptions` 无 `maxConcurrent`、`ItemCard/CharacterCard/SceneJSON/CostStats` 缺字段、`.at()` 超出 lib、`check-template.mjs` 无声明、`vite.config.ts` 的 `Connect.ServerResponse` 等。已逐文件按现类型修齐（只改测试类型层，不改运行时语义，每个文件改后单跑确认输出不变），类型门现已变绿并去掉 `continue-on-error` 转为硬门禁
 
+
+### 修复（第三轮：表情 / 尺寸校验 / 失败项落盘 / 跨端一致性）
+- **中文表情名导致素材页恒显示「缺图」且互相覆盖**（#1492/#1496）：立绘差分的**文件名**用归一化 id，而表情集的**值**被原样保存并当作素材页的查找 key。AI 返回中文表情（「微笑」「大笑」）时：① key 永不匹配 → 图已生成仍显示缺图；② 两个**等长**中文词经 sanitizeId 得到**同一串下划线** → 生成任务互相覆盖、另一个被静默丢弃；③ 提示词里被塞进中文。新增 core/emotions.ts：已知情绪词映射到标准英文 id（微笑→happy 等 40+ 条），未知值用 emo_ + 稳定哈希保底（与角色名归一化同思路），提取阶段即归一化并按 id 去重、强制包含 normal、上限 10，且保证幂等
+- **imageSizeMatches 改三态后遗留两处真值判断**（#1498）：三元真值判断与取反判断在返回值变成字符串后恒为真，尺寸校验静默失效（mismatch 也被当命中）。两处改为显式比较 mismatch，并新增源码级契约测试防止复发（已验证能分别抓住三元、取反、逻辑与三种反例）
+- **单章「已有成品」清单与生产命名口径不一致**（#1493）：清单里表情名没消毒、也没强制包含 normal——中文表情恒判未完成（单章「已全部生成、0 计费跳过」永不生效），而缺默认立绘时反而被判「完整」而跳过补图。现与 buildImageTasks 逐字对齐（消毒 + 强制 normal + 按 id 去重）
+- **失败项落盘 O(n²)**（#1494）：每失败一次就整份读改写 failed.json，批量几千个失败即几千次全量 I/O。现首次失败立即落盘（保留崩溃恢复时效），500ms 窗口内的后续失败合并进同一次写，写链仍串行化
+- **桌面端与网页端透明判定阈值不一致**（#1495）：Rust 用整数除法算百分比（实际阈值是 ≥6%），Web 用浮点比（精确 5%）——5%~5.99% 的素材两端判定相反。Rust 改为整数交叉相乘，两端现在都是精确的 >5%，并补边界回归测试（5% / 5.4% / 6% / 4.9%）
+- **网页版取不到画布时把「未抠图」当成「已透明」**（#1497）：webHasTransparency 在 canvas 上下文获取失败时返回 true，调用方据此直接跳过抠图并保留绿幕——静默降级成绿底立绘。现改为抛出（与 Rust 侧 Ok/Err 语义一致），由调用方走「抠图失败保留原图 + 记日志」分支
+
+
+### 修复（第四轮：Agent 表情字段 / 看板缓存隔离）与一项实测否决
+- **Agent 扫描阶段没有 emotions 字段**（#1499）：`add_character` 工具 schema 从未声明 emotions，模型建卡时无法按剧情报表情差分，只能等后续补全阶段产出——「AI 按剧情提取角色表情集」在 Agent 模式下等于没生效（提示词却一直这么要求）。现补 schema 字段与提示词说明，并让 `mergeCharacterPatch` / `mergeCharacter` 在并集时先归一化成稳定英文 id（与立绘文件名、extract.ts 同一口径），避免中文表情绕过归一化
+- **看板把演示剧本当成正式剧本点绿**（#1501）：`countFreshScripts` 对 `script_*` 与 `script_demo_*` 两个前缀一视同仁，于是「未配置文本 API 时跑过一次演示」之后，正式模式下看板的剧本阶段会被演示缓存点亮——看板与真实产物不符（提取阶段早已按模式分离，剧本计数漏做）。现改为**单向隔离**：正式模式只认正式缓存；演示模式允许用正式缓存兜底（内容指纹已校验，有真剧本好过整章误报未完成）。`stores/project.ts` 的缓存恢复同步收紧（正式模式不再用演示剧本兜底，否则整本书会被恢复成演示内容）
+- **实测否决一项「性能优化」**（#1500）：审计怀疑 `visualBible` 指纹的逐字节 BigInt 哈希是主线程卡顿主因。实测（本机基准）BigInt 版约 **1.2 GB/s**（2MB 27ms、40MB 569ms），改成 32 位分量整数运算反而略慢（V8 的 BigInt 小整数路径已足够快）。真实开销在**文件 I/O**（每张参考图整份读入 + base64），故保留原实现——同时保证所有既有指纹逐位不变，不会因「算法变了」误判输入已变化而触发全量重画
+
+
+### 修复（第五轮：鉴赏室全坏 / 转义与分页 / 迁移清空 API Key / 导入口径）
+- **每个成品的鉴赏模式都是坏的**（#1507）：`unlockCg`/`unlockBgm` 的 content 被写成了 `game/background/x.png` 形式，但引擎在**解析期**就会给资源类指令补目录——`assets/index-*.js` 里 `case Ae.unlockCg:return r(e,Or.background)`，而 `r` 即 `yi()`：`case 0:r='./game/background/'+e`；unlock 处理器随后把 **content 本身**当 url 存进 appreciationData，鉴赏页再原样当图片/音频 src。于是实际路径变成 `./game/background/game/background/x.png` → CG 缩略图全 404、BGM 试听静音、已解锁高亮比对永不成立。第 1460 轮把它改成带目录时方向搞反了（注释断言「引擎不补目录」），本轮依据打包产物改回裸文件名，并同步修正 5 处把它固化下来的测试断言。对照：`Title_img` 走同一个 `yi()`，而 renderConfig 只写裸文件名——这就是引擎约定
+- **台词里的字面竖线被当成翻页符，静默丢字**（#1508）：引擎分页函数 `Os(text, Max_line)` 的实现是 `text.split(/(?<!\\)\|/).map(qC)`——**先按未转义竖线切段，再还原转义**。而 `esc()` 不转义 `|`，含竖线的台词（表格、分隔符）第 3 段起被 `Max_line:2` 裁掉。现在 `esc()` 补上 `|` 转义（引擎还原表里本就有 `\| → |`）
+- **「长台词自动分页」其实从未生效**（#1508）：旧写法 `esc(paginateForTextBox(x))` 把分页符也转义成 `\|`，而引擎切段发生在还原之前 → 永远只有一段，整句挤在一屏后被 `Max_line:2` 截掉。新增 `renderSpokenText()`：先按**原文长度**分页、逐页转义，再用**未转义**的 `|` 拼回分页符，使「字面竖线（`\|`）」与「分页符（`|`）」在产物里严格区分；6 处调用点统一接入
+- **配置迁移会把系统凭据库里的 API Key 全部清空**（#1504）：Rust 侧 `write_api_secrets` 把空串解释为「删除该条凭据」（其注释还写着「由 configMigration.nonEmptySecrets 保证」——而那个函数**从不存在**），`configSecrets` 又会给每个没有内联 key 的配置填 `""`，桌面分支未做非空过滤。于是只要发生过一次迁移（版本升级、重复 id 修复），keyring 条目就被逐条删除，用户界面直接显示空 Key、只能重填。现补上并导出 `nonEmptySecrets`，迁移回写与加载期批量写统一过滤；显式删除仍走 `removeConfig`/`removePreset` 的单条路径，语义不变
+- **Web/Node 端为解析图片尺寸读整张图**（#1503）：Tauri 侧早已只读文件头，Web 端退回 `readFileBase64` 会整图读入 + base64 只为取几个字节。现拿到 base64 后立刻截断到 64KB 对应的前缀（按 4 字符对齐，保证可解码），内存占用从「整图」降到几十 KB
+- **IndexedDB 写事务缺少 abort 处理 → 界面可能永久假死**（#1505）：`txPut`/`txDelete` 只挂了 `onerror`，而配额耗尽时事务在**没有 error 事件**的情况下中止（只触发 `abort`），Promise 既不 resolve 也不 reject，调用方的 `await` 永久挂起（导入页 `importing` 标志永不复位）。现补 `onabort`，并抽出 `watchTx` 供单测直接锁住三种回调路径
+- **单文件导入不做正文归一化 → 追加一章后整本付费重跑**（#1506）：多文件/追加路径都走 `normalizeNovelText`，单文件路径只去 BOM，正文仍带 `\r` 与连续空行。于是「CRLF 单文件导入 → 追加 → 重启」时 `fullText` 变化、`novelFingerprint` 失配，分章/剧本/卡片/图片缓存全部判为过期。现三条路径统一归一化，并让单文件导入与多文件路径一样拒绝空文件
+- **日志落盘改为真正的追加写入**（#1502）：此前每次 flush 都要「读全量 + 拼 + 写全量」，成本随日志体积增长。新增 Rust `append_text_file`（O_APPEND + 显式 flush）与 `appendTextFile` 包装（Web/Node 自动退化为读改写），日志侧只在累积到校验窗口时才做一次整体截断检查；追加负载的分隔规则抽成纯函数 `composeAppendPayload`，与旧实现逐字一致（首行不加前导换行、结尾不补换行）
+
+
+### 修复（第六轮：加载既有项目后无法继续生成）
+- **缺少 `project_state.json` 的既有项目完全打不开**（#1509）：`restoreProjectState` 在该文件不存在时**直接返回空状态**。但那个文件只是「上次保存时的快照」——用户把开发中的项目拷到另一台机器、只带了 `.novel2vn` 与产物、或快照被清理时，磁盘上其实还有 `split.json`（分章正文）、`cards.json`（卡片）、`meta.json`、`cache/`（剧本缓存），完全够继续生成。旧行为下加载后小说/卡片/章节全丢，生成页只剩「还没有小说」，用户无法继续未完成的部分。现改为：快照缺失也照常往下走，逐项从磁盘重建，并明确提示「已按磁盘恢复」
+- **连 `split.json` 都没有时给出章节骨架兜底**（#1509）：只拷了 `cache/` 剧本缓存或产物的项目，此前 `novel` 恒为 null、生成入口整块消失。现在用剧本缓存的章节序号建骨架（剧本正文不是原文，不能当小说正文，故只保证「逐章生成/重跑/补齐」可用），并提示「重新分章」需重新导入原文
+- **空壳 meta 覆盖了磁盘上的作品信息**（#1509）：快照缺失时 persist 层会交回一个只含 cards 的结果（meta 全空），store 侧原本把它当作有效快照直接使用，导致界面上的作品标题/章节数变成空白。现识别「空壳 meta」并回落到磁盘 `meta.json`
+
+
+### 修复（第七轮：把「项目」与「分章」搬到生成页，解决找不到的问题）
+- **「项目目录」与「AI 分章」此前只存在于「生成设置」页的 tab 里**（#1510）：用户反馈「看半天才找到分章节和导入的地方」。但这两件事恰恰发生在生成页、且发生在生成之前——必须先选定项目、再把小说切成章节，才谈得上逐章生成。现在生成页顶部新增「项目与分章」卡片：目录选择器（路径输入 + 浏览… + 加载该项目）常驻直出，分章面板默认展开（AI 分章 / 标记为已核对 / 追加新章节 / 分章意见），并在其上方直接显示分章状态标签与来源（如「待核对分章 · 分章：导入规则切分」）
+- **目录改动没有提示**：输入框内容与已加载项目不一致时，此前没有任何反馈（用户以为已经切过去了）。现在高亮「加载该项目」并提示「目录已改动：点加载该项目才会切过去」
+- **设置页不再重复动作按钮**：「生成设置 → 分章」保留纯设置项（碎章合并阈值 / 保留特殊章节），并复用同一个分章面板 + 一个「去生成页」按钮；「生成设置 → 项目」改为只显示当前项目路径 + 「去生成页切换项目」。两个地方都能操作但都找不到，比只有一个入口更糟
+
+### 已知未修（本轮已核实、明确留待后续，不静默）
+- `utils/logFile.ts` 每次 flush 仍是「读全量 + 追加 + 写全量」：Rust 侧目前没有 append 命令，新增命令会牵动 Web 版虚拟 FS 与权限模型，故本轮不动；日志文件上限 5000 行、flush 节流 50 行/1s，实际影响有限
+- `core/visualBible.ts` 的指纹计算仍会把每张参考图**整份读入并 base64**（#1500 实测：卡顿来自这部分文件 I/O，不是哈希算法——BigInt 版哈希约 1.2 GB/s，已否决替换）。要消除需要按 (路径 + 大小 + mtime) 记忆化，涉及缓存失效正确性，留待后续
+- 尺寸校验的三态改造已落地，但「Web 端无 read_file_header 等价命令」仍会让 Web 版为取尺寸读整图（Node/Tauri 已只读文件头）；补齐需要给虚拟 FS 增加分段读接口
 ### 修复（立绘改为全身构图 2026-09-18）
 - 立绘/表情/服装/动作从「半身（thighs-up）」改回「全身 head to feet」：此前代码为追求舞台人物更大而强制半身，导致角色卡生成半身照片；现提示词明确要求全身、含鞋子、不裁切
 - 人物类任务（立绘/表情/服装/动作/三视图）追加构图负面词：`half body, bust shot, waist-up, close-up, cropped head/legs/feet, out of frame`，防止模型自行裁成半身

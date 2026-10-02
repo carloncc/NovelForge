@@ -71,6 +71,22 @@ export function t(key: string, params?: Record<string, string | number>): string
   return out;
 }
 
+/**
+ * 把当前语言同步到文档级可访问性/系统集成点：
+ * - <html lang>：屏幕阅读器朗读语言、拼写检查、CJK 字体回退都依赖它。
+ *   index.html 里静态写着 zh-CN，仅靠挂载后设置会有一段首帧按中文处理。
+ * - document.title：窗口标题/任务栏在 en/ja/ko 下此前恒为中文。
+ */
+export function syncDocumentLocale(): void {
+  const code = currentLang.value;
+  try {
+    document.documentElement.lang = code;
+    document.title = t("NovelForge - AI 视觉小说转换工具");
+  } catch {
+    /* 无 DOM 环境（测试/SSR）忽略 */
+  }
+}
+
 export function useI18n() {
   return { t, currentLang, setLang, LANGS };
 }

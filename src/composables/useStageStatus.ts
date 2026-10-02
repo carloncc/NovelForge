@@ -70,12 +70,17 @@ export function useStageStatus(input: StageStatusInput) {
     return { title, text };
   }
 
-  /** 统计「与当前章节输入指纹匹配」的剧本缓存数（正式/演示前缀都认） */
+  /** 统计「与当前章节输入指纹匹配」的剧本缓存数。
+   *  #1501：demo/正式必须按当前模式优先取——与提取阶段（base.extract）和管线
+   *  （loadChaptersFiltered）的口径保持一致。旧实现"两个前缀都认"，于是未配置文本 API
+   *  时跑过一次演示之后，看板的剧本阶段会在正式模式下被演示缓存点绿（看板与真实产物不符）。
+   *  仍旧保留"另一种变体兜底"，避免只有演示缓存时整章突然显示未完成。 */
   async function countFreshScripts(
     metaDir: string,
     lang: string,
     chapters: { index: number; title: string; text?: string }[],
     styleFrag: string,
+    demo: boolean,
   ): Promise<number> {
     let names: Set<string>;
     try {
@@ -88,7 +93,15 @@ export function useStageStatus(input: StageStatusInput) {
     for (const ch of chapters) {
       const eff = await effectiveChapter(metaDir, lang, ch);
       const rest = scriptCacheRest(eff.title, eff.text, styleFrag);
-      if (names.has(`script_ch${ch.index + 1}_${rest}.json`) || names.has(`script_demo_ch${ch.index + 1}_${rest}.json`)) matched++;
+      // #1501：隔离是**单向**的。
+      // - 正式模式：演示剧本一律不算数——演示剧本是"没配文本 API 时的占位内容"，
+      //   拿它把正式项目的剧本阶段点绿，看板就与真实产物不符（这正是旧实现的 bug）。
+      // - 演示模式：正式缓存可以作为兜底（内容指纹已按当前标题/正文/画风校验过，
+      //   有真剧本总比让整章显示未完成更好）。
+      const hit = demo
+        ? names.has(`script_demo_ch${ch.index + 1}_${rest}.json`) || names.has(`script_ch${ch.index + 1}_${rest}.json`)
+        : names.has(`script_ch${ch.index + 1}_${rest}.json`);
+      if (hit) matched++;
     }
     return matched;
   }
@@ -202,7 +215,7 @@ export function useStageStatus(input: StageStatusInput) {
       const options = input.getOptions();
       return scriptFingerprint({ style: options.scriptStyle, compressNarration: options.compressNarration, cardsFp });
     })();
-    const freshScripts = await countFreshScripts(metaDir, lang, enabledChapters, styleFrag);
+    const freshScripts = await countFreshScripts(metaDir, lang, enabledChapters, styleFrag, !input.getLlmAvailable());
     if (token !== refreshToken) return;
     base.script = activeCount > 0 && freshScripts >= activeCount;
 

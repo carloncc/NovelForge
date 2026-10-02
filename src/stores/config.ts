@@ -15,6 +15,7 @@ import {
   DEFAULT_CUTOUT_SETTINGS,
   loadConfigFile,
   configSecrets,
+  nonEmptySecrets,
   serializeConfigFile,
   UnsupportedConfigVersionError,
   type ConfigFile,
@@ -196,12 +197,16 @@ async function readSecretsEntry(ids: string[]): Promise<Record<string, string>> 
 
 /** 初始加载期写（只加不删：迁移回写全是空值时不得冲掉刚迁入内存的旧明文密钥） */
 async function writeSecretsLoadPhase(secrets: Record<string, string>): Promise<void> {
+  // #1504：桌面分支此前**没有**做非空过滤，而 Rust 侧空串=删除凭据——
+  // 迁移回写里每个"没有内联 key"的配置都是 ""，于是升级一次就把系统凭据库里的 API Key 全删了。
+  // 两端的语义必须一致：批量写只加不删。
+  const nonEmpty = nonEmptySecrets(secrets);
+  if (!Object.keys(nonEmpty).length) return;
   if (useWebKeyStore()) {
-    const nonEmpty = Object.fromEntries(Object.entries(secrets).filter(([, v]) => !!v));
-    if (Object.keys(nonEmpty).length) await writeWebSecretsAsync(nonEmpty);
+    await writeWebSecretsAsync(nonEmpty);
     return;
   }
-  return tauri.writeApiSecrets(secrets);
+  return tauri.writeApiSecrets(nonEmpty);
 }
 
 export const configReady = loadPersisted();

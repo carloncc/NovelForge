@@ -836,7 +836,9 @@ async function testApprovedBibleFingerprintPreventsOldCacheBypass(): Promise<voi
   const originalSizeMatches = tauri.imageSizeMatches;
   // 模拟的生成图是 1x1 像素，无法通过 1024x1024 尺寸校验；
   // 尺寸校验通过与否由 imageSizeMatches 负责，这里模拟为一致，聚焦指纹绑定对缓存生效的控制。
-  tauri.imageSizeMatches = async () => true;
+  // #1489：imageSizeMatches 改为三态（ok/mismatch/unknown）——unknown 表示"读不出尺寸"，
+  // 调用方不再据此删图。这里模拟"尺寸一致"。
+  tauri.imageSizeMatches = async () => "ok" as const;
   tauri.http = async () => {
     requestCount++;
     return {
@@ -959,7 +961,7 @@ async function testWrongSizeCacheIsRegeneratedInsteadOfSkipped(): Promise<void> 
   let requestCount = 0;
   const originalHttp = tauri.http;
   const originalSizeMatches = tauri.imageSizeMatches;
-  tauri.imageSizeMatches = async () => false; // 尺寸不符 → 缓存作废
+  tauri.imageSizeMatches = async () => "mismatch" as const; // 尺寸不符 → 缓存作废并重新生成
   tauri.http = async () => {
     requestCount++;
     return {

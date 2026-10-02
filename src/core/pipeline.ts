@@ -81,6 +81,13 @@ export interface PipelineInput {
   append?: { baseFullText: string; tailText: string };
 }
 
+/**
+ * #1494：失败项落盘合并窗口。
+ * 批量失败时旧实现"每次失败都整份读改写 failed.json"→ O(n²) 磁盘 I/O；
+ * 现在首次失败立刻落盘（保留崩溃恢复时效），窗口内的后续失败合并进一次写。
+ */
+const NF_PIPELINE_FAILED_TASKS_FLUSH_MS = 500;
+
 const DEFAULT_PRICES = {
   llmInYuanPer1m: 2,
   llmOutYuanPer1m: 8,
@@ -496,6 +503,11 @@ export class Pipeline {
   private appendedIndexes: number[] = [];
   /** 纯追加模式新增章节的原始章节（分章时记录；B07 提取前按目标语言取译文用，保证新旧卡同源） */
   private appendedRawChapters: ChapterInfo[] = [];
+  /** #1494：失败项落盘合并窗口——批量失败时把 N 次「读全文 + 写全文」压成常数次。
+   *  旧实现每次失败都整份读改写 failed.json，一批几千个失败即 O(n²) 磁盘 I/O。
+   *  语义保持"首次失败立即落盘"（崩溃/重启仍能恢复），窗口内的后续失败合并进同一次写。 */
+  private failedTasksFlushTimer?: ReturnType<typeof setTimeout>;
+  private failedTasksFlushChain: Promise<void> = Promise.resolve();
 
   constructor(private input: PipelineInput) {}
 
@@ -515,8 +527,8 @@ export class Pipeline {
       taskId: f.id,
       taskKind: f.kind,
     });
-    // 增量落盘：中断/崩溃/重启后「失败项」仍可恢复
-    void this.persistFailedTasks();
+    // 增量落盘：中断/崩溃/重启后「失败项」仍可恢复（#1494：批量失败时按窗口合并写） */
+    this.scheduleFailedTasksPersist();
   }
 
   /** 当前失败的只读快照（供中止/异常路径回填 UI，避免失败列表丢失） */
@@ -529,16 +541,46 @@ export class Pipeline {
     return this.succeededTaskIds.has(f.id);
   }
 
+  /** 合并而非覆盖：保留历史失败项（未在本次成功的），避免"任何一次无关的成功运行"把失败列表清空；
+   *  本次成功的任务从列表移除（失败项只在真正修复成功后才消失）。串行化在 mutateFailedTasks 内保证。 */
+  private writeFailedTasksNow(): Promise<void> {
+    this.failedTasksFlushChain = this.failedTasksFlushChain.then(async () => {
+      try {
+        await mutateFailedTasks(this.input.outputDir, (prev) => [
+          ...prev.filter((f) => !this.wasSucceeded(f) && !this.failedTasks.some((n) => failedTaskIdentity(n) === failedTaskIdentity(f))),
+          ...this.failedTasks,
+        ]);
+      } catch {
+        /* 失败列表落盘失败不阻断 */
+      }
+    });
+    return this.failedTasksFlushChain;
+  }
+
+  /** 立即落盘（首次失败 / 收尾调用）：保证崩溃、强制退出后失败项仍在 */
   private async persistFailedTasks(): Promise<void> {
-    try {
-      // 合并而非覆盖：保留历史失败项（未在本次成功的），避免"任何一次无关的成功运行"把失败列表清空；
-      // 本次成功的任务从列表移除（失败项只在真正修复成功后才消失）
-      await mutateFailedTasks(this.input.outputDir, (prev) => [
-        ...prev.filter((f) => !this.wasSucceeded(f) && !this.failedTasks.some((n) => failedTaskIdentity(n) === failedTaskIdentity(f))),
-        ...this.failedTasks,
-      ]);
-    } catch {
-      /* 失败列表落盘失败不阻断 */
+    this.clearFailedTasksFlushTimer();
+    await this.writeFailedTasksNow();
+  }
+
+  /** 合并窗口内的落盘：批量失败时把每次失败一次写盘压成每窗口一次 */
+  private scheduleFailedTasksPersist(): void {
+    // 首个失败立即写盘（保留原有的崩溃恢复时效），并开启合并窗口吸收紧接着的批量失败
+    if (this.failedTasksFlushTimer === undefined) {
+      void this.writeFailedTasksNow();
+      this.failedTasksFlushTimer = setTimeout(() => {
+        this.failedTasksFlushTimer = undefined;
+        void this.writeFailedTasksNow();
+      }, NF_PIPELINE_FAILED_TASKS_FLUSH_MS);
+      return;
+    }
+    // 窗口内：不重复排队，等窗口到期的那次写统一落盘（列表是实时快照，不会漏）
+  }
+
+  private clearFailedTasksFlushTimer(): void {
+    if (this.failedTasksFlushTimer !== undefined) {
+      clearTimeout(this.failedTasksFlushTimer);
+      this.failedTasksFlushTimer = undefined;
     }
   }
 

@@ -243,6 +243,19 @@ async function writeTextFallback(path: string, content: string): Promise<void> {
   await fs.writeFile(path, content, "utf-8");
 }
 
+/** 追加写入的兜底实现：无 append 能力的后端退化为「读 + 拼 + 写」。
+ *  Rust 桌面版有真正的 O_APPEND（append_text_file），Web/Node 走这里。 */
+async function appendTextFallback(path: string, content: string): Promise<void> {
+  if (isWebRuntime()) {
+    const web = await webRuntime();
+    const existing = await web.webReadTextFile(path).catch(() => ({ text: "" }));
+    return web.webWriteTextFile(path, existing.text + content);
+  }
+  const fs = await import("node:fs/promises");
+  await fs.mkdir(path.substring(0, path.lastIndexOf("/")), { recursive: true });
+  await fs.appendFile(path, content, "utf-8");
+}
+
 async function readFileBase64Fallback(path: string): Promise<string> {
   if (isWebRuntime()) return (await webRuntime()).webReadFileBase64(path);
   const fs = await import("node:fs/promises");
@@ -404,6 +417,12 @@ export const tauri = {
   writeTextFile: wrap("writeTextFile", (path: string, content: string): Promise<void> => {
     if (isTauri()) return invoke("write_text_file", { path, content });
     return writeTextFallback(path, content);
+  }),
+  /** #1502：追加写入。日志落盘用它取代「读全量 + 写全量」，成本与新增行数成正比。
+   *  无 append 能力的后端自动退化为读改写。 */
+  appendTextFile: wrap("appendTextFile", (path: string, content: string): Promise<void> => {
+    if (isTauri()) return invoke("append_text_file", { path, content });
+    return appendTextFallback(path, content);
   }),
   readFileBase64: wrap("readFileBase64", (path: string): Promise<string> => {
     if (isTauri()) return invoke("read_file_base64", { path });
@@ -581,27 +600,40 @@ export const tauri = {
   }),
   /** 判断图片文件尺寸是否匹配目标宽高（读 PNG/JPEG/WebP/GIF 文件头）
    *  B85：Tauri 环境改用 read_file_header 只读文件头（旧实现 readFileBase64 会把整张图
-   *  读入内存并 base64 编码，只为解析 4 字节宽高）；Web/Node 无对应命令，回退 readFileBase64。 */
-  imageSizeMatches: wrap("imageSizeMatches", async (path: string, targetWidth: number, targetHeight: number): Promise<boolean> => {
-    try {
-      let buf: Uint8Array;
-      if (isTauri()) {
-        // 4KB 足以覆盖典型文件头；JPEG 的 SOF 段可能排在 EXIF(APP1) 之后，512B 有漏判风险。
-        // Rust 侧对 maxBytes 封顶 64KB，绝不会把整文件读进来。
-        const header = (await invoke("read_file_header", { path, maxBytes: 4096 })) as { base64?: string };
-        buf = header.base64 ? base64ToBuffer(header.base64) : new Uint8Array();
-      } else {
-        buf = base64ToBuffer(await tauri.readFileBase64(path));
+   *  读入内存并 base64 编码，只为解析 4 字节宽高）；Web/Node 无对应命令，回退 readFileBase64。
+   *
+   *  #1489：返回值从 boolean 改为三态。旧实现把「解析不出尺寸」与「尺寸确实不符」都返回 false，
+   *  调用方据此直接删掉缓存图并重新生成——而带大 EXIF/ICC 的 JPEG 其 SOF 段排在 4KB 之后，
+   *  「解析不出」会被误判成「尺寸不符」，于是**已付费的图被反复删除重画**。现在把两种情形分开：
+   *  - mismatch：确实能解析出尺寸且与要求不符 → 可安全重新生成
+   *  - unknown ：读不出/解析不出（含上限外的文件头）→ 保留既有图片，不当作损坏 */
+  imageSizeMatches: wrap(
+    "imageSizeMatches",
+    async (path: string, targetWidth: number, targetHeight: number): Promise<"ok" | "mismatch" | "unknown"> => {
+      try {
+        let buf: Uint8Array;
+        if (isTauri()) {
+          // 64KB：JPEG 的 SOF 段可能排在 EXIF(APP1)/ICC(APP2) 之后，4KB 会漏判（Rust 侧封顶 64KB，
+          // 绝不会把整文件读进来）。
+          const header = (await invoke("read_file_header", { path, maxBytes: 65536 })) as { base64?: string };
+          buf = header.base64 ? base64ToBuffer(header.base64) : new Uint8Array();
+        } else {
+          // #1503：Web/Node 没有 read_file_header，此前退回 readFileBase64 会**把整张图读进来**，
+          // 只为解析头部几个字节（Tauri 侧早已改成只读文件头）。这里在拿到 base64 之后立刻截断：
+          // 头部最多需要 64KB，按 base64 的 4/3 比例取对应字符数（并对齐到 4 的倍数，
+          // 避免截在半路让解码器报错）。内存占用从「整图」降到「56KB 字符串」。
+          const raw = await tauri.readFileBase64(path);
+          buf = base64ToBuffer(sliceBase64Head(raw, IMAGE_HEADER_BYTES));
+        }
+        const size = detectImageSize(buf);
+        if (!size) return "unknown";
+        return size.width === targetWidth && size.height === targetHeight ? "ok" : "mismatch";
+      } catch {
+        // 读取失败：无法证明图片有问题，按 unknown 处理（绝不据此删图）
+        return "unknown";
       }
-      const size = detectImageSize(buf);
-      // 无法识别/解析失败 → 不合格（触发重生成）。旧实现一律放行，会让尺寸错误但文件名
-      // 命中的缓存图被当成合格复用。
-      return size !== null && size.width === targetWidth && size.height === targetHeight;
-    } catch {
-      // 读取失败同样视为不合格（文件缺失/损坏本就该重新生成）
-      return false;
-    }
-  }),
+    },
+  ),
   cutoutModelStatus: wrap("cutoutModelStatus", (modelId: string, filename: string): Promise<CutoutModelStatus> => {
     if (isTauri()) return invoke("model_download_status", { modelId, filename }).then((r) => r as CutoutModelStatus);
     if (isWebRuntime()) return webRuntime().then((web) => web.webCutoutModelStatus(modelId, filename));
@@ -625,6 +657,24 @@ export const tauri = {
     return Promise.resolve();
   }),
 };
+
+/** 解析图片尺寸所需的最大头部字节数（与 Rust 侧 read_file_header 的封顶一致） */
+const IMAGE_HEADER_BYTES = 65536;
+
+/**
+ * 从 base64 字符串中截出「足够解析文件头」的前缀（#1503）。
+ * - 每 3 字节编码成 4 个字符，故前缀字符数 = ceil(bytes / 3) * 4；
+ * - 必须先按 4 的倍数对齐再交给解码器，否则末尾是不完整 quartet，解码会抛错或丢字节。
+ */
+export function sliceBase64Head(b64: string, bytes: number): string {
+  if (!b64) return b64;
+  const chars = Math.ceil(bytes / 3) * 4;
+  // bytes<=0（非正上限）时不做截断：截成空串会让调用方以为"文件是空的"，
+  // 反而制造出比"多读一点"更糟的误判。
+  if (chars <= 0 || b64.length <= chars) return b64;
+  return b64.slice(0, chars - (chars % 4));
+}
+
 
 /**
  * 目标 zip 是否位于源目录内部（#1116）：桌面版把包存到项目目录里时，Rust 先创建 zip 再遍历源目录，

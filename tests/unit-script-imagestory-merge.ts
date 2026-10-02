@@ -15,6 +15,12 @@ function assert(cond: boolean, msg: string): void {
 const dlg = (text: string, characterId = "alice"): Line => ({ type: "dialogue", characterId, emotion: "normal", text });
 const nar = (text: string): Line => ({ type: "narration", text });
 
+/** Line 是 DialogueLine | NarrationLine 的联合，characterId 只在对话分支上存在。
+ *  直接用 r.lines[0].characterId 会 TS2339（tests 类型门是硬门禁）。这里用类型守卫收窄。 */
+function speakerOf(line: Line): string | undefined {
+  return line.type === "dialogue" ? line.characterId : undefined;
+}
+
 /* ---------- 1) 纯标点判定 ---------- */
 assert(isPunctuationOnlyText("！！！"), "！！！应判纯标点");
 assert(isPunctuationOnlyText("……？！"), "……？！应判纯标点");
@@ -31,7 +37,7 @@ assert(!isPunctuationOnlyText("   "), "空白行不算（上游过滤）");
   const r = mergePunctuationOnlyLines([dlg("你先走"), dlg("！！！"), dlg("我断后", "bob")]);
   assert(r.lines.length === 2, `应剩 2 行，实际 ${r.lines.length}`);
   assert(r.lines[0].text === "你先走！！！", `应缀尾，实际 ${r.lines[0].text}`);
-  assert(r.lines[0].characterId === "alice", "宿主行说话人不变");
+  assert(speakerOf(r.lines[0]) === "alice", "宿主行说话人不变");
   assert(r.lines[1].text === "我断后", "后行不动");
   assert(r.merged === 1, "应计 1 句合并");
 }

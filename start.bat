@@ -5,33 +5,33 @@ cd /d "%ROOT%"
 
 echo.
 echo ==========================================
-echo   NovelForge 启动 / 打包脚本
+echo   NovelForge launcher / packaging script
 echo ==========================================
 echo.
 
 :menu
 echo.
-echo 请选择操作:
-echo   [1] 启动开发环境 (pnpm tauri dev)
-echo   [2] 打包安装程序 (tauri build)
-echo   [3] 仅编译,不打包 (tauri build --no-bundle)
-echo   [4] 安装依赖 (pnpm install)
-echo   [q] 退出
+echo Choose an action:
+echo   [1] Start dev environment (pnpm tauri dev)
+echo   [2] Package installer (tauri build)
+echo   [3] Compile only, no bundle (tauri build --no-bundle)
+echo   [4] Install dependencies (pnpm install)
+echo   [q] Quit
 echo.
-set /p choice=请输入数字后回车:
+set /p choice=Enter a number and press Enter: 
 if "%choice%"=="1" goto dev
 if "%choice%"=="2" goto package
 if "%choice%"=="3" goto build
 if "%choice%"=="4" goto install
 if /i "%choice%"=="q" goto end
-echo 无效输入,请重试.
+echo Invalid input, please try again.
 goto menu
 
 :dev
 call :check_deps || goto :end
 call :ensure_install
 echo.
-echo 启动开发环境, Ctrl+C 退出...
+echo Starting dev environment, press Ctrl+C to exit...
 pnpm tauri dev
 goto end
 
@@ -39,11 +39,11 @@ goto end
 call :check_deps || goto :end
 call :ensure_install
 echo.
-echo 正在打包安装程序...
+echo Packaging installer...
 pnpm tauri build
 if errorlevel 1 goto fail
 echo.
-echo [OK] 打包完成! 产物位于: src-tauri\target\release\bundle\
+echo [OK] Package complete. Artifacts: src-tauri\target\release\bundle\
 start "" "src-tauri\target\release\bundle"
 goto end
 
@@ -51,54 +51,54 @@ goto end
 call :check_deps || goto :end
 call :ensure_install
 echo.
-echo 正在编译(不打包)...
+echo Compiling (no bundle)...
 pnpm tauri build --no-bundle
 if errorlevel 1 goto fail
 echo.
-echo [OK] 编译完成! exe 位于: src-tauri\target\release\NovelForge.exe
+echo [OK] Compile complete. exe: src-tauri\target\release\NovelForge.exe
 goto end
 
 :install
 call :check_deps || goto :end
 call :ensure_install
 echo.
-echo [OK] 依赖安装完成.
+echo [OK] Dependencies installed.
 goto end
 
 :check_deps
 where pnpm >nul 2>nul
 if errorlevel 1 (
-    echo [ERROR] 未找到 pnpm, 请先安装: npm install -g pnpm
+    echo [ERROR] pnpm not found. Install it first: npm install -g pnpm
     exit /b 1
 )
 where cargo >nul 2>nul
 if errorlevel 1 (
-    echo [ERROR] 未找到 cargo, 请先安装 Rust: https://rustup.rs
+    echo [ERROR] cargo not found. Install Rust first: https://rustup.rs
     exit /b 1
 )
 where node >nul 2>nul
 if errorlevel 1 (
-    echo [ERROR] 未找到 node, 请先安装 Node.js
+    echo [ERROR] node not found. Install Node.js first.
     exit /b 1
 )
 exit /b 0
 
 :ensure_install
 if not exist node_modules (
-    echo 首次运行, 安装前端依赖...
+    echo First run: installing frontend dependencies...
     call pnpm install
     if errorlevel 1 (
-        echo [ERROR] 依赖安装失败.
+        echo [ERROR] Dependency installation failed.
         exit /b 1
     )
 ) else (
-    echo node_modules 已存在, 跳过安装.
+    echo node_modules found, skipping install.
 )
 exit /b 0
 
 :fail
 echo.
-echo [ERROR] 执行失败, 请查看上方错误信息.
+echo [ERROR] Command failed. See the error output above.
 goto end
 
 :end

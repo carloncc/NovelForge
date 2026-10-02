@@ -156,7 +156,11 @@ async function main(): Promise<void> {
 
   const originalWriteTextFile = tauri.writeTextFile;
   tauri.writeTextFile = async (path, content) => {
-    if (path.endsWith("/.novel2vn/project_state.json")) throw new Error("injected project-state write failure");
+    // #1490：project_state.json 已改为原子写（先写 <.tmp> 再 replace），注入点必须同时覆盖
+    // 临时文件与实际落盘路径，否则这个用例会因为「拦截的路径不再被写」而假通过/假失败。
+    if (path.endsWith("/.novel2vn/project_state.json") || path.endsWith("/.novel2vn/project_state.json.tmp")) {
+      throw new Error("injected project-state write failure");
+    }
     return originalWriteTextFile(path, content);
   };
   try {
@@ -196,7 +200,10 @@ async function main(): Promise<void> {
   assert(projectState.lastResult?.chapters.length === 2, "structurally invalid chapter caches must be skipped");
 
   tauri.writeTextFile = async (path, content) => {
-    if (path.endsWith("/.novel2vn/project_state.json")) throw new Error("visible project-state failure");
+    // #1490：同样要覆盖原子写的临时文件路径
+    if (path.endsWith("/.novel2vn/project_state.json") || path.endsWith("/.novel2vn/project_state.json.tmp")) {
+      throw new Error("visible project-state failure");
+    }
     return originalWriteTextFile(path, content);
   };
   try {

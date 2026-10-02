@@ -153,6 +153,55 @@ async function restoreNovelFromSplitCache(
   };
 }
 
+/**
+ * #1509：连 split.json 都没有时的最后一层兜底——从剧本缓存（.novel2vn/cache/script_*.json）
+ * 重建章节骨架。
+ *
+ * 为什么需要：用户把"开发到一半"的项目拷来/换机器，或分章缓存被清掉时，磁盘上往往还留着
+ * cards.json、meta.json、cache/ 里的剧本与素材。旧实现此时让 novel 保持 null，
+ * 生成页整块入口消失（只剩「还没有小说」），明明有产物却无法继续。
+ * 这里只用章节标题+序号建骨架（剧本正文不是原文，不能当小说正文），
+ * 让「逐章生成/重跑/补齐」这些按章操作能继续；依赖原文的「重新分章」仍会提示重新导入。
+ */
+async function restoreNovelFromScriptCache(outputDir: string): Promise<NovelDoc | null> {
+  let names: string[] = [];
+  try {
+    const entries = await tauri.listDir(`${outputDir}/.novel2vn/cache`);
+    names = entries.filter((entry) => !entry.isDir).map((entry) => entry.name);
+  } catch {
+    return null;
+  }
+  const byChapter = new Map<number, string>();
+  for (const name of names) {
+    const match = name.match(/^script(_demo)?_ch(\d+)_(.+)\.json$/);
+    if (!match) continue;
+    const chapterNumber = Number(match[2]);
+    // 同一章可能有多个指纹版本：保留标题更"厚"的那个（标题为空的旧缓存让位给有标题的）
+    const rest = match[3];
+    const current = byChapter.get(chapterNumber);
+    if (!current || rest.length > current.length) byChapter.set(chapterNumber, rest);
+  }
+  if (!byChapter.size) return null;
+  const indexes = [...byChapter.keys()].sort((a, b) => a - b);
+  const chapters: ChapterInfo[] = indexes.map((chapterNumber, position) => {
+    const text = `（第 ${chapterNumber} 章：分章缓存缺失，仅保留章节骨架；可重新导入小说以恢复原文）`;
+    return {
+      index: position,
+      title: `第 ${chapterNumber} 章`,
+      text,
+      charCount: text.length,
+      enabled: true,
+    };
+  });
+  return {
+    fileName: "已生成项目",
+    sourcePath: "",
+    encoding: "utf-8",
+    fullText: chapters.map((chapter) => chapter.text).join("\n\n"),
+    chapters,
+  };
+}
+
 export async function saveProjectState(state: {
   novel: NovelDoc | null;
   materials: MaterialAsset[];
@@ -215,7 +264,14 @@ export async function saveProjectState(state: {
       cards: withoutInlineReferences(state.lastResult.cards),
     };
   }
-  await tauri.writeTextFile(stateFile(state.outputDir), JSON.stringify(persistedState, null, 2));
+  // #1490：project_state.json 改为原子写（写 .tmp 再 replace）。
+  // 直接写目标文件时，崩溃/断电会留下半截 JSON——恢复侧解析失败等于「项目状态全丢」，
+  // 用户重新生成一次就是真金白银的重跑。replacePath 在 Tauri/Web/Node 三端都已实现，
+  // 且 Rust 侧 replace_path 自带备份与回滚（与写图像清单一一致的做法）。
+  const target = stateFile(state.outputDir);
+  const temporary = `${target}.tmp`;
+  await tauri.writeTextFile(temporary, JSON.stringify(persistedState, null, 2));
+  await tauri.replacePath(temporary, target);
 }
 
 function withoutInlineReferences(cards: ExtractionResult): ExtractionResult {
@@ -245,9 +301,19 @@ export async function restoreProjectState(outputDir: string): Promise<{
     warnings: loadedBible.warnings,
   };
   try {
-    if (!(await tauri.pathExists(stateFile(outputDir)))) return empty;
-    const { text } = await tauri.readTextFile(stateFile(outputDir));
-    const persistedState = parsePersistedState(JSON.parse(text));
+    // #1509：没有 project_state.json 时**不能**直接返回空状态。
+    // 该文件只是"上次保存时的快照"：用户把开发中的项目目录拷到另一台机器、只带了 .novel2vn
+    // 与产物、或快照因任何原因缺失时，磁盘上其实还有 split.json（分章正文）、cards.json（卡片）、
+    // meta.json、cache/（剧本缓存）——完全够继续生成。旧实现在这里直接 return empty，
+    // 于是「加载该项目/导入项目」后小说、卡片、章节全丢，只剩一句「还没有小说」，
+    // 用户无法继续未完成的部分。现改为：快照缺失也照常往下走，逐项从磁盘重建。
+    let persistedState: PersistedState = { materials: [], outputDir } as unknown as PersistedState;
+    let hasStateSnapshot = false;
+    if (await tauri.pathExists(stateFile(outputDir))) {
+      const { text } = await tauri.readTextFile(stateFile(outputDir));
+      persistedState = parsePersistedState(JSON.parse(text));
+      hasStateSnapshot = true;
+    }
 
     let novel: NovelDoc | null = null;
     let importError: string | undefined;
@@ -296,6 +362,7 @@ export async function restoreProjectState(outputDir: string): Promise<{
     // 源文件缺失/不可读（重命名、移动、清理过下载目录，或导入时就没有真实路径）时，
     // 用分章缓存把小说重建出来，而不是让重启后的生成页丢掉整个「按章节生成」入口。
     let novelRestoredFromSplitCache = false;
+    let novelRestoredFromScriptCache = false;
     if (!novel) {
       novel = await restoreNovelFromSplitCache(
         outputDir,
@@ -304,6 +371,12 @@ export async function restoreProjectState(outputDir: string): Promise<{
         persistedState.novel?.chapters,
       );
       novelRestoredFromSplitCache = !!novel;
+      // #1509：连 split.json 都没有（只拷了 cache/ 剧本缓存或产物）时，再用剧本缓存的章节正文兜一层。
+      // 这些都是"开发到一半"的项目，novel 为 null 会让整个生成页失去入口。
+      if (!novel) {
+        novel = await restoreNovelFromScriptCache(outputDir);
+        novelRestoredFromScriptCache = !!novel;
+      }
     }
 
     const warnings = [...loadedBible.warnings];
@@ -352,11 +425,41 @@ export async function restoreProjectState(outputDir: string): Promise<{
       }
     }
 
+    // #1509：没有 project_state.json 时，把磁盘上的工作副本（cards.json）补进 lastResult，
+    // 否则「单阶段重跑 / 素材页 / 视觉守门」拿不到卡片而整块不可用——正是「无法继续未完成部分」的直接原因。
+    // 这里只补 cards（类型允许的字段）；meta 由调用方（stores/project.ts）在快照缺失时用磁盘 meta.json 兜底。
+    // #1509：快照缺失但磁盘上有工作副本（cards.json）时，把它交回上层，
+    // 让「单阶段重跑 / 素材页 / 视觉守门 / 章节生成」都有卡片可用（否则这些面板整块不可用）。
+    // meta 用空壳占位，上层 store 会用磁盘 meta.json 兜底补全。
+    const restoredResult = persistedState.lastResult
+      ? { ...persistedState.lastResult, cards: workingCards ?? persistedState.lastResult.cards }
+      : !hasStateSnapshot && workingCards
+        ? {
+            meta: {
+              title: "",
+              gameKey: "",
+              chapterCount: 0,
+              charCount: 0,
+              sceneCount: 0,
+              lineCount: 0,
+              outputDir,
+              webgalVersion: "",
+              generatedAt: "",
+            },
+            cards: workingCards,
+            cost: { llmTokens: 0, imageCount: 0, ttsChars: 0, llmCostYuan: 0, imageCostYuan: 0, ttsCostYuan: 0 },
+          }
+        : null;
+    if (!hasStateSnapshot && restoredResult) {
+      warnings.push(
+        "缺少项目状态快照（project_state.json），已按磁盘上的卡片与分章缓存恢复：生成内容可继续使用，但素材列表与部分生成选项需要重新确认",
+      );
+    }
     return {
       novel,
       materials: persistedState.materials ?? [],
       options: persistedState.options ?? null,
-      lastResult: persistedState.lastResult ?? null,
+      lastResult: restoredResult,
       visualBible,
       warnings,
     };

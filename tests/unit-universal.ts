@@ -91,6 +91,17 @@ async function main(): Promise<void> {
     joinUrl("https://api.test.com/api?key=1", "/v1/images/generations") === "https://api.test.com/api/v1/images/generations?key=1",
     `带 query 的 joinUrl 错误: ${joinUrl("https://api.test.com/api?key=1", "/v1/images/generations")}`,
   );
+  // #1491 回归：base 的**版本段在 query 之前**（如 /paas/v4?key=…，智谱预设的真实形态）时，
+  // 版本去重仍须生效，否则拼出 /paas/v4/v1/... 直接 404。
+  assert(
+    joinUrl("https://open.bigmodel.cn/api/paas/v4?key=1", "/v1/images/generations") ===
+      "https://open.bigmodel.cn/api/paas/v4/images/generations?key=1",
+    `版本段在 query 之前时未去重: ${joinUrl("https://open.bigmodel.cn/api/paas/v4?key=1", "/v1/images/generations")}`,
+  );
+  assert(
+    joinUrl("https://api.test.com/v1", "/v1/chat/completions") === "https://api.test.com/v1/chat/completions",
+    "base 带版本段时不应拼成 /v1/v1",
+  );
   assert(
     normalizeProviderBaseUrl("https://api.test.com/v1beta?key=1") === "https://api.test.com/v1beta?key=1",
     "通用适配器 base 的 query 应保留",

@@ -1,9 +1,33 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 import { computed, watch } from "vue";
 import { t } from "../../../i18n";
 import { projectState } from "../../../stores/project";
 import LazyThumb from "../../LazyThumb.vue";
 import { useGenerateController } from "../../../stores/generate";
+import { confirmDialog } from "../../../composables/useConfirmDialog";
+
+/**
+ * #1484：缩略图「点击放大」此前只是 `div + @click`，没有 role/tabindex/keydown，
+ * 键盘与读屏用户完全用不了大图预览（项目自身在 styles.css 里把头部 div 改成原生 button
+ * 就是为了这个，缩略图漏掉了）。这里不能直接换成 <button>——缩略图内部嵌了复选框、
+ * <details>/<summary> 与操作按钮，button 里嵌交互元素是非法 HTML、会破坏点击与读屏。
+ * 故保留 div，补上 role=button / tabindex / Enter+Space 键处理，并只在真的有图可预览时
+ * 才暴露为可操作（缺图时是纯展示，不该被 Tab 到、也不该被念成按钮）。
+ */
+function thumbA11y(file: string | undefined, label: string): Record<string, unknown> {
+  if (!file) return {};
+  return {
+    role: "button",
+    tabindex: "0",
+    "aria-label": label,
+    onKeydown: (e: KeyboardEvent) => {
+      if (e.key !== "Enter" && e.key !== " ") return;
+      // 空格默认会滚动页面，必须阻止
+      e.preventDefault();
+      openPreview(file, label);
+    },
+  };
+}
 
 // 结果区子面板：状态全部来自 generate store。
 const {
@@ -71,14 +95,14 @@ const {
 const regenLocked = computed(() => busy.value || queueRunning.value || !!assetBusy.value);
 
 /** 批量付费动作补二次确认：与配音/清理等批量动作对齐，误点一次可能烧掉十几张图 */
-function confirmRegenAllFigure(id: string, name: string): void {
+async function confirmRegenAllFigure(id: string, name: string): Promise<void> {
   if (regenLocked.value) return;
-  if (!window.confirm(t("将重新生成「{name}」的全部表情（多张付费图）。继续吗？", { name }))) return;
+  if (!(await confirmDialog({ title: t("将重新生成「{name}」的全部表情（多张付费图）。继续吗？", { name }), tone: "danger" }))) return;
   regenAllFigure(id);
 }
-function confirmRegenThreeView(id: string, name: string): void {
+async function confirmRegenThreeView(id: string, name: string): Promise<void> {
   if (regenLocked.value) return;
-  if (!window.confirm(t("将重新生成「{name}」的三视图，并联动重画其立绘/表情/动作/服装（多张付费图）。继续吗？", { name }))) return;
+  if (!(await confirmDialog({ title: t("将重新生成「{name}」的三视图，并联动重画其立绘/表情/动作/服装（多张付费图）。继续吗？", { name }), tone: "danger" }))) return;
   regenThreeView(id);
 }
 
@@ -170,14 +194,28 @@ watch(assetTab, () => {
             <button class="btn secondary small" :disabled="regenLocked" @click="confirmRegenAllFigure(row.id, row.name)">{{ t("重新生成全部表情") }}</button>
           </div>
           <div class="asset-thumb-row">
-            <div v-if="row.threeView" class="asset-thumb" :title="t('三视图（点击放大；有参考图时将基于参考图生成）')" @click="openPreview(row.threeView, `${row.name} · 三视图`)">
+            <div
+              v-if="row.threeView"
+              class="asset-thumb"
+              :title="t('三视图（点击放大；有参考图时将基于参考图生成）')"
+              v-bind="thumbA11y(row.threeView, `${row.name} · ${t('三视图')}`)"
+              @click="openPreview(row.threeView, `${row.name} · 三视图`)"
+            >
               <label class="asset-sel" @click.stop><input type="checkbox" :aria-label="`${row.name} · ${t('三视图')}`" :checked="selected.has(`threeview:${row.id}`)" @change="toggleSelect(`threeview:${row.id}`)" /></label>
               <LazyThumb :path="row.threeView" :alt="t('三视图')" />
               <span class="thumb-label">{{ t("三视图") }}</span>
               <!-- #1122：缩略图操作收敛（最小折叠方案）：常驻只留复选框，「抠图」收进折叠菜单，点击不触发放大 -->
               <details class="thumb-ops" @click.stop><summary>{{ t("操作") }}</summary><button class="btn ghost small" :disabled="regenLocked" @click.stop="reCutout('figure', `${row.id}_threeview`, row.threeView)">{{ t("抠图") }}</button></details>
             </div>
-            <div v-for="e in row.emotions" :key="e.emo" class="asset-thumb" :class="{ missing: !e.file }" :title="`${EMOTION_LABELS[e.emo] ?? e.emo}（点击放大）`" @click="e.file && openPreview(e.file, `${row.name} · ${EMOTION_LABELS[e.emo] ?? e.emo}`)">
+            <div
+              v-for="e in row.emotions"
+              :key="e.emo"
+              class="asset-thumb"
+              :class="{ missing: !e.file }"
+              :title="`${EMOTION_LABELS[e.emo] ?? e.emo}（点击放大）`"
+              v-bind="thumbA11y(e.file, `${row.name} · ${EMOTION_LABELS[e.emo] ?? e.emo}`)"
+              @click="e.file && openPreview(e.file, `${row.name} · ${EMOTION_LABELS[e.emo] ?? e.emo}`)"
+            >
               <label class="asset-sel" @click.stop><input type="checkbox" :aria-label="`${row.name} · ${EMOTION_LABELS[e.emo] ?? e.emo}`" :checked="selected.has(`figure:${row.id}:${e.emo}`)" @change="toggleSelect(`figure:${row.id}:${e.emo}`)" /></label>
               <LazyThumb v-if="e.file" :path="e.file" :alt="EMOTION_LABELS[e.emo] ?? e.emo" />
               <span class="thumb-label">{{ EMOTION_LABELS[e.emo] ?? e.emo }}</span>
@@ -190,7 +228,15 @@ watch(assetTab, () => {
           </div>
           <div v-if="row.costumes.length" style="border-top: 1px dashed var(--border); margin-top: 8px; padding-top: 8px">
             <div class="asset-thumb-row">
-              <div v-for="ct in row.costumes" :key="ct.id" class="asset-thumb" :class="{ missing: !ct.file }" :title="`${ct.name}（点击放大）`" @click="ct.file && openPreview(ct.file, `${row.name} · ${ct.name}`)">
+              <div
+                v-for="ct in row.costumes"
+                :key="ct.id"
+                class="asset-thumb"
+                :class="{ missing: !ct.file }"
+                :title="`${ct.name}（点击放大）`"
+                v-bind="thumbA11y(ct.file, `${row.name} · ${ct.name}`)"
+                @click="ct.file && openPreview(ct.file, `${row.name} · ${ct.name}`)"
+              >
                 <label class="asset-sel" @click.stop><input type="checkbox" :aria-label="`${row.name} · ${ct.name}`" :checked="selected.has(`figure:${row.id}:ct_${ct.id}`)" @change="toggleSelect(`figure:${row.id}:ct_${ct.id}`)" /></label>
                 <LazyThumb v-if="ct.file" :path="ct.file" :alt="ct.name" />
                 <span class="thumb-label">{{ ct.name }}</span>
@@ -204,7 +250,15 @@ watch(assetTab, () => {
           </div>
           <div v-if="row.actions.length" style="border-top: 1px dashed var(--border); margin-top: 8px; padding-top: 8px">
             <div class="asset-thumb-row">
-              <div v-for="a in row.actions" :key="a.id" class="asset-thumb" :class="{ missing: !a.file }" :title="`${a.name}（点击放大）`" @click="a.file && openPreview(a.file, `${row.name} · ${a.name}`)">
+              <div
+                v-for="a in row.actions"
+                :key="a.id"
+                class="asset-thumb"
+                :class="{ missing: !a.file }"
+                :title="`${a.name}（点击放大）`"
+                v-bind="thumbA11y(a.file, `${row.name} · ${a.name}`)"
+                @click="a.file && openPreview(a.file, `${row.name} · ${a.name}`)"
+              >
                 <label class="asset-sel" @click.stop><input type="checkbox" :aria-label="`${row.name} · ${a.name}`" :checked="selected.has(`action:${row.id}:${a.id}`)" @change="toggleSelect(`action:${row.id}:${a.id}`)" /></label>
                 <LazyThumb v-if="a.file" :path="a.file" :alt="a.name" />
                 <span class="thumb-label">{{ a.name }}</span>
@@ -233,7 +287,13 @@ watch(assetTab, () => {
             <button class="btn small" :disabled="regenLocked" @click="regenItem(row.id)">{{ t("重新生成") }}</button>
           </div>
           <div class="asset-thumb-row">
-            <div class="asset-thumb" :class="{ missing: !row.file }" :title="row.file ? t('点击放大') : t('未生成')" @click="row.file && openPreview(row.file, `${row.name} · 物品图`)">
+            <div
+              class="asset-thumb"
+              :class="{ missing: !row.file }"
+              :title="row.file ? t('点击放大') : t('未生成')"
+              v-bind="thumbA11y(row.file, `${row.name} · 物品图`)"
+              @click="row.file && openPreview(row.file, `${row.name} · 物品图`)"
+            >
               <LazyThumb v-if="row.file" :path="row.file" :alt="row.name" />
               <span class="thumb-label">{{ t("物品图") }}</span>
               <button v-if="row.file" class="btn ghost small" :disabled="regenLocked" @click.stop="reCutout('item', row.id, row.file)">{{ t("抠图") }}</button>
@@ -257,7 +317,13 @@ watch(assetTab, () => {
             <button class="btn small" :disabled="regenLocked" @click="regenBg(row.sceneId)">{{ t("重新生成") }}</button>
           </div>
           <div class="asset-thumb-row">
-            <div class="asset-thumb" :class="{ missing: !row.file }" :title="row.file ? t('点击放大') : t('未生成')" @click="row.file && openPreview(row.file, `背景 · ${row.location}`)">
+            <div
+              class="asset-thumb"
+              :class="{ missing: !row.file }"
+              :title="row.file ? t('点击放大') : t('未生成')"
+              v-bind="thumbA11y(row.file, `背景 · ${row.location}`)"
+              @click="row.file && openPreview(row.file, `背景 · ${row.location}`)"
+            >
               <LazyThumb v-if="row.file" :path="row.file" :alt="row.location" />
               <span class="thumb-label">{{ t("背景图") }}</span>
             </div>
@@ -280,7 +346,13 @@ watch(assetTab, () => {
             <button class="btn small" :disabled="regenLocked" @click="regenCgRow(row.chapter, row.sceneId)">{{ t("重新生成") }}</button>
           </div>
           <div class="asset-thumb-row">
-            <div class="asset-thumb" :class="{ missing: !row.file }" :title="row.file ? t('点击放大') : t('未生成')" @click="row.file && openPreview(row.file, `CG · ${row.title}`)">
+            <div
+              class="asset-thumb"
+              :class="{ missing: !row.file }"
+              :title="row.file ? t('点击放大') : t('未生成')"
+              v-bind="thumbA11y(row.file, `CG · ${row.title}`)"
+              @click="row.file && openPreview(row.file, `CG · ${row.title}`)"
+            >
               <LazyThumb v-if="row.file" :path="row.file" :alt="row.title" />
               <span class="thumb-label">CG</span>
             </div>

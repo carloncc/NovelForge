@@ -143,6 +143,7 @@ pub fn run() {
             commands::bless_project_dir,
             commands::read_text_file,
             commands::write_text_file,
+            commands::append_text_file,
             commands::read_file_base64,
             commands::read_file_header,
             commands::write_file_base64,

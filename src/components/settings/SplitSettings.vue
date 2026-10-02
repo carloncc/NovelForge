@@ -1,28 +1,8 @@
 <script setup lang="ts">
-import { computed } from "vue";
 import { t } from "../../i18n";
 import { projectState } from "../../stores/project";
-import { useGenerateController } from "../../stores/generate";
-
-const {
-  splitOpinion,
-  splitConfirmed,
-  previewSplit,
-  confirmSplit,
-  appendInput,
-  pickAppendFile,
-  onAppendFile,
-  busy,
-  assetBusy,
-  queueRunning,
-  error,
-} = useGenerateController();
-
-/** #1110/#1358：管线/素材/队列任一在途即视为忙；按钮禁用并给出原因，避免静默无反应 */
-const splitBusy = computed(() => busy.value || queueRunning.value || !!assetBusy.value);
-const splitBusyReason = computed(() =>
-  splitBusy.value ? t("有生成/素材任务正在运行，请等它完成或先点侧栏「停止」再试") : "",
-);
+import { goPage } from "../../stores/nav";
+import SplitPanel from "../generate/SplitPanel.vue";
 
 /** #1362：碎章阈值与预算同口径，负数钳到 0（下游按 0 = 不合并处理） */
 function onSplitMinCharsChange(e: Event): void {
@@ -37,23 +17,11 @@ function onSplitMinCharsChange(e: Event): void {
 <template>
   <div class="card">
     <div class="card-head">
-      <h3>{{ t("分章") }}</h3>
-      <span class="hint">{{ t("章节边界与追加导入") }}</span>
+      <h3>{{ t("分章设置") }}</h3>
+      <span class="hint">{{ t("碎章合并与特殊章节保留") }}</span>
     </div>
 
-    <div class="row split-row">
-      <input
-        class="grow"
-        type="text"
-        v-model="splitOpinion"
-        :placeholder="t('分章意见（可选）：如“第×章太长请拆分”…')"
-      />
-      <button class="btn secondary small" :disabled="splitBusy" :title="splitBusyReason" @click="previewSplit">{{ t("AI 分章") }}</button>
-    </div>
-    <p v-if="error" class="notice danger mt-2">{{ error }}</p>
-    <p class="hint mt-2">{{ t("填了意见会强制全书 AI 重新分章（计费），并作废下游剧本/图像/配音缓存") }}</p>
-
-    <div class="field-grid mt-3">
+    <div class="field-grid">
       <div class="field">
         <span>{{ t("碎章（短章）合并阈值") }}</span>
         <div class="row num-row">
@@ -70,16 +38,17 @@ function onSplitMinCharsChange(e: Event): void {
         </span>
       </label>
     </div>
+  </div>
 
-    <div class="row mt-3 split-actions">
-      <button class="btn secondary small" :disabled="splitConfirmed" @click="confirmSplit">
-        {{ splitConfirmed ? t("分章已核对") : t("标记为已核对") }}
-      </button>
-      <span v-if="splitConfirmed" class="tag ok">{{ t("已核对") }}</span>
-      <button class="btn secondary small" :disabled="splitBusy" :title="splitBusyReason" @click="pickAppendFile">{{ t("追加新章节") }}</button>
-      <input ref="appendInput" type="file" accept=".txt,text/plain" style="display: none" @change="onAppendFile" />
+  <!-- #1510：分章动作按钮已随分章面板搬到生成页直出；这里只留设置项并给出明确去处，
+       避免「两个地方都能分章、但都找不到」。 -->
+  <div class="card mt-3">
+    <div class="card-head">
+      <h3>{{ t("分章操作") }}</h3>
+      <span class="hint">{{ t("已移到生成页顶部，随时可用") }}</span>
     </div>
-    <p class="hint mt-2">{{ t("核对章节边界无误后标记；改动分章选项会让标记自动失效") }}</p>
+    <SplitPanel />
+    <button class="btn secondary small mt-3" @click="goPage('generate')">{{ t("去生成页") }}</button>
   </div>
 </template>
 
@@ -110,17 +79,9 @@ function onSplitMinCharsChange(e: Event): void {
   font-weight: 400;
   margin-bottom: 0;
 }
-/* 全局 .row > * 会把按钮/单位拉成等宽：这两行只按内容宽排布 */
-.split-row > *,
-.num-row > *,
-.split-actions > * {
+.num-row > * {
   flex: none;
   min-width: 0;
-}
-/* 全局输入框 width:100% 会把按钮挤到下一行：给输入框一个可收缩的基准宽度，保持同一行 */
-.split-row input {
-  flex: 1 1 240px;
-  width: auto;
 }
 .num-row input[type="number"] {
   width: 110px;

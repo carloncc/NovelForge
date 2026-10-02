@@ -104,7 +104,7 @@ export function sceneVocalKeyPart(baseKey: string, si: number, total = 1): strin
   return total <= 1 ? baseKey : `${baseKey}_p${si + 1}`;
 }
 
-function esc(text: string): string {
+export function esc(text: string): string {
   return (text || "")
     .replace(/\\/g, "\\\\")
     .replace(/;/g, "\\;")
@@ -112,6 +112,10 @@ function esc(text: string): string {
     .replace(/,/g, "\\,")
     .replace(/\./g, "\\.")
     .replace(/`/g, "\\`")
+    // #1508：竖线必须转义。引擎的文本分页（Os）对**未转义**的 | 切段，而 NovelForge 自己又用 | 表示「分页」——
+    // 台词里出现字面竖线（表格/分隔符）时会被当成翻页符，超出 Max_line:2 的后续段落被静默丢弃。
+    // 引擎的还原表里有 \\| → |，转义后仍能正常显示为竖线。
+    .replace(/\|/g, "\\|")
     // 空格+连字符会被引擎当成指令选项（`/ -/` 解析），导致该行文字从 " -" 处被腰斩；
     // 替换为非断连字符（视觉几乎一致，但不触发选项解析）
     .replace(/ -/g, " \u2011")
@@ -314,6 +318,31 @@ function splitUnvoicedMessage(text: string, voiced: boolean): string[] {
   return out.length ? out : [t];
 }
 
+/**
+ * 把一句台词渲染成可直接写入脚本的文本（已转义、分页符是真竖线）（#1508）。
+ *
+ * 顺序很关键，且此前是错的：
+ * 引擎 `Os(text, Max_line)` 的实现是 `text.split(/(?<!\\)\|/).map(qC)` ——
+ * **先按未转义竖线切段，再对每段做转义还原**。所以旧的 `esc(paginateForTextBox(x))`
+ * 会把分页符也转义成 `\\|`，切段时不再匹配 → 整句挤在一屏，超出 Max_line:2 的部分被裁掉，
+ * 「长台词自动分页」实际上从未生效。
+ * 正确顺序：先转义（字面竖线变 `\\|`），再按字符数插入**未转义**的 `|` 作为分页符。
+ */
+export function renderSpokenText(text: string, maxChars = TEXTBOX_PAGE_MAX_CHARS): string {
+  // 分页阈值必须按**原文长度**算（玩家看到的字符数），所以先只把字面竖线占位保护起来：
+  // 用 \u0000 临时顶替——它不可能是正文内容，也不会被 paginateForTextBox 当成分隔符或断句标点。
+  // 顺序：原文 → 竖线占位 → 按长度分页 → 逐页转义 → 还原竖线为转义形式 → 用未转义 | 拼回分页符。
+  // 这样「字面竖线」与「分页符」在产物里严格区分：引擎先按裸 | 切段，再把转义竖线还原成字面竖线。
+  const raw = text || "";
+  if (!raw) return "";
+  const PLACEHOLDER = String.fromCharCode(0);
+  const protectedRaw = raw.split("|").join(PLACEHOLDER);
+  const paginated = paginateForTextBox(protectedRaw, maxChars);
+  return paginated.split("|").map(function (page) {
+    return esc(page.split(PLACEHOLDER).join("|"));
+  }).join("|");
+}
+
 /** 文本框单页字符上限（UI99/1458）：引擎文本框 white-space:nowrap + overflow:hidden，
  *  每行仅约 32 中文字符、默认可见 2 行；旧 140 配 Max_line:8 会使第 3 分段起被丢弃。
  *  收紧到 64（2 行），配合 Max_line:2 与引擎真实容量对齐。 */
@@ -465,13 +494,13 @@ export function renderChapter(
     if (speechParts.length > 1) {
       speechParts.forEach((seg, si) => {
         const partFile = vocalFor(scene, idx, si, speechParts.length);
-        out.push(`${name}:${esc(paginateForTextBox(seg))}${partFile ? ` -vocal=${getBaseName(partFile)}` : ""};`);
+        out.push(`${name}:${renderSpokenText(seg)}${partFile ? ` -vocal=${getBaseName(partFile)}` : ""};`);
       });
     } else {
       // 长句按句读拆成多条消息（一屏一句）；有配音的保持单条，避免换页掐断语音
       const segs = splitUnvoicedMessage(line.text, !!vocalFile);
       segs.forEach((seg, si) => {
-        out.push(`${name}:${esc(paginateForTextBox(seg))}${si === 0 ? vocalArg : ""};`);
+        out.push(`${name}:${renderSpokenText(seg)}${si === 0 ? vocalArg : ""};`);
       });
     }
   };
@@ -497,7 +526,7 @@ export function renderChapter(
         } else {
           // 说话人不可识别时按旁白输出，避免生成「???」人名
           const narVocal = vocalFor(scene, idx);
-          out.push(`:${esc(paginateForTextBox(line.text))}${narVocal ? ` -vocal=${getBaseName(narVocal)}` : ""};`);
+          out.push(`:${renderSpokenText(line.text)}${narVocal ? ` -vocal=${getBaseName(narVocal)}` : ""};`);
         }
         return;
       }
@@ -657,14 +686,14 @@ export function renderChapter(
       if (narParts.length > 1) {
         narParts.forEach((seg, si) => {
           const partFile = vocalFor(scene, idx, si, narParts.length);
-          out.push(`:${esc(paginateForTextBox(wrapMonologue(seg)))}${partFile ? ` -vocal=${getBaseName(partFile)}` : ""};`);
+          out.push(`:${renderSpokenText(wrapMonologue(seg))}${partFile ? ` -vocal=${getBaseName(partFile)}` : ""};`);
         });
       } else {
         // 内心独白用「」包裹区分（WebGAL 无行内样式，括号标记最稳妥；独白不拆行）
         const narText = wrapMonologue(line.text);
         const narSegs = splitUnvoicedMessage(narText, !!narVocalFile || !!line.monologue);
         narSegs.forEach((seg, si) => {
-          out.push(`:${esc(paginateForTextBox(seg))}${si === 0 ? narVocalArg : ""};`);
+          out.push(`:${renderSpokenText(seg)}${si === 0 ? narVocalArg : ""};`);
         });
       }
     }
@@ -708,9 +737,14 @@ export function renderChapter(
         bgmUnlocked.add(bgmFile);
         // 鉴赏室显示可读中文标签（此前显示 bgm_ambient_1 这类原始文件名）
         const bgmName = bgmDisplayName(getBaseName(bgmFile));
-        // 1460：unlockBgm/unlockCg 的 content 被引擎原样存进 appreciationData.url（无目录补全），
-        // 裸文件名在鉴赏室解析到游戏根目录全破图/404；输出带目录的相对路径（鉴赏页在输出根目录可解析）。
-        out.push(`unlockBgm:game/bgm/${getBaseName(bgmFile)} -name=${esc(bgmName)};`);
+        // #1460 结论作废（#1507 实测更正）：引擎在**解析期**就会给资源类指令的 content 补上目录——
+        // assets/index-*.js 里 `case Ae.unlockBgm:return r(e,Or.bgm)` / `case Ae.unlockCg:return r(e,Or.background)`，
+        // 而 `r` 即 `yi()`：`case 0:r=\`./game/background/${e}\`` / `case 1:r=\`./game/bgm/${e}\``。
+        // unlock 处理器随后把 **content 本身**当 url 存进 appreciationData（AEe/EEe: `const t=e.content … {url:t}`），
+        // 鉴赏页再把 url 原样当图片 src / 音频 src。所以 content 必须是**裸文件名**：
+        // 写成 game/bgm/x.mp3 会被引擎再补一次，得到 ./game/bgm/game/bgm/x.mp3 → 缩略图与试听全 404。
+        // 对照：Title_img 也走同一个 yi()，而 renderConfig 只写裸文件名——这就是引擎的约定。
+        out.push(`unlockBgm:${getBaseName(bgmFile)} -name=${esc(bgmName)};`);
       }
       lastBgm = bgmFile;
     } else if (lastBgm) {
@@ -747,7 +781,7 @@ export function renderChapter(
         const { shot, file } = shotList[shotCursor++];
         out.push(`changeBg:${getBaseName(file)} -duration=400 -ease=easeInOut -next;`);
         lastBgEmitted = getBaseName(file);
-        out.push(`unlockCg:game/background/${getBaseName(file)} -name=${esc(shot.note || scene.location || "分镜")};`);
+        out.push(`unlockCg:${getBaseName(file)} -name=${esc(shot.note || scene.location || "分镜")};`);
       }
     };
     // 触发点 ≤ 0 的分镜在第一句之前就切换
@@ -759,7 +793,7 @@ export function renderChapter(
         const { shot, file } = shotList[shotCursor++];
         out.push(`changeBg:${getBaseName(file)} -duration=400 -ease=easeInOut -next;`);
         lastBgEmitted = getBaseName(file);
-        out.push(`unlockCg:game/background/${getBaseName(file)} -name=${esc(shot.note || scene.location || "分镜")};`);
+        out.push(`unlockCg:${getBaseName(file)} -name=${esc(shot.note || scene.location || "分镜")};`);
       } else {
         emitDueShots(0);
       }
@@ -817,7 +851,7 @@ export function renderChapter(
       // 名场面特写运镜：缓慢推近 CG，强化冲击力
       out.push(`setTransform:{"scale":{"x":1.08,"y":1.08}} -target=bg-main -duration=2500 -next;`);
       // 有 cgEvent 用事件标题/描述，无事件（旧图残留/手动放图）也解锁，避免鉴赏室漏 CG
-      out.push(`unlockCg:game/background/${getBaseName(cgFile)} -name=${esc(cg?.title || cg?.description || scene.location || "CG")};`);
+      out.push(`unlockCg:${getBaseName(cgFile)} -name=${esc(cg?.title || cg?.description || scene.location || "CG")};`);
       out.push(`:${esc(cg?.description || cg?.title || `${scene.location} ${scene.atmosphere || ""}`.trim() || "名场面")};`);
       out.push(`changeBg:${bgFile ? getBaseName(bgFile) : (lastBgEmitted ?? "none")} -duration=500 -ease=easeInOut -next;`);
       if (bgFile) lastBgEmitted = getBaseName(bgFile);

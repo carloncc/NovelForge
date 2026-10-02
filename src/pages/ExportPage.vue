@@ -7,6 +7,7 @@ import { lintProject, buildExportOverridePrompt, type LintReport } from "../core
 import { errMsg } from "../utils/errors";
 import { log } from "../utils/logger";
 import { t } from "../i18n";
+import { confirmDialog } from "../composables/useConfirmDialog";
 import { useGenerateController } from "../stores/generate";
 import PageHead from "../components/PageHead.vue";
 import { goPage } from "../stores/nav";
@@ -318,7 +319,15 @@ async function packZip(): Promise<void> {
   // #1433：留痕延后到真正开始打包时再记——此前在保存对话框前就记，取消保存会留下「继续打包」假记录
   let overrideErrors = 0;
   if (report.errors.length) {
-    if (!window.confirm(buildExportOverridePrompt(report))) {
+    // 弹层化：原文末段是问句，其余是错误分类清单。标题只放问句——屏幕阅读器把标题当对话框的
+    // 可访问名称，整段清单会读成一大串；清单移入正文。文案由 buildExportOverridePrompt 原样提供，
+    // 不改写；格式若变化（无空行分段）则整体作为标题回退，绝不丢文案。
+    const prompt = buildExportOverridePrompt(report);
+    const cut = prompt.lastIndexOf("\n\n");
+    const override = cut > 0
+      ? { title: prompt.slice(cut + 2).trim(), message: prompt.slice(0, cut).trim(), tone: "danger" as const }
+      : { title: prompt, tone: "danger" as const };
+    if (!(await confirmDialog(override))) {
       setMsg(t("存在导出检查错误，已取消打包（见上方检查结果）"), false);
       return;
     }

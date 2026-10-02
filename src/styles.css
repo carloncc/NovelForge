@@ -27,10 +27,17 @@
   --bg-hover: #faf8ff;
   --border: #e5e0f0;
   --border-strong: #d6ceeb;
+  /* #1478：装饰级浅紫（--border-strong #d6ceeb）在白底上只有 1.51:1，被复用为表单控件
+     边界后，输入框/复选框的可点击范围几乎看不见（WCAG 1.4.11 要求非文本对比度 ≥ 3:1）。
+     新增专用令牌：#8b7fb8 在白卡上 3.60:1、在页面底 --bg 上 3.33:1，均达标。 */
+  --border-control: #8b7fb8;
   --text: #111827;
   --text-dim: #4b5563;
-  /* 旧值 #9ca3af 在浅底上仅 2.3–2.5:1：placeholder、日志时间、缩略图标签等继承处全部不达标，统一提深 */
-  --text-faint: #6b7280;
+  /* 旧值 #9ca3af 在浅底上仅 2.3–2.5:1：placeholder、日志时间、缩略图标签等继承处全部不达标，统一提深。
+     #1478：上一轮提到 #6b7280 只够白卡（4.83:1），在 --bg #f7f5fb 上 4.47:1、--bg-soft #f1eefb 上 4.23:1
+     仍不达 AA（12–13px 小字多处落在页面底/软底上）。再压深到 #5f6672：
+     白卡 5.78:1 / --bg 5.35:1 / --bg-soft 5.06:1，三种底全部达标。 */
+  --text-faint: #5f6672;
   --primary: #6d28d9;
   --primary-2: #6366f1;
   --primary-soft: #f3eefe;
@@ -81,6 +88,21 @@
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
   }
+}
+
+/* #1480：全局键盘焦点兜底。此前只有输入框/复选框/.disclosure-head 有 :focus-visible，
+   .btn / .nav-item / .tab / .link-btn / .preset-pill / summary 等全靠 UA 默认环，
+   在自定义了 background/border 的控件上几乎看不见。导出游戏模板（core/project.ts）已有
+   同样的兜底，这里把应用本体补齐，保证纯键盘用户始终能看出焦点在哪。 */
+:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* 深色预览舞台上的控件需要浅色环才看得见 */
+.asset-preview :focus-visible {
+  outline-color: #fff;
 }
 
 html,
@@ -418,7 +440,9 @@ body {
 }
 
 .btn.danger {
-  background: linear-gradient(135deg, #dc2626, #f87171);
+  /* #1478：亮端 #f87171 与白字只有 2.77:1（AA 需 4.5:1）。收到 #dc2626 后两端分别
+     为 4.83:1 / 6.47:1，白字在整条渐变上都达标（.btn 统一 color:#fff）。 */
+  background: linear-gradient(135deg, #b91c1c, #dc2626);
 }
 
 .btn.ghost {
@@ -553,7 +577,8 @@ input[type="number"],
 select,
 textarea {
   background: var(--bg-card);
-  border: 1px solid var(--border-strong);
+  /* #1478：控件边界用专用令牌（3.3:1+），装饰性浅紫只用于分隔线/卡片描边 */
+  border: 1px solid var(--border-control);
   color: var(--text);
   border-radius: var(--radius-sm);
   padding: 8px 12px;
@@ -618,7 +643,7 @@ input[type="checkbox"] {
   appearance: none;
   width: 17px;
   height: 17px;
-  border: 1.5px solid var(--border-strong);
+  border: 1.5px solid var(--border-control);
   border-radius: 5px;
   cursor: pointer;
   position: relative;
@@ -1297,6 +1322,20 @@ code {
   cursor: zoom-in;
 }
 
+/* #1484：缩略图补了 role=button/tabindex/keydown（键盘可达）。div 不像原生控件那样
+   自带焦点环与 button 的字体/行高重置，这里补齐，否则 Tab 到缩略图时看不出焦点在哪。 */
+.asset-thumb:focus-visible,
+.vb-thumb:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+.asset-thumb,
+.vb-thumb {
+  font: inherit;
+  text-align: center;
+}
+
 .asset-thumb:hover {
   border-color: var(--primary);
   box-shadow: var(--shadow-hover);
@@ -1880,7 +1919,8 @@ details.card[open] > summary.card-head h3::before {
 
 .vb-source-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  /* #1479：同上 */
+  grid-template-columns: repeat(auto-fit, minmax(min(230px, 100%), 1fr));
   gap: var(--space-3);
   margin-bottom: var(--space-4);
 }
@@ -2362,7 +2402,8 @@ details.card[open] > summary.card-head h3::before {
 /* 选项网格（勾选项统一排版） */
 .opt-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  /* #1479：同上 */
+  grid-template-columns: repeat(auto-fill, minmax(min(210px, 100%), 1fr));
   gap: 10px 24px;
 }
 
@@ -2381,7 +2422,8 @@ details.card[open] > summary.card-head h3::before {
 /* 表单网格（label.field 标签在上、输入在下，纵向对齐） */
 .field-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  /* #1479：同上 */
+  grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr));
   gap: var(--space-3) var(--space-4);
   align-items: end;
 }
@@ -2446,7 +2488,8 @@ details.adv[open] > summary::before {
 /* ===== 导出页：三端分发 ===== */
 .dist-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  /* #1479：裸 minmax(300px,1fr) 在窄容器下轨道无法收缩，窗口 ≲640px 时撑出横向滚动条 */
+  grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr));
   gap: var(--space-4);
 }
 
@@ -2472,11 +2515,14 @@ details.adv[open] > summary::before {
 }
 
 .dist-icon.pc {
-  background: linear-gradient(135deg, #2563eb, #60a5fa);
+  /* #1478：亮端 #60a5fa 与白色图形的对比度仅 2.54:1（WCAG 1.4.11 需 3:1）；
+     收到 #2563eb 后为 5.17:1。 */
+  background: linear-gradient(135deg, #1d4ed8, #2563eb);
 }
 
 .dist-icon.apk {
-  background: linear-gradient(135deg, #059669, #34d399);
+  /* #1478：亮端 #34d399 仅 1.92:1；收到 #059669 后为 3.77:1。 */
+  background: linear-gradient(135deg, #047857, #059669);
 }
 
 .dist-title {
@@ -2545,7 +2591,8 @@ details.adv[open] > summary::before {
 /* 素材库网格 */
 .mat-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  /* #1479：同上，min() 让轨道可收缩到容器宽度 */
+  grid-template-columns: repeat(auto-fill, minmax(min(260px, 100%), 1fr));
   gap: var(--space-3);
 }
 

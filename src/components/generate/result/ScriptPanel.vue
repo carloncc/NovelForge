@@ -5,6 +5,7 @@ import { projectState } from "../../../stores/project";
 import { isTauri, tauri } from "../../../utils/tauri";
 import { SCRIPT_MIN_KEPT_RATIO, SCRIPT_MIN_NARRATION_RATIO } from "../../../core/script";
 import { useGenerateController } from "../../../stores/generate";
+import { confirmDialog } from "../../../composables/useConfirmDialog";
 
 // 结果区子面板：状态全部来自 generate store。
 const {
@@ -37,7 +38,8 @@ function chapterLabel(rep: { chapterIndex: number; title: string }): string {
   const base = (rep.title ?? "").trim() || t("未命名");
   return /^第\s*[0-9一二三四五六七八九十百千零〇两]+\s*[章回节话篇部幕卷]/.test(base)
     ? base
-    : `${t("第")}${rep.chapterIndex + 1}${t("章")} ${base}`;
+    // #1476：改用整句键（同 ChapterWorkbench，避免 "Chapter 4chapters" 这类碎片拼接）
+    : t("第 {n} 章 {title}", { n: rep.chapterIndex + 1, title: base });
 }
 /** 逐章重写/核对操作锁：管线/队列/素材任务任一在跑时都禁用（runChapterFullRegen 的 fromQueue
  *  会绕过队列检查，队列间隙点击会插进第二条链） */
@@ -54,11 +56,11 @@ const filteredChapters = computed(() => {
 const visibleChapters = computed(() => filteredChapters.value.slice(0, scriptVisibleLimit.value));
 
 /** 清空意见：会影响所有章节（包含当前不可见章节）的意见与全量勾选，执行前确认 */
-function clearScriptOpinions(): void {
+async function clearScriptOpinions(): Promise<void> {
   const feedbackCount = Object.values(scriptChapterFeedback.value).filter((v) => (v ?? "").trim()).length;
   const forceCount = Object.values(chapterForce.value).filter(Boolean).length;
   if (feedbackCount || forceCount) {
-    if (!window.confirm(`将清空全部章节的${feedbackCount ? `意见（${feedbackCount} 章已填）` : ""}${feedbackCount && forceCount ? "与" : ""}${forceCount ? `「全量」勾选（${forceCount} 章）` : ""}（包含当前不可见的章节）。继续吗？`)) return;
+    if (!(await confirmDialog({ title: `将清空全部章节的${feedbackCount ? `意见（${feedbackCount} 章已填）` : ""}${feedbackCount && forceCount ? "与" : ""}${forceCount ? `「全量」勾选（${forceCount} 章）` : ""}（包含当前不可见的章节）。继续吗？`, tone: "danger" }))) return;
   }
   scriptChapterFeedback.value = {};
   chapterForce.value = {};

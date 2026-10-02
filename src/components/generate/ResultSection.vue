@@ -10,6 +10,7 @@ import ScriptPanel from "./result/ScriptPanel.vue";
 import FailedPanel from "./result/FailedPanel.vue";
 import LogPanel from "./result/LogPanel.vue";
 import { useGenerateController } from "../../stores/generate";
+import { scrollToTop } from "../../utils/motion";
 
 /** UI15：用户可见数字按当前界面语言本地化；渲染时读取 currentLang，切语言后自动重渲染 */
 function fmtNumber(n: number): string {
@@ -43,11 +44,8 @@ const {
 function goEmptyFull(): void {
   runMode.value = "full";
   void nextTick(() => {
-    try {
-      window.scrollTo({ top: 0, behavior: "smooth" });
-    } catch {
-      /* 忽略 */
-    }
+    // #1482：reduce-motion 下用 instant（原来是硬编码 smooth）
+    scrollToTop();
   });
 }
 </script>

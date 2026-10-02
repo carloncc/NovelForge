@@ -105,7 +105,20 @@ const ZHTW_EQUAL_ALLOW = new Set([
   "重跑配音",
   "修改素材映射",
   "移除素材",
+  // 章节序数：繁体与简体的写法本就相同（"第 1 章"/"第 1 章：标题" 两语言一致）
+  "第 {n} 章",
+  "第 {n} 章 {title}",
+  // 分章操作：简繁同形（分章操作 的繁体写法不变）
+  "分章操作",
+  // 日志阶段徽标：简繁同形（追加/中止/提示 在繁体里写法不变）
+  "追加",
+  "中止",
+  "提示",
 ]);
+
+// 日文汉字与中文同形即正确（不是"没翻译"）：日文的「追加」「中止」「画像認識」等
+// 本就写作汉字，值等于键属预期结果，#1476 补键时逐条核对过。
+const JA_EQUAL_ALLOW = new Set(["追加", "中止"]);
 
 // 允许为空值的显式白名单（目前无：空值一律失败）
 const EMPTY_ALLOW = new Set();
@@ -146,7 +159,12 @@ for (const f of files) {
   }
 
   // 伪翻译检测：值等于键且键含 CJK
-  const allow = f === "zh-TW" ? new Set([...COMMON_EQUAL_ALLOW, ...ZHTW_EQUAL_ALLOW]) : COMMON_EQUAL_ALLOW;
+  const allow =
+    f === "zh-TW"
+      ? new Set([...COMMON_EQUAL_ALLOW, ...ZHTW_EQUAL_ALLOW])
+      : f === "ja"
+        ? new Set([...COMMON_EQUAL_ALLOW, ...JA_EQUAL_ALLOW])
+        : COMMON_EQUAL_ALLOW;
   const pseudo = [...map.entries()].filter(([k, v]) => v === k && CJK_RE.test(k) && !allow.has(k)).map(([k]) => k);
   if (pseudo.length) {
     failed = true;

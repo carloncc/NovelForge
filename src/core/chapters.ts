@@ -1,4 +1,4 @@
-﻿import type { ChapterInfo, NovelDoc } from "./types";
+import type { ChapterInfo, NovelDoc } from "./types";
 import { tauri } from "../utils/tauri";
 import { basename, basenameWithoutExt } from "../utils/path";
 import { log } from "../utils/logger";
@@ -95,7 +95,17 @@ export function splitChapters(fullText: string, baseTitle: string): ChapterInfo[
 export async function importNovelFile(path: string): Promise<NovelDoc> {
   const done = log.time("chapters", `导入小说 ${path}`);
   const { text, encoding } = await tauri.readTextFile(path);
-  const cleaned = text.replace(/^\uFEFF/, "");
+  // #1506：必须与多文件/追加路径用**同一个**归一化函数。
+  // 旧实现只去掉 BOM，正文里仍留着 \r 与 3+ 连续空行；而 importNovelFiles / joinAppendText
+  // 会走 normalizeNovelText。于是「CRLF 单文件导入 → 追加一章 → 重启」时 fullText 从
+  // 「已归一化」变回「带 \r」，novelFingerprint 变化 → 分章/剧本/卡片/图片缓存全部判为过期，
+  // 整本重新调用付费 API。B12 注释承诺的"追加与重导得到一致 fullText"此前只在多文件路径成立。
+  const cleaned = normalizeNovelText(text.replace(/^\uFEFF/, ""));
+  // 空/纯空白文件：多文件路径会抛错，单文件路径此前会兜底造出一个空章节并"导入成功"，
+  // 空小说进入管线后只是把报错推迟到 LLM 调用（还可能白烧一次额度）。口径统一为直接拒绝。
+  if (!cleaned.trim()) {
+    throw new Error("文件内容为空，无法导入");
+  }
   const fileName = basename(path);
   const baseTitle = basenameWithoutExt(path);
   const chapters = splitChapters(cleaned, baseTitle);

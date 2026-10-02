@@ -15,6 +15,7 @@ import { fileToBase64 } from "../utils/file";
 import { log } from "../utils/logger";
 import { classifyMaterial } from "../utils/materials";
 import { currentLang, t } from "../i18n";
+import { confirmDialog } from "../composables/useConfirmDialog";
 import PageHead from "../components/PageHead.vue";
 import LazyThumb from "../components/LazyThumb.vue";
 import AssetPreview from "../components/AssetPreview.vue";
@@ -30,9 +31,9 @@ function guardRunning(action: string): boolean {
 }
 
 /** 移除素材引用（只删引用关系，不删磁盘文件），二次确认防点错 */
-function confirmRemoveMaterial(path: string, name: string): void {
+async function confirmRemoveMaterial(path: string, name: string): Promise<void> {
   if (!guardRunning(t("移除素材"))) return;
-  if (!window.confirm(t("从素材库移除「{name}」？只删除引用关系，磁盘文件保留。", { name }))) return;
+  if (!(await confirmDialog({ title: t("从素材库移除「{name}」？只删除引用关系，磁盘文件保留。", { name }), tone: "danger" }))) return;
   removeMaterial(path);
 }
 
@@ -76,7 +77,7 @@ async function pickNovel(): Promise<void> {
     if (!paths.length) return;
     // #1292：登记选中文件所在目录（用户经系统对话框明示授权），否则后续读取被白名单拒绝
     for (const p of paths) await blessParentDir(p);
-    if (projectState.novel && !window.confirm(t("将覆盖当前已导入的「{name}」。继续吗？", { name: projectState.novel.fileName }))) return;
+    if (projectState.novel && !(await confirmDialog({ title: t("将覆盖当前已导入的「{name}」。继续吗？", { name: projectState.novel.fileName }), tone: "danger" }))) return;
     const doc = paths.length > 1 ? await importNovelFiles(paths) : await importNovelFile(paths[0]);
     if (!(await guardNovelDir(doc))) return;
     projectState.novel = doc;
@@ -95,7 +96,7 @@ async function onNovelFile(e: Event): Promise<void> {
   input.value = "";
   if (!files.length) return;
   if (!guardRunning(t("导入小说"))) return;
-  if (projectState.novel && !window.confirm(t("将覆盖当前已导入的「{name}」。继续吗？", { name: projectState.novel.fileName }))) return;
+  if (projectState.novel && !(await confirmDialog({ title: t("将覆盖当前已导入的「{name}」。继续吗？", { name: projectState.novel.fileName }), tone: "danger" }))) return;
   error.value = "";
   notice.value = "";
   importing.value = true;
@@ -139,7 +140,7 @@ async function loadDemo(): Promise<void> {
   // guardNovelDir 内含 mkdirAll/restoreProject 可能抛错，必须 catch 写入 error（异步点击处理器裸 rejection 只进 console）。
   error.value = "";
   notice.value = "";
-  if (projectState.novel && !window.confirm(t("加载示例小说将覆盖当前已导入的小说（标题修改/章节停用一并丢失）。继续吗？"))) return;
+  if (projectState.novel && !(await confirmDialog({ title: t("加载示例小说将覆盖当前已导入的小说（标题修改/章节停用一并丢失）。继续吗？"), tone: "danger" }))) return;
   const doc: NovelDoc = {
     fileName: "星陨之城的守夜人.txt",
     sourcePath: "",
@@ -306,15 +307,15 @@ async function openProject(dir: string): Promise<void> {
   }
 }
 
-function removeProject(id: string): void {
+async function removeProject(id: string): Promise<void> {
   const target = (configState.projects ?? []).find((p) => p.id === id);
-  if (!window.confirm(t("将「{name}」从项目列表移除？只删记录，磁盘文件保留。", { name: target?.name ?? id }))) return;
+  if (!(await confirmDialog({ title: t("将「{name}」从项目列表移除？只删记录，磁盘文件保留。", { name: target?.name ?? id }), tone: "danger" }))) return;
   removeProjectEntry(id);
 }
 
 /** 最近目录的「移除记录」此前没有确认，与注册项目的同名按钮行为不一致 */
-function removeRecent(dir: string): void {
-  if (!window.confirm(t("将从最近列表移除「{dir}」？只删记录，磁盘文件保留。", { dir }))) return;
+async function removeRecent(dir: string): Promise<void> {
+  if (!(await confirmDialog({ title: t("将从最近列表移除「{dir}」？只删记录，磁盘文件保留。", { dir }), tone: "danger" }))) return;
   removeRecentOutputDir(dir);
 }
 
@@ -330,7 +331,7 @@ async function newProject(): Promise<void> {
   // #1414：先登记用户自选目录再读快照，否则白名单外路径恒返回 null，「已有项目缓存」确认守卫静默失效
   await blessParentDir(picked);
   const snap = await readDirNovelIdentity(picked);
-  if (snap && !window.confirm(t("该目录已有「{name}」的项目缓存。点「确定」打开它，点「取消」换个目录。", { name: snap.fileName }))) return;
+  if (snap && !(await confirmDialog({ title: t("该目录已有「{name}」的项目缓存。点「确定」打开它，点「取消」换个目录。", { name: snap.fileName }) }))) return;
   try {
     await restoreProject(picked);
     configState.outputDir = picked;
@@ -353,13 +354,15 @@ async function guardNovelDir(doc: { fileName: string; chapters: { title: string 
   // #1364：decideNovelImport 已改为同文件名即判 same（titleSig 含 AI 分章后标题，同书重导必然不一致）。
   // 这里保留同名覆盖确认作双保险（换文件重名的极端情况），不再建子目录。
   if (snap && snap.fileName === doc.fileName) {
-    return window.confirm(
-      t("重新导入「{name}」将覆盖当前分章/改名结果（含 AI 分章标题与章节启停）。\n\n点「确定」继续覆盖，点「取消」中止导入。", { name: doc.fileName }),
-    );
+    return await confirmDialog({
+      title: t("重新导入「{name}」将覆盖当前分章/改名结果（含 AI 分章标题与章节启停）。\n\n点「确定」继续覆盖，点「取消」中止导入。", { name: doc.fileName }),
+      tone: "danger",
+    });
   }
-  if (!window.confirm(
-    t("当前输出目录属于「{oldName}」的项目，继续导入会覆盖它的缓存。\n\n点「确定」为「{newName}」新建独立项目目录，点「取消」留在当前目录（覆盖旧缓存）。", { oldName: snap?.fileName ?? "", newName: doc.fileName }),
-  )) return true;
+  if (!(await confirmDialog({
+    title: t("当前输出目录属于「{oldName}」的项目，继续导入会覆盖它的缓存。\n\n点「确定」为「{newName}」新建独立项目目录，点「取消」留在当前目录（覆盖旧缓存）。", { oldName: snap?.fileName ?? "", newName: doc.fileName }),
+    tone: "danger",
+  }))) return true;
   const target = `${dir.replace(/[\\/]+$/, "")}/${suggestProjectSubdirName(doc.fileName)}`;
   await tauri.mkdirAll(target);
   await restoreProject(target);

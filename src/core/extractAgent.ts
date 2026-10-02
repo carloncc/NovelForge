@@ -133,6 +133,8 @@ function unionStrings(base?: string[], patch?: string[]): string[] | undefined {
   return out;
 }
 
+import { normalizeCharacterEmotions, normalizeEmotionId } from "./emotions";
+
 /** 角色补丁合并（重复 add_character 共用）：
  * 标量字段只接受非空新值（旧实现 Object.assign 会把缺省/空字段直接写进去，抹掉已收集信息），
  * 数组字段（actions/costumes 按 id、emotions 按值）并集而非整体覆盖。 */
@@ -150,7 +152,13 @@ function mergeCharacterPatch(target: CharacterCard, patch: Record<string, unknow
       continue;
     }
     if (k === "emotions") {
-      if (Array.isArray(v)) target.emotions = unionStrings(target.emotions, v as string[]);
+      // #1499：表情值要归一化成稳定英文 id（与 extract.ts / 立绘文件名同一口径）。
+      // 直接用原始值并集会让「微笑」这类中文进来，与文件名 key 对不上（素材页恒显示缺图），
+      // 且等长的两个中文词会被消毒成同一个文件名而互相覆盖。
+      if (Array.isArray(v)) {
+        const merged = unionStrings(target.emotions, v.filter((e): e is string => typeof e === "string").map(normalizeEmotionId));
+        target.emotions = normalizeCharacterEmotions(merged);
+      }
       continue;
     }
     (target as unknown as Record<string, unknown>)[k] = v;
@@ -184,6 +192,14 @@ function charParams(required: string[]): Record<string, unknown> {
           },
           required: ["id", "name", "prompt"],
         },
+      },
+      // #1499：Agent 扫描阶段此前没有 emotions 字段，模型无法在建卡时报表情差分，
+      // 只能等后续补全阶段产出——「AI 按剧情提取角色表情集」在 Agent 模式下等于没生效。
+      emotions: {
+        type: "array",
+        description:
+          "该角色剧情中实际需要的表情差分（英文小写标识，如 happy/sad/angry/surprised/shy/embarrassed；6-10 个，不需要包含 normal）",
+        items: { type: "string" },
       },
     },
     required,
@@ -624,14 +640,12 @@ export function mergeCharacter(target: CharacterCard, source: CharacterCard): vo
   }
   const mergedCostumes = [...costumeMap.values()];
   if (mergedCostumes.length || target.costumes || source.costumes) target.costumes = mergedCostumes;
-  // 表情集按字符串并集（去重保序）
+  // 表情集并集（#1499：先归一化成稳定英文 id 再并集，与 extract/extractAgent 的口径统一）
   if (Array.isArray(source.emotions) || Array.isArray(target.emotions)) {
-    const seen = new Set<string>();
-    target.emotions = [...(target.emotions ?? []), ...(source.emotions ?? [])].filter((e) => {
-      if (typeof e !== "string" || !e || seen.has(e)) return false;
-      seen.add(e);
-      return true;
-    });
+    const merged = [...(target.emotions ?? []), ...(source.emotions ?? [])]
+      .filter((e): e is string => typeof e === "string" && !!e)
+      .map(normalizeEmotionId);
+    target.emotions = normalizeCharacterEmotions(merged);
   }
 }
 
@@ -955,7 +969,7 @@ function scanSystemPrompt(feedback?: string): string {
   return `你是视觉小说制作人的「角色提取代理」。小说会被分成多段陆续发给你，你的任务是用工具逐步收集制作视觉小说所需的卡片。
 
 工具说明：
-- add_character(id, name, appearance, clothing, personality, voiceDesc, color, isNpc)：新增一个角色。所有有台词或推动剧情发展的人物都要收录，数量按剧情决定、不要人为设限；有台词但戏份少的次要角色/NPC 请把 isNpc 设为 true。同一角色已存在时请用 update_character 更新，不要新建重复 id。
+- add_character(id, name, appearance, clothing, personality, voiceDesc, color, isNpc, emotions)：新增一个角色。所有有台词或推动剧情发展的人物都要收录，数量按剧情决定、不要人为设限；有台词但戏份少的次要角色/NPC 请把 isNpc 设为 true。同一角色已存在时请用 update_character 更新，不要新建重复 id。emotions 填该角色剧情中实际需要的表情差分（英文小写标识，如 happy/sad/angry/surprised/shy，6-10 个，不需要包含 normal），剧情出现明显情绪起伏时就要补。
 - update_character(id, patch)：更新已有角色的字段。
 - add_scene(id, location, atmosphere, time)：新增一个故事场景地点。
 - add_item(id, name, appearance, note)：新增重要物品（获得、交接、使用的关键道具）。

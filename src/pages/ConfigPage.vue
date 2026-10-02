@@ -20,6 +20,7 @@ import { fetchMiniMaxVoices } from "../core/voiceProfiles";
 import { errMsg } from "../utils/errors";
 import { log } from "../utils/logger";
 import { currentLang, t } from "../i18n";
+import { confirmDialog } from "../composables/useConfirmDialog";
 import PageHead from "../components/PageHead.vue";
 import { knownImageModelCapabilities, isImageCapabilityConflict } from "../api/providers";
 import { checkCustomTemplate } from "../api/templates";
@@ -140,7 +141,7 @@ async function downloadCurrentModel(): Promise<void> {
 
 async function removeCurrentModel(): Promise<void> {
   const model = currentCutoutModel.value;
-  if (!window.confirm(t("删除本地 AI 抠图模型「{name}」？删除后需重新下载才能再用于抠图。继续吗？", { name: model.id }))) return;
+  if (!(await confirmDialog({ title: t("删除本地 AI 抠图模型「{name}」？删除后需重新下载才能再用于抠图。继续吗？", { name: model.id }), tone: "danger" }))) return;
   cutoutBusy.value = true;
   cutoutError.value = "";
   try {
@@ -303,12 +304,12 @@ function onCustomTemplateChange(cfg: ApiConfig, e: Event): void {
 }
 
 /** 音色库输入处理（#1139）：清空需二次确认（清空后配音将不可用，无假回退） */
-function onVoiceLibraryChange(cfg: ApiConfig, e: Event): void {
+async function onVoiceLibraryChange(cfg: ApiConfig, e: Event): Promise<void> {
   const el = e.target as HTMLTextAreaElement;
   const list = el.value.split("\n").map((s: string) => s.trim()).filter(Boolean);
   if (!list.length) {
     const old = Array.isArray(cfg.extra!.voiceLibrary) ? [...(cfg.extra!.voiceLibrary as string[])] : [];
-    if (old.length && !window.confirm(t("清空音色库后配音将不可用（各 TTS 服务均无名为 default 的音色）。确定要清空吗？"))) {
+    if (old.length && !(await confirmDialog({ title: t("清空音色库后配音将不可用（各 TTS 服务均无名为 default 的音色）。确定要清空吗？"), tone: "danger" }))) {
       el.value = old.join("\n");
       return;
     }
@@ -332,7 +333,7 @@ async function runTest(kind: ChannelKey, cfg: ApiConfig): Promise<void> {
       ? t("将真实合成一句测试语音（扣少量字符额度）")
       : t("将真实调用一次（扣少量 token 额度）");
   // costHint 本身已以「将」开头（如「将真实调用…」），这里不能再拼一个，否则出现「将将」
-  if (!window.confirm(t("测试连接{costHint}。继续吗？", { costHint }))) return;
+  if (!(await confirmDialog({ title: t("测试连接{costHint}。继续吗？", { costHint }) }))) return;
   testing.value = { key: kind, id: cfg.id };
   testResult.value = null;
   log.info("page", `测试连接 ${kind}`, { model: cfg.model, baseUrl: cfg.baseUrl });
@@ -367,17 +368,17 @@ function cfgActive(kind: ChannelKey, id: string): boolean {
 }
 
 /** 删除整组配置：不可恢复，二次确认 */
-function confirmRemovePreset(id: string): void {
+async function confirmRemovePreset(id: string): Promise<void> {
   const preset = configState.presets.find((p) => p.id === id);
   const n = preset ? Object.values(preset.channels).flat().length : 0;
-  if (!window.confirm(t("删除配置组「{name}」（含 {n} 个 API 配置，不可恢复）？", { name: preset?.name ?? id, n }))) return;
+  if (!(await confirmDialog({ title: t("删除配置组「{name}」（含 {n} 个 API 配置，不可恢复）？", { name: preset?.name ?? id, n }), tone: "danger" }))) return;
   removePreset(id);
 }
 
 /** 删除单个 API 配置：切走正在用的通道，二次确认 */
-function confirmRemoveConfig(kind: ChannelKey, id: string, label: string): void {
+async function confirmRemoveConfig(kind: ChannelKey, id: string, label: string): Promise<void> {
   const inUse = activePreset().active[kind] === id;
-  if (!window.confirm(t("删除{inUsePart}「{label}」？不可恢复。", { inUsePart: inUse ? t("（正在使用，将自动切换到同通道第一个）") : "", label }))) return;
+  if (!(await confirmDialog({ title: t("删除{inUsePart}「{label}」？不可恢复。", { inUsePart: inUse ? t("（正在使用，将自动切换到同通道第一个）") : "", label }), tone: "danger" }))) return;
   removeConfig(kind, id);
 }
 

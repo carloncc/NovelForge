@@ -1,7 +1,7 @@
 import type { ApiConfig } from "../src/core/types";
 import { chatVision, testVision, VisionApiError } from "../src/api/openaiCompatible";
 import { PROVIDERS, protocolForConfig } from "../src/api/providers";
-import { configSecrets, loadConfigFile, migrateConfigFile } from "../src/stores/configMigration";
+import { configSecrets, loadConfigFile, migrateConfigFile, nonEmptySecrets } from "../src/stores/configMigration";
 import { createApiPreset, defaultApiConfig } from "../src/stores/config";
 import { verifyImage } from "../src/core/selfcheck";
 import { tauri } from "../src/utils/tauri";
@@ -155,6 +155,43 @@ async function main(): Promise<void> {
   });
   assert(scrubbedWrites.length === 1 && !scrubbedWrites[0].includes("sk-text"), "当前 schema 中的内联密钥也必须立即从配置文件清除");
   assert(scrubbedSecrets[0]?.["llm-active"] === "sk-text", "清除当前 schema 明文前必须先写入安全存储");
+
+  // ---- #1504 回归：批量回写密钥**绝不能包含空串** ----
+  // Rust 侧 write_api_secrets 把空串解释为"删除该条系统凭据"，而 configSecrets 会给每个
+  // 没有内联 key 的配置填 ""。桌面分支此前未过滤空值 → 一次迁移就把 keyring 里的 API Key 全删掉，
+  // 用户界面直接显示空 Key、只能重填。这里锁住"批量写只加不删"。
+  {
+    const guardedWrites: Record<string, string>[] = [];
+    const configWithBlankEntry = JSON.stringify({
+      configSchemaVersion: 3,
+      presets: [{
+        id: "blank-preset",
+        name: "混合",
+        channels: {
+          llm: [{ id: "has-key", apiKey: "sk-present" }],
+          vision: [],
+          image: [{ id: "no-key" }],
+          tts: [],
+        },
+        active: { llm: "has-key", image: "no-key" },
+      }],
+    });
+    await loadConfigFile(configWithBlankEntry, {
+      createId: () => "never",
+      createVisionDefault: () => defaultApiConfig("vision"),
+      writeConfig: async () => {},
+      readSecrets: async () => ({}),
+      writeSecrets: async (secrets) => { guardedWrites.push(secrets); },
+    });
+    for (const written of guardedWrites) {
+      const blanks = Object.entries(written).filter(([, value]) => !value).map(([id]) => id);
+      assert(blanks.length === 0, `批量回写密钥不得包含空串（会被 Rust 当成删除凭据）：${blanks.join(",")}`);
+    }
+    // nonEmptySecrets 本身的语义
+    const filtered = nonEmptySecrets({ a: "k", b: "", c: "j" });
+    assert(!("b" in filtered) && filtered.a === "k" && filtered.c === "j", "nonEmptySecrets 必须剔除空值并保留其余");
+    assert(Object.keys(nonEmptySecrets({ b: "" })).length === 0, "全空输入应得到空对象（调用方据此跳过写库）");
+  }
 
   let repairedId = 0;
   const duplicateIds = migrateConfigFile({

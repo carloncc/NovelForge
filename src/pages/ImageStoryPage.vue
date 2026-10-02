@@ -374,7 +374,7 @@ onBeforeUnmount(() => {
         </div>
         <div v-for="group in imageStoryShots" :key="group.chapter" class="mb-3">
           <div class="stage-row-label" style="margin-bottom: 6px">
-            <b>{{ group.title || `${t("第")}${group.chapter + 1}${t("章")}` }}</b>
+            <b>{{ group.title || t("第 {n} 章", { n: group.chapter + 1 }) }}</b>
             <span class="faint small">{{ group.shots.length }} {{ t("张") }}</span>
           </div>
           <div class="shot-grid">
@@ -408,7 +408,7 @@ onBeforeUnmount(() => {
           <div class="shot-grid">
             <div v-for="m in imageStoryMissingShots.slice(0, 24)" :key="m.id" class="shot-cell">
               <div class="shot-thumb" style="display: flex; align-items: center; justify-content: center; background: var(--panel); border: 1px dashed var(--border)">
-                <span class="hint">{{ m.title || `${t("第")}${m.chapter + 1}${t("章")}` }} · {{ m.note }}</span>
+                <span class="hint">{{ m.title || t("第 {n} 章", { n: m.chapter + 1 }) }} · {{ m.note }}</span>
               </div>
               <div class="shot-actions">
                 <span class="hint">{{ m.id }}</span>

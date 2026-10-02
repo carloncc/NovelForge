@@ -1,15 +1,17 @@
 <script setup lang="ts">
 import { t } from "../../i18n";
 import { projectState } from "../../stores/project";
+import { confirmDialog } from "../../composables/useConfirmDialog";
 
 /** 全量重跑开关：开启前二次确认，避免误勾后每一次生成都全价计费；取消要还原勾选态 */
-function onSkipCacheChange(e: Event): void {
+async function onSkipCacheChange(e: Event): Promise<void> {
   const input = e.target as HTMLInputElement;
   if (
     input.checked &&
-    !window.confirm(
-      t("开启「跳过缓存（全量重跑）」后，之后每一次生成/重跑都会忽略缓存全量重生成（全价计费）。确定开启吗？"),
-    )
+    !(await confirmDialog({
+      title: t("开启「跳过缓存（全量重跑）」后，之后每一次生成/重跑都会忽略缓存全量重生成（全价计费）。确定开启吗？"),
+      tone: "primary",
+    }))
   ) {
     input.checked = false;
     return;

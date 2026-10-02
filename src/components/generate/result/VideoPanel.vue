@@ -4,6 +4,8 @@ import { t } from "../../../i18n";
 import { isTauri } from "../../../utils/tauri";
 import { sanitizeId } from "../../../core/render";
 import { useGenerateController } from "../../../stores/generate";
+import { confirmDialog } from "../../../composables/useConfirmDialog";
+import { scrollToTop } from "../../../utils/motion";
 
 // 结果区子面板：状态全部来自 generate store。
 const {
@@ -28,25 +30,28 @@ async function reassembleForVideo(): Promise<void> {
 }
 
 /** #1400：已启用位置再次导入时二次确认，避免选错文件静默覆盖成品 */
-function confirmImportVideo(vp: { id: string; title: string; enabled?: boolean }): void {
+async function confirmImportVideo(vp: { id: string; title: string; enabled?: boolean }): Promise<void> {
   if (vp.enabled) {
-    if (!window.confirm(t("该位置已有已导入视频，覆盖吗？（先前导入的成品将被替换且无撤销）"))) return;
+    if (!(await confirmDialog({ title: t("该位置已有已导入视频，覆盖吗？（先前导入的成品将被替换且无撤销）"), tone: "danger" }))) return;
   }
   void importVideo(vp);
 }
 
 /** 视频推荐位由「剧本」阶段生成：此前本页没有任何重生成入口，用户找不到路径。
  * 这里引导到单阶段重跑并说明缓存语义（默认复用缓存，需覆盖要勾全量/填意见）。 */
-function gotoScriptRegen(): void {
+async function gotoScriptRegen(): Promise<void> {
   if (busy.value || assetBusy.value || queueRunning.value) return;
-  if (!window.confirm(t("视频推荐位是「剧本」阶段的一部分：重新生成需要重跑剧本阶段（有 LLM 时计费）。\n\n注意：已缓存章节默认复用缓存、不会覆盖推荐位；如需强制重生成，请在「剧本」行勾选「全量」或填写意见后再点「重新生成」。\n\n现在切到「单阶段重跑」吗？"))) return;
+  // #1476：不要把这句拆成「短问句 + 说明」两条 t()——词条以中文原文为 key，拆分后
+  // 两个新键在四语言词典里都不存在，弹层会静默回退中文（原文里最后那句问句还会被丢掉）。
+  // 整段作为一个已收录词条作为标题，四语言都有译文。
+  if (!(await confirmDialog({
+    title: t("视频推荐位是「剧本」阶段的一部分：重新生成需要重跑剧本阶段（有 LLM 时计费）。\n\n注意：已缓存章节默认复用缓存、不会覆盖推荐位；如需强制重生成，请在「剧本」行勾选「全量」或填写意见后再点「重新生成」。\n\n现在切到「单阶段重跑」吗？"),
+    tone: "primary",
+  }))) return;
   runMode.value = "stage";
   void nextTick(() => {
-    try {
-      window.scrollTo({ top: 0, behavior: "smooth" });
-    } catch {
-      /* 忽略 */
-    }
+    // #1482：reduce-motion 下用 instant
+    scrollToTop();
   });
 }
 </script>
@@ -64,7 +69,7 @@ function gotoScriptRegen(): void {
         <span>
           <span class="tag" :class="vp.enabled ? 'ok' : ''">{{ vp.enabled ? t("已启用") : t("未生成") }}</span>
           <span style="font-weight: 600">{{ vp.title }}</span>
-          <span style="color: var(--text-dim); font-size: 12px; margin-left: 8px">{{ t("第") }} {{ vp.chapter }} {{ t("章") }} · {{ vp.location }} · {{ vp.durationSecs }}s</span>
+          <span style="color: var(--text-dim); font-size: 12px; margin-left: 8px">{{ t("第 {n} 章", { n: vp.chapter }) }} · {{ vp.location }} · {{ vp.durationSecs }}s</span>
         </span>
         <div style="display: flex; gap: 8px">
           <button class="btn small" @click="copyText(vp.videoPrompt, t('视频提示词'))">{{ t("复制提示词") }}</button>

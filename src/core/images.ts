@@ -1563,6 +1563,8 @@ export async function runImageTask(
   let source = "";
   let resolvedReferences: ImageReference[] = [];
   let materialReference: ImageReference | undefined;
+  /** #1489：尺寸确实不符的旧缓存图——等新图成功写盘后再删，避免生成失败/中止时丢失既有成品 */
+  let staleCacheToRemove: string | null = null;
 
   // 视觉守门三视图复用：角色三视图已在视觉守门确认过（approved）→ 直接复用其图，不重复生成。
   // 视觉守门流程已生成并确认 threeview_<id>.png，此处作为最终素材直接引用，避免每轮重生成。
@@ -1588,16 +1590,24 @@ export async function runImageTask(
         fileName: task.fileName,
       });
     } else if (task.width > 0 && task.height > 0) {
-      // 尺寸校验：缓存图尺寸与要求不一致（如旧竖屏背景）→ 视为缓存失效重新生成
-      const sizeOk = await tauri.imageSizeMatches(cached, task.width, task.height).catch(() => true);
-      if (sizeOk) {
+      // 尺寸校验：缓存图尺寸与要求不一致（如旧竖屏背景）→ 视为缓存失效重新生成。
+      // #1489：三态判定——只有「确实解析出尺寸且不符」才删图重生成；
+      // 「解析不出」（大 EXIF/ICC 的 JPEG 文件头超出读取上限、Web 端读取失败等）不再删图，
+      // 否则已付费的图会被反复删除重画（旧实现把两种情形都当 false）。
+      const sizeState = await tauri.imageSizeMatches(cached, task.width, task.height).catch((): "unknown" => "unknown");
+      if (sizeState === "ok" || sizeState === "unknown") {
         path = cached;
         source = "缓存";
+        if (sizeState === "unknown") {
+          logger.info("images", "缓存图尺寸无法解析，按合格复用（不删图）", { id: task.id, fileName: task.fileName });
+        }
         logger.debug("images", "图像命中缓存", { id: task.id, fileName: task.fileName });
       } else {
+        // 尺寸确实不符：先重新生成，成功写盘后再删旧图——若本次生成失败/被中止，
+        // 旧图仍在，缓存映射不会指向一个已被删除的文件。
         logger.info("images", "缓存图尺寸与要求不符，重新生成", { id: task.id, fileName: task.fileName, want: `${task.width}x${task.height}` });
-        await tauri.removePath(cached).catch(() => {});
-        // 删除后继续走下方生成分支（path 仍为 null）
+        staleCacheToRemove = cached;
+        // 继续走下方生成分支（path 仍为 null）
       }
     } else {
       path = cached;
@@ -2066,6 +2076,11 @@ export async function runImageTask(
   }
 
   if (path) {
+    // #1489：新图已成功写盘——现在才删掉那张尺寸不符的旧缓存图（生成失败/中止时旧图仍在）
+    if (staleCacheToRemove && staleCacheToRemove !== path) {
+      await tauri.removePath(staleCacheToRemove).catch(() => {});
+      staleCacheToRemove = null;
+    }
     // B69：AI 生成结果写入旁路参数元数据（供下次命中校验）；用户素材拷贝不写，按旧缓存兼容处理。
     if (source.startsWith("AI 生成") && cfg) {
       await writeImageArtifactMeta(path, imageMetaForTask(task, cfg, effectiveNegative(task, opts.negativePrompt)));
@@ -2174,7 +2189,18 @@ export async function generateImages(
         : figureDetail === "core"
           ? FIGURE_EMOTIONS
           : (c.emotions?.length ? c.emotions : FIGURE_EMOTIONS);
-      for (const emo of emoList) names.push(`figure_${sanitizeId(c.id)}_${emo}.png`);
+      // #1493：必须与 buildImageTasks 逐字一致——
+      // ① 表情名要 sanitizeId（那边文件名用的是消毒后的 id，这里旧实现直接用原始名，
+      //    AI 返回中文表情时清单恒判"缺图"，导致单章「已全部生成、0 计费跳过」永远不生效）；
+      // ② 必须强制包含 normal（缺了它，默认立绘缺失反而会被判成"完整"而跳过补图）；
+      // ③ 消毒后同 id 要去重（「微笑/大笑」这类同长度中文会撞成同一个文件名）。
+      const seenEmo = new Set<string>();
+      for (const raw of ["normal", ...emoList]) {
+        const id = sanitizeId(String(raw)) || "normal";
+        if (seenEmo.has(id)) continue;
+        seenEmo.add(id);
+        names.push(`figure_${sanitizeId(c.id)}_${id}.png`);
+      }
       if (threeView && figureDetail !== "core") {
         for (const ct of c.costumes ?? []) names.push(`figure_${sanitizeId(c.id)}_ct_${sanitizeId(ct.id)}_normal.png`);
       }
@@ -2406,7 +2432,10 @@ export async function generateImages(
       const metaOk = !!c && (!cfg || await cachedImageMetaMatches(c, imageMetaForTask(task, cfg, effectiveNegative(task, DEFAULT_NEGATIVE))));
       if (c && metaOk) {
         if (task.width > 0 && task.height > 0) {
-          hit = (await tauri.imageSizeMatches(c, task.width, task.height).catch(() => true)) ? c : null;
+          // #1498：三态判定必须显式收窄——字符串结果恒为真值，旧的 `(await …) ? c : null`
+          // 会永远命中缓存，尺寸校验形同虚设（"mismatch" 也算通过）。
+          const sizeState = await tauri.imageSizeMatches(c, task.width, task.height).catch((): "unknown" => "unknown");
+          hit = sizeState === "mismatch" ? null : c;
         } else {
           hit = c;
         }

@@ -4,6 +4,7 @@ import { inputCharBudgetForText, outputTokensForText } from "../api/providers";
 import { voiceLibraryFor } from "../stores/config";
 import { pickVoiceForGender, voiceGenderOf } from "./minimaxVoices";
 import { normalizeEntityId } from "./ids";
+import { normalizeCharacterEmotions } from "./emotions";
 import type { ApiConfig } from "./types";
 
 const SYSTEM_PROMPT = `你是视觉小说制作人。从小说文本中提取制作视觉小说所需的结构化信息。
@@ -203,20 +204,10 @@ export function normalizeExtractionResult(result: ExtractionResult, lib: string[
         .filter((ct) => ct && ct.id && ct.prompt)
         .map((ct) => ({ id: normalizeEntityId(ct.id, "ct"), name: ct.name || ct.id, prompt: ct.prompt }));
     }
-    // 表情集归一化：只保留非空字符串、去重、上限 10（prompt 要求 6-10 个）；
-    // 上限同时兜底模型超量返回导致立绘张数/费用暴涨
-    if (Array.isArray(c.emotions)) {
-      const seen = new Set<string>();
-      const cleaned: string[] = [];
-      for (const e of c.emotions) {
-        if (typeof e !== "string") continue;
-        const v = e.trim();
-        if (!v || seen.has(v)) continue;
-        seen.add(v);
-        cleaned.push(v);
-      }
-      c.emotions = cleaned.slice(0, 10);
-    }
+    // 表情集归一化（#1496）：映射成稳定英文 id、按 id 去重、强制包含 normal、上限 10。
+    // 旧实现按原始值去重并原样保存，中文表情会与文件名口径不一致（界面恒显示缺图），
+    // 且等长的两个中文词会被消毒成同一个文件名而互相覆盖。
+    c.emotions = normalizeCharacterEmotions(c.emotions);
   }
   return result;
 }

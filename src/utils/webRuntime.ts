@@ -783,7 +783,10 @@ export async function webHasTransparency(dataB64: string): Promise<boolean> {
     canvas.width = img.width;
     canvas.height = img.height;
     const ctx = canvas.getContext("2d");
-    if (!ctx) return true;
+    // #1497：取不到 2D 上下文时不能再返回 true。返回 true 的语义是「这张图已经带透明通道」，
+    // 调用方（images.ts 的 cutoutFigure）会因此**直接跳过抠图并原样保留绿幕**——
+    // 属于静默降级成"绿底立绘"。改为抛出，让调用方的 catch 走"抠图失败保留原图 + 记日志"分支。
+    if (!ctx) throw new Error(t("无法创建画布上下文"));
     ctx.drawImage(img, 0, 0);
     const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
     // 与桌面版（Rust has_transparency）对齐：alpha<16 的像素占比 >5% 才算「已透明」。
@@ -793,8 +796,11 @@ export async function webHasTransparency(dataB64: string): Promise<boolean> {
       if (data[i] < 16) low++;
     }
     return low / Math.max(1, data.length / 4) > 0.05;
-  } catch {
-    return true;
+  } catch (error) {
+    // 解码/画布失败同样抛出（#1497）：与 Rust 侧 has_transparency 的 Ok/Err 语义一致，
+    // 由调用方决定降级策略，绝不用"已透明"来假装成功。
+    log.warn("webRuntime", "透明通道检测失败，交由调用方降级", { error: String(error).slice(0, 160) });
+    throw error;
   }
 }
 

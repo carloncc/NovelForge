@@ -107,10 +107,43 @@ async function main(): Promise<void> {
     await testResultRebuiltFromDisk();
     await testNoCardsStaysNull();
     await testMissingMetaFallsBack();
+    await testNoStateFileStillContinues();
   } finally {
     rmSync(ROOT, { recursive: true, force: true });
   }
-  console.log("=== restore missing-result tests passed ===");
+  /**
+ * #1509：**完全没有 project_state.json** 的项目（用户把开发中的项目拷到另一台机器、
+ * 只带了 .novel2vn 与产物，或快照被清理）也必须能加载并继续未完成的部分。
+ * 旧实现在缺少该文件时直接返回空状态 → 小说/卡片/章节全丢，生成页只剩「还没有小说」。
+ */
+async function testNoStateFileStillContinues(): Promise<void> {
+  const outputDir = `${ROOT}/no-state-file`;
+  mkdirSync(`${outputDir}/.novel2vn/cache`, { recursive: true });
+  // 注意：不写 project_state.json
+  seedSplit(outputDir, ["第1章 一", "第2章 二", "第3章 三"]);
+  writeFileSync(`${outputDir}/.novel2vn/cards.json`, JSON.stringify(cards([
+    character("linche", "林澈"),
+  ]), null, 2), "utf8");
+  writeFileSync(`${outputDir}/.novel2vn/meta.json`, JSON.stringify({
+    title: "半成品项目", gameKey: "abc12345", chapterCount: 3, charCount: 9, sceneCount: 3,
+    lineCount: 6, outputDir, webgalVersion: "4.6.3", generatedAt: "2026-01-01T00:00:00.000Z",
+  }, null, 2), "utf8");
+  // 已有剧本缓存（"开发到一半"的典型形态）
+  writeFileSync(`${outputDir}/.novel2vn/cache/script_ch1_aaa.json`, JSON.stringify({ chapter: 0, title: "第1章 一", scenes: [] }), "utf8");
+
+  await restoreProject(outputDir);
+  assert(projectState.novel, "没有状态快照时仍必须恢复出小说（否则无法继续逐章生成）");
+  assert(projectState.novel.chapters.length === 3, `应恢复 3 章，实际 ${projectState.novel.chapters.length}`);
+  assert(projectState.lastResult, "磁盘上有 cards.json 时必须补出 lastResult");
+  assert(projectState.lastResult.cards.characters.length === 1, "卡片应来自 cards.json");
+  assert(projectState.lastResult.meta.title === "半成品项目", "meta 应来自 meta.json（不是空壳）");
+  assert(
+    projectState.visualBibleWarnings.some((w) => w.includes("缺少项目状态快照")),
+    `应明确提示按磁盘恢复，实际 ${JSON.stringify(projectState.visualBibleWarnings)}`,
+  );
+}
+
+console.log("=== restore missing-result tests passed ===");
 }
 
 main().catch((error) => {

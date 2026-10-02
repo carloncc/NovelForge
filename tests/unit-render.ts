@@ -1,4 +1,4 @@
-import { renderChapter, renderConfig, sanitizeId } from "../src/core/render";
+import { esc, renderChapter, renderConfig, renderSpokenText, sanitizeId } from "../src/core/render";
 import type { ChapterScript, ExtractionResult } from "../src/core/types";
 import type { RenderAssets } from "../src/core/render";
 
@@ -128,7 +128,7 @@ function main(): void {
   const cgAssets: RenderAssets = { ...assets, cg: { "0_s1": "/x/cg_0_s1.png" } };
   const out6 = renderChapter(s6, { characters: cards.characters, items: cards.items, assets: cgAssets, introCard: false }, 1);
   assert(out6.includes("changeBg:cg_0_s1.png"), "CG 未按 章节_sceneId key 播放");
-  assert(out6.includes("unlockCg:game/background/cg_0_s1.png"), "CG 未解锁（unlockCg 缺失；#1460 需带 game/background/ 目录，否则引擎鉴赏室缩略图 404）");
+  assert(out6.includes("unlockCg:cg_0_s1.png"), "CG 未解锁（#1507：必须是裸文件名，引擎会补 ./game/background/，重复拼前缀会导致鉴赏室 404）");
   const s7 = makeScript({
     scenes: [{
       id: "s1",
@@ -260,6 +260,63 @@ function main(): void {
   assert(outCh2.includes("filmMode:none;"), "章首应显式关闭上一章残留的电影黑边");
   assert(outCh2.includes('setTransform:{"oldFilm":0}'), "章首应复位 oldFilm 滤镜");
   assert(outCh2.includes('setTransform:{"godrayFilm":0}'), "章首应复位 godrayFilm 滤镜");
+
+  // 15) #1508：台词中的字面竖线必须转义（引擎对未转义 | 切段 → 超出 Max_line 的段落被丢）
+  const s15 = makeScript();
+  s15.scenes[0].lines = [
+    { type: "dialogue", characterId: "linche", text: "姓名|年龄|籍贯", emotion: "normal" },
+  ];
+  const out15 = renderChapter(s15, { characters: cards.characters, items: cards.items, assets, introCard: false }, 1);
+  const say15 = nonCommentLines(out15).find((l) => l.startsWith("林澈:"))!;
+  assert(say15.includes("姓名\\|年龄\\|籍贯"), `台词里的字面竖线必须转义为 \\|（否则会被引擎当成分页符丢字）: ${say15}`);
+  // 句内不得出现"未转义"的竖线（除分页符外）
+  assert(!/(^|[^\\])\|/.test(say15.replace(/^林澈:/, "").replace(/;$/, "")), `不得残留未转义竖线: ${say15}`);
+
+  // 16) #1508：长台词的分页符必须是"真竖线"（引擎先切段再还原转义）
+  const s16 = makeScript();
+  const longText = "城门前，守夜人林澈握着佩剑，目光如鹰隼般扫视着官道上渐行渐远的人流。他已经在城门口站了整整六个时辰。";
+  s16.scenes[0].lines = [{ type: "narration", text: longText }];
+  const out16 = renderChapter(s16, { characters: cards.characters, items: cards.items, assets, introCard: false }, 1);
+  const nar16 = nonCommentLines(out16).filter((l) => l.startsWith(":")).map((l) => l.replace(/^:/, "").replace(/;$/, ""));
+  // 无配音的长旁白会先被"按句拆成多条消息"，因此每条通常已在单页容量内
+  // （这正是避免超长裁切的另一条防线）。分页符只在单条超过 TEXTBOX_PAGE_MAX_CHARS 时出现，
+  // 故这里只断言"若有分页符，必须是未转义的真竖线"。
+  const hasRealPageBreak = nar16.some((l) => /(^|[^\\])\|/.test(l));
+  const hasEscapedPipe = nar16.some((l) => l.includes("\\|"));
+  assert(!hasRealPageBreak || !hasEscapedPipe || true, "占位（见下条直接断言）");
+  if (hasRealPageBreak) {
+    assert(!hasEscapedPipe, `分页符必须是未转义竖线（转义后引擎不会切段，整句会被 Max_line 裁掉）: ${JSON.stringify(nar16)}`);
+  }
+  // 还原后内容逐字完整（去掉 \| 与分页符）
+  const restored = nar16.join("").replace(/\\\|/g, "|").replace(/\|/g, "");
+  assert(restored === longText, `分页后还原内容应逐字完整，实际: ${JSON.stringify(restored)}`);
+
+  // 17) #1508 契约：renderSpokenText 必须"先转义、再用未转义竖线分页"。
+  // 上游多会先把长句按句拆成多条消息，所以这一步用直接调用锁住契约本身。
+  {
+    // 短句：不引入分页符
+    assert(renderSpokenText("短句") === esc("短句"), "短句不应产生分页符");
+    // 字面竖线：必须转义（否则被引擎当分页符，后续段落被丢）
+    assert(esc("a|b") === "a\\|b", `字面竖线必须转义: ${esc("a|b")}`);
+    // 超长句：分页符必须是未转义的 |，且每页内部无未转义 |
+    // 注意 fixture 必须**超过** TEXTBOX_PAGE_MAX_CHARS(64)，否则 paginateForTextBox 按设计不分页
+    const long = "城门前，守夜人林澈握着佩剑，目光如鹰隼般扫视着官道上渐行渐远的人流。他已经在城门口站了整整六个时辰，却始终没有等到那个约定之人，直到晨钟敲响才缓缓转身离去。";
+    assert(long.length > 64, "fixture 必须超过单页上限，否则该用例无效");
+    const rendered = renderSpokenText(long);
+    const pages = rendered.split("|");
+    assert(pages.length >= 2, `超长句应分成多页，实际 ${pages.length}: ${rendered}`);
+    // 分页符确实存在（未转义）→ 引擎 Os 会切段
+    assert(rendered.includes("|"), "必须有未转义的分页竖线");
+    assert(!rendered.includes("\\|"), `分页路径里不该出现被转义的分页符: ${rendered}`);
+    // 还原后逐字完整（去掉分页符；本句没有字面竖线）
+    assert(pages.join("") === long, `分页还原应逐字完整，实际: ${JSON.stringify(pages.join(""))}`);
+    // 含字面竖线的超长句：字面竖线转义、分页符不转义，两者不得混淆
+    const withPipes = long + "|续";
+    const rendered2 = renderSpokenText(withPipes);
+    assert(rendered2.includes("\\|"), "字面竖线应保留为转义形式");
+    assert(rendered2.includes("|"), "分页符应存在");
+    assert(rendered2.split("\\|").join("|").split("|").join("") === withPipes.replace(/\|/g, ""), "混合场景还原应完整");
+  }
 
   console.log("=== 渲染注入边界测试通过 ===");
 }
