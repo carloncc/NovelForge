@@ -2,6 +2,8 @@
 import { t } from "../../i18n";
 import { projectState } from "../../stores/project";
 import { confirmDialog } from "../../composables/useConfirmDialog";
+import { DEFAULT_BACKGROUND_REUSE } from "../../core/types";
+import type { BackgroundReuseMode } from "../../core/types";
 
 /** 全量重跑开关：开启前二次确认，避免误勾后每一次生成都全价计费；取消要还原勾选态 */
 async function onSkipCacheChange(e: Event): Promise<void> {
@@ -27,7 +29,7 @@ function clampNonNegativeInt(raw: unknown): number {
   return Math.max(0, Math.floor(n));
 }
 
-function onBudgetChange(key: "cgPerChapter" | "imageBudgetPerChapter" | "videoPointsPerChapter", e: Event): void {
+function onBudgetChange(key: "cgPerChapter" | "imageBudgetPerChapter" | "videoPointsPerChapter" | "backgroundsPerLocation", e: Event): void {
   const el = e.target as HTMLInputElement;
   const clamped = clampNonNegativeInt(el.value);
   projectState.options[key] = clamped;
@@ -39,6 +41,41 @@ function onSeedChange(e: Event): void {
   const clamped = clampNonNegativeInt(el.value);
   projectState.options.imageSeed = clamped;
   if (el.value.trim() !== String(clamped)) el.value = String(clamped);
+}
+
+/** #1580 背景复用口径：改变的是「背景任务清单」（502 个场景实例 → N 张图），
+ *  章节灯/看板由 generate.ts 的 watch 自动刷新，这里只落值。
+ *  切换口径会换掉全部背景文件名（bg_<sceneId> ↔ bg_<桶>），旧图不会被复用 → 二次确认，
+ *  与「跳过缓存」同一套防误触口径（这条真的会重新计费）。 */
+const REUSE_MODES: BackgroundReuseMode[] = ["locationTimeWeather", "locationTime", "location", "off"];
+function reuseMode(): BackgroundReuseMode {
+  const v = projectState.options.backgroundReuse;
+  return v && REUSE_MODES.includes(v) ? v : DEFAULT_BACKGROUND_REUSE;
+}
+async function onReuseChange(e: Event): Promise<void> {
+  const el = e.target as HTMLSelectElement;
+  const next = REUSE_MODES.includes(el.value as BackgroundReuseMode) ? (el.value as BackgroundReuseMode) : DEFAULT_BACKGROUND_REUSE;
+  const prev = reuseMode();
+  if (next === prev) return;
+  if (
+    !(await confirmDialog({
+      title: t("切换背景复用口径会改变全部背景图的文件名：已生成的背景会全部判为缺失、按新口径重新生成（计费）。确定切换吗？"),
+      message: t("（口径越粗越省：地点×昼夜×天气 ≈ 300 张、地点×昼夜 ≈ 280 张、只按地点 ≈ 200 张、关闭 = 一个场景一张。旧文件不会自动删除，可在「素材」页点「清理无效素材」回收）"),
+      tone: "primary",
+    }))
+  ) {
+    el.value = prev;
+    return;
+  }
+  projectState.options.backgroundReuse = next;
+}
+function reuseModeLabel(mode: BackgroundReuseMode): string {
+  switch (mode) {
+    case "locationTimeWeather": return t("地点 × 昼夜 × 天气（推荐）");
+    case "locationTime": return t("地点 × 昼夜");
+    case "location": return t("只按地点（最省）");
+    default: return t("关闭：一个场景一张（最贵）");
+  }
 }
 
 /** 1399：SE 音量。seVolume 未进 GenerationOptions 类型表（白名单外），用可选交集读写；
@@ -153,6 +190,19 @@ function onSeVolumeChange(e: Event): void {
           <span>{{ t("每章背景数上限（0 = 不限制）") }}</span>
           <input type="number" min="0" placeholder="0" :value="projectState.options.imageBudgetPerChapter" @change="(e) => onBudgetChange('imageBudgetPerChapter', e)" />
           <span class="hint">{{ t("仅限制背景图；立绘/物品不受限，CG 用上方单独上限") }}</span>
+        </label>
+        <label class="field">
+          <span>{{ t("同一地点背景上限（每章，0 = 不限制）") }}</span>
+          <input type="number" min="0" placeholder="3" :disabled="reuseMode() !== 'off'" :value="projectState.options.backgroundsPerLocation" @change="(e) => onBudgetChange('backgroundsPerLocation', e)" />
+          <span v-if="reuseMode() !== 'off'" class="hint">{{ t("已开启背景复用，此项不生效（复用已从根上消除「同一间房被画几十次」，继续叠加只会把昼夜/天气差分一起裁掉）；要恢复它请把上方「背景复用」改为关闭") }}</span>
+          <span v-else class="hint">{{ t("同一地点在一章内最多出几张背景（默认 3）：LLM 给每个场景实例都写一条独一无二的氛围，实测同一间公寓被画过 79 次；0 = 保留全部氛围图") }}</span>
+        </label>
+        <label class="field">
+          <span>{{ t("背景复用（一张图服务多个场景）") }}</span>
+          <select :value="reuseMode()" @change="onReuseChange">
+            <option v-for="m in REUSE_MODES" :key="m" :value="m">{{ reuseModeLabel(m) }}</option>
+          </select>
+          <span class="hint">{{ t("同一「地点 × 昼夜 × 天气」的场景共用一张背景图（VN 常规做法，一个地点 2~4 张：昼/夜/雨）。实测某 30 章项目 502 个场景实例 → 约 300 张；同一间公寓从 24 张降到几张。关闭 = 一个场景实例一张图，由上方「同一地点背景上限」收敛") }}</span>
         </label>
         <label class="field">
           <span>{{ t("每场景视频推荐点数上限（0 = 不限制）") }}</span>

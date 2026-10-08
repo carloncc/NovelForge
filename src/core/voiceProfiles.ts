@@ -1,4 +1,5 @@
 import type { ApiConfig, VoiceProfile } from "./types";
+import { t } from "../i18n";
 import { ttsConfigById, upsertVoiceProfile } from "../stores/config";
 import { tauri } from "../utils/tauri";
 import { activeAbortSignal } from "../api/abort";
@@ -38,12 +39,12 @@ function apiUrl(config: ApiConfig, path: string): string {
 
 function assertMiniMaxConfig(config: ApiConfig): void {
   if (config.adapter !== "minimax-tts" && !/minimaxi?\.com/i.test(config.baseUrl)) {
-    throw new Error("声音克隆目前只支持 MiniMax TTS 配置，请选择 MiniMax 配置");
+    throw new Error(t("声音克隆目前只支持 MiniMax TTS 配置，请选择 MiniMax 配置"));
   }
 }
 
 function minimaxAuthHeaders(config: ApiConfig): Record<string, string> {
-  if (!config.apiKey.trim()) throw new Error("所选 TTS 配置没有 API Key");
+  if (!config.apiKey.trim()) throw new Error(t("所选 TTS 配置没有 API Key"));
   return { Authorization: `Bearer ${config.apiKey}` };
 }
 
@@ -130,7 +131,7 @@ export async function createMiniMaxVoiceProfile(input: {
 }
 
 /** 从 MiniMax 获取可用音色（系统 + 用户克隆/设计）。voice_type: system/voice_cloning/voice_generation/all */
-export interface MiniMaxRemoteVoice {
+interface MiniMaxRemoteVoice {
   voice_id: string;
   voice_name: string;
   kind: "system" | "clone" | "design";

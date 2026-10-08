@@ -9,6 +9,7 @@ import {
   writeWebSecretsAsync,
 } from "../utils/webKeys";
 import { getTemplate } from "../api/templates";
+import { limiterKeyForConfig, pruneLimiters } from "../api/openaiCompatible";
 import {
   CONFIG_SCHEMA_VERSION,
   DEFAULT_CONCURRENCY_BY_CHANNEL,
@@ -35,7 +36,7 @@ function makeId(): string {
   return Math.random().toString(36).slice(2, 10);
 }
 
-export const DEFAULT_VOICE_LIBRARY = [
+const DEFAULT_VOICE_LIBRARY = [
   "alloy",
   "echo",
   "fable",
@@ -343,7 +344,10 @@ async function retryMigrationPersistence(): Promise<void> {
   pendingMigrationContent = "";
   pendingMigrationSecrets = {};
   lastPersistedContent = migratedContent;
-  lastPersistedSecrets = JSON.stringify(configSecrets(configState));
+  // 这里记的必须是**实际写盘的那份**（迁移集），不能记当前内存里的集合：迁移受阻期间
+  // configPersistenceBlocked=true 会让 watcher 提前返回，用户在横幅挂着时输入的 apiKey 只存在于
+  // 内存；若在此声称「当前集合已持久化」，下面 :351 的非密文相同早退就不会补写，重启即丢 key。
+  lastPersistedSecrets = migratedSecretsSig;
   configPersistenceBlocked = secretStoreUnavailable;
   configPersistenceError.value = secretStoreUnavailable ? configPersistenceError.value : "";
   const currentContent = persistedConfigContent();
@@ -414,10 +418,6 @@ export function upsertVoiceProfile(profile: VoiceProfile): void {
   else configState.voiceProfiles[index] = profile;
 }
 
-export function removeVoiceProfile(id: string): VoiceProfile | undefined {
-  const index = configState.voiceProfiles.findIndex((profile) => profile.id === id);
-  return index < 0 ? undefined : configState.voiceProfiles.splice(index, 1)[0];
-}
 
 export function addConfig(kind: ChannelKey): void {
   const preset = activePreset();
@@ -442,7 +442,17 @@ export async function removeConfig(kind: ChannelKey, id: string): Promise<boolea
   if (preset.active[kind] === id) {
     preset.active[kind] = list[0]?.id ?? "";
   }
+  // B34：限流器表按配置 key 常驻，删除配置后旧条目不会自动释放，长期改配置会让
+  // IMAGE_LIMITERS / LLM_LIMITERS 无界增长。此处是删除 API 配置的唯一入口，接上清理。
+  pruneLimiters(activeLimiterKeys());
   return true;
+}
+
+/** 当前仍存在的全部 API 配置的限流器 key（跨所有配置组） */
+function activeLimiterKeys(): string[] {
+  return configState.presets.flatMap((p) =>
+    (Object.keys(p.channels) as ChannelKey[]).flatMap((k) => p.channels[k] ?? []),
+  ).map(limiterKeyForConfig);
 }
 
 export function addPreset(): void {
@@ -469,6 +479,9 @@ export async function removePreset(id: string): Promise<boolean> {
   if (configState.activePresetId === id) {
     configState.activePresetId = configState.presets[0].id;
   }
+  // B34：删除整组同样是「删除 API 配置」，必须和 removeConfig 一样释放限流器条目，
+  // 否则整组删除后 IMAGE_LIMITERS / LLM_LIMITERS 仍按旧 key 常驻（B34 只接了一半）。
+  pruneLimiters(activeLimiterKeys());
   return true;
 }
 

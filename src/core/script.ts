@@ -16,9 +16,11 @@ import { chatJson, EmptyContentError, type LlmProgressEvent } from "../api/opena
 import { estimateCharsPerToken, inputCharBudgetForText, outputTokensForText } from "../api/providers";
 import { splitNovelForAgent } from "./textSplit";
 import { log as logger } from "../utils/logger";
+import { safeSlice } from "../utils/text";
 import { tauri } from "../utils/tauri";
 import { scriptCacheRest, scriptPartFileName, scriptPartRest, scanScriptPartCache } from "./cache";
 import { loreContextForScript } from "./cards";
+import { sanitizeId } from "./render";
 import type { ApiConfig } from "./types";
 
 /**
@@ -181,7 +183,7 @@ function buildItemContext(items: ItemCard[]): string {
     .join("\n");
 }
 
-export interface ScriptChapterOptions {
+interface ScriptChapterOptions {
   /** 剧本文风：整体按此风格改写台词与旁白（如"古风典雅"）；留空不调整 */
   style?: string;
   /** 用户对上一版剧本的意见，重新生成时严格参考 */
@@ -224,6 +226,32 @@ export function resolveCgMax(cgMax?: number): number {
 
 /** 视频推荐位提示词规则（#1135，纯函数供单测）：
  *  关闭时明确要求不输出 videoPoints（而不是生成后再清空，白花 token）；限数时注入整章上限 */
+/** #1547：视频推荐位 id 的 sanitize 后唯一化（纯函数，供单测）。
+ *
+ * 与 ensureUniqueSceneIds 是同一个坑的两处：那里的注释写得很清楚——
+ * 缓存键全都是 sanitizeId(scene.id)，而 sanitizeId 把非 [a-zA-Z0-9_-] 全替换成 "_"，
+ * 于是「城门」与「城楼」都会变成 "___"。场景侧已经补了去重，视频位侧一直没有：
+ * script.ts 清洗时写的是 `id: vp.id || \`vp_${scene}_${k}\``，LLM 给了 id 就原样采用，
+ * 既不归一也不去重；而 render.ts:742/846、project.ts:1193、generate.ts:3908 全都拿
+ * sanitizeId(vp.id) 当作视频文件名与映射键。两个中文 id 清洗后同名 → 写同一个 video_*.mp4，
+ * 两个视频位在成品里指向同一段视频。
+ *
+ * @param vps 本章该场景的推荐位（已过滤残条）
+ * @param used 章内已占用的 sanitize 后形态，跨场景共用，故由调用方持有
+ */
+export function ensureUniqueVideoPointIds(
+  vps: { id: string }[],
+  used: Set<string>,
+): void {
+  for (const vp of vps) {
+    const base = vp.id || "vp";
+    let id = base;
+    let n = 2;
+    while (used.has(sanitizeId(id))) id = `${base}_${n++}`;
+    used.add(sanitizeId(id));
+    vp.id = id;
+  }
+}
 export function videoPointsPromptRule(useVideoPoints?: boolean, limit?: number): string {
   if (useVideoPoints === false) {
     return "【本次已关闭视频推荐位（覆盖上文规则 6）】：不要输出 videoPoints 字段，不要为视频推荐位花费任何篇幅，把篇幅留给台词与旁白保真。";
@@ -352,7 +380,7 @@ export function planScriptChunks(
   // 输出侧：期望 JSON 约占正文 0.6~1 倍，按单次输出预算的 1/3 留思考余量反推
   const probeTokens = outputTokensForText(
     cfg,
-    `${systemPrompt}\n${buildScriptUser(chapter, cards, extra, chapter.text.slice(0, 4000))}`,
+    `${systemPrompt}\n${buildScriptUser(chapter, cards, extra, safeSlice(chapter.text, 4000))}`,
   );
   const byOutput = Math.floor(probeTokens * (1 / 3) * estimateCharsPerToken(chapter.text));
   const chunkBudget = Math.max(3000, Math.min(byInput, byOutput, SCRIPT_BLOCK_MAX_CHARS));
@@ -419,7 +447,7 @@ export function isPunctuationOnlyText(text: string): boolean {
   return /^[\p{P}\p{S}\s]*$/u.test(t);
 }
 
-export interface MergePunctuationResult {
+interface MergePunctuationResult {
   lines: Line[];
   /** 并入相邻行的句数 */
   merged: number;
@@ -485,6 +513,8 @@ interface ScriptSceneContext {
   cgCount: { value: number };
   /** 整章视频位配额累计（#1135：上限按整章计，达上限后后续场景不再出） */
   videoCount: { value: number };
+  /** #1547：整章已占用的 sanitize 后视频位 id 形态（跨场景/跨分块共享，与 cgCount/videoCount 同理） */
+  videoIdSeen: Set<string>;
   /** 视频推荐位开关透传（#1135）：false=映射侧直接丢弃，不写残条 */
   useVideoPoints?: boolean;
   /** 整章视频位上限透传（#1135：0/缺省=不限） */
@@ -517,6 +547,28 @@ export function normalizeSceneFigures(raw: unknown, cards: ExtractionResult): st
     out.push(id);
   }
   return out;
+}
+
+/**
+ * CG 事件构造（纯函数，供单测）。
+ *
+ * #1515：模型偶尔漏 imagePrompt。旧实现 `imagePrompt: s.cg.imagePrompt` 会把 undefined 原样写进
+ * 剧本缓存，之后**每次**读回都被 parseChapterScript 判为坏数据 —— 而所有调用点都是读缓存
+ * （pipeline.readCachedScript 按 cache-miss 重新付费生成整章、useChapterStatus 置 null 后
+ * 界面显示"剧本未生成"）。实测用户 30 章缓存里 5 章共 11 处命中此坑。
+ * 这里统一归一化成字符串，保证"写出去的缓存一定能被读回来"。
+ */
+export function buildCgEvent(
+  cg: { title?: unknown; description?: unknown; imagePrompt?: unknown },
+  triggerIndex: number,
+): CgEvent {
+  return {
+    triggerIndex,
+    title: typeof cg.title === "string" ? cg.title : "",
+    description: typeof cg.description === "string" ? cg.description : "",
+    imagePrompt: typeof cg.imagePrompt === "string" ? cg.imagePrompt : "",
+    videoSuggestion: undefined,
+  };
 }
 
 /** 把一次模型回执映射为场景数组（含分支/CG/物品/视频位/分镜清洗与配额） */
@@ -567,13 +619,7 @@ function mapScriptScenes(model: ScriptModel, ctx: ScriptSceneContext): SceneJSON
         logger.warn("script", `CG 超过每章 ${CG_PER_CHAPTER_MAX} 个上限，已丢弃多余 CG`, { scene: s.id || i, title: s.cg.title });
       } else {
         ctx.cgCount.value++;
-        cgEvent = {
-          triggerIndex: Math.max(0, Math.floor(lines.length / 3)),
-          title: s.cg.title,
-          description: s.cg.description,
-          imagePrompt: s.cg.imagePrompt,
-          videoSuggestion: undefined,
-        };
+        cgEvent = buildCgEvent(s.cg, Math.max(0, Math.floor(lines.length / 3)));
       }
     }
 
@@ -598,7 +644,7 @@ function mapScriptScenes(model: ScriptModel, ctx: ScriptSceneContext): SceneJSON
         const finalBranch = ctx.imageOnly ? mergePunctuationOnlyLines(mappedBranch).lines : mappedBranch;
         return {
           id: c.id || `choice_${s.id || i}_${k}`,
-          prompt: (c.prompt || "继续").slice(0, 20),
+          prompt: safeSlice(c.prompt || "继续", 20),
           lines: finalBranch,
         };
       });
@@ -630,7 +676,7 @@ function mapScriptScenes(model: ScriptModel, ctx: ScriptSceneContext): SceneJSON
             prompt: sh.prompt.trim(),
             triggerLineIndex,
             ...(characters && characters.length ? { characters } : {}),
-            ...(typeof sh.note === "string" && sh.note.trim() ? { note: sh.note.trim().slice(0, 20) } : {}),
+            ...(typeof sh.note === "string" && sh.note.trim() ? { note: safeSlice(sh.note.trim(), 20) } : {}),
           };
         });
       if (!shots.length) shots = undefined;
@@ -660,6 +706,8 @@ function mapScriptScenes(model: ScriptModel, ctx: ScriptSceneContext): SceneJSON
             videoPrompt: vp.videoPrompt,
             durationSecs: vp.durationSecs || 5,
           }));
+        // #1547：按 sanitize 后的形态去重（LLM 给的 id 原样保留，冲突才加后缀）
+        ensureUniqueVideoPointIds(cleaned, ctx.videoIdSeen);
         if (!VIDEO_PER_CHAPTER_MAX) return cleaned;
         const remain = VIDEO_PER_CHAPTER_MAX - ctx.videoCount.value;
         if (remain <= 0) {
@@ -711,9 +759,12 @@ export function splitForDegrade(text: string): string[] {
  *  此类失败等量重试注定再次失败，调用方应降级（拆分/换通道）而非硬扛；鉴权/参数/审查类返回 false。 */
 export function isServerClassFailure(e: unknown): boolean {
   const status = typeof e === "object" && e !== null ? (e as { status?: unknown }).status : undefined;
-  if (status === 429 || status === 500 || status === 502 || status === 503 || status === 504) return true;
+  // #1557：原来是 500/502/503/504 逐个列举，漏掉 505-599——**尤其 Cloudflare 的 520-527**
+  // （中转站极常见）。漏判会让这类瞬时故障被判成「非服务端故障」，调用方不再重试/降级，
+  // 本章白失败一次。改为整个 5xx 段。
+  if (status === 429 || (typeof status === "number" && status >= 500 && status <= 599)) return true;
   // 纯文本匹配必须带边界/上下文（\b429\b、HTTP 503），避免 "1500 tokens" 这类数字误伤
-  return /\b429\b|\b50[0-4]\b|HTTP (429|50[0-4])|status.?(429|50[0-4])|timed out|timeout|error sending request|socket|econnreset|econnaborted|reset by peer|overload|capacity/i.test(failureText(e));
+  return /\b429\b|\b5\d\d\b|HTTP (429|5\d\d)|status.?5\d\d|timed out|timeout|error sending request|socket|econnreset|econnaborted|reset by peer|overload|capacity/i.test(failureText(e));
 }
 
 /**
@@ -809,6 +860,7 @@ export async function scriptChapter(
     resolveSceneId,
     cgCount: { value: 0 },
     videoCount: { value: 0 },
+    videoIdSeen: new Set<string>(),
     useVideoPoints: opts.useVideoPoints,
     videoPointsPerChapter: opts.videoPointsPerChapter,
     cgMax: opts.cgMax,
@@ -1324,7 +1376,7 @@ function demoScriptChapter(chapter: ChapterInfo, cards: ExtractionResult): Chapt
       sc.cg = {
         triggerIndex: Math.floor(sc.lines.length / 2),
         title: "战斗高潮",
-        description: (hit as { text: string }).text.slice(0, 40),
+        description: safeSlice((hit as { text: string }).text, 40),
         imagePrompt: "anime illustration, epic battle scene, hero with glowing blue sword against dark beasts on ancient city wall at night, dramatic composition, cinematic lighting",
       };
       break;
@@ -1353,7 +1405,7 @@ function demoScriptChapter(chapter: ChapterInfo, cards: ExtractionResult): Chapt
           triggerIndex: i,
           itemId: item.id,
           action: /(接过|收到|获得|收好|送给|赠|交到|拿出|取出)/.test(l.text) ? "obtain" : "show",
-          description: l.text.slice(0, 50),
+          description: safeSlice(l.text, 50),
         });
       }
     }
@@ -1665,7 +1717,7 @@ export function deleteScriptLine(script: ChapterScript, sceneIndex: number, line
   return next;
 }
 
-export interface ScriptVerifyFile {
+interface ScriptVerifyFile {
   version: 1;
   chapterIndex: number;
   title: string;

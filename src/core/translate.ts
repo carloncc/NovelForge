@@ -5,7 +5,7 @@ import { inputCharBudgetForText, outputTokensForText } from "../api/providers";
 import { splitNovelForAgent } from "./textSplit";
 import { log as logger } from "../utils/logger";
 
-export interface TranslatedChapter {
+interface TranslatedChapter {
   title: string;
   text: string;
 }

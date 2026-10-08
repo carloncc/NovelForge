@@ -2,10 +2,11 @@
 import { computed, ref, watch, onBeforeUnmount, type ComponentPublicInstance } from "vue";
 import type { CharacterCard, ExtractionResult } from "../core/types";
 import { activeConfig, configState, voiceLibraryFor } from "../stores/config";
-import { tauri, isTauri } from "../utils/tauri";
+import { tauri, isTauri, blessParentDir } from "../utils/tauri";
 import { vfsWriteFileBase64 } from "../utils/vfsWeb";
 import { projectState } from "../stores/project";
 import { saveEditedCards, shouldBlockCardSave, shouldBlockRecordingStart } from "../core/cards";
+import { chapterCharacterIds } from "../core/images";
 import { open } from "@tauri-apps/plugin-dialog";
 import { errMsg } from "../utils/errors";
 import { fileToBase64 } from "../utils/file";
@@ -33,6 +34,32 @@ function setSavedMsg(msg: string, level: "ok" | "err" = "ok"): void {
   savedMsg.value = msg;
   savedMsgLevel.value = level;
 }
+/**
+ * 角色出场章节数（已有剧本时才算得出）：帮用户判断哪些角色是「没什么用的」，
+ * 从而在「图片档位」里把它们设成路人档（默认立绘 + 1 张表情）。
+ * 只读展示 + 一键建议，**不参与生成**——档位始终由角色卡上的字段决定（见 core/figureBudget.ts）。
+ */
+const screenChapters = computed<Map<string, number>>(() => {
+  const counts = new Map<string, number>();
+  for (const chapter of projectState.lastResult?.chapters ?? []) {
+    for (const id of chapterCharacterIds(chapter)) counts.set(id, (counts.get(id) ?? 0) + 1);
+  }
+  return counts;
+});
+/** 建议设为路人档的角色：已标 NPC + 有剧本佐证只出场 ≤1 章 + 当前不是路人档 */
+const cameoSuggestions = computed(() =>
+  local.value.characters.filter((c) => {
+    const n = screenChapters.value.get(c.id);
+    return c.isNpc === true && n !== undefined && n <= 1 && c.figureTier !== "cameo";
+  }),
+);
+function applyCameoTier(): void {
+  const targets = cameoSuggestions.value;
+  if (!targets.length) return;
+  for (const c of targets) c.figureTier = "cameo";
+  setSavedMsg(t("已把 {n} 个角色标为「路人」档（默认立绘 + 1 张表情），保存后生效", { n: targets.length }));
+}
+
 const refImgInput = ref<HTMLInputElement | null>(null);
 // v-for 内用字符串 ref 会得到元素数组，ref.value.click() 必然失效；函数 ref 只记录最后挂载的输入框即可
 // （点击哪个输入框都会读 refImgTarget，因此不需要区分具体是哪一个）
@@ -91,10 +118,26 @@ async function recognizeChar(c: CharacterCard): Promise<void> {
 // 父组件卡片更新（重新生成后）时同步刷新本地副本
 // 1408：视觉守门面板用 splice 原位替换 characters 元素（数组引用不变），
 // 浅 watch 感知不到，卡片页显示旧 prompt，点保存还会把新描述覆盖回旧值。加 deep。
+//
+// 但 deep watch 无法区分「外部改了 props」与「用户正在改 local」，会直接把用户尚未保存的
+// 卡片编辑整份覆盖掉（setSavedMsg("") 还会顺手抹掉「未保存」提示）。
+// 主因——视觉守门面板与卡片同 tab 同时挂载、守门的 in-place splice 触发本 watcher——已由
+// 拆成独立 tab 消除；这里保留「快照比对」作为兜底：只要 local 与上次同步的快照不一致，
+// 就认定用户改过，此时不动 local，只更新基线并提示。
+let lastSyncedJson = JSON.stringify(props.cards);
 watch(
   () => props.cards,
   () => {
-    local.value = JSON.parse(JSON.stringify(props.cards));
+    const nextJson = JSON.stringify(props.cards);
+    if (JSON.stringify(local.value) !== lastSyncedJson) {
+      // 有未保存编辑：保留用户改动，只更新基线，避免下次再被误判为「已同步」。
+      // 提示用户自行决定是否用新数据覆盖（重新生成后保存仍以 local 为准）。
+      lastSyncedJson = nextJson;
+      setSavedMsg(t("卡片有未保存的修改：已保留你的编辑，重新生成的结果需点「保存」才会覆盖"), "err");
+      return;
+    }
+    local.value = JSON.parse(nextJson);
+    lastSyncedJson = nextJson;
     setSavedMsg("");
   },
   { deep: true },
@@ -142,7 +185,12 @@ async function importCharacterVoice(card: CharacterCard): Promise<void> {
 async function chooseVoiceReference(card: CharacterCard): Promise<void> {
   if (!isTauri()) { voiceFileTarget.value = card; voiceFileInput.value?.click(); return; }
   const picked = await open({ multiple: false, filters: [{ name: t("参考声音"), extensions: ["wav", "mp3", "m4a", "ogg", "flac"] }] });
-  if (typeof picked === "string") await createVoiceFromPath(card, picked);
+  if (typeof picked === "string") {
+    // #1520：先登记所选文件所在目录（与导入/追加路径同一套白名单授权）。否则位于工作目录/
+    // 临时目录/家目录之外的位置（D 盘、移动硬盘、网络盘）会被 resolve_safe_path 直接拒绝。
+    await blessParentDir(picked);
+    await createVoiceFromPath(card, picked);
+  }
 }
 
 function audioMime(fileName: string): string {
@@ -316,6 +364,8 @@ async function pickReferenceImage(card: CharacterCard): Promise<void> {
     filters: [{ name: t("参考图"), extensions: ["png", "jpg", "jpeg", "webp"] }],
   });
   if (!picked || typeof picked !== "string") return;
+  // #1520：同 chooseVoiceReference——不登记目录，跨盘的参考图读不到
+  await blessParentDir(picked);
   try {
     const b64 = await tauri.readFileBase64(picked);
     card.referenceImage = b64;
@@ -463,6 +513,13 @@ onBeforeUnmount(() => {
           <input type="checkbox" v-model="invalidateScript" />
           {{ t("同时重写剧本") }}
         </label>
+        <button
+          v-if="cameoSuggestions.length"
+          class="btn secondary small"
+          :disabled="busy"
+          :title="t('按已生成的剧本统计：这些角色只出场 1 章，设为路人档可省下大量表情/服装/动作差分（可随时改回）')"
+          @click="applyCameoTier"
+        >{{ t("把出场 ≤1 章的角色设为「路人」档（{n}）", { n: cameoSuggestions.length }) }}</button>
         <button class="btn secondary small" :disabled="busy || castBusy" @click="aiCastVoices">
           {{ castBusy ? t("AI 挑选中…") : t("AI 选音色") }}
         </button>
@@ -494,6 +551,19 @@ onBeforeUnmount(() => {
           </select>
         </label>
         <label class="field"><span>{{ t("主题色") }}</span><input type="text" v-model="c.color" placeholder="#3b5bdb" /></label>
+      </div>
+      <div class="row">
+        <label class="field grow-2">
+          <span>{{ t("图片档位") }}</span>
+          <select v-model="c.figureTier">
+            <option :value="undefined">{{ t("自动（按角色重要度）") }}</option>
+            <option value="main">{{ t("主要角色（全量）") }}</option>
+            <option value="supporting">{{ t("次要角色（精简）") }}</option>
+            <option value="cameo">{{ t("路人（最省）") }}</option>
+          </select>
+          <span class="hint">{{ t("图片档位决定该角色生成多少张立绘/表情/服装/动作：主要＝全量；次要＝表情 5 张、服装 1 套、动作 1 个；路人＝默认立绘＋1 张表情（无服装/动作）。渲染端对缺失差分有回退，不会出现空场。") }}</span>
+          <span v-if="screenChapters.get(c.id) !== undefined" class="hint">{{ t("出场章节：{n}", { n: screenChapters.get(c.id) ?? 0 }) }}</span>
+        </label>
       </div>
       <label class="field"><span>{{ t("外貌") }}</span><input type="text" v-model="c.appearance" /></label>
       <label class="field"><span>{{ t("服装") }}</span><input type="text" v-model="c.clothing" /></label>

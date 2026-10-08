@@ -19,7 +19,7 @@ export interface ApiConfig {
   concurrency?: number;
 }
 
-export interface ApiChannel {
+interface ApiChannel {
   llm: ApiConfig[];
   vision: ApiConfig[];
   image: ApiConfig[];
@@ -92,8 +92,18 @@ export interface CharacterCard {
   costumes?: CharacterCostume[];
   /** 自定义表情集（由 AI 按剧情决定，不设上限；缺省使用标准 5 表情） */
   emotions?: string[];
-  /** 是否为次要角色/NPC（有台词但戏份少）；仅用于标注，生成流程与主要角色一致 */
+  /** 是否为次要角色/NPC（有台词但戏份少）；auto 档位下据此给该角色精简图片预算 */
   isNpc?: boolean;
+  /** 图片档位（立绘/表情/服装/动作的预算）：缺省 auto=按 isNpc 判定；显式设置覆盖自动判定 */
+  figureTier?: FigureTierSetting;
+  /**
+   * 剧本实际使用情况（剧本阶段统计后写回卡片）：表情/服装/动作的**按需出图**依据。
+   * 三个数组都是「剧本里真的用到 + 按使用次数降序 + 已过滤到卡片内合法 id」。
+   * 实测某 30 章项目：表情 160 张里 115 张、服装 80 张里 73 张从未被任何台词引用；
+   * 反向还有 69 处台词标注的动作没生成（生成端只取卡面前 2 个）。
+   * 缺省 = 还没有剧本（按卡片顺序 + 档位预算出图，与旧行为一致）。
+   */
+  imageUsage?: CharacterImageUsage;
   /** Legacy inline image payload. Read during migration, but never write to new project JSON. */
   referenceImage?: string;
   /** Project-local character reference path used by current code. */
@@ -101,7 +111,7 @@ export interface CharacterCard {
   color: string;
 }
 
-export type VoiceProfileStatus = "ready" | "creating" | "error";
+type VoiceProfileStatus = "ready" | "creating" | "error";
 
 export interface VoiceProfile {
   id: string;
@@ -117,9 +127,9 @@ export interface VoiceProfile {
   createdAt: string;
 }
 
-export type VisualBibleStatus = "draft" | "approved" | "stale";
+type VisualBibleStatus = "draft" | "approved" | "stale";
 export type StyleSource = "reference_image" | "novel_analysis";
-export type ImageReferenceRole = "identity" | "style" | "structure";
+type ImageReferenceRole = "identity" | "style" | "structure";
 
 export interface ImageReference {
   role: ImageReferenceRole;
@@ -351,6 +361,14 @@ export interface ImageTask {
   id: string;
   /** 该任务所属章节（仅背景/CG：ChapterScript.chapter，0-based 连续编号）；用于按章精确强制重画 */
   chapter?: number;
+  /**
+   * 背景复用的同桶场景 id（仅 kind=background，含任务自身的 id）：
+   * 这些场景共用本任务的**同一个文件**，生成后要一并写进 assets.bg（渲染端逐场景查映射）。
+   * 缺省=旧行为（本任务只服务 id 那一个场景）。
+   */
+  bgSceneIds?: string[];
+  /** 同桶场景涉及的章节（0-based，仅 kind=background）：单章强制重画要能命中跨章共享的桶 */
+  bgChapters?: number[];
   characterId?: string;
   prompt: string;
   references?: ImageReference[];
@@ -491,6 +509,50 @@ export interface NovelDoc {
 
 export type FigureDetail = "core" | "full";
 
+/**
+ * 角色图片的「剧本实际使用情况」（写回角色卡，见 CharacterCard.imageUsage）。
+ * 只在剧本阶段统计一次，之后所有构建路径（主管线/单章跳过判定/章节灯/素材页/重生成/补缺）
+ * 都从卡片读同一份，因此文件名清单结构上不会漂移（#1521 那一族 bug 的根因就是两处口径不一致）。
+ */
+export interface CharacterImageUsage {
+  /** 剧本里用到的表情 id（按使用次数降序；normal 总会补上） */
+  emotions: string[];
+  /** 剧本里真正换上的服装 id（按使用次数降序） */
+  costumes: string[];
+  /** 剧本里用到的动作 id（按使用次数降序） */
+  actions: string[];
+  /** 统计口径的章节数（剧本重跑后此值变化 → 使用集合随之刷新） */
+  chapters: number;
+}
+
+/** 角色图片档位：main=主要角色（全量）/ supporting=次要角色（精简）/ cameo=路人（最省） */
+export type FigureTier = "main" | "supporting" | "cameo";
+
+/**
+ * 背景复用口径（#1580）：一张背景图服务**一组**场景，而不是一个场景实例。
+ *
+ * 起因：背景任务原本按 `scene.id` 建，一个场景实例一张图。实测某 30 章项目 502 个场景实例、
+ * 同一间公寓出现 62 次（8 章），于是同一间房被画了 24 张几乎一样的夜景——
+ * 而每张的提示词只是把同一张画换个说法重写（502 条 bgPrompt 无一重复，按提示词去重省不下来）。
+ * VN 的行业常规是「一个地点 2~4 张（昼/夜/雨）」，故按「地点 × 昼夜 × 天气」分桶复用。
+ *
+ * 分桶键**只吃场景自身字段**（纯函数，见 images.ts 的 backgroundBucketKey）：
+ * 任何调用方（主管线、单章、章节灯、素材页、重生成、补缺、清理）拿到的是同一份清单与同一个文件名，
+ * 结构上不可能漂移——这是 #1521 那族 bug（两条路径口径不一致 → 单章永远凑不齐、反复计费）的防线。
+ */
+export type BackgroundReuseMode = "off" | "location" | "locationTime" | "locationTimeWeather";
+
+/**
+ * 背景复用默认口径：地点 × 昼夜 × 天气。
+ *
+ * 所有调用点一律走这个常量（不要各自写 `?? "off"`）：只要有一处口径不同，
+ * 「单章构建」与「整本构建」就会算出不同的文件名清单，直接复现 #1521。
+ */
+export const DEFAULT_BACKGROUND_REUSE: BackgroundReuseMode = "locationTimeWeather";
+
+/** 角色卡上的图片档位设置：auto=按 isNpc 自动判定（默认） */
+export type FigureTierSetting = FigureTier | "auto";
+
 export interface GenerationOptions {
   useImage: boolean;
   useTts: boolean;
@@ -509,6 +571,22 @@ export interface GenerationOptions {
   imageSelfCheck: boolean;
   /** 每章图像数上限（0 = 不限制，默认） */
   imageBudgetPerChapter: number;
+  /**
+   * 同一地点在**单章内**的背景图上限（0 = 不限制）。
+   * 实测某 30 章项目 502 张背景里，同一间公寓被画了 79 次、一个"秘密写作据点"在一章内画了 21 次——
+   * LLM 给每个场景实例都写一条独一无二的氛围字符串，于是同一地点反复重画。
+   * 口径按「每章」计而不是全书：单章/章节灯的构建上下文只有一章，按全书统计会让两条路径算出
+   * 不同的任务清单（#1521 那族 bug：单章永远凑不齐成品、反复重新计费）。
+   */
+  backgroundsPerLocation?: number;
+  /**
+   * 背景复用口径（#1580，默认 DEFAULT_BACKGROUND_REUSE=地点×昼夜×天气）：
+   * 同一「地点 × 昼夜 × 天气」桶内的全部场景共用一张背景图，只有跨桶才另出一张。
+   * off = 旧行为（一个场景实例一张图，由 backgroundsPerLocation 收敛）。
+   * 开启复用后 backgroundsPerLocation 不再生效——它当初就是为"同一间房被画 79 次"打的补丁，
+   * 而复用从根上消除了重复；继续叠加只会把昼夜/天气差分也一起裁掉。
+   */
+  backgroundReuse?: BackgroundReuseMode;
   /** 每章 CG 数上限（0 = 不限制，默认） */
   cgPerChapter: number;
   skipCache: boolean;
@@ -604,7 +682,7 @@ export interface ExportSettings {
 }
 
 /** 世界观卡片（#799） */
-export type LoreKind = "map" | "quest" | "faction" | "artifact" | "system" | "other";
+type LoreKind = "map" | "quest" | "faction" | "artifact" | "system" | "other";
 export interface LoreCard {
   id: string;
   /** 短标题（如「黑水城防线图」「铁盟入会试炼」） */

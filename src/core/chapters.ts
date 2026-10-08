@@ -1,4 +1,5 @@
 import type { ChapterInfo, NovelDoc } from "./types";
+import { t } from "../i18n";
 import { tauri } from "../utils/tauri";
 import { basename, basenameWithoutExt } from "../utils/path";
 import { log } from "../utils/logger";
@@ -84,7 +85,8 @@ export function splitChapters(fullText: string, baseTitle: string): ChapterInfo[
   }
 
   if (!merged.length) {
-    merged.push({ index: 0, title: "第一章", text: fullText.trim(), charCount: fullText.length });
+    // #1527：charCount 必须与 text 对齐（与 split.ts 的同款回退口径一致）
+    merged.push({ index: 0, title: "第一章", text: fullText.trim(), charCount: fullText.trim().length });
   }
   if (merged.length === 1 && !anyChapter) {
     merged[0].title = baseTitle || "第一章";
@@ -92,6 +94,42 @@ export function splitChapters(fullText: string, baseTitle: string): ChapterInfo[
   return merged;
 }
 
+/**
+ * 解析「增量追加」要拼到原文后面的那部分正文（#1519）。
+ *
+ * 背景：用户把新章节写进**同一个** txt、再在追加对话框里选中这个 txt，是很自然的操作。
+ * 旧实现无条件把所选文件整份当作「新增内容」拼到原文后面，于是：
+ *   1. 全文被重复一遍；
+ *   2. 分章/提取/剧本/图像对着重复内容重跑一遍——真实计费；
+ *   3. sourcePaths 不变（该路径已在列表里），重启后按源文件重新导入又变回未重复的版本，
+ *      内存与磁盘长期不一致，指纹来回跳变。
+ *
+ * 故：所选文件若已在原文里，则只取「原文之后真正多出来的尾巴」；取不出来就明确拒绝，
+ * 而不是默默把整份文件再拼一遍。纯函数，便于单测。
+ */
+type AppendTailResult =
+  | { ok: true; tail: string }
+  | { ok: false; reason: "empty" | "multiSource" | "same" | "notSuffix" };
+
+export function resolveAppendTail(
+  tailRaw: string,
+  baseFullText: string,
+  alreadyImported: boolean,
+  multiSource: boolean,
+): AppendTailResult {
+  // 与导入链共用同一归一化（含 BOM 剥离）：旧实现在调用点内联复制了一份、漏掉 BOM 剥离，
+  // 靠 joinAppendText 再兜一次才没出事——多一层依赖就多一个能漏的地方。
+  const tail = normalizeNovelText(tailRaw);
+  if (!tail) return { ok: false, reason: "empty" };
+  if (!alreadyImported) return { ok: true, tail };
+  if (multiSource) return { ok: false, reason: "multiSource" };
+  const base = normalizeNovelText(baseFullText);
+  if (tail === base) return { ok: false, reason: "same" };
+  if (!tail.startsWith(base)) return { ok: false, reason: "notSuffix" };
+  const delta = tail.slice(base.length).trim();
+  if (!delta) return { ok: false, reason: "empty" };
+  return { ok: true, tail: delta };
+}
 export async function importNovelFile(path: string): Promise<NovelDoc> {
   const done = log.time("chapters", `导入小说 ${path}`);
   const { text, encoding } = await tauri.readTextFile(path);
@@ -104,7 +142,7 @@ export async function importNovelFile(path: string): Promise<NovelDoc> {
   // 空/纯空白文件：多文件路径会抛错，单文件路径此前会兜底造出一个空章节并"导入成功"，
   // 空小说进入管线后只是把报错推迟到 LLM 调用（还可能白烧一次额度）。口径统一为直接拒绝。
   if (!cleaned.trim()) {
-    throw new Error("文件内容为空，无法导入");
+    throw new Error(t("文件内容为空，无法导入"));
   }
   const fileName = basename(path);
   const baseTitle = basenameWithoutExt(path);
@@ -145,7 +183,7 @@ export async function importNovelFiles(paths: string[]): Promise<NovelDoc> {
   }
   const nonEmpty = parts.filter((p) => p.text.trim());
   if (nonEmpty.length === 0) {
-    throw new Error("所选文件均为空，无法导入");
+    throw new Error(t("所选文件均为空，无法导入"));
   }
   // B12：与 joinAppendText 共用同一归一化函数，分隔统一为 \n\n（各部分已折叠 3+ 换行），
   // 保证「追加拼接」与「重启后重新导入」得到同一 fullText（指纹一致，不误触重分章）

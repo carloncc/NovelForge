@@ -153,7 +153,16 @@ onBeforeUnmount(() => {
         <span class="hint">{{ t("全屏后可用 Esc 退出；游戏内坐标系按 16:9 适配") }}</span>
       </div>
       <div ref="stageRef" class="preview-stage" :class="{ zoomed: zoom > 100 }" :style="stageStyle">
-        <iframe :key="reloadKey" class="preview-frame" :src="url" allow="fullscreen; autoplay" />
+        <!-- referrerpolicy="no-referrer"：否则 webview 会给预览服务带上 Referer=http://tauri.localhost/，
+             被服务端的同源校验 403（服务端已同时放行应用自身来源，这里是双保险，也避免把
+             应用 URL 泄漏给预览内容）。 -->
+        <iframe
+          :key="reloadKey"
+          class="preview-frame"
+          :src="url"
+          allow="fullscreen; autoplay"
+          referrerpolicy="no-referrer"
+        />
       </div>
     </div>
     <div v-else class="card empty">

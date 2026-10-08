@@ -15,8 +15,6 @@ import {
 } from "../src/stores/config";
 import {
   normalizeExportUiLanguage,
-  coerceTranslationLanguage,
-  resolveTranslationLanguageUpdate,
 } from "../src/stores/project";
 
 function assert(cond: boolean, msg: string): void {
@@ -123,15 +121,9 @@ async function main(): Promise<void> {
   assert(keep.config.presets[0].channels.llm[0].model === "my-model-123", "未知 model 应保留");
 
   // #1320：空语言保持空语义，导出界面语言独立
-  assert(coerceTranslationLanguage("") === "", "空翻译目标保持空");
-  assert(coerceTranslationLanguage("zh_CN") === "zh_CN", "非空原样");
-  assert(coerceTranslationLanguage(undefined) === "", "非字符串回空");
   assert(normalizeExportUiLanguage("") === "zh_CN", "界面语言空回退 zh_CN");
   assert(normalizeExportUiLanguage("en") === "en", "界面语言合法保留");
   assert(normalizeExportUiLanguage("ko") === "ko", "ko 是合法游戏界面语言（WebgalLanguage），应保留");
-  assert(resolveTranslationLanguageUpdate("", "zh_CN", false) === "", "未触碰不覆盖空语言");
-  assert(resolveTranslationLanguageUpdate("", "", true) === "", "触碰写空仍保持空（不翻译）");
-  assert(resolveTranslationLanguageUpdate("", "en", true) === "en", "触碰写非空生效");
 
   // #1333：签名纳入 Key 内容（K→K 也能感知），不明文存 Key
   const s1 = modelFetchSignature({ id: "c1", baseUrl: "https://a", apiKey: "wrong-key", extra: {} });

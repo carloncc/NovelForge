@@ -1,6 +1,5 @@
 import "fake-indexeddb/auto";
 import {
-  vfsWriteFile,
   vfsWriteTextFile,
   vfsReadTextFile,
   vfsReadFileBase64,
@@ -55,11 +54,17 @@ async function main(): Promise<void> {
   assert(await vfsExists("/app/copy/game/scene/start.txt"), "copyDirAll 失败");
 
   // 递归收集（含排除）
+  // #1522：点文件/点目录一律不收集——口径与桌面端 write_zip_contents、预览服务器的
+  // is_preview_blocked 一致（那里本来就拒绝点文件，收集上来只会被服务端丢掉、白占上传流量）。
+  // 因此「.novel2vn/meta.json」现在由策略挡下，不再依赖调用方显式 exclude。
   await vfsWriteTextFile("/app/project/.novel2vn/meta.json", "{}");
   const all = await vfsCollectFiles("/app/project");
-  assert(all.length === 4, `collectFiles 数量错误: ${all.length}`);
-  const noMeta = await vfsCollectFiles("/app/project", ["/app/project/.novel2vn"]);
-  assert(noMeta.length === 3, "collectFiles 排除失败");
+  assert(all.length === 3, `collectFiles 数量错误（点文件应被策略排除）: ${all.length}`);
+  assert(!all.some((f) => f.path.includes(".novel2vn")), "点文件不得进入收集结果");
+  // exclude 机制本身仍需对普通路径生效（不能被点文件策略顺带废掉）
+  const noGame = await vfsCollectFiles("/app/project", ["/app/project/game"]);
+  assert(noGame.length === 2, `collectFiles 排除失败: ${noGame.length}`);
+  assert(!noGame.some((f) => f.path.startsWith("game/")), "被排除的目录仍在结果中");
 
   // 删除（递归）
   await vfsRemove("/app/project/game/scene");

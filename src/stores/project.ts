@@ -15,11 +15,11 @@ import { tauri } from "../utils/tauri";
 import { log } from "../utils/logger";
 import { clearThumbCache } from "../composables/useAssetThumbs";
 import { activeConfig } from "./config";
-import { STEP_TO_STAGE, type StageKey } from "../core/types";
+import { STEP_TO_STAGE, DEFAULT_BACKGROUND_REUSE, type StageKey } from "../core/types";
 import { parseChapterScript } from "../core/dataValidation";
 import { runStatusSetFailed } from "./runStatus";
 
-export interface ProjectState {
+interface ProjectState {
   novel: NovelDoc | null;
   materials: MaterialAsset[];
   outputDir: string;
@@ -46,6 +46,14 @@ const DEFAULT_OPTIONS: GenerationOptions = {
   characterPoses: true,
   imageSelfCheck: false,
   imageBudgetPerChapter: 0,
+  // 同一地点在单章内的背景上限（0=不限）：默认 3——实测同地点最多被画过 79 次
+  // （LLM 给每个场景实例都写一条独一无二的氛围），收敛后仍保留白天/夜晚/情绪差异
+  backgroundsPerLocation: 3,
+  // #1580 背景复用：默认「地点 × 昼夜 × 天气」——同桶场景共用一张图。
+  // 实测某 30 章项目 502 个场景实例里，同一间公寓出现 62 次（8 章）、被画了 24 张几乎一样的夜景
+  // （502 条 bgPrompt 无一重复，按提示词去重省不下来），而 VN 的行业常规是一个地点 2~4 张（昼/夜/雨）。
+  // 开启后上面的 backgroundsPerLocation 不再生效（复用已从根上消除重复）。
+  backgroundReuse: DEFAULT_BACKGROUND_REUSE,
   cgPerChapter: 0,
   skipCache: false,
   videoPointsPerChapter: 0,
@@ -164,7 +172,7 @@ export async function persistCurrentProjectState(): Promise<boolean> {
 /** 启动恢复期间挂起自动保存：否则恢复完成前的 800ms 防抖会把"空状态"写回磁盘，
  *  项目状态文件（含已导入小说/卡片/失败项）被静默清空（大项目恢复耗时 >800ms 时必现）。 */
 let projectSaveSuspended = false;
-export function suspendProjectSave(suspended: boolean): void {
+function suspendProjectSave(suspended: boolean): void {
   projectSaveSuspended = suspended;
 }
 
@@ -447,14 +455,6 @@ export function resetActiveStage(): void {
   lastActiveStage = undefined;
 }
 
-/** 清除某阶段的历史 error 标记（重试成功/确认恢复后调用）。
- * stageLastLevels 只保留「最后一条级别」，若阶段失败后不再产生新日志，error 会一直挂到
- * clearLogs；调用方可在此阶段重跑成功时调用本函数显式销账。 */
-export function resetStageLevel(stage: StageKey): void {
-  stageLastLevels[stage] = undefined;
-  if (lastActiveStage === stage) lastActiveStage = undefined;
-}
-
 export function pushLog(ev: PipelineEvent): void {
   projectState.logs.push(ev);
   if (projectState.logs.length > 2000) {
@@ -468,6 +468,15 @@ export function pushLog(ev: PipelineEvent): void {
     stageLastLevels[stage] = ev.level;
     if (ev.level !== "error") lastActiveStage = stage;
   }
+  // 统一日志出口：pushLog 此前只进 projectState.logs（生成页「运行日志」tab），
+  // 侧栏运行日志与磁盘 novelforge.log 都看不到分章/提取/剧本/图像/配音等阶段消息——
+  // 用户排查时「日志里什么都没有」正是这个原因。转投 logger 后两条流合一，
+  // 侧栏、磁盘文件、内存历史拿到的是同一份内容。
+  const write = ev.level === "error" ? log.error
+    : ev.level === "warn" ? log.warn
+    : ev.level === "success" ? log.success
+    : log.info;
+  write(ev.step, ev.message);
 }
 
 export function addMaterial(mat: MaterialAsset): void {
@@ -492,8 +501,8 @@ export function removeMaterial(path: string): void {
  * - 导出保存写入口径：仅当用户真的改动翻译目标（touched）才写，否则保持原值。
  */
 
-export const EXPORT_UI_LANGUAGES = ["zh_CN", "zh_TW", "en", "ja", "ko"] as const;
-export type ExportUiLanguage = (typeof EXPORT_UI_LANGUAGES)[number];
+const EXPORT_UI_LANGUAGES = ["zh_CN", "zh_TW", "en", "ja", "ko"] as const;
+type ExportUiLanguage = (typeof EXPORT_UI_LANGUAGES)[number];
 
 /** 纯函数：界面语言归一化（无空语义，非法/空一律回退 zh_CN） */
 export function normalizeExportUiLanguage(v: unknown): ExportUiLanguage {
@@ -501,21 +510,7 @@ export function normalizeExportUiLanguage(v: unknown): ExportUiLanguage {
   return (EXPORT_UI_LANGUAGES as readonly string[]).includes(s) ? (s as ExportUiLanguage) : "zh_CN";
 }
 
-/** 纯函数：翻译目标归一化（保持空语义，永不回退 zh_CN） */
-export function coerceTranslationLanguage(v: unknown): string {
-  return typeof v === "string" ? v : "";
-}
 
-/**
- * 纯函数：导出保存是否应更新翻译目标。
- * - touched=false（用户没动该下拉）：保持 current；
- * - touched=true：写入 coerce 后的 incoming（即使 "" 也照写，保持“不翻译”语义）。
- */
-export function resolveTranslationLanguageUpdate(current: string, incoming: unknown, touched: boolean): string {
-  if (!touched) return current;
-  if (typeof incoming !== "string") return current;
-  return incoming;
-}
 
 /** 导出界面语言（独立于翻译目标；按项目目录持久化到 localStorage，不进管线指纹） */
 export const exportSettings = reactive<{ uiLanguage: ExportUiLanguage }>({ uiLanguage: "zh_CN" });
@@ -552,12 +547,6 @@ export function setExportUiLanguage(v: unknown): ExportUiLanguage {
 }
 
 /** 翻译目标写入口（保持空语义；UI 侧设置页/导出页统一走这里，不再 `|| "zh_CN"`） */
-export function setTranslationLanguage(v: unknown): string {
-  const next = coerceTranslationLanguage(v);
-  projectState.options.language = next;
-  scheduleSave();
-  return next;
-}
 
 // #1320 初载（对应顶部 watch 的非 immediate 设计）：模块初始化完成后按当前项目载入一次
 try {

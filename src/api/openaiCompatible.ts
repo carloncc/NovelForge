@@ -2,7 +2,7 @@ import { httpStream, isTauri, tauri, type HttpResult } from "../utils/tauri";
 import { activeAbortSignal } from "./abort";
 import { version as APP_VERSION } from "../../package.json";
 import type { ApiConfig, ChannelKey, ImageModelCapabilities, ImageReference } from "../core/types";
-import { unifiedImage, unifiedTts, utf8FromB64 } from "./universal";
+import { unifiedImage, unifiedTts, utf8FromB64, httpStatusError } from "./universal";
 import { normalizeBaseUrl, joinApiPath, customHeadersFor } from "./baseUrl";
 import { resolveTemplate, getTemplate } from "./templates";
 import { ConcurrencyLimiter } from "../utils/performance";
@@ -25,12 +25,11 @@ export { ReferenceImageError } from "./providers";
 import { zlibSync } from "fflate";
 import { log, redactUrl } from "../utils/logger";
 
-/** HTTP 状态错误（1317）：禁止 throw 裸对象，统一挂 status 的 Error（保栈）。 */
-function httpStatusError(status: number, message: string): Error {
-  const e = new Error(message);
-  (e as { status?: number }).status = status;
-  return e;
-}
+// #1569：本文件原先自带一份 httpStatusError，与 universal.ts 的那份**逐字相同**（都是挂 .status 的 Error）。
+// 两份实现在今天都对，所以没有故障；但 classifyError 的双信号分类**完全依赖 .status 被挂上**——
+// 将来只改一处、另一处漏改，那条 API 路径就会静默退化成「纯文本分类」，
+// 而文本分类对 408/425 这类只靠状态码区分的错误无能为力（见 errorClassifier 的注释）。
+// universal.ts 那份是导出的、且 universal 不依赖本文件（已核，无环），故复用它，只留一份实现。
 
 /** #1411：用户显式放行局域网/本机其它端口（默认关闭）。types.ts 不加字段（另一路加），此处局部声明透传给 Rust http_request.allowLan。 */
 function lanFlag(cfg: ApiConfig): boolean {
@@ -129,16 +128,11 @@ export function pruneLimiters(activeKeys: Iterable<string>): void {
   for (const key of [...LLM_LIMITERS.keys()]) if (!keep.has(key)) LLM_LIMITERS.delete(key);
 }
 
-/** 清空全部限流器（B34）：见 pruneLimiters 注释 */
-export function disposeLimiters(): void {
-  IMAGE_LIMITERS.clear();
-  LLM_LIMITERS.clear();
-}
-
 /**
  * 通过 OpenAI 兼容的 GET /models 拉取模型列表，并按通道能力过滤。
  * 无 apiKey 或请求失败时抛出可读错误；返回的列表可存入 config.extra.discoveredModels。
- */export async function fetchModelsForChannel(cfg: ApiConfig, kind: ChannelKey): Promise<DiscoveredModel[]> {
+ */
+export async function fetchModelsForChannel(cfg: ApiConfig, kind: ChannelKey): Promise<DiscoveredModel[]> {
   if (!cfg.baseUrl?.trim()) throw new Error("请先填写 Base URL 再刷新模型");
   const base = normalizeBaseUrl(cfg.baseUrl, cfg.extra?.pathPrefix as string | undefined);
   // joinApiPath：base 带 query 时把 /models 拼进 pathname 而不是 query（B109）
@@ -270,7 +264,7 @@ export function headersFor(cfg: ApiConfig): Record<string, string> {
   }
   return headers;
 }
-export interface ChatOptions {
+interface ChatOptions {
   temperature?: number;
   maxTokens?: number;
   json?: boolean;
@@ -352,7 +346,7 @@ export interface ToolCall {
   };
 }
 
-export type ChatMessageRole = "system" | "user" | "assistant" | "tool";
+type ChatMessageRole = "system" | "user" | "assistant" | "tool";
 
 /** 支持 function calling 的对话消息；无工具调用时与旧 { role, content } 完全兼容 */
 export interface ChatMessage {
@@ -363,11 +357,11 @@ export interface ChatMessage {
   tool_calls?: ToolCall[];
 }
 
-export interface VisionChatOptions extends ChatOptions {
+interface VisionChatOptions extends ChatOptions {
   imageMime?: string;
 }
 
-export type VisionApiErrorCode =
+type VisionApiErrorCode =
   | "VISION_CONFIGURATION_INVALID"
   | "VISION_CAPABILITY_UNSUPPORTED"
   | "VISION_RESPONSE_INVALID"
@@ -522,7 +516,7 @@ export function retryDelayFor(attempt: number): number {
 }
 
 /** 生成吞吐下限（tok/s）：超时按它给足余量，避免把「慢但在出字」的请求掐死 */
-export const MIN_GEN_TOKENS_PER_SEC = 30;
+const MIN_GEN_TOKENS_PER_SEC = 30;
 
 /**
  * 单次请求超时（秒，纯函数，供单测）：调用方给的 timeoutSecs 是「期望预算」下的超时，
@@ -852,7 +846,10 @@ export async function chatCompletion(
       } catch (e) {
         // 用户中止必须原样抛出（重发等于对已取消的请求继续计费）
         const errText = String(e instanceof Error ? e.message : e);
-        if (streamSignal?.aborted || /已中止|请求被取消|cancelled/i.test(errText)) throw e;
+        // #1557：改用唯一的中止判定来源。原实现自带一份窄正则（缺 aborted / canceled 单 l、已取消），
+        // 而 web 运行时 fetch 中止抛的正是「The user aborted a request.」——漏判后不会原样抛出，
+        // 会掉进下面的「回退整包请求重发一次」：**对用户已经取消的请求继续计费**（正是上一行注释禁止的事）。
+        if (streamSignal?.aborted || classifyError(e) === "aborted") throw e;
         log.warn("api", "流式请求失败，回退整包请求重发一次", {
           url: redactUrl(url),
           error: errText.slice(0, 200),
@@ -910,12 +907,19 @@ export async function chatCompletion(
       // 「匿名/未知模型」自动学习最大输出：厂商 400 报文常带出真实上限数字。
       // 解析到就把上限挂到错误上，交由 runOnce 记录并降级重试一次（仅 4xx；5xx 已在上方抛出）。
       const maxTokensLimit = parseMaxTokensLimitFromError(text);
+      // 状态码必须挂到 Error 上：与 universal.ts 的 httpStatusError 同口径。上层
+      // classifyError(e, status) 走「状态码 + 文本」双信号分类，不带 status 会退化成
+      // 纯文本匹配——而纯文本只覆盖 /400|404/ 两个码，422/402/409/415 等会被判成
+      // unknown 并按网络错误退避重试 4 次（1+10+20+30=61s），对注定失败的请求反复计费。
       if (maxTokensLimit !== undefined) {
         const limitError = new Error(`LLM 返回错误 ${res.status}: ${message}`) as Error & { maxTokensLimit?: number };
         limitError.maxTokensLimit = maxTokensLimit;
+        (limitError as Error & { status?: number }).status = res.status;
         throw limitError;
       }
-      throw new Error(`LLM 返回错误 ${res.status}: ${message}`);
+      const httpError = new Error(`LLM 返回错误 ${res.status}: ${message}`) as Error & { status?: number };
+      httpError.status = res.status;
+      throw httpError;
     }
 
     log.info("api", "LLM 响应返回", {
@@ -1241,8 +1245,9 @@ export function nextBudgetAfterThinking(
  */
 export function reasoningFallbackContent(reasoning: string, json: boolean): string {
   if (!json) return reasoning;
-  const candidate = extractJsonFromMixed(reasoning);
-  return candidate === reasoning ? "" : candidate;
+  // json 模式只接受「真的抠出 JSON」：抠不到返回空串，让上层走「模型只思考没产出」的
+  // EmptyContentError，而不是把整段思考当正文回填后触发一轮同样昂贵的「修复」长思考。
+  return extractJsonFromMixed(reasoning) ?? "";
 }
 
 /** 本次响应实际用于思考的 token 数（纯函数，供单测）：优先取服务端报告，
@@ -1267,7 +1272,7 @@ export function escalationFutile(budget: number, resp: { reasoningTokens?: numbe
  * 推理型模型（deepseek 系列）的 reasoning_content 通常是：思考文字 + 末尾一个完整 JSON。
  * 策略：从文本末尾向前找闭合符，再向后做括号平衡扫描定位匹配的开括号，尝试 JSON.parse。
  */
-function extractJsonFromMixed(text: string): string {
+function extractJsonFromMixed(text: string): string | null {
   const cleaned = text.replace(/```json|```/g, "");
   const endIndexes: number[] = [];
   for (let i = cleaned.length - 1; i >= 0; i--) {
@@ -1310,7 +1315,11 @@ function extractJsonFromMixed(text: string): string {
       }
     }
   }
-  return cleaned;
+  // 抠不到就返回 null（而不是原文本）：调用方此前拿「返回值 === 入参」当「没抠到」的哨兵，
+  // 但本函数开头会剥掉 ```json 围栏，只要思考里出现过围栏这个等式就恒为 false —— 于是
+  // 整段思考被当成正文回填，或把思考里半截 JSON 片段（{"id": 1}）当正文交给 JSON.parse，
+  // 绕过「模型只思考没产出」的 EmptyContentError 兜底。显式 null 让判空不再依赖字符串相等。
+  return null;
 }
 
 /** 续写判定（纯函数，供单测）：finish=length 且轮次未超即续写；从第 2 次续写起，
@@ -1355,7 +1364,11 @@ export async function chatJson<T>(
     opts.onEvent?.({ kind: "response", attempt: requestCount, finishReason, contentLen: content.length, accumulatedLen: accumulated.length });
 
     // 输出因长度上限被截断 → 请求模型从中断处续写（生成多少、下轮接着往后补，不设总量天花板）
-    if (shouldContinueJson(finishReason, continueCount, maxContinue, content.length, opts.minContinueProgress ?? 0)) {
+    // 本轮正文为空时绝不续写：finish_reason=length 且 content 为空时 shouldContinueJson 恒为 true
+    // （minProgress 守卫在 continueCount<1 时不生效），于是空响应会被「续写」最多 3 次，
+    // 每次都是一整轮付费调用（内部还会重跑预算放大循环），而下面 1388 的注释明确要求
+    // 这种情况立刻抛 EmptyContentError。空产出直接放行到下面的空产出分支。
+    if (content.trim() && shouldContinueJson(finishReason, continueCount, maxContinue, content.length, opts.minContinueProgress ?? 0)) {
       continueCount++;
       log.warn("api", "JSON 输出被截断，请求续写", { accumulatedLen: accumulated.length, attempt: continueCount });
       opts.onEvent?.({ kind: "continue", attempt: continueCount, finishReason, contentLen: content.length, accumulatedLen: accumulated.length });

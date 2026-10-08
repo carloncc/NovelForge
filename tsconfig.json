@@ -16,8 +16,10 @@
     ],
     "skipLibCheck": true,
     "noEmit": true,
-    "noUnusedLocals": false,
-    "noUnusedParameters": false,
+    // 死代码门禁：未使用的局部变量/导入/参数一律报错（CI 的 vue-tsc / typecheck:tests 会拦住）。
+    // 确实要保留的形参请用 `_` 前缀显式标注。
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
     "types": [
       "vite/client",
       "node"

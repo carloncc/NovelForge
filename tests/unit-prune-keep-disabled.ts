@@ -48,9 +48,17 @@ assert(fixed.cg["s2"] === "cg2.png", "停用章 cg 必须保留");
 assert(fixed.vocal["ch1_s2_0"] === "v2.mp3", "停用章配音必须保留");
 assert(fixed.bg["stale"] === undefined, "真正过期映射仍应清理");
 
-// 3) 去重：停用脚本与启用章同 index 时不重复
+// 3) 同 index 的停用脚本必须**保留**，不能去重：进到这里时启用章已被原地重编号为 0..k-1
+//    （pipeline 的 chapters.forEach((c, i) => c.chapter = i)），而停用脚本带的是**原始**
+//    novel index（缓存写在重编号之前，loadDisabledScriptsForPrune 也按原始 index 选）。
+//    旧实现拿重编号后的集合去过滤，于是任何「原始 index ≤ k」的停用章都被当成重复项丢掉，
+//    只有排在末尾的停用章侥幸留下 → 中间停用章的 bg/cg/vocal 映射被剪掉。保留集是并集，
+//    重复项无害；宁可多留也不能少留（少留 = 删掉停用章的付费素材映射）。
 const dup = buildPruneKeepChapters(enabled, [chapter(0, ["s9"])]);
-assert(dup.length === 1, `同 index 去重后应为 1 章，实际 ${dup.length}`);
+assert(dup.length === 2, `同 index 的停用脚本必须保留（并集），实际 ${dup.length}`);
+const dupAssets = { bg: { s9: "bg9.png" }, cg: {}, vocal: {} };
+pruneAssetRefs(dupAssets, dup);
+assert(dupAssets.bg["s9"] === "bg9.png", "同 index 停用章的映射必须保留（这正是旧实现丢掉的那批）");
 
 // 4) 无停用章时原样返回
 assert(buildPruneKeepChapters(enabled, []).length === 1, "无停用章时保留集不变");

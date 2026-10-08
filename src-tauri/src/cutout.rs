@@ -175,6 +175,7 @@ fn dilate(mask: &[bool], w: u32, h: u32) -> Vec<bool> {
 /// - 与透明像素相邻的不透明边界像素做一次轻量去绿
 /// - 迭代膨胀 fringe（最多 3 像素），把不透明但靠边、被绿晕污染的发丝内部像素也去绿
 /// - 主体内远离边界的非绿色像素完全不受影响
+///
 /// `aggressive=true` 用于亮绿色背景：触发阈值更低、边界带去绿强度更强，
 /// 防止 AI 生成的有渐变绿底在人物边缘残留绿边/绿晕。
 pub(crate) fn despill(rgba: &mut RgbaImage, alpha: &[f32], aggressive: bool) {
@@ -274,7 +275,7 @@ fn apply_despill(
 ///
 /// 仅适用于绿底场景（与 `despill` 的 aggressive 共用入口）。
 /// 返回命中像素数（被彻底去绿 + 置透明的像素），用于统计与调试。
-fn sweep_trapped_green(rgba: &mut RgbaImage, alpha: &mut Vec<f32>) -> usize {
+fn sweep_trapped_green(rgba: &mut RgbaImage, alpha: &mut [f32]) -> usize {
     let (w, h) = rgba.dimensions();
     let n = (w * h) as usize;
     let mut trap: Vec<bool> = vec![false; n];
@@ -346,6 +347,7 @@ fn sweep_trapped_green(rgba: &mut RgbaImage, alpha: &mut Vec<f32>) -> usize {
 /// - 前景内部与背景色相近的孤立像素（如脸部高光、浅色头发内侧）因“不连通”而不会被误删
 /// - 最后做 despill（去除绿幕常见的绿边/绿晕）与 alpha 3x3 中值平滑（去噪点/空洞）
 /// - 对亮绿色背景自动切换为色度加权距离（降亮度权重）+ 更大容差，把有渐变/光照的绿底也抠干净
+///
 /// 返回 (PNG base64, 被置为全透明的像素比例 0.0~1.0)。比例用于判断“背景识别是否过激”
 /// （例如 AI 画了纯黑背景，黑色前景与背景色距离≈0 会被误抠，removed 会异常偏高）。
 pub fn cutout(data_b64: &str, threshold: f32) -> Result<String, String> {
@@ -372,6 +374,12 @@ fn decode_guarded(data_b64: &str) -> Result<image::DynamicImage, String> {
     let img = image::load_from_memory(&bytes).map_err(|e| format!("图片解码失败: {e}"))?;
     // 在 to_rgba8 分配整幅缓冲之前先检查尺寸，避免超大图直接吃满内存
     let pixels = u64::from(img.width()) * u64::from(img.height());
+    // #1542：0×N / N×0 的退化尺寸此前不被拒绝。下游 alpha_median3x3 / dilate 虽然自身
+    // 不会越界（`i % w` 只在 n>0 即 w>0 时才执行），但「一张 0 像素的图」本身不该进入管线——
+    // 它会让 has_transparency 的 total 取 max(1) 兜底、让抠图产出空 alpha，语义上说不通。
+    if pixels == 0 {
+        return Err("图片尺寸为 0（宽或高为 0），已拒绝".to_string());
+    }
     if pixels > MAX_INPUT_PIXELS {
         return Err(format!(
             "图片尺寸过大（{}×{}，{} 万像素），超过 4096×4096 上限，已拒绝",
@@ -462,8 +470,7 @@ pub fn cutout_with_stats(
             0.0
         } else {
             let t = (d - thr) / (thr_edge - thr);
-            let s = t * t * (3.0 - 2.0 * t);
-            s
+            t * t * (3.0 - 2.0 * t)
         };
         alpha_out[i] = a;
         if x > 0 {
@@ -1128,7 +1135,7 @@ mod tests {
     ///   1. flood 距离大 → 默认 alpha=1.0
     ///   2. max(rgb)<60 → 旧 dark_fg 保护强制保留不透明（误判为前景）
     ///   3. sweep 判据 g-max(r,b)>30 不命中（混合色 g-max ≈ 10）
-    /// → 抠图后保留为不透明墨绿残渣，视觉上接近黑色。
+    ///      → 抠图后保留为不透明墨绿残渣，视觉上接近黑色。
     ///
     /// 修复：绿幕下「暗色前景保护」仅保护 r≈g 或 g≤r 或 g≤b 的真暗前景；偏绿（g>r 或 g>b）
     /// 的暗像素当作绿幕泄漏；sweep_trapped_green 对被完全包围且偏绿的暗像素彻底去绿 + alpha 置 0。
@@ -1298,6 +1305,64 @@ mod tests {
     /// #1471 回归：has_transparency 与 cutout_with_stats 必须共用同一套输入上限。
     /// 旧实现只在 cutout_with_stats 里校验，has_transparency 会无上限地整图解码
     /// （图像阶段判断素材是否已带透明通道时调用），超大图可直接吃满内存。
+    /// #1542：两个卷积核在退化尺寸上不得 panic。
+    /// alpha_median3x3 末尾的 `i % w` 只有在 n>0（即 w>0）时才会执行，
+    /// 但把这条不变量直接钉住，免得将来改写循环边界时踩到除零。
+    #[test]
+    fn image_kernels_tolerate_degenerate_sizes() {
+        assert_eq!(alpha_median3x3(&[], 0, 0), Vec::<f32>::new());
+        assert_eq!(alpha_median3x3(&[1.0], 0, 0), vec![1.0]);
+        assert_eq!(alpha_median3x3(&[0.5], 1, 1), vec![0.5]);
+        assert_eq!(alpha_median3x3(&[0.1, 0.9, 0.2, 0.8], 2, 2), vec![0.1, 0.9, 0.2, 0.8]);
+        assert_eq!(dilate(&[], 0, 0), Vec::<bool>::new());
+        assert_eq!(dilate(&[true], 0, 0), vec![true]);
+        assert_eq!(dilate(&[true], 1, 1), vec![true]);
+        // 1×N 与 N×1：内层循环为空，四边全保留原值
+        assert_eq!(dilate(&[true, false, true], 3, 1), vec![true, true, true]);
+        // 3×3 只有中心被膨胀。dilate 的内层是 dx,dy ∈ [-1,1] 且只跳过 (0,0)，
+        // 即 **8 邻域**（含对角），不是十字——原先我按四邻写期望值，是断言错了，代码是对的。
+        let m = [
+            false, false, false,
+            false, true, false,
+            false, false, false,
+        ];
+        assert_eq!(dilate(&m, 3, 3), vec![true; 9], "3×3 单点应被膨胀成全亮（8 邻域）");
+        // 角落像素同样会越界被裁掉，不得越界
+        let corner = [true, false, false, false, false, false, false, false, false];
+        assert_eq!(
+            dilate(&corner, 3, 3),
+            vec![true, true, false, true, true, false, false, false, false],
+            "左上角像素只向右/下/右下膨胀，不得越界",
+        );
+    }
+
+    /// #1542：0 像素图片不得进入管线。
+    ///
+    /// **这条负控是无效的，如实记录**：png 解码器本身就会拒绝宽/高为 0 的图，所以把
+    /// decode_guarded 里那道 pixels == 0 守卫去掉，本测试照样通过——它分不清「解码器拒了」
+    /// 与「我们的守卫拒了」。守卫本身保留（与 #1471 的显式输入闸门一致，属纵深防御），
+    /// 但**不能声称它是修掉了一个可触发的缺陷**。
+    #[test]
+    fn zero_dimension_input_is_rejected_somewhere() {
+        // 构造一张 0×N 的 PNG：IHDR 里宽/高为 0
+        let mut png: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        let mut ihdr: Vec<u8> = Vec::new();
+        ihdr.extend_from_slice(&13u32.to_be_bytes());
+        ihdr.extend_from_slice(b"IHDR");
+        ihdr.extend_from_slice(&0u32.to_be_bytes()); // width = 0
+        ihdr.extend_from_slice(&1u32.to_be_bytes()); // height = 1
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // bit depth 8, color RGBA
+        ihdr.extend_from_slice(&0u32.to_be_bytes()); // crc（解码器先校验尺寸，通常先失败）
+        png.extend_from_slice(&ihdr);
+        png.extend_from_slice(&[0, 0, 0, 0]);
+        png.extend_from_slice(&0u32.to_be_bytes());
+        png.extend_from_slice(&[0xae, 0x42, 0x60, 0x82]);
+        let b64 = B64.encode(&png);
+        match decode_guarded(&b64) {
+            Err(_) => {} // 解码器直接拒了 0 宽——同样符合预期
+            Ok(_) => panic!("0 像素图片竟被放行（#1542）"),
+        }
+    }
     #[test]
     fn has_transparency_shares_the_same_input_limits() {
         // 超尺寸：与 cutout_with_stats 同样的「4096」提示

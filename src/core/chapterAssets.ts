@@ -1,4 +1,5 @@
 import type { ChapterScript, ExtractionResult, GenerationOptions, ImageTask } from "./types";
+import { DEFAULT_BACKGROUND_REUSE } from "./types";
 import { buildImageTasks, chapterCharacterIds, chapterItemIds } from "./images";
 
 // 兼容旧引用：实现已下沉到 images.ts（单章任务裁剪与章节灯共用同一口径，避免两处漂移）
@@ -35,5 +36,7 @@ export function chapterScopeImageTasks(
     threeView: options.characterPoses !== false,
     actions: options.characterPoses !== false,
     styleAnchor: false,
+    backgroundsPerLocation: options.backgroundsPerLocation ?? 0,
+    backgroundReuse: options.backgroundReuse ?? DEFAULT_BACKGROUND_REUSE,
   });
 }

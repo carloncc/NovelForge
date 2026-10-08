@@ -10,6 +10,7 @@
  * Node 单测通过注入 KeyStorageLike fake 覆盖纯逻辑；加密往返需 crypto.subtle（缺失时仅内存，不落盘）。
  */
 import { t } from "../i18n";
+import { b64decode } from "./base64";
 
 export interface KeyStorageLike {
   getItem(key: string): string | null;
@@ -26,7 +27,7 @@ export const OPTIN_KEY = "novelforge:api-secrets.persist";
 
 /* ==================== 默认存储（缺失时返回 undefined，调用方降级为纯内存） ==================== */
 
-export function defaultSessionStorage(): KeyStorageLike | undefined {
+function defaultSessionStorage(): KeyStorageLike | undefined {
   try {
     return typeof sessionStorage !== "undefined" ? sessionStorage : undefined;
   } catch {
@@ -34,7 +35,7 @@ export function defaultSessionStorage(): KeyStorageLike | undefined {
   }
 }
 
-export function defaultLocalStorage(): KeyStorageLike | undefined {
+function defaultLocalStorage(): KeyStorageLike | undefined {
   try {
     return typeof localStorage !== "undefined" ? localStorage : undefined;
   } catch {
@@ -174,7 +175,12 @@ function getOrCreateKey(): Promise<CryptoKey | null> {
       if (kept) return kept;
       // 非导出密钥：extractable=false，内存持有，料永不出内存
       const fresh = await s.generateKey({ name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
-      void idbSaveKey(fresh);
+      // 必须 await：调用方（flushWebSecrets）拿到 key 后立刻用 AES-GCM 加密并把密文写进
+      // sessionStorage。fire-and-forget 时若标签页在 IDB 事务提交前关闭，下次会话
+      // idbLoadKey 读回 null → 重新生成一把新 key → 旧密文永久无法解密，
+      // restoreEncrypted 的 catch 会清掉全部已存 API 密钥且无恢复路径。
+      // 存失败仍然不阻断本次会话使用（沿用原意），只是不再制造这个竞态。
+      await idbSaveKey(fresh).catch(() => undefined);
       return fresh;
     })();
   }
@@ -261,14 +267,9 @@ function bytesToB64(bytes: Uint8Array): string {
   return (globalThis as unknown as { btoa(s: string): string }).btoa(s);
 }
 
-function b64ToBytes(b64: string): Uint8Array {
-  const g = globalThis as unknown as { Buffer?: { from(s: string, e: string): Uint8Array } };
-  if (g.Buffer) return new Uint8Array(g.Buffer.from(b64, "base64"));
-  const s = (globalThis as unknown as { atob(s: string): string }).atob(b64);
-  const out = new Uint8Array(s.length);
-  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
-  return out;
-}
+// #1532：原本是 base64.ts 的第四份手抄副本（globalThis.Buffer 优先），
+// 在 Node 下对非法字符静默返回 0 字节、在浏览器下抛错——同一份数据两端行为不一致。
+const b64ToBytes = b64decode;
 
 function randomIv(): Uint8Array {
   const iv = new Uint8Array(12);

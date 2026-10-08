@@ -7,7 +7,7 @@ import type {
   ImageTask,
   StageKey,
 } from "./types";
-import { STAGE_ORDER } from "./types";
+import { STAGE_ORDER, DEFAULT_BACKGROUND_REUSE } from "./types";
 import { buildImageTasks } from "./images";
 import { buildVoiceJobsOrEmpty } from "./voice";
 
@@ -21,7 +21,7 @@ import { buildVoiceJobsOrEmpty } from "./voice";
 /** 可级联补齐的资产阶段集合；顺序与 STAGE_ORDER 一致 */
 const ASSET_STAGE_SET = new Set<StageKey>(["image", "voice", "assemble"]);
 
-export interface CascadeEnabled {
+interface CascadeEnabled {
   /** 与 options.useImage 同源（界面同一个复选框） */
   image: boolean;
   /** 与 options.useTts 同源（界面同一个复选框） */
@@ -73,6 +73,8 @@ export function statusImageTasks(
     threeView: options.characterPoses !== false,
     actions: options.characterPoses !== false,
     styleAnchor: options.styleAnchor !== false,
+    backgroundsPerLocation: options.backgroundsPerLocation ?? 0,
+    backgroundReuse: options.backgroundReuse ?? DEFAULT_BACKGROUND_REUSE,
   });
 }
 
@@ -83,6 +85,9 @@ export function imageTaskHasAsset(task: ImageTask, assets: AssetMap | undefined)
   if (task.kind === "background") return Boolean(assets.bg[task.id]);
   if (task.kind === "cg") return Boolean(assets.cg[task.id]);
   if (task.kind === "item") return Boolean(assets.item[task.id]);
+  // shot（分镜/图片小说）有自己的映射表：漏掉这一支会让 shot 任务一路落到 assets.figure[task.id]，
+  // 恒判「缺失」——useStageStatus 的图像灯永远不绿，missingImageTaskCount 也会虚增付费确认里的张数。
+  if (task.kind === "shot") return Boolean(assets.shot?.[task.id]);
   return Boolean(assets.figure[task.id]);
 }
 
@@ -107,7 +112,7 @@ function missingVoiceJobCount(
   return buildVoiceJobsOrEmpty(tts, chapters, cards.characters).filter((job) => !assets?.vocal[job.key]).length;
 }
 
-export interface CascadePlan {
+interface CascadePlan {
   /** 本次要补齐的阶段（按 STAGE_ORDER 排序） */
   stages: StageKey[];
   /** 预计要生成的图片张数（仅统计图像阶段） */

@@ -5,7 +5,7 @@
 import { zipSync } from "fflate";
 
 interface ZipWorkerRequest {
-  entries: Record<string, [Uint8Array, { level: 0 | 6 }]>;
+  entries: Record<string, [Uint8Array, { level: 0 | 6; os?: number; attrs?: number }]>;
 }
 
 self.onmessage = (ev: MessageEvent<ZipWorkerRequest>) => {

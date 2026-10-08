@@ -2,7 +2,7 @@
 import { computed, onMounted, ref } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
 import { projectState, addMaterial, removeMaterial, restoreProject } from "../stores/project";
-import { upsertProject, removeProjectEntry, readDirNovelIdentity, decideNovelImport, suggestProjectSubdirName } from "../stores/projects";
+import { upsertProject, removeProjectEntry, readDirNovelIdentity, decideNovelImport, suggestProjectSubdirName, lastEvictedProjects, PROJECT_LIST_LIMIT } from "../stores/projects";
 import { configState, addRecentOutputDir, removeRecentOutputDir } from "../stores/config";
 import { importNovelFile, importNovelFiles } from "../core/chapters";
 import { tauri, isTauri, blessParentDir } from "../utils/tauri";
@@ -501,7 +501,11 @@ async function guardNovelDir(doc: { fileName: string; chapters: { title: string 
           <button v-else class="btn ghost small" :title="t('只从列表移除记录，不删除磁盘文件')" @click="removeRecent(row.dir)">{{ t("移除记录") }}</button>
         </div>
       </div>
-      <p v-else class="faint small">{{ t("暂无项目：导入小说后前往生成页会自动创建，或点本卡右上角“新建项目…”") }}</p>
+      <!-- #1511：超出上限被挤出的项目此前无声消失，用户以为项目丢了；这里点明数量与找回方式 -->
+      <p v-if="lastEvictedProjects.length" class="hint small">
+        {{ t("另有 {n} 个更早的项目未显示（列表最多保留 {limit} 个）。文件仍在磁盘上，点「新建项目…」选对应目录即可重新打开。", { n: lastEvictedProjects.length, limit: PROJECT_LIST_LIMIT }) }}
+      </p>
+      <p v-if="!projectRows.length" class="faint small">{{ t("暂无项目：导入小说后前往生成页会自动创建，或点本卡右上角“新建项目…”") }}</p>
     </div>
 
     <AssetPreview

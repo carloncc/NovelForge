@@ -3,12 +3,13 @@
  * - 提取角色卡时管线已会让 AI 选一次；本模块提供「随时重选」的独立入口（角色卡编辑页按钮）。
  * - 纯函数 applyVoiceAssignments 负责校验：id 存在、音色在库内、性别一致、主要角色尽量不撞色。
  */
+import { t } from "../i18n";
 import { chatJson } from "../api/openaiCompatible";
 import { voiceLibraryFor } from "../stores/config";
 import { minimaxVoiceLabel, pickVoiceForGender, voiceGenderOf } from "./minimaxVoices";
 import type { ApiConfig, CharacterCard } from "./types";
 
-export interface VoiceCastAssignment {
+interface VoiceCastAssignment {
   characterId: string;
   voiceName: string;
   reason?: string;
@@ -51,7 +52,7 @@ export async function aiAssignVoices(
   voiceLib?: string[],
 ): Promise<VoiceCastAssignment[]> {
   const lib = voiceLib ?? voiceLibraryFor(cfg);
-  if (!lib.length) throw new Error("音色库为空：请先在「API 配置」里为 TTS 填写音色库");
+  if (!lib.length) throw new Error(t("音色库为空：请先在「API 配置」里为 TTS 填写音色库"));
   const libText = lib
     .map((id) => {
       const g = voiceGenderOf(id);

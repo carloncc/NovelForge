@@ -2,7 +2,7 @@
 import { t } from "../../i18n";
 
 /** 生成范围：逐章 / 整书 / 单阶段（与 GeneratePage 的 runMode 同构） */
-export type GenerateScope = "chapter" | "full" | "stage";
+type GenerateScope = "chapter" | "full" | "stage";
 
 defineProps<{ modelValue: GenerateScope; disabled?: boolean }>();
 const emit = defineEmits<{ "update:modelValue": [value: GenerateScope] }>();

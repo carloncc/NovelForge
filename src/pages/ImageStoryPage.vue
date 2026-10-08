@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { currentLang, t } from "../i18n";
+import { t, formatLogTime } from "../i18n";
 import PageHead from "../components/PageHead.vue";
 import LazyThumb from "../components/LazyThumb.vue";
 import AssetPreview from "../components/AssetPreview.vue";
@@ -25,7 +25,7 @@ import {
   followMainProjectDir,
   goImport,
 } from "../stores/imageStory";
-import { isTauri } from "../utils/tauri";
+import { isTauri, blessParentDir } from "../utils/tauri";
 import { errMsg } from "../utils/errors";
 
 const preview = ref<{ path: string; label: string } | null>(null);
@@ -113,7 +113,7 @@ watch(
 );
 
 function formatTime(ms: number): string {
-  return new Date(ms).toLocaleTimeString(currentLang.value === "zh-CN" ? "zh-CN" : currentLang.value);
+  return formatLogTime(ms);
 }
 
 async function pickDir(): Promise<void> {
@@ -121,7 +121,11 @@ async function pickDir(): Promise<void> {
   try {
     const { open } = await import("@tauri-apps/plugin-dialog");
     const picked = await open({ directory: true, defaultPath: imageStoryState.outputDir || projectState.outputDir });
-    if (typeof picked === "string" && picked) setImageStoryDir(picked.replace(/\\/g, "/"));
+    if (typeof picked === "string" && picked) {
+      // #1520：选定的输出目录会被后续读写；先登记，否则白名单外的目录一律拒绝
+      await blessParentDir(picked);
+      setImageStoryDir(picked.replace(/\\/g, "/"));
+    }
   } catch (e) {
     imageStoryState.lastError = errMsg(e).slice(0, 200);
   }
@@ -311,11 +315,11 @@ onBeforeUnmount(() => {
                 <span class="hint">{{ t("开启后按台词行合成语音（TTS 计费，命中缓存不重复计费）；失败会进入下方失败清单，可用「重试失败项」补配") }}</span>
               </span>
             </label>
-            <label class="opt-item opt-stack" :title="t('使用独立图片识别 API 核对生成图，不合格自动重生成 1 次（会增加费用与耗时）')">
+            <label class="opt-item opt-stack" :title="t('使用独立图像识别 API 核对生成图，不合格自动重生成 1 次（会增加费用与耗时）')">
               <input type="checkbox" v-model="imageStoryState.options.imageSelfCheck" :disabled="busy" />
               <span class="opt-text">
                 {{ t("图像自检（多模态核对，不合格自动重生成）") }}
-                <span class="hint">{{ t("使用独立图片识别 API 核对生成图，不合格自动重生成 1 次（会增加费用与耗时）") }}</span>
+                <span class="hint">{{ t("使用独立图像识别 API 核对生成图，不合格自动重生成 1 次（会增加费用与耗时）") }}</span>
               </span>
             </label>
             <label class="opt-item opt-stack">

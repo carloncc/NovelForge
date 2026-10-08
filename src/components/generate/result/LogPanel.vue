@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { currentLang, t } from "../../../i18n";
+import { t, formatLogTime } from "../../../i18n";
 import { projectState } from "../../../stores/project";
 import { useGenerateController } from "../../../stores/generate";
 
@@ -14,9 +14,9 @@ const {
   LOG_RENDER_LIMIT,
 } = useGenerateController();
 
-/** UI15：日志时间按界面语言本地化；渲染时读取 currentLang，切语言后自动重渲染 */
+/** #1525：统一走 i18n 层的 formatLogTime，与三处日志导出同口径（面板与导出不再各写一份） */
 function formatTime(ms: number): string {
-  return new Date(ms).toLocaleTimeString(currentLang.value === "zh-CN" ? "zh-CN" : currentLang.value);
+  return formatLogTime(ms);
 }
 </script>
 
@@ -38,9 +38,10 @@ function formatTime(ms: number): string {
     </div>
     <div class="log-panel" ref="logPanelRef">
       <div v-for="(l, i) in visibleLogs" :key="`${i}:${l.at}:${l.step}`" class="log-line" :class="l.level">
-        <span class="time">{{ formatTime(l.at) }}</span>
+        <!-- 格式：【源头】时间 描述（与运行日志页 LogsPage 同口径） -->
         <!-- UI10：阶段名接入词典；t() 缺键自动回退中文原文，安全 -->
-        <span class="step-badge">{{ t(l.step) }}</span>
+        <span class="step-badge">【{{ t(l.step) }}】</span>
+        <span class="time">{{ formatTime(l.at) }}</span>
         <span>{{ l.message }}</span>
       </div>
       <p v-if="!visibleLogs.length" class="faint small">{{ t("暂无日志：开始生成后会在这里实时滚动显示") }}</p>

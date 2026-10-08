@@ -237,7 +237,7 @@ export function getTemplate(id: string | undefined): AdapterTemplate | undefined
 }
 
 /** 自定义适配器模板校验结果（#1126：配置页与落盘前统一走这一个校验，避免「alert 后坏值照样保存」） */
-export type CustomTemplateCheck =
+type CustomTemplateCheck =
   | { ok: true; template: AdapterTemplate }
   | { ok: false; error: string };
 

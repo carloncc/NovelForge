@@ -1,12 +1,12 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import { currentLang, t } from "../../../i18n";
+import { t, formatLogTime } from "../../../i18n";
 import { ERROR_CLASS_ICON, ERROR_CLASS_LABEL, classifyError } from "../../../utils/errorClassifier";
 import { useGenerateController } from "../../../stores/generate";
 
-/** UI15：失败时间按界面语言本地化；渲染时读取 currentLang，切语言后自动重渲染 */
+/** #1525：统一走 i18n 层的 formatLogTime，与三处日志导出同口径（面板与导出不再各写一份） */
 function formatTime(ms: number): string {
-  return new Date(ms).toLocaleTimeString(currentLang.value === "zh-CN" ? "zh-CN" : currentLang.value);
+  return formatLogTime(ms);
 }
 
 // 结果区子面板：状态全部来自 generate store。

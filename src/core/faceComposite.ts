@@ -32,12 +32,12 @@ export const STROKE_SOFT_RANGE = 24;
 /** 红晕叠加强度 */
 export const BLUSH_STRENGTH = 0.5;
 /** 肤色采样跳过高饱和像素的阈值（max-min > 55） */
-export const SKIN_SAT_SKIP = 55;
+const SKIN_SAT_SKIP = 55;
 /** 脸部编辑参考尺寸（长边，像素） */
-export const FACE_EDIT_LONG_SIDE = 1024;
+const FACE_EDIT_LONG_SIDE = 1024;
 
 /** 笔触提取模式：brow/mouth 只用变暗 dark，eye 用 max(dark,light)，红晕走 blush */
-export type StrokeMode = "dark" | "max" | "blush";
+type StrokeMode = "dark" | "max" | "blush";
 
 export function partStrokeMode(part: FaceRigPart): StrokeMode {
   if (part === "blush_left" || part === "blush_right") return "blush";
@@ -45,7 +45,7 @@ export function partStrokeMode(part: FaceRigPart): StrokeMode {
   return "dark";
 }
 
-export function clamp01fc(v: number): number {
+function clamp01fc(v: number): number {
   return v <= 0 ? 0 : v >= 1 ? 1 : v;
 }
 
@@ -110,7 +110,7 @@ export function skinMedianOffset(cleanSamples: Rgb[], candSamples: Rgb[]): Rgb {
   return [median(diffs[0]), median(diffs[1]), median(diffs[2])].map((v) => Math.round(v)) as Rgb;
 }
 
-export interface CompositePixelOptions {
+interface CompositePixelOptions {
   /** 该像素的允许区掩膜值（0..1，已含椭圆×1.08+羽化） */
   mask: number;
   mode: StrokeMode;
@@ -148,7 +148,7 @@ export function compositeFacePixel(base: Rgb, clean: Rgb, cand: Rgb, opts: Compo
 
 /* ================= 错误类型（显式失败，禁止静默降级） ================= */
 
-export class FaceCompositeError extends Error {
+class FaceCompositeError extends Error {
   readonly code = "FACE_COMPOSITE_FAILED" as const;
   constructor(message: string) {
     super(message);
@@ -189,7 +189,7 @@ function canvasToB64(canvas: HTMLCanvasElement): string {
   return b64;
 }
 
-export interface FaceCompositeIo {
+interface FaceCompositeIo {
   /** 合成后的整图 PNG（base64，不含 data URL 前缀；alpha 与允许区外像素与 base 逐像素一致） */
   dataB64: string;
   /** 本次肤色通道中位差（诊断用） */
@@ -343,7 +343,7 @@ export async function compositeExpressionFace(opts: {
   return { dataB64: canvasToB64(outCv.canvas), skinOffset };
 }
 
-export interface RunFaceCompositeTaskOptions {
+interface RunFaceCompositeTaskOptions {
   task: ImageTask;
   /** base（normal 立绘）产物路径：缺失直接显式报错，不静默降级 */
   basePath?: string;

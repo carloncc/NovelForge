@@ -1,5 +1,6 @@
 import type {
   ApiConfig,
+  BackgroundReuseMode,
   ChapterScript,
   ExtractionResult,
   FigureDetail,
@@ -8,6 +9,7 @@ import type {
   PipelineEvent,
   ProjectVisualBible,
 } from "./types";
+import { DEFAULT_BACKGROUND_REUSE } from "./types";
 import { buildImageTasks, runImageTask } from "./images";
 import { setImageConcurrency } from "../api/openaiCompatible";
 import { buildVoiceJobs, runVoiceJob } from "./voice";
@@ -48,10 +50,14 @@ export interface RegenContext {
   imageSeed?: number;
   /** 是否启用风格锚点（跟随生成页设置） */
   styleAnchor?: boolean;
+  /** 同一地点在单章内的背景上限（跟随生成页设置；与主管线同口径，否则重生成会多建/漏建背景） */
+  backgroundsPerLocation?: number;
+  /** 背景复用口径（#1580，跟随生成页设置；与主管线同口径，否则重生成会多建/漏建背景） */
+  backgroundReuse?: BackgroundReuseMode;
   visualBible?: ProjectVisualBible;
 }
 
-export interface RegenImageResult {
+interface RegenImageResult {
   task: ImageTask;
   path: string;
 }
@@ -69,6 +75,12 @@ async function mergeAssetMap(outputDir: string, results: RegenImageResult[]): Pr
         : regenerated.task.kind === "figure" || regenerated.task.kind === "threeview" || regenerated.task.kind === "action" ? map.figure
         : map.item;
       target[regenerated.task.id] = regenerated.path;
+      // #1580：同桶场景共用这一张——别名不写进映射，重生成后那些场景会退回"沿用上一张背景"
+      if (regenerated.task.kind === "background") {
+        for (const sid of regenerated.task.bgSceneIds ?? []) {
+          if (sid !== regenerated.task.id) target[sid] = regenerated.path;
+        }
+      }
     }
   });
 }
@@ -107,11 +119,16 @@ export async function regenerateImages(
     detail: ctx.figureDetail ?? "full",
     threeView: ctx.threeView !== false,
     actions: ctx.actions !== false,
+    // 0 = 调用方不额外限制动作数（手动重生成要能覆盖全部动作）。
+    // 注意这**不是**「全量」的保证：角色图片档位（次要角色/路人）仍是硬上限，
+    // 与主管线/补缺/单章跳过判定共用 core/figureBudget.ts 的同一份预算。
     maxActionsPerCharacter: 0,
     style: approvedBible?.styleDescription ?? ctx.style,
     feedback,
     baseSeed: ctx.imageSeed,
     styleAnchor: approvedBible ? false : ctx.styleAnchor !== false,
+    backgroundsPerLocation: ctx.backgroundsPerLocation ?? 0,
+    backgroundReuse: ctx.backgroundReuse ?? DEFAULT_BACKGROUND_REUSE,
   });
   const tasks = allTasks.filter(predicate);
   if (!tasks.length) return [];
@@ -354,6 +371,8 @@ export function selectCharacterThreeViewRegenerationTasks(
     feedback,
     baseSeed: ctx.imageSeed,
     styleAnchor: false,
+    backgroundsPerLocation: ctx.backgroundsPerLocation ?? 0,
+    backgroundReuse: ctx.backgroundReuse ?? DEFAULT_BACKGROUND_REUSE,
   });
 }
 
@@ -382,7 +401,9 @@ export function regenerateItemImage(
   return regenerateImages(ctx, (t) => t.kind === "item" && t.id === itemId, feedback, signal, onProgress, stats);
 }
 
-/** 重新生成某个场景背景图 */
+/** 重新生成某个场景背景图
+ *  #1580：复用口径下一张图服务同桶的多个场景，素材页点的那张图可能不是桶的代表场景——
+ *  只按 id 匹配会让「重新生成这张背景」对别名场景完全失效（点了没反应）。 */
 export function regenerateBackground(
   ctx: RegenContext,
   sceneId: string,
@@ -391,7 +412,14 @@ export function regenerateBackground(
   onProgress?: (done: number, total: number, label: string) => void,
   stats?: RegenBatchStats,
 ): Promise<RegenImageResult[]> {
-  return regenerateImages(ctx, (t) => t.kind === "background" && t.id === sceneId, feedback, signal, onProgress, stats);
+  return regenerateImages(
+    ctx,
+    (t) => t.kind === "background" && (t.id === sceneId || (t.bgSceneIds ?? []).includes(sceneId)),
+    feedback,
+    signal,
+    onProgress,
+    stats,
+  );
 }
 
 /** 重新生成某张 CG

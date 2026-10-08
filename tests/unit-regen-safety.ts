@@ -171,7 +171,7 @@ const line = (text: string, characterId = "c1") => ({ type: "dialogue" as const,
   const oldCards: ExtractionResult = {
     title: "t",
     characters: [
-      { id: "iriyasatoshi", name: "入谷聪", appearance: "旧", imagePrompt: "old", voiceName: "lin", voiceProfileId: "vp1", referenceImagePath: "ref/old.png" } as never,
+      { id: "iriyasatoshi", name: "入谷聪", appearance: "旧", imagePrompt: "old", voiceName: "lin", voiceProfileId: "vp1", referenceImagePath: "ref/old.png", figureTier: "cameo" } as never,
     ],
     scenes: [],
     items: [],
@@ -195,6 +195,9 @@ const line = (text: string, characterId = "c1") => ({ type: "dialogue" as const,
   assert((kept as { voiceProfileId?: string }).voiceProfileId === "vp1", "音色映射应沿用老的");
   assert(kept.voiceName === "lin", "已选音色应沿用老的");
   assert((kept as { referenceImagePath?: string }).referenceImagePath === "ref/old.png", "参考图应沿用老的");
+  // #1575：图片档位是用户手工选择（次要角色/路人=省图），与音色同属身份粘性字段——
+  // 重提后若被冲回 auto，用户降下来的档位会静默失效（路人又按主要角色的量出图）
+  assert((kept as { figureTier?: string }).figureTier === "cameo", "手工设置的图片档位应沿用老的");
   assert(aligned.characters.find((c) => c.name === "入谷聪")!.id === "routanakisaki2", "重复认领应保留新 id");
   // 无老卡片：原样返回
   const passthrough = alignExtractedIds(undefined, fresh);

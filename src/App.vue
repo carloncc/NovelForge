@@ -22,12 +22,14 @@ const pages: { id: PageId; labelKey: string; comp: Component }[] = [
   { id: "imageStory", labelKey: "图片小说", comp: defineAsyncComponent(() => import("./pages/ImageStoryPage.vue")) },
   { id: "preview", labelKey: "预览", comp: defineAsyncComponent(() => import("./pages/PreviewPage.vue")) },
   { id: "export", labelKey: "导出", comp: defineAsyncComponent(() => import("./pages/ExportPage.vue")) },
+  { id: "logs", labelKey: "运行日志", comp: defineAsyncComponent(() => import("./pages/LogsPage.vue")) },
 ];
 // 按流程分组：准备(1-3) → 制作(4-5) → 发布(6-7)，渲染时连续编号
 const navGroups: { labelKey: string; ids: PageId[] }[] = [
   { labelKey: "准备", ids: ["import", "config", "settings"] },
   { labelKey: "制作", ids: ["generate", "imageStory"] },
   { labelKey: "发布", ids: ["preview", "export"] },
+  { labelKey: "诊断", ids: ["logs"] },
 ];
 const flatPages = pages;
 function pageOf(id: PageId): (typeof pages)[number] {
@@ -44,7 +46,10 @@ const aboutOpen = ref(false);
 const noticeText = computed(() => {
   const parts: string[] = [];
   if (projectState.saveError) parts.push(`${t("自动保存失败")}：${projectState.saveError}`);
-  parts.push(...projectState.visualBibleWarnings);
+  // #1513：visualBibleWarnings 由 core 层产出（无法 import i18n），此前原样进横幅——
+  // 非中文语言下这里直接显示简体原文。t() 对非键是恒等透传（dict[key] ?? key），
+  // 所以已是目标语言/含动态细节的文案不会被二次翻译，静态中文则能被换掉。
+  parts.push(...projectState.visualBibleWarnings.map((w) => t(w)));
   // #1296：Web 端旧明文密钥迁移/加密存储警告（config 侧产出，此处统一横幅透出）
   if (webSecretsMigrationWarning.value) parts.push(webSecretsMigrationWarning.value);
   return parts.join("；");
@@ -66,6 +71,7 @@ const icons: Record<string, string> = {
   settings: "M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6",
   preview: "M8 5.14V19L19 12L8 5.14Z",
   export: "M20 13V19C20 20.1046 19.1046 21 18 21H6C4.89543 21 4 20.1046 4 19V13M12 15V3M12 3L8 7M12 3L16 7",
+  logs: "M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01",
 };
 
 const versionText = `v${version}`;
@@ -111,7 +117,7 @@ onMounted(async () => {
       log.error("app", `启动恢复项目状态失败：${message}`, { outputDir: configState.outputDir });
       projectState.visualBibleWarnings = [
         ...projectState.visualBibleWarnings,
-        `项目状态恢复失败：${message}（可到生成页点「加载该项目」重试）`,
+        t("项目状态恢复失败：{detail}（可到生成页点「加载该项目」重试）", { detail: message }),
       ];
     }
   } else {
@@ -158,6 +164,8 @@ onMounted(async () => {
         </svg>
         <span>{{ t(pageOf(id).labelKey) }}</span>
         <span v-if="id === 'generate' && runFailedCount" class="nav-badge" :title="t('有失败任务未处理（点开生成页 → 失败项）')">{{ runFailedCount }}</span>
+        <!-- 日志页搬去右侧后，侧栏仍需一眼看出「后台还在跑」 -->
+        <span v-if="id === 'logs' && runActive" class="nav-dot" :title="t('生成中…')" />
       </button>
     </template>
     <div v-if="runActive" class="run-indicator">
@@ -237,6 +245,24 @@ onMounted(async () => {
   font-size: 11px;
   line-height: 18px;
   text-align: center;
+}
+/* 日志页的「后台运行中」指示：只做存在感，不抢失败徽标的语义（失败是红底数字） */
+.nav-dot {
+  margin-left: auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--warn);
+  animation: nav-dot-pulse 1.2s ease-in-out infinite;
+}
+@keyframes nav-dot-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
 }
 .run-indicator {
   display: flex;

@@ -29,14 +29,16 @@ export function unregisterRunAbort(runId: string, signal?: AbortSignal): void {
   if (cur && signal && cur !== signal) return;
   registry.delete(runId);
   if (activeOwner === runId && (!signal || active === signal)) {
-    active = undefined;
-    activeOwner = undefined;
+    // 1301：不能直接清空 active —— registry 里可能还有别的运行在进行（典型：图片小说结束后
+    // 管线仍在跑）。旧实现一清到底，此后管线的请求只能拿到 undefined 信号，
+    // invokeHttpWithCancel 因而不下发 requestId，「停止」再也取消不了在途请求（跑完照旧计费）。
+    // 回落到最近注册的剩余条目。
+    const fallback = [...registry.entries()].pop();
+    active = fallback?.[1];
+    activeOwner = fallback?.[0];
   }
 }
 
-export function signalForRun(runId: string): AbortSignal | undefined {
-  return registry.get(runId);
-}
 
 export function setActiveAbortSignal(signal: AbortSignal | undefined, owner?: string): void {
   // 兼容旧调用：无 owner 的 clear 仅在无 owner 记录或信号同一时生效，避免误清他人

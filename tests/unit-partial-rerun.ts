@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { splitChapters } from "../src/core/chapters";
@@ -8,10 +8,27 @@ import { demoScriptAll } from "../src/core/script";
 import { buildImageTasks } from "../src/core/images";
 import { generateImages } from "../src/core/images";
 import { buildVoiceJobs, generateVoice } from "../src/core/voice";
-import { scriptCacheFileName } from "../src/core/cache";
+import { isScriptPartFileName } from "../src/core/cache";
 import { DEMO_NOVEL } from "../src/core/demoNovel";
 import type { PipelineEvent } from "../src/core/types";
 import { tauri } from "../src/utils/tauri";
+
+/**
+ * 定位某章的整章剧本缓存文件。
+ *
+ * 不再硬编码 scriptCacheFileName(..., "") —— 剧本缓存键含卡片指纹（scriptStyleFrag），
+ * 手工传空串等于把指纹公式复制一份到测试里，公式一变就 ENOENT（曾经就这么断过）。
+ * 这里直接按「非段缓存 + 章号匹配」取实际落盘的文件名，让断言聚焦真正要验证的行为：
+ * 单章重跑不得改动其它章的缓存内容。
+ */
+async function findScriptCache(cacheDir: string, chapterPos: number): Promise<string> {
+  const names = await readdir(cacheDir);
+  const hit = names.filter(
+    (n) => !isScriptPartFileName(n) && new RegExp(`^script_demo_ch${chapterPos}_[^.]*\\.json$`).test(n),
+  );
+  if (hit.length !== 1) throw new Error(`期望恰好 1 个第 ${chapterPos} 章整章剧本缓存，实际 ${hit.length}：${names.join(", ")}`);
+  return join(cacheDir, hit[0]);
+}
 
 function assert(cond: boolean, msg: string): void {
   if (!cond) throw new Error(msg);
@@ -74,11 +91,18 @@ async function main(): Promise<void> {
     assert(r.failed.length === 0, "图像全命中不应有失败");
     assert(r.generated === 0, `图像全命中实际生成数应为 0，实际 ${r.generated}`);
 
-    // 删掉一张 → 只有它走执行（无 API 则跳过），其余依旧静默（选文件名唯一的任务，避免同 id 覆盖干扰计数）
+    // 删掉一张 → 只有它走执行（无 API 则跳过），其余依旧静默
+    // （#1580：复用后一张背景图服务同桶多个场景，故要求「文件名唯一」**且**「id 唯一」——
+    //  demo 剧本章节间 scene.id 会重复，只按文件名挑会挑到 id 与他人相撞的任务，
+    //  断言「缺失的图不应有映射」就会被他人的映射干扰）
     const fileUseCount = new Map<string, number>();
-    for (const t of tasks) fileUseCount.set(t.fileName, (fileUseCount.get(t.fileName) ?? 0) + 1);
-    const victim = tasks.find((t) => t.kind === "background" && fileUseCount.get(t.fileName) === 1)!;
-    assert(!!victim, "应有文件名唯一的背景任务");
+    const idUseCount = new Map<string, number>();
+    for (const t of tasks) {
+      fileUseCount.set(t.fileName, (fileUseCount.get(t.fileName) ?? 0) + 1);
+      idUseCount.set(t.id, (idUseCount.get(t.id) ?? 0) + 1);
+    }
+    const victim = tasks.find((t) => t.kind === "background" && fileUseCount.get(t.fileName) === 1 && idUseCount.get(t.id) === 1)!;
+    assert(!!victim, "应有文件名与 id 都唯一的背景任务");
     await tauri.removePath(`${cacheRoot}/images/${victim.fileName}`).catch(() => {});
     const logs2: PipelineEvent[] = [];
     const r2 = await generateImages(
@@ -129,7 +153,7 @@ async function main(): Promise<void> {
     const res1 = await runAll((e) => logs1.push(e));
     assert(res1.chapters.length === 2, `首次应产出 2 章，实际 ${res1.chapters.length}`);
     const cacheDir = `${out}/.novel2vn/cache`;
-    const ch0File = scriptCacheFileName(cacheDir, true, 0, novel.chapters[0].title, novel.chapters[0].text, "");
+    const ch0File = await findScriptCache(cacheDir, 1);
     const ch0Before = await readFile(ch0File, "utf8");
 
     // 单章重跑第 2 章（带意见）：第 1 章必须复用、文件内容不变；总章数不丢
@@ -224,7 +248,7 @@ async function main(): Promise<void> {
     }).run();
     assert(first.chapters.length === 2, `首次应产出 2 章，实际 ${first.chapters.length}`);
     const cacheDir = `${out}/.novel2vn/cache`;
-    const ch0File = scriptCacheFileName(cacheDir, true, 0, novel.chapters[0].title, novel.chapters[0].text, "");
+    const ch0File = await findScriptCache(cacheDir, 1);
     const ch0Before = await readFile(ch0File, "utf8");
 
     const logs: PipelineEvent[] = [];

@@ -267,7 +267,7 @@ const templatesByChannel = computed(() => ({
   tts: templatesForCapability("tts"),
 }));
 
-function onTemplateChange(kind: ChannelKey, cfg: ApiConfig, templateId: string): void {
+function onTemplateChange(_kind: ChannelKey, cfg: ApiConfig, templateId: string): void {
   if (!templateId) {
     cfg.adapter = undefined;
     return;
@@ -439,7 +439,7 @@ function modelValueFor(cfg: ApiConfig): string {
   return cfg.model ?? "";
 }
 
-function onModelSelect(kind: ChannelKey, cfg: ApiConfig, e: Event): void {
+function onModelSelect(_kind: ChannelKey, cfg: ApiConfig, e: Event): void {
   const value = (e.target as HTMLSelectElement).value;
   if (value === "__custom__") {
     customModelOpen.value[cfg.id] = true;

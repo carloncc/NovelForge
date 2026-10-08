@@ -14,7 +14,7 @@ import { tauri } from "../utils/tauri";
  *   release 的 owner 复查放到 stop 完成后执行。
  */
 
-export type PreviewOwner = "main" | "imageStory";
+type PreviewOwner = "main" | "imageStory";
 
 let owner: PreviewOwner | null = null;
 /** #1429：当前持有者对应的根目录（成功 claim 时记录，release 成功时清空，失败保持不变用于回滚语义） */

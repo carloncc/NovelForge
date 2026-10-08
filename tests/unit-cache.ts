@@ -1,6 +1,5 @@
 import { splitChapters } from "../src/core/chapters";
 import { Pipeline } from "../src/core/pipeline";
-import { DEMO_NOVEL } from "../src/core/demoNovel";
 import type { PipelineEvent } from "../src/core/types";
 import { tauri } from "../src/utils/tauri";
 import { mkdtemp } from "node:fs/promises";

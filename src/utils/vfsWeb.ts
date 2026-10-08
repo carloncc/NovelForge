@@ -9,7 +9,7 @@ import { log } from "./logger";
 const DB_NAME = "novelforge-fs";
 const STORE = "files";
 
-export interface VfsEntry {
+interface VfsEntry {
   name: string;
   path: string;
   isDir: boolean;
@@ -29,7 +29,7 @@ let dbPromise: Promise<IDBDatabase> | null = null;
 
 function openDb(): Promise<IDBDatabase> {
   if (dbPromise) return dbPromise;
-  dbPromise = new Promise((resolve, reject) => {
+  dbPromise = new Promise<IDBDatabase>((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, 1);
     req.onupgradeneeded = () => {
       if (!req.result.objectStoreNames.contains(STORE)) {
@@ -38,6 +38,12 @@ function openDb(): Promise<IDBDatabase> {
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error ?? new Error("IndexedDB 打开失败"));
+  }).catch((err: unknown) => {
+    // 失败的 Promise 不能留在缓存里：旧实现把它永久挂在 dbPromise 上，此后每一次 VFS 调用
+    // 都直接复用同一个失败结果——用户即便在浏览器里腾出配额、修好 IndexedDB，也必须重启
+    // 整个应用（Web 构建没有别的恢复入口）。失败即清空，下一次调用重新尝试打开。
+    dbPromise = null;
+    throw err;
   });
   return dbPromise;
 }
@@ -116,29 +122,11 @@ async function txGetMany(keys: string[]): Promise<Map<string, VfsNode | undefine
 }
 
 /** 批量读取文件（一次事务一批；不存在的 path 直接跳过），返回顺序与入参一致 */
-export async function vfsReadFilesBatch(
-  paths: string[],
-  batchSize = 64,
-): Promise<{ path: string; data: ArrayBuffer }[]> {
-  const normalized = paths.map(normalizeVfsPath);
-  const out: { path: string; data: ArrayBuffer }[] = [];
-  for (let i = 0; i < normalized.length; i += batchSize) {
-    const batch = normalized.slice(i, i + batchSize);
-    const nodes = await txGetMany(batch);
-    for (const key of batch) {
-      const node = nodes.get(key);
-      if (node?.kind === "file") out.push({ path: key, data: node.data });
-    }
-  }
-  return out;
-}
 
 function normalizeVfsPath(p: string): string {
   const parts = p.split(/[\\/]/).filter(Boolean);
   return "/" + parts.join("/");
 }
-
-
 
 /** 确保目录链存在 */
 async function ensureDir(path: string): Promise<void> {
@@ -168,7 +156,7 @@ export async function vfsWriteTextFile(path: string, content: string): Promise<v
  *  3) 候选标签不受支持时跳过；都失败则回退 UTF-8 宽容解码。
  *  局限：短文本下 GBK 与 BIG5 字节集高度重叠，可能互相干净解码成对方错字（此时按 GBK 优先）；
  *  桌面版可用 Rust chardetng 精确识别。 */
-export interface DecodedNovel {
+interface DecodedNovel {
   text: string;
   encoding: string;
 }
@@ -344,20 +332,61 @@ export async function vfsReplacePath(src: string, dst: string): Promise<void> {
     const node = await txGet(key);
     if (node) entries.push({ key, node });
   }
-  // 先清空目标路径，再写入源节点（与旧事务实现的顺序一致）
   const destinationKeys = (await txKeys()).filter((key) => key === destination || key.startsWith(destination + "/"));
-  for (const key of destinationKeys) await txDelete(key);
-  for (const entry of entries) {
-    await txPut(`${destination}${entry.key.slice(source.length)}`, entry.node);
-  }
+  // #1490 契约：project_state.json 的原子写依赖 replace_path —— 写 .tmp 再整体替换，
+  // 替换中途失败必须保留旧状态。Tauri 侧 replace_path 自带备份+回滚；Web 侧此前把
+  // 「逐个 delete + 逐个 put」拆成 N+M 个独立事务，一旦中途撞上 IndexedDB 配额
+  // （QuotaExceededError），删除已提交而 put 失败，旧状态被永久抹掉、只剩半截 .tmp。
+  // IndexedDB 事务本身即原子：把删除与写入放进同一个 readwrite 事务，任一步失败整体 abort，
+  // 磁盘状态回到替换前，与 Tauri 侧的回滚语义对齐。
+  const db = await openDb();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(STORE, "readwrite");
+    watchTx(tx, resolve, reject);
+    const store = tx.objectStore(STORE);
+    for (const key of destinationKeys) store.delete(key);
+    for (const entry of entries) {
+      store.put(entry.node, `${destination}${entry.key.slice(source.length)}`);
+    }
+    // 真正的「移动」必须删掉源键：Tauri 侧 replace_path 走 fs::rename，源路径随之消失；
+    // Web 侧此前只复制不删，于是 voice.ts 的「把孤儿付费音频移进 .novel2vn/trash」
+    // 在 Web 上等于没删（purged 计数虚高、IndexedDB 只增不减），project_state.json 等
+    // 原子写的 .tmp 中间键也会永久残留。源键若同时落在目标前缀内（源是目标的祖先/自身）
+    // 不能删，否则会把刚 put 进去的目标一起删掉。
+    for (const key of sourceKeys) {
+      if (key === destination || key.startsWith(destination + "/")) continue;
+      store.delete(key);
+    }
+  });
 }
 
 /** 筛选根目录下的文件 key（1 次键事务 + 内存过滤，不做任何值读取） */
+/**
+ * 相对路径是否可以进入发布包（#1522）。
+ *
+ * 口径来自预览服务器的 is_preview_blocked：那里把「任一路径组件以 . 开头」当作隐私、不对外提供，
+ * 打包器却只排除调用方显式列出的前缀，于是 .git / .env / .npmrc / .idea 会跟着发布包发出去——
+ * 项目目录由用户自选，挑在仓库里就会连整个 .git 一起吞进去。两侧对齐后不存在这个缺口。
+ *
+ * 游戏本体不依赖任何点文件（预览服务器本来就拒绝它们，游戏照样能跑），因此这条规则
+ * 不会让正常素材被误伤。
+ */
+export function isPublishableRelativePath(relative: string): boolean {
+  // #1536：原先只按 "/" 切分，Rust 侧 is_preview_blocked 的 Path::components() 在 Windows 上
+  // 同时按 / 与反斜杠切分——于是 "a\.env" 在 Rust 被拦、在 Web 打包器却放行（更宽松 = 安全方向失守）。
+  // 真实 key 经 normalizeVfsPath 归一化后不会带反斜杠，所以这是潜在而非现网缺口；
+  // 但既然差分测试能把它逼出来，就把切分口径对齐，别留给将来。
+  return !relative.split(/[\\/]/).some((seg) => seg.startsWith("."));
+}
+
 async function collectFileKeys(root: string, excludePrefixes: string[] = []): Promise<{ prefix: string; keys: string[] }> {
   const prefix = normalizeVfsPath(root);
   const keys = (await txKeys()).filter((key) => {
     if (!key.startsWith(prefix + "/")) return false;
     const relative = key.slice(prefix.length + 1);
+    // #1522：点文件/点目录一律不进包。与 Rust 侧 write_zip_contents、预览服务器的
+    // is_preview_blocked 同一口径：任一路径组件以 . 开头即不进包。
+    if (!isPublishableRelativePath(relative)) return false;
     // exclude 同时支持绝对路径与"相对 root 的目录名"（如 ".novel2vn"）：此前相对名永远匹配不上，
     // Web 打包会把内部缓存/状态一起打进 zip
     return !excludePrefixes.some((ep) => {
@@ -369,9 +398,6 @@ async function collectFileKeys(root: string, excludePrefixes: string[] = []): Pr
 }
 
 /** 一次键事务列出根目录下所有文件 key（打包/预览的流式收集入口，避免把值与键一起驻留） */
-export async function vfsListFilePaths(root: string, excludePrefixes: string[] = []): Promise<string[]> {
-  return (await collectFileKeys(root, excludePrefixes)).keys;
-}
 
 /** 递归收集路径下所有文件（用于打包 zip / 预览上传）。
  *  #1144：值读取改为分批 txGetMany（每批一次事务），不再逐 key 单事务往返。 */
@@ -389,7 +415,7 @@ export async function vfsCollectFiles(
 }
 
 /** 分块读取进度：total 为候选 key 数（含目录项，略微高估），done 为已读到的文件数 */
-export interface VfsBatchProgress {
+interface VfsBatchProgress {
   done: number;
   total: number;
 }
@@ -456,9 +482,4 @@ export function vfsDownloadChunks(chunks: Uint8Array[], downloadName: string, mi
 }
 
 /** 从 IndexedDB 读取文件并触发浏览器下载（zip 等） */
-export async function vfsDownloadFile(path: string, downloadName: string): Promise<void> {
-  const buf = await vfsReadFile(path);
-  if (!buf) throw new Error(`文件不存在：${path}`);
-  vfsDownloadBytes(new Uint8Array(buf), downloadName);
-}
 

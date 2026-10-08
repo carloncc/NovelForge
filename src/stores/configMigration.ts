@@ -20,7 +20,7 @@ export function concurrencyFor(cfg: ApiConfig | undefined, kind: ChannelKey): nu
 
 /** AI 抠图设置：抠图方式 + 所选模型（模型列表见 core/cutout/models.ts） */
 export type CutoutMode = "ai" | "chroma" | "off";
-export interface CutoutSettings {
+interface CutoutSettings {
   mode: CutoutMode;
   modelId: string;
 }
@@ -53,7 +53,7 @@ export interface ProjectEntry {
   updatedAt: string;
 }
 
-export interface ConfigMigrationResult {
+interface ConfigMigrationResult {
   config: ConfigFile;
   migrated: boolean;
   /** #1308：丢弃/改名/回填项的人类可读警告（UI 侧用 t key 占位展示，见下方 t() 调用） */
@@ -64,7 +64,7 @@ export interface ConfigMigrationResult {
 
 type ConfigFactory = () => ApiConfig;
 
-export interface ConfigLoadOptions {
+interface ConfigLoadOptions {
   createId: () => string;
   createVisionDefault: ConfigFactory;
   writeConfig: (content: string) => Promise<void>;
@@ -72,7 +72,7 @@ export interface ConfigLoadOptions {
   writeSecrets: (secrets: Record<string, string>) => Promise<void>;
 }
 
-export interface ConfigLoadResult {
+interface ConfigLoadResult {
   config: ConfigFile;
   migrationPending: boolean;
   migrationSaveError?: Error;

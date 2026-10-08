@@ -1,8 +1,9 @@
 import type { CharacterCard, ExtractionResult, ItemCard, LoreCard } from "./types";
 import { sanitizeId } from "./render";
 import { tauri } from "../utils/tauri";
+import { stripImageExt } from "../core/cache";
 
-export interface CardsSaveResult {
+interface CardsSaveResult {
   scriptCacheCleared: number;
   imageCacheCleared: number;
 }
@@ -13,7 +14,7 @@ export interface CardsSaveResult {
  * 双计时器叠加、参考音频混片。调用方（EditCards）应在 startSystemAudioRecording
  * 入口调用，返回 true 即拒绝并提示用户先停止/取消当前录音。
  */
-export interface RecordingMutexState {
+interface RecordingMutexState {
   recordingChar: string | null;
   hasRecorder: boolean;
   hasStream: boolean;
@@ -30,7 +31,7 @@ export function shouldBlockRecordingStart(state: RecordingMutexState): boolean {
  * 保存按钮若在这些操作在途时可用，会把不含新字段的快照写盘，内存与磁盘分叉、
  * 重启后付费结果丢失。返回 true 即应禁用「保存卡片」并在 save() 入口二次拦截。
  */
-export interface CardSaveMutexState {
+interface CardSaveMutexState {
   saving: boolean;
   recognizing: boolean;
   voiceBusy: boolean;
@@ -62,7 +63,11 @@ export async function saveEditedCards(
   // 保留旧缓存中的小说指纹（防止用户编辑被指纹校验误判作废），同时留一份旧卡片做差分
   let novelFp: string | undefined;
   let oldCards: ExtractionResult | null = null;
-  for (const f of ["cards.json", "cards_demo.json"]) {
+  // 必须先读**当前模式**的文件。旧实现固定按 cards.json → cards_demo.json 探测，demo 模式下
+  // 拿到的是正式卡片：差分（下面 deadCharIds/IMAGE_FIELDS）会拿另一套卡片判「谁被删了」，
+  // 把另一模式里存在的付费立绘/三视图当死角色删掉；正式小说的 _novelFp 也会被写进 cards_demo.json。
+  const cachePrefix = demo ? "cards_demo" : "cards";
+  for (const f of [`${cachePrefix}.json`, demo ? "cards.json" : "cards_demo.json"]) {
     try {
       const { text } = await tauri.readTextFile(`${metaDir}/${f}`);
       const parsed = JSON.parse(text) as ExtractionResult & { _novelFp?: string };
@@ -74,7 +79,6 @@ export async function saveEditedCards(
   }
   // demo/正式隔离：只写当前模式的文件。旧实现同时写两份同一 payload，
   // demo 改卡污染正式、正式改卡污染 demo，且 _novelFp 被单值覆盖导致误作废。
-  const cachePrefix = demo ? "cards_demo" : "cards";
   const payload = novelFp ? { ...cards, _novelFp: novelFp } : cards;
 
   await tauri.writeTextFile(`${metaDir}/${cachePrefix}.json`, JSON.stringify(payload, null, 2));
@@ -140,7 +144,7 @@ export async function saveEditedCards(
     const liveItem = new Set(
       (cards.items ?? []).filter((i) => !deadItemIds.has(i.id)).map((i) => `item_${sanitizeId(i.id).toLowerCase()}`),
     );
-    const baseNoExt = (name: string): string => name.replace(/\.(png|jpg|jpeg|webp)$/i, "");
+    const baseNoExt = (name: string): string => stripImageExt(name);
     for (const e of entries) {
       if (e.isDir) continue;
       const lower = e.name.toLowerCase();

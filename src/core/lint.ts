@@ -1,7 +1,7 @@
 import { tauri } from "../utils/tauri";
 import { TTS_SPEECH_MAX_CHARS } from "./render";
 
-export interface LintIssue {
+interface LintIssue {
   level: "error" | "warning";
   scope: string;
   message: string;
@@ -26,7 +26,7 @@ export interface LintReport {
 
 /** 导出检查错误的分类（#1107）：素材缺失多由模板/环境回填问题导致，用户无法在生成页修复；
  *  语法/结构错误属产物可修复缺陷，打包前建议先修。分类只用于提示与留痕，不改变拦截行为。 */
-export interface LintErrorBreakdown {
+interface LintErrorBreakdown {
   /** 素材引用缺失（scope 为「素材(...)」或 message 含「引用缺失/配音缺失」） */
   missingAsset: LintIssue[];
   /** 语法/结构等产物自身缺陷 */
@@ -199,7 +199,10 @@ export async function lintProject(outputDir: string): Promise<LintReport> {
         // unlockCg/unlockBgm/playEffect 均需校验存在性；bgm:none / changeFigure:none 豁免
         // 1460 兼容：unlock 内容现为 game/background|bgm/<file> 相对路径，取 basename 比对（旧裸文件名同样兼容）。
         if (assetDir) {
-          const rawName = line.slice(cmd.length + 1).split(" ")[0].replace(/;$/, "");
+          // 按 " -" 切而不是按空格切：文件名带空格（"my theme.mp3"）会被截成 "my"，
+          // 于是报出「引用缺失：my」的假错误；lint 错误会挡住导出（导出页要红色确认）。
+          // project.ts 的 directiveArg 一直是按 " -" 解析的，这里与之对齐。
+          const rawName = line.slice(cmd.length + 1).split(" -")[0].trim().replace(/;$/, "");
           const fileName = (rawName.split(/[\\/]/).pop() || rawName).toLowerCase();
           if (fileName !== "none" && !assetFiles[assetDir].has(fileName)) {
             report.summary.missingAssets++;

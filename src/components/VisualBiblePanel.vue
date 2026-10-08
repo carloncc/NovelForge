@@ -5,7 +5,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { projectState, pushLog, scheduleSave } from "../stores/project";
 import { activeConfig } from "../stores/config";
 import { concurrencyFor } from "../stores/configMigration";
-import { tauri, isTauri } from "../utils/tauri";
+import { tauri, isTauri, blessParentDir } from "../utils/tauri";
 import { errMsg } from "../utils/errors";
 import { fileToBase64 } from "../utils/file";
 import { configIsUsable } from "../api/providers";
@@ -13,6 +13,7 @@ import { useAssetThumbs } from "../composables/useAssetThumbs";
 import { confirmDialog } from "../composables/useConfirmDialog";
 import LazyThumb from "./LazyThumb.vue";
 import AssetPreview from "./AssetPreview.vue";
+import { finishRunActivity, isRunActivityActive, startRunActivity, updateRunActivity } from "../stores/runLog";
 import type { CharacterCard, ProjectVisualBible, StyleSource } from "../core/types";
 import {
   acceptCharacterSheet,
@@ -32,6 +33,8 @@ import {
   replaceCharacterReference,
   replaceStyleReference,
   rewriteStyleDescription,
+  listStaleVisualBibleArtifacts,
+  purgeStaleVisualBibleArtifacts,
   syncBibleCharactersWithCards,
   updateStyleDescription,
   validateVisualBibleForApproval,
@@ -39,6 +42,7 @@ import {
 } from "../core/visualBible";
 import type { VisualBibleImageInput } from "../core/visualBible";
 import { visualBibleErrorMessage } from "../core/visualBibleWorkflow";
+import { figureCostumeEntries } from "../core/images";
 import { useGenerateController } from "../stores/generate";
 
 interface PendingImage {
@@ -65,9 +69,42 @@ const pendingStyleImage = ref<PendingImage | null>(null);
 const pendingCharImages = ref<Record<string, PendingImage>>({});
 const styleDescriptionText = ref("");
 const rewriteInstruction = ref("");
+/** 草稿创建在全局运行态里的 key：切页后据此恢复「生成中」按钮态，避免重复启动一次全量付费出图 */
+const VB_DRAFT_KEY = "vb-draft";
+/** 同步卡片 / 全局重新生成 的全局运行态 key（同样要跨切页存活） */
+const VB_SYNC_KEY = "vb-sync";
+const VB_REGEN_KEY = "vb-regen-all";
 const creating = ref(false);
 const createProgress = ref<{ phase: "style" | "threeview"; done: number; total: number } | null>(null);
 const busyKey = ref("");
+/**
+ * 角色级任务用「集合」而不是「单槽」。
+ *
+ * 旧实现所有角色共用 busyKey 一个槽 + runLocked 一刀切（!!busyKey.value），于是点某个角色的
+ * 「重新生成三视图」，其余所有角色的按钮全部变灰——「重新生成一个，其他就没法生成」。
+ * 现在角色级 key 进 charBusy 集合：多个角色可同时重生成，互不阻塞、互不覆盖 spinner；
+ * busyKey 只留给全局操作（风格改写/示例图/同步卡片/全局重生成/批准…）。
+ */
+const charBusy = ref<Set<string>>(new Set());
+function markCharBusy(key: string): void {
+  const next = new Set(charBusy.value);
+  next.add(key);
+  charBusy.value = next;
+}
+function clearCharBusy(key: string): void {
+  const next = new Set(charBusy.value);
+  next.delete(key);
+  charBusy.value = next;
+}
+/** 该角色自己是否有任务在跑：用于「只锁自己这一行」的按钮 */
+function isCharBusyFor(id: string): boolean {
+  for (const key of charBusy.value) {
+    // char-sheet:ID / char-desc:ID / char-accept:ID / char-ref:ID
+    if (key.endsWith(`:${id}`)) return true;
+    if (key.startsWith(`char-sheet-ct:${id}:`)) return true;
+  }
+  return false;
+}
 const createError = ref("");
 const styleError = ref("");
 const approvalError = ref("");
@@ -79,12 +116,59 @@ const bible = computed<ProjectVisualBible | null>(() => projectState.visualBible
 const characters = computed<CharacterCard[]>(() => projectState.lastResult?.cards.characters ?? []);
 const outputDir = computed(() => projectState.outputDir);
 
+/**
+ * 旧修订产物清理：每次重跑守门都会生成一批带新修订号的文件，旧修订留在盘上不再被引用
+ * （实测某项目 169 张 / 228 MB 里只有 26 张是清单引用的）。这里只统计与删除**清单不再引用**的图，
+ * 当前清单引用的产物一个都不动。
+ */
+const staleArtifacts = ref<{ files: number; bytes: number } | null>(null);
+const purgeBusy = ref(false);
+async function refreshStaleArtifacts(): Promise<void> {
+  if (!outputDir.value) {
+    staleArtifacts.value = null;
+    return;
+  }
+  try {
+    const stale = await listStaleVisualBibleArtifacts(outputDir.value);
+    staleArtifacts.value = { files: stale.files.length, bytes: stale.bytes };
+  } catch {
+    staleArtifacts.value = null;
+  }
+}
+async function purgeStaleArtifacts(): Promise<void> {
+  const dir = outputDir.value;
+  const stale = staleArtifacts.value;
+  if (!dir || !stale?.files) return;
+  const mb = (stale.bytes / 1048576).toFixed(1);
+  if (!(await confirmDialog({
+    title: t("删除 {n} 张不再被守门清单引用的旧修订产物（约 {mb} MB）？当前清单引用的图不会动，删除后无法恢复。", { n: stale.files, mb }),
+    tone: "danger",
+  }))) return;
+  purgeBusy.value = true;
+  try {
+    const result = await purgeStaleVisualBibleArtifacts(dir);
+    pushLog({
+      step: "视觉守门",
+      message: `已清理旧修订产物 ${result.deleted} 张（${(result.bytes / 1048576).toFixed(1)} MB）${result.failed ? `，${result.failed} 张删除失败（可稍后重试）` : ""}`,
+      level: result.failed ? "warn" : "success",
+      at: Date.now(),
+    });
+    await refreshStaleArtifacts();
+  } catch (e) {
+    pushLog({ step: "视觉守门", message: `清理旧修订产物失败：${errMsg(e).slice(0, 120)}`, level: "error", at: Date.now() });
+  } finally {
+    purgeBusy.value = false;
+  }
+}
+
 const bibleNeedsReview = computed(() => !bible.value || bible.value.status !== "approved");
 const hasCards = computed(() => characters.value.length > 0);
 const stylePreviewSrc = computed(() => pendingStyleImage.value?.dataUrl || (bible.value ? vbPath(bible.value.styleReferencePath) : ""));
 // 改写类操作统一锁：主管线/素材批量/章节队列/草稿生成中，任何改写与重生成都必须禁用——
 // 双管线并发会同时写 visual-bible.json / cards 并重复计费（此前仅「批准」有三锁）
-const runLocked = computed(() => !!busyKey.value || creating.value || !!pipelineBusy.value || !!assetBusy.value || !!queueRunning.value);
+const runLocked = computed(() => !!busyKey.value || charBusy.value.size > 0 || creating.value || !!pipelineBusy.value || !!assetBusy.value || !!queueRunning.value);
+/** 角色行按钮的锁：只受全局任务影响，**不受其他角色影响**（这就是「独立重生成」的关键） */
+const charRowLocked = computed(() => !!busyKey.value || creating.value || !!pipelineBusy.value || !!assetBusy.value || !!queueRunning.value);
 
 /** 视觉守门批量操作的取消信号：当前请求完成后不再调度后续（已完成的部分按操作语义保留），供「中断」按钮使用 */
 const vbAbort = ref(false);
@@ -109,6 +193,7 @@ const canApprove = computed(() => {
     && approvalErrors.value.length === 0
     && !creating.value
     && !busyKey.value
+    && charBusy.value.size === 0
     && !pipelineBusy.value
     && !assetBusy.value
     && !queueRunning.value;
@@ -174,6 +259,8 @@ async function pickStyleFile(): Promise<void> {
     filters: [{ name: t("参考图"), extensions: ["png", "jpg", "jpeg", "webp"] }],
   });
   if (!picked || typeof picked !== "string") return;
+  // #1520：登记所在目录，否则白名单外（D 盘等）的参考图读不到
+  await blessParentDir(picked);
   try {
     const dataB64 = await tauri.readFileBase64(picked);
     const mime = mimeOf(picked);
@@ -206,6 +293,8 @@ async function pickCharacterFile(characterId: string): Promise<void> {
     filters: [{ name: t("角色参考图"), extensions: ["png", "jpg", "jpeg", "webp"] }],
   });
   if (!picked || typeof picked !== "string") return;
+  // #1520：同上，先登记目录
+  await blessParentDir(picked);
   try {
     const dataB64 = await tauri.readFileBase64(picked);
     const mime = mimeOf(picked);
@@ -253,8 +342,17 @@ async function syncFingerprintBeforeApproval(): Promise<void> {
   }
 }
 
+// 旧修订产物的统计随项目/守门状态变化刷新（进面板、换项目、重建草稿后）
+watch(outputDir, () => void refreshStaleArtifacts(), { immediate: true });
+watch(() => bible.value?.status, () => void refreshStaleArtifacts());
+
 onMounted(() => {
   void syncFingerprintBeforeApproval();
+  // 切页会销毁本组件（App.vue 用 <component :is> 且没有 KeepAlive），但后台任务仍在跑。
+  // 回来后必须恢复「生成中」态：否则按钮重新可点，会再启动一次全量付费出图（重复计费）。
+  if (isRunActivityActive(VB_DRAFT_KEY)) creating.value = true;
+  if (isRunActivityActive(VB_SYNC_KEY)) busyKey.value = "sync-cards";
+  if (isRunActivityActive(VB_REGEN_KEY)) busyKey.value = "regenerate-all";
 });
 
 async function refreshApprovalValidation(): Promise<void> {
@@ -272,9 +370,27 @@ async function refreshApprovalValidation(): Promise<void> {
 }
 
 /** #1409：core 的批准校验错误是英文硬编码；渲染前经 localizeVisualBibleApprovalError 映射为 t() key。 */
-const localizedApprovalErrors = computed(() =>
-  localizeVisualBibleApprovalErrors(approvalErrors.value).map((entry) => t(entry.key, entry.params)),
-);
+/**
+ * 但 25 个角色各来一条「…的三视图尚未确认，请先点「确认此角色」」，批准条就变成一堵
+ * 25 行的墙：用户看不出总共有几类问题、也不知道该从哪儿下手。这里按 key 归类，
+ * 把重复最多的「尚未确认」收成一条并列出角色名，其余类型（缺失/不可读/版本不一致）保持逐条。
+ */
+const ACCEPT_ERROR_KEY = "角色「{id}」的三视图尚未确认，请先点「确认此角色」";
+const localizedApprovalErrors = computed(() => {
+  const pendingIds: string[] = [];
+  const others: string[] = [];
+  for (const entry of localizeVisualBibleApprovalErrors(approvalErrors.value)) {
+    const id = entry.params?.id;
+    if (entry.key === ACCEPT_ERROR_KEY && typeof id === "string") pendingIds.push(id);
+    else others.push(t(entry.key, entry.params));
+  }
+  const summary: string[] = [];
+  if (pendingIds.length === 1) summary.push(t(ACCEPT_ERROR_KEY, { id: pendingIds[0] }));
+  else if (pendingIds.length > 1) {
+    summary.push(t("{n} 个角色的三视图尚未确认：{names}", { n: pendingIds.length, names: pendingIds.join("、") }));
+  }
+  return [...summary, ...others];
+});
 
 /** #1409：approve/accept 抛错的英文 stale 文案同样本地化；ReferenceImage/Vision 等已有中文文案原样保留。 */
 function visualBibleErrorText(error: unknown, context: { imageModel?: string; visionModel?: string }): string {
@@ -368,7 +484,13 @@ async function createDraft(): Promise<void> {
     imageCfg,
     characterReferences,
     onProgress: (phase: "style" | "threeview", done: number, total: number) => {
+      // 只驱动面板内的阶段进度（风格分析按章分片、三视图按角色计数），
+      // 全局进度条交给 onImageProgress——两者口径不同，混用会让进度条来回跳。
       createProgress.value = { phase, done, total };
+    },
+    // 真实出图数（含换装三视图）：这才是「第 n 张 / 共 m 张」
+    onImageProgress: (done: number, total: number, label: string) => {
+      updateRunActivity(VB_DRAFT_KEY, { done, total, detail: label });
     },
     isAborted: () => vbAbort.value,
   };
@@ -376,6 +498,7 @@ async function createDraft(): Promise<void> {
   vbAbort.value = false;
   creating.value = true;
   createProgress.value = null;
+  startRunActivity({ key: VB_DRAFT_KEY, label: t("创建视觉守门草稿"), page: "generate" });
   pushLog({
     step: "视觉守门",
     message: `创建草稿开始（风格来源：${styleSource.value === "reference_image" ? "参考图" : "小说分析"}；${cards.characters.length} 个角色${Object.keys(pendingCharImages.value).length ? `，其中 ${Object.keys(pendingCharImages.value).length} 个带上传参考图` : ""}）`,
@@ -437,6 +560,7 @@ async function createDraft(): Promise<void> {
   } finally {
     creating.value = false;
     createProgress.value = null;
+    finishRunActivity(VB_DRAFT_KEY);
   }
 }
 
@@ -569,7 +693,7 @@ async function replaceCharacterFromUpload(characterId: string): Promise<void> {
   const pending = pendingCharImages.value[characterId];
   const character = characters.value.find((candidate) => candidate.id === characterId);
   if (!current || !outputDir.value || !character || !pending) return;
-  busyKey.value = `char-ref:${characterId}`;
+  markCharBusy(`char-ref:${characterId}`);
   charErrors.value[characterId] = "";
   try {
     await replaceCharacterReference(
@@ -588,7 +712,7 @@ async function replaceCharacterFromUpload(characterId: string): Promise<void> {
       imageModel: activeConfig("image")?.model,
       visionModel: activeConfig("vision")?.model,
     });
-  } finally {
+    clearCharBusy(`char-ref:${characterId}`);
     busyKey.value = "";
   }
 }
@@ -605,10 +729,10 @@ async function regenerateCharacter(characterId: string): Promise<void> {
     charErrors.value[characterId] = t("重新生成三视图需要配置图像生成 API");
     return;
   }
-  busyKey.value = `char-sheet:${characterId}`;
+  markCharBusy(`char-sheet:${characterId}`);
   charErrors.value[characterId] = "";
   if (!(await confirmDialog({ title: t("重新生成「{name}」的三视图？将覆盖当前版本（已确认的打回待确认），并产生 1 张图片费用。", { name: character.name }), tone: "danger" }))) {
-    busyKey.value = "";
+    clearCharBusy(`char-sheet:${characterId}`);
     return;
   }
   pushLog({ step: "视觉守门", message: `角色「${character.name}」三视图重新生成开始…`, level: "info", at: Date.now() });
@@ -622,7 +746,7 @@ async function regenerateCharacter(characterId: string): Promise<void> {
       imageModel: imageCfg.model,
       visionModel: activeConfig("vision")?.model,
     });
-  } finally {
+    clearCharBusy(`char-sheet:${characterId}`);
     busyKey.value = "";
   }
 }
@@ -645,7 +769,7 @@ async function regenerateCharacterDesc(characterId: string): Promise<void> {
     charErrors.value[characterId] = t("重新生成角色描述需要配置视觉或文本 API");
     return;
   }
-  busyKey.value = `char-desc:${characterId}`;
+  markCharBusy(`char-desc:${characterId}`);
   charErrors.value[characterId] = "";
   pushLog({ step: "视觉守门", message: `角色「${character.name}」描述重新生成开始…`, level: "info", at: Date.now() });
   try {
@@ -680,7 +804,7 @@ async function regenerateCharacterDesc(characterId: string): Promise<void> {
     charErrors.value[characterId] = visualBibleErrorMessage(e, {
       visionModel: visionCfg.model,
     });
-  } finally {
+    clearCharBusy(`char-desc:${characterId}`);
     busyKey.value = "";
   }
 }
@@ -717,6 +841,7 @@ async function syncCharactersWithCards(): Promise<void> {
   busyKey.value = "sync-cards";
   approvalError.value = "";
   vbAbort.value = false;
+  startRunActivity({ key: VB_SYNC_KEY, label: t("同步当前卡片"), page: "generate", total: missing.length });
   pushLog({
     step: "视觉守门",
     message: `同步开始：缺失 ${missing.length} 个条目待补建${extra.length ? `，多余 ${extra.length} 个待移除` : ""}…`,
@@ -735,6 +860,7 @@ async function syncCharactersWithCards(): Promise<void> {
       isAborted: () => vbAbort.value,
       onProgress: (done, total) => {
         createProgress.value = { phase: "threeview", done, total };
+        updateRunActivity(VB_SYNC_KEY, { done, total });
       },
     });
     await refreshFingerprint();
@@ -759,6 +885,7 @@ async function syncCharactersWithCards(): Promise<void> {
   } finally {
     busyKey.value = "";
     createProgress.value = null;
+    finishRunActivity(VB_SYNC_KEY);
   }
 }
 
@@ -784,6 +911,8 @@ async function regenerateAllCharacters(): Promise<void> {
     busyKey.value = "";
     return;
   }
+  // 确认之后才登记全局运行态：取消时提前 return，不会留下一个永远「运行中」的僵尸条目
+  startRunActivity({ key: VB_REGEN_KEY, label: t("全局重新生成"), page: "generate", total: n });
   pushLog({
     step: "视觉守门",
     message: `全局重新生成开始：${n} 个角色重写描述＋重画三视图（${limit} 并发）…`,
@@ -801,6 +930,7 @@ async function regenerateAllCharacters(): Promise<void> {
       isAborted: () => vbAbort.value,
       onProgress: (done) => {
         createProgress.value = { phase: "threeview", done, total: n };
+        updateRunActivity(VB_REGEN_KEY, { done, total: n });
       },
     });
     // 同步内存卡片（后续管线用新描述）
@@ -828,6 +958,7 @@ async function regenerateAllCharacters(): Promise<void> {
   } finally {
     busyKey.value = "";
     createProgress.value = null;
+    finishRunActivity(VB_REGEN_KEY);
   }
 }
 
@@ -837,7 +968,7 @@ async function acceptCharacter(characterId: string): Promise<void> {
     pushLog({ step: "视觉守门", message: "确认角色未执行：视觉守门数据或输出目录不可用", level: "warn", at: Date.now() });
     return;
   }
-  busyKey.value = `char-accept:${characterId}`;
+  markCharBusy(`char-accept:${characterId}`);
   charErrors.value[characterId] = "";
   const t0 = Date.now();
   pushLog({ step: "视觉守门", message: `角色「${characters.value.find((c) => c.id === characterId)?.name ?? characterId}」确认开始…`, level: "info", at: Date.now() });
@@ -851,7 +982,7 @@ async function acceptCharacter(characterId: string): Promise<void> {
       imageModel: activeConfig("image")?.model,
       visionModel: activeConfig("vision")?.model,
     });
-  } finally {
+    clearCharBusy(`char-accept:${characterId}`);
     busyKey.value = "";
   }
 }
@@ -921,7 +1052,12 @@ function costumeSheetsFor(characterId: string): { costumeId: string; name: strin
   const sheets = bible.value?.characters[characterId]?.costumeSheets ?? {};
   const rows: { costumeId: string; name: string; inCard: boolean; sheet?: import("../core/types").VisualBibleCostumeSheet }[] = [];
   const seen = new Set<string>();
+  // 只列**会产生换装立绘**的服装（角色图片档位预算，见 core/figureBudget.ts）：
+  // 次要角色/路人的第 2 套起服装本就不生成换装图，列出来只会显示"未生成"并诱导用户点重建，
+  // 白花一张三视图的钱买一张没人用的图。超出预算的套数由 costumeSheetsSkipped 如实说明。
+  const budgeted = new Set(figureCostumeEntries(character, { detail: "full", threeView: true }).map((ct) => ct.id));
   for (const ct of character.costumes ?? []) {
+    if (!budgeted.has(ct.id)) continue;
     seen.add(ct.id);
     rows.push({ costumeId: ct.id, name: ct.name, inCard: true, sheet: sheets[ct.id] });
   }
@@ -930,6 +1066,14 @@ function costumeSheetsFor(characterId: string): { costumeId: string; name: strin
     if (!seen.has(costumeId)) rows.push({ costumeId, name: costumeId, inCard: false, sheet });
   }
   return rows;
+}
+
+/** 超出该角色图片档位、不会生成换装立绘的服装套数（面板如实说明，而不是显示成「未生成」） */
+function costumeSheetsSkipped(characterId: string): number {
+  const character = characters.value.find((candidate) => candidate.id === characterId);
+  if (!character) return 0;
+  const total = character.costumes?.length ?? 0;
+  return Math.max(0, total - figureCostumeEntries(character, { detail: "full", threeView: true }).length);
 }
 
 function characterCostumeSheetPath(characterId: string, costumeId: string): string {
@@ -952,7 +1096,7 @@ async function regenCostumeSheet(characterId: string, costumeId: string): Promis
   }
   const costumeName = character.costumes?.find((ct) => ct.id === costumeId)?.name ?? costumeId;
   const hasSheet = !!current.characters[characterId]?.costumeSheets?.[costumeId];
-  busyKey.value = `char-sheet-ct:${characterId}:${costumeId}`;
+  markCharBusy(`char-sheet-ct:${characterId}:${costumeId}`);
   charErrors.value[characterId] = "";
   if (!(await confirmDialog({
     title: hasSheet
@@ -960,7 +1104,7 @@ async function regenCostumeSheet(characterId: string, costumeId: string): Promis
       : t("生成「{name}」的「{costume}」三视图？该服装暂无锚点（角色打回待确认；仅作废该服装锚点图，不影响表情/动作/其它服装立绘），并产生 1 张图片费用。", { name: character.name, costume: costumeName }),
     tone: "danger",
   }))) {
-    busyKey.value = "";
+    clearCharBusy(`char-sheet-ct:${characterId}:${costumeId}`);
     return;
   }
   pushLog({ step: "视觉守门", message: `角色「${character.name}」服装「${costumeName}」三视图重新生成开始…`, level: "info", at: Date.now() });
@@ -976,7 +1120,7 @@ async function regenCostumeSheet(characterId: string, costumeId: string): Promis
       imageModel: imageCfg.model,
       visionModel: activeConfig("vision")?.model,
     });
-  } finally {
+    clearCharBusy(`char-sheet-ct:${characterId}:${costumeId}`);
     busyKey.value = "";
   }
 }
@@ -1071,6 +1215,13 @@ async function regenCostumeSheet(characterId: string, costumeId: string): Promis
                 <button class="btn small" :disabled="runLocked" @click="saveStyleDescription">{{ t("保存风格") }}</button>
                 <button class="btn secondary small" :disabled="runLocked" @click="rewriteStyle">{{ t("AI 重写") }}</button>
                 <button
+                  v-if="staleArtifacts && staleArtifacts.files > 0"
+                  class="btn ghost small"
+                  :disabled="runLocked || purgeBusy"
+                  :title="t('每次重跑守门都会留下带旧修订号的产物，清单已不再引用；只删除这些，当前引用的图不动')"
+                  @click="purgeStaleArtifacts"
+                >{{ purgeBusy ? t("清理中…") : t("清理旧修订产物（{n} 张 / {mb} MB）", { n: staleArtifacts.files, mb: (staleArtifacts.bytes / 1048576).toFixed(1) }) }}</button>
+                <button
                   v-if="bible.styleSource === 'novel_analysis'"
                   class="btn secondary small"
                   :disabled="runLocked"
@@ -1128,13 +1279,13 @@ async function regenCostumeSheet(characterId: string, costumeId: string): Promis
                 <span v-if="characterNeedsRegeneration(row.id)" class="tag err">{{ t("需重新生成") }}</span>
               </div>
               <div class="vb-character-actions">
-                <button class="btn small" :disabled="runLocked" @click="regenerateCharacter(row.id)">
-                  <span v-if="busyKey === `char-sheet:${row.id}`" class="spinner" />
+                <button class="btn small" :disabled="charRowLocked || isCharBusyFor(row.id)" @click="regenerateCharacter(row.id)">
+                  <span v-if="charBusy.has(`char-sheet:${row.id}`)" class="spinner" />
                   {{ t("重新生成三视图") }}
                 </button>
                 <button
                   class="btn secondary small"
-                  :disabled="runLocked || characterNeedsRegeneration(row.id)"
+                  :disabled="charRowLocked || isCharBusyFor(row.id) || characterNeedsRegeneration(row.id)"
                   @click="acceptCharacter(row.id)"
                 >{{ t("确认此角色") }}</button>
               </div>
@@ -1176,6 +1327,7 @@ async function regenCostumeSheet(characterId: string, costumeId: string): Promis
               <div class="vb-fold-summary">
                 {{ t("服装三视图锚点（换装用）") }}
                 <span class="vb-section-hint">{{ costumeSheetsFor(row.id).length }}{{ t("套") }}</span>
+                <span v-if="costumeSheetsSkipped(row.id)" class="vb-section-hint">{{ t("（另有 {n} 套超出该角色图片档位，不生成换装图）", { n: costumeSheetsSkipped(row.id) }) }}</span>
               </div>
               <div class="vb-costume-grid">
                 <div v-for="cs in costumeSheetsFor(row.id)" :key="cs.costumeId" class="vb-costume-cell">
@@ -1191,8 +1343,8 @@ async function regenCostumeSheet(characterId: string, costumeId: string): Promis
                   <div class="vb-costume-meta">
                     <span class="asset-name">{{ cs.name }}</span>
                     <span v-if="!cs.sheet" class="tag warn">{{ t("未生成") }}</span>
-                    <button v-if="cs.inCard" class="btn ghost small" :disabled="runLocked" @click="regenCostumeSheet(row.id, cs.costumeId)">
-                      <span v-if="busyKey === `char-sheet-ct:${row.id}:${cs.costumeId}`" class="spinner" />
+                    <button v-if="cs.inCard" class="btn ghost small" :disabled="charRowLocked || isCharBusyFor(row.id)" @click="regenCostumeSheet(row.id, cs.costumeId)">
+                      <span v-if="charBusy.has(`char-sheet-ct:${row.id}:${cs.costumeId}`)" class="spinner" />
                       {{ cs.sheet ? t("重新生成") : t("生成") }}
                     </button>
                   </div>
@@ -1205,11 +1357,11 @@ async function regenCostumeSheet(characterId: string, costumeId: string): Promis
                 <code>{{ bible.characters[row.id]?.prompt || t("暂无") }}</code>
                 <button
                   class="btn ghost small"
-                  :disabled="runLocked"
+                  :disabled="charRowLocked || isCharBusyFor(row.id)"
                   :title="t('旧版 LLM 提取时把背景写死成其他颜色时使用，会强制改成纯绿幕')"
                   @click="regenerateCharacterDesc(row.id)"
                 >
-                  <span v-if="busyKey === `char-desc:${row.id}`" class="spinner" />
+                  <span v-if="charBusy.has(`char-desc:${row.id}`)" class="spinner" />
                   {{ t("重新生成描述") }}
                 </button>
               </div>

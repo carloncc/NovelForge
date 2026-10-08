@@ -56,8 +56,14 @@ function goEmptyFull(): void {
   <div class="tabs">
     <button class="tab" :class="{ active: tab === 'run' }" @click="tab = 'run'">{{ t("运行") }}</button>
     <button class="tab" :class="{ active: tab === 'products' }" @click="tab = 'products'; loadScripts(); loadAssetMapNow(); checkVideos()">{{ t("产物") }}</button>
-    <button class="tab" :class="{ active: tab === 'settings' }" @click="tab = 'settings'">
-      {{ t("设定") }}
+    <button class="tab" :class="{ active: tab === 'settings' }" @click="tab = 'settings'">{{ t("设定") }}</button>
+    <!-- 视觉守门独立成 tab，不再和「设定」（人物卡片）挤在一起：
+         守门确认的是人物**形象**（一角色一张三视图），卡片编辑改的是**文案**，是两件事。
+         拆开还顺带消掉一个真实数据冲突：同 tab 同时挂载时，守门面板对 characters 的
+         in-place splice 会触发 EditCards 的 deep watch，把用户尚未保存的卡片编辑整份覆盖
+         （详见 EditCards.vue 里 lastSyncedJson 快照比对的注释）。 -->
+    <button class="tab" :class="{ active: tab === 'bible' }" @click="tab = 'bible'">
+      {{ t("视觉守门") }}
       <span v-if="visualBibleReviewNeeded" class="tab-badge">{{ t("待确认") }}</span>
     </button>
     <button class="tab" :class="{ active: tab === 'log' }" @click="tab = 'log'">{{ t("日志") }}</button>
@@ -128,6 +134,9 @@ function goEmptyFull(): void {
       <p>{{ t("尚无生成结果，先运行一次生成") }}</p>
       <button class="btn small" @click="goEmptyFull">{{ t("去整书生成") }}</button>
     </div>
+  </div>
+
+  <div v-else-if="tab === 'bible'">
     <div id="visual-bible-anchor" class="vb-anchor">
       <VisualBiblePanel class="mt-4" @approve="resumeAfterVisualApproval" @changed="onVisualBibleChanged" @prepare="prepareVisualBible" />
     </div>

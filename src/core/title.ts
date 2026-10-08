@@ -29,7 +29,12 @@ export function resolveProjectTitle(args: {
   outputDir?: string;
   fileName?: string;
 }): string {
-  const candidates = [args.exportTitle, args.cardsTitle, baseName(args.outputDir ?? ""), fileStem(args.fileName ?? "")];
+  // 导出标题是用户显式输入的，不能过 isJunkTitle：该过滤把独立的 final/copy/tmp/untitled/gbk…
+  // 一律当垃圾串，会把「The Final Chapter」这种正经标题换成卡片标题或目录名。
+  // 过滤只针对「从卡片标题/目录名/文件名推出来的」候选。
+  const explicit = (args.exportTitle ?? "").trim();
+  if (explicit) return explicit;
+  const candidates = [args.cardsTitle, baseName(args.outputDir ?? ""), fileStem(args.fileName ?? "")];
   for (const candidate of candidates) {
     const t = (candidate ?? "").trim();
     if (t && !isJunkTitle(t)) return t;

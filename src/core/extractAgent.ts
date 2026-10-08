@@ -8,6 +8,7 @@ import { extractFromNovel } from "./extract";
 import { normalizeEntityId } from "./ids";
 import { splitNovelForAgent } from "./textSplit";
 import { log as logger } from "../utils/logger";
+import { safeSlice } from "../utils/text";
 
 /**
  * Agent 模式的「角色/场景/物品」提取：
@@ -19,9 +20,9 @@ import { log as logger } from "../utils/logger";
  * 若模型/接口不支持 function calling，自动回退到「文本动作协议」（每轮输出一个 JSON 动作）。
  */
 
-export type AgentLog = (message: string, level?: "info" | "warn" | "success") => void;
+type AgentLog = (message: string, level?: "info" | "warn" | "success") => void;
 
-export interface ExtractAgentOptions {
+interface ExtractAgentOptions {
   onUsage?: (pt: number, ct: number) => void;
   /** 返回 true 表示已中止（外部 abort），agent 停止调度下一步 */
   isAborted?: () => boolean;
@@ -36,14 +37,14 @@ export interface ExtractAgentOptions {
 }
 
 /** 单次工具调用的结构化参数（供状态机执行） */
-export interface AgentToolCall {
+interface AgentToolCall {
   id: string;
   name: string;
   args: Record<string, unknown>;
 }
 
 /** 状态机执行一个工具调用的结果（回传给模型的 tool 消息） */
-export interface AgentToolResult {
+interface AgentToolResult {
   callId: string;
   ok: boolean;
   content: string;
@@ -64,7 +65,7 @@ export function loreMapOf(state: ExtractAgentState): Map<string, LoreCard> {
   return state.lore;
 }
 
-export interface AgentChatResponse {
+interface AgentChatResponse {
   content: string;
   toolCalls?: ToolCall[];
 }
@@ -353,12 +354,17 @@ export function applyTool(state: ExtractAgentState, call: AgentToolCall): AgentT
         return ok(`已收录角色「${name}」(${id})，当前共 ${state.characters.size} 个角色`);
       }
       case "update_character": {
-        const id = str(call.args.id);
+        // id 必须与 add_character 同口径归一化：add 时中文/含空格 id 已变成 c_<hash>，
+        // 这里按原始 id 查表必然找不到，模型给的修正被静默丢弃。
+        const id = normalizeEntityId(call.args.id, "c");
         const existing = state.characters.get(id);
         if (!existing) return fail(`角色 ${id} 不存在，请用 add_character 添加`);
         const patch = call.args.patch;
         if (patch && typeof patch === "object") {
-          Object.assign(existing, omit(patch as Record<string, unknown>, "id", "name"));
+          // 用 mergeCharacterPatch 而不是 Object.assign：后者会把「存在但为空」的字段直接写进去，
+          // 抹掉前面 chunk 已收集的信息（mergeCharacterPatch 的注释已把这点记为旧实现的 bug），
+          // 且 actions/costumes 这类数组会被整体替换而不是按 id 并集。
+          mergeCharacterPatch(existing, omit(patch as Record<string, unknown>, "id", "name"));
         }
         return ok(`已更新角色「${existing.name}」(${id})`);
       }
@@ -507,7 +513,7 @@ export function stateSummary(state: ExtractAgentState): string {
   // 「当前已收录卡片」→ 误判已有角色、重复建卡。
   const clip = (v: unknown, max: number): string => {
     const s = typeof v === "string" ? v : "";
-    return s.length > max ? `${s.slice(0, max)}…` : s;
+    return s.length > max ? `${safeSlice(s, max)}…` : s;
   };
   let characters = [...state.characters.values()].map((c) => ({
     id: c.id,
@@ -628,6 +634,8 @@ export function mergeCharacter(target: CharacterCard, source: CharacterCard): vo
   if (!target.gender && source.gender) target.gender = source.gender;
   // isNpc 旧卡片可能没有该字段：仅当 target 缺失时补（false 是默认值，无法区分“明确主要角色”）
   if (target.isNpc == null && source.isNpc != null) target.isNpc = source.isNpc;
+  // 图片档位同理：用户手工设的档位不该被新卡（没有该字段）抹掉
+  if (target.figureTier == null && source.figureTier != null) target.figureTier = source.figureTier;
   const actionMap = new Map<string, CharacterAction>();
   for (const a of [...(target.actions ?? []), ...(source.actions ?? [])]) {
     if (a?.id && !actionMap.has(a.id)) actionMap.set(a.id, a);
@@ -1050,7 +1058,7 @@ export async function extractFromNovelAgent(
 
 /* ==================== 分段经典提取（非 Agent 模式的全书覆盖） ==================== */
 
-export interface ChunkedExtractOptions {
+interface ChunkedExtractOptions {
   onUsage?: (pt: number, ct: number) => void;
   /** 用户对上一版提取结果的修改意见（逐段注入） */
   feedback?: string;

@@ -3,7 +3,9 @@
  * - 开发环境（import.meta.env.DEV）下输出到 console
  * - 所有环境都会记录到内存历史缓冲（dumpLogHistory），便于 UI 或调试导出
  */
-export type LogLevel = "debug" | "info" | "warn" | "error";
+// success：与 PipelineEvent["level"] 对齐（pushLog 会转投 logger），缺了成功态会退化成 info
+// 而丢掉侧栏的绿色标识；DEV console 与文件 sink 都按 else 分支处理，无需额外适配。
+export type LogLevel = "debug" | "info" | "success" | "warn" | "error";
 
 export interface LogEntry {
   at: number;
@@ -37,12 +39,16 @@ function isSensitiveKey(key: string): boolean {
 /** URL 脱敏（1295）：`?key=`/`access_token`/`sig`/`signature` 等查询参数值一律脱敏。
  * 日志侧 URL 统一经此函数再入库，不只靠字段名。 */
 export function redactUrl(url: string): string {
-  return url.replace(/([?&](?:api[_-]?key|authorization|token|secret|password|access_token|sig|signature|key)=)[^&\s"']+/gi, `$1${REDACTED}`);
+  // #1533：原来只认 ? 和 & 两个分隔符，漏了 URL 片段的 #。
+  // 探针实证 `#key=SECRET` / `#access_token=SECRET` 原样进日志（凭据没被脱敏）。
+  return url.replace(/([?&#](?:api[_-]?key|authorization|token|secret|password|access_token|sig|signature|key)=)[^&#\s"']+/gi, `$1${REDACTED}`);
 }
 
 /** 日志文本清洗（1317）：洗掉 CRLF（防伪造行）并限长。 */
 export function sanitizeLogText(text: string): string {
-  const flat = text.replace(/[\r\n]+/g, " ");
+  // #1535：原来只洗 CR/LF（防伪造日志行），NUL 等控制字符会原样进日志文件——
+  // 下游按 NUL 截断读取时会看到半截内容。同一类问题一并处理。
+  const flat = text.replace(/[\u0000-\u001f\u007f]+/g, " ");
   return flat.length > LOG_TEXT_LIMIT ? `${flat.slice(0, LOG_TEXT_LIMIT)}…` : flat;
 }
 
@@ -77,11 +83,32 @@ export function redactSensitive(value: unknown, seen = new WeakSet<object>()): u
 }
 
 /** 可插拔的日志文件写入器（由应用启动时注册，写入磁盘，便于离线诊断） */
-export type LogFileSink = (entry: LogEntry) => void;
+type LogFileSink = (entry: LogEntry) => void;
 let logFileSink: LogFileSink | null = null;
 
 export function setLogFileSink(sink: LogFileSink | null): void {
   logFileSink = sink;
+}
+
+/** 实时日志观察者（侧栏运行日志面板用）：与文件 sink 并行，互不影响。
+ *  返回取消订阅函数；观察者自身抛错绝不能影响日志主流程。 */
+const logListeners = new Set<(entry: LogEntry) => void>();
+
+export function addLogListener(fn: (entry: LogEntry) => void): () => void {
+  logListeners.add(fn);
+  return () => {
+    logListeners.delete(fn);
+  };
+}
+
+function notifyLogListeners(entry: LogEntry): void {
+  for (const fn of logListeners) {
+    try {
+      fn(entry);
+    } catch {
+      /* 观察者异常不得打断日志写入 */
+    }
+  }
 }
 
 const DEV =
@@ -130,6 +157,7 @@ function push(level: LogLevel, scope: string, message: string, data?: unknown): 
   if (history.length >= HISTORY_LIMIT) history.shift();
   history.push(entry);
   logFileSink?.(entry);
+  notifyLogListeners(entry);
 
   if (!DEV) return;
   const time = new Date(entry.at).toISOString();
@@ -146,6 +174,9 @@ export const log = {
   },
   info(scope: string, message: string, data?: unknown): void {
     push("info", scope, message, data);
+  },
+  success(scope: string, message: string, data?: unknown): void {
+    push("success", scope, message, data);
   },
   warn(scope: string, message: string, data?: unknown): void {
     push("warn", scope, message, data);

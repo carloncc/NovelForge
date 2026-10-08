@@ -17,8 +17,10 @@ import type {
   StageFeedback,
   StageKey,
 } from "./types";
-import { STAGE_ORDER, languageName } from "./types";
+import { t } from "../i18n";
+import { STAGE_ORDER, languageName, DEFAULT_BACKGROUND_REUSE } from "./types";
 import type { RenderAssets, WebgalLanguage } from "./render";
+import { SUPPORTED_WEBGAL_VERSION } from "./render";
 import { sanitizeId, inferWebgalLanguage } from "./render";
 import { demoExtract } from "./extract";
 import { extractFromNovelAgent, extractFromNovelChunked, mergeCharacter, normalizeName } from "./extractAgent";
@@ -31,6 +33,7 @@ import { generateImages } from "./images";
 import { generateVoice, vocalKeysForChapters } from "./voice";
 import { assembleProject, gameKeyFor } from "./project";
 import { cacheDirFor, titleHash, scriptCacheRest, scriptCacheFileName, scriptFingerprint, cardsFingerprint, isScriptPartFileName } from "./cache";
+import { attachCharacterImageUsage, imageUsageReport } from "./imageUsage";
 import { resolveProjectTitle } from "./title";
 export { titleHash, scriptCacheRest, scriptCacheFileName };
 import { normalizeNovelText } from "./chapters";
@@ -43,12 +46,13 @@ import { setActiveAbortSignal, registerRunAbort, unregisterRunAbort } from "../a
 import { concurrencyFor } from "../stores/configMigration";
 import { voiceLibraryFor } from "../stores/config";
 import { setLlmConcurrency } from "../api/openaiCompatible";
-import { assertVisualBibleApprovalStatus, assertVisualBibleReadyForImages } from "./visualBible";
+import { assertVisualBibleApprovalStatus, assertVisualBibleReadyForImages, ensureCostumeAnchors } from "./visualBible";
 import { readAssetMap, updateAssetMap, backupAssetMap } from "./assetMap";
 import { parseChapterScript } from "./dataValidation";
 import { failedTaskIdentity, mutateFailedTasks } from "./failedTasks";
+import { stripImageExt } from "../core/cache";
 
-export interface PipelineInput {
+interface PipelineInput {
   novel: NovelDoc;
   cards?: ExtractionResult;
   llm?: ApiConfig;
@@ -88,7 +92,12 @@ export interface PipelineInput {
  */
 const NF_PIPELINE_FAILED_TASKS_FLUSH_MS = 500;
 
-const DEFAULT_PRICES = {
+/**
+ * 各阶段预估单价（元）。**单一事实来源**：页面侧的展示用价（如 imageStory 的 IMAGE_YUAN_EACH）
+ * 一律从这里取，不要再各自写字面量——否则改一处会导致两个页面报出不同的费用
+ * （本会话 #1558 就是「同名/同口径的两份实现悄悄漂移」的同类教训）。
+ */
+export const DEFAULT_PRICES = {
   llmInYuanPer1m: 2,
   llmOutYuanPer1m: 8,
   imageYuanEach: 0.3,
@@ -202,18 +211,22 @@ function imageSeedFor(title: string, opts: GenerationOptions): number | undefine
 
 // 章节内场景 id 去重：LLM 可能输出重复 id，会导致背景图/配音/BGM 互相覆盖。
 // 幂等：重复 id 追加 _2/_3 后缀；已带后缀的不重复处理。
+//
+// 去重必须按 **sanitizeId 之后的形态**判重，而不是原始 id：配音/背景/CG/立绘的
+// 缓存键全都是 sanitizeId(scene.id)，而 sanitizeId 把非 [a-zA-Z0-9_-] 全替换成 "_"，
+// 于是「城门」与「城楼」两个不同场景都会变成 "___"。原始 id 互不相同便不会被这里
+// 去重，但下游键完全相同 → 两人共用一份配音/背景图。
+// 故 seen 集合登记 sanitize 后的形态，冲突时给原始 id 加后缀直到 sanitize 后也唯一。
 export function ensureUniqueSceneIds(script: ChapterScript): void {
-  // 两遍处理：先把最终分配结果（含加后缀后的 id）全部登记进 seen 再写回。
-  // 旧实现只登记“基准 id”，输入形如 [s1, s1, s1_2] 时第 3 个原样保留 s1_2，
-  // 与第 2 个重新生成的 s1_2 相撞——去重不幂等。
   const seen = new Set<string>();
   const planned: (string | null)[] = [];
   for (const scene of script.scenes) {
     const base = scene.id || "s";
     let id = base;
     let n = 2;
-    while (seen.has(id)) id = `${base}_${n++}`;
-    seen.add(id);
+    // 后缀加在原始 id 上：sanitizeId 保留 a-zA-Z0-9_-，所以 "_2" 会让 sanitize 结果同步变化。
+    while (seen.has(sanitizeId(id))) id = `${base}_${n++}`;
+    seen.add(sanitizeId(id));
     planned.push(id === base ? null : id);
   }
   script.scenes.forEach((scene, i) => {
@@ -292,8 +305,13 @@ export function pruneAssetRefs(
  * 停用章不进 chapters（防组装写回），但其映射必须保留——否则重启用后只跑组装，背景/配音缺失。 */
 export function buildPruneKeepChapters(chapters: ChapterScript[], disabledScripts: ChapterScript[]): ChapterScript[] {
   if (!disabledScripts.length) return chapters;
-  const seen = new Set(chapters.map((c) => c.chapter));
-  return [...chapters, ...disabledScripts.filter((c) => !seen.has(c.chapter))];
+  // 不能按 c.chapter 去重：进到这里时启用章已被原地重编号为 0..k-1（pipeline 的
+  // chapters.forEach((c, i) => c.chapter = i)），而停用章剧本仍带**原始** novel index
+  // （缓存写在重编号之前，loadDisabledScriptsForPrune 也按原始 index 选）。
+  // 旧实现用重编号后的集合去过滤，任何「原始 index ≤ k」的停用章都会被当成重复项丢掉，
+  // 只有排在末尾的停用章侥幸留下 → 剪枝会删掉中间停用章的 bg/cg/vocal 映射，
+  // 重新启用后只跑组装就背景缺失、台词没声。保留集重复项本身无害（Set 并集），直接合并。
+  return [...chapters, ...disabledScripts];
 }
 
 /** 重提 id 对齐（纯函数）：新卡片按归一化姓名认领老 id，避免视觉守门/人物图/配音因 id  churn 全废。
@@ -313,14 +331,25 @@ export function alignExtractedIds(
   }
   const claimedOldIds = new Set<string>();
   const usedCharIds = new Set<string>();
+  // 保留「自有 id」前也必须查重：同一批提取里出现两张同名卡时（追加提取会重复登记同一角色，
+  // mergeAppendedCards 的注释已把这种输入当作预期），两张卡都走「保留自己 id」分支并保留
+  // 同一个 id，于是下游 figure_<id>/threeview/item/vocal 键全部互相覆盖——一个角色的立绘
+  // 与配音被另一个顶掉。与 mergeAppendedCards 的 uniqueId 同口径加 _x 后缀。
+  const claimId = (want: string, used: Set<string>): string => {
+    let id = want;
+    let n = 2;
+    while (used.has(id)) id = `${want}_x${n++}`;
+    used.add(id);
+    return id;
+  };
   let adopted = 0;
   const characters = fresh.characters.map((fc) => {
     const key = normalizeName(fc.name);
     const hit = key ? oldByName.get(key) : undefined;
     // usedCharIds 兜底：老 id 已被本批其它新卡占用时不认领，避免对齐后出现重复 id
     if (!hit || hit.id === fc.id || claimedOldIds.has(hit.id) || usedCharIds.has(hit.id)) {
-      usedCharIds.add(fc.id);
-      return fc;
+      const id = claimId(fc.id, usedCharIds);
+      return id === fc.id ? fc : { ...fc, id };
     }
     claimedOldIds.add(hit.id);
     usedCharIds.add(hit.id);
@@ -334,6 +363,9 @@ export function alignExtractedIds(
       voiceName: hit.voiceName || fc.voiceName,
       referenceImage: fc.referenceImage ?? hit.referenceImage,
       referenceImagePath: fc.referenceImagePath ?? hit.referenceImagePath,
+      // 角色图片档位（次要角色/路人=省图）是**用户手工选择**，与音色同理属于身份粘性字段：
+      // 老卡有值就沿用，否则每次重提都把用户降下来的档位冲回 auto（路人又按主要角色的量出图）
+      figureTier: hit.figureTier ?? fc.figureTier,
     };
   });
   const oldSceneByLoc = new Map<string, (typeof fresh.scenes)[number]>();
@@ -348,8 +380,8 @@ export function alignExtractedIds(
     const key = normalizeName(fs.location);
     const hit = key ? oldSceneByLoc.get(key) : undefined;
     if (!hit || hit.id === fs.id || claimedSceneIds.has(hit.id) || usedSceneIds.has(hit.id)) {
-      usedSceneIds.add(fs.id);
-      return fs;
+      const id = claimId(fs.id, usedSceneIds);
+      return id === fs.id ? fs : { ...fs, id };
     }
     claimedSceneIds.add(hit.id);
     usedSceneIds.add(hit.id);
@@ -368,8 +400,8 @@ export function alignExtractedIds(
     const key = normalizeName(fi.name);
     const hit = key ? oldItemByName.get(key) : undefined;
     if (!hit || hit.id === fi.id || claimedItemIds.has(hit.id) || usedItemIds.has(hit.id)) {
-      usedItemIds.add(fi.id);
-      return fi;
+      const id = claimId(fi.id, usedItemIds);
+      return id === fi.id ? fi : { ...fi, id };
     }
     claimedItemIds.add(hit.id);
     usedItemIds.add(hit.id);
@@ -470,6 +502,21 @@ export function mergeAppendedCards(
       addedItems++;
     }
   }
+  // 世界观卡（lore）此前整批没并：非追加路径是整份写入 {...cards}，追加路径只并了
+  // 角色/场景/物品，于是「增量追加」把新章节提取到的世界观卡静默丢掉——世界观列表不增长，
+  // cards.ts 的 loreContextForScript 也不会给新章节任何设定上下文，只能整本重提（付费）。
+  // 按 id / 归一化标题去重，老卡优先。
+  const lore = [...(merged.lore ?? [])];
+  const loreIds = new Set(lore.map((l) => l.id));
+  const loreTitles = new Set(lore.map((l) => normalizeName(l.title)).filter(Boolean));
+  for (const fl of freshCards.lore ?? []) {
+    const titleKey = normalizeName(fl.title);
+    if (loreIds.has(fl.id) || (titleKey && loreTitles.has(titleKey))) continue;
+    lore.push(fl);
+    loreIds.add(fl.id);
+    if (titleKey) loreTitles.add(titleKey);
+  }
+  merged.lore = lore;
   return { merged, addedCharacters, addedScenes, addedItems };
 }
 
@@ -938,7 +985,7 @@ export class Pipeline {
         const deadFigurePrefix = [...deadCharIds].map((id) => `figure_${sanitizeId(id).toLowerCase()}_`);
         const deadThreeview = new Set([...deadCharIds].map((id) => `threeview_${sanitizeId(id).toLowerCase()}`));
         const deadItem = new Set([...deadItemIds].map((id) => `item_${sanitizeId(id).toLowerCase()}`));
-        const baseNoExt = (name: string): string => name.replace(/\.(png|jpg|jpeg|webp)$/i, "");
+        const baseNoExt = (name: string): string => stripImageExt(name);
         const victims: string[] = [];
         try {
           const imgDir = `${this.cacheRoot}/images`;
@@ -1599,7 +1646,7 @@ export class Pipeline {
         at: Date.now(),
       });
     } else if (input.append?.tailText?.trim()) {
-      throw new Error("增量追加必须勾选「分章」阶段（新增部分需要分章），已中止（旧章节未动）");
+      throw new Error(t("增量追加必须勾选「分章」阶段（新增部分需要分章），已中止（旧章节未动）"));
     } else if (!input.novel.chapters.length || (input.novel.chapters.length === 1 && input.novel.chapters[0].text === input.novel.fullText)) {
       // 未勾选分章，且导入时是未切章状态（单章=全文）→ 需要从缓存恢复 AI 分章结果
       const cachedSplit = await this.loadSplitChapters();
@@ -1847,7 +1894,7 @@ export class Pipeline {
       if (cards) {
         log({ step: "提取", message: "[缓存] 复用角色/场景/物品卡", level: "info", at: Date.now() });
       } else {
-        throw new Error("未勾选「提取」阶段且无卡片缓存，请先勾选提取或加载已有项目");
+        throw new Error(t("未勾选「提取」阶段且无卡片缓存，请先勾选提取或加载已有项目"));
       }
     }
     // 卡片指纹进入剧本缓存键：卡片 id/名称变化时旧剧本自动失效（避免渲染人名退化成内部 id）
@@ -1892,8 +1939,16 @@ export class Pipeline {
           });
         }
       }
+      // scriptChapter 的文风入参（去空白后传；空串按「未设置」处理）
       const style = (this.options.scriptStyle ?? "").trim();
-      const styleFrag = scriptFingerprint({ style, compressNarration: this.options.compressNarration });
+      // 缓存键必须与读取侧完全一致：读取走 this.scriptStyleFrag()（含 cardsFp），
+      // 此前这里手工重算且漏掉 cardsFp，导致剧本阶段写 A 文件、非剧本阶段（组装 /
+      // loadDisabledScriptsForPrune）按 B 文件找，永久 100% miss：
+      //   - 只跑 assemble 阶段 → 命中 0 章并抛「未找到与当前小说匹配的剧本缓存」；
+      //   - 停用章保护 → loadDisabledScriptsForPrune 恒返回 []，pruneAssetRefs
+      //     照删停用章的 bg/cg/vocal 映射，正是该注释声称要防的回归。
+      // scriptFingerprint 内部已 trim，scriptStyleFrag 覆盖 style/compressNarration/cardsFp。
+      const styleFrag = this.scriptStyleFrag();
       // 先清理与当前章节失配的过期剧本缓存（重分章/重翻译/改标题正文/换文风后残留），
       // 避免旧剧本混入本次结果；旧版无指纹文件保留（加载时兼容并提示重跑）
       const prunedScripts = await this.pruneStaleScriptCache(workingChapters, styleFrag, demo);
@@ -2268,7 +2323,7 @@ export class Pipeline {
             "可能原因：重分章 / 重导小说 / 修改标题正文 / 切换翻译语言后未重跑剧本。请先运行「剧本」阶段（勾选剧本后点开始，或点该阶段的重新生成）。",
         );
       } else {
-        throw new Error("未勾选「剧本」阶段且无剧本缓存，请先勾选剧本或加载已有项目");
+        throw new Error(t("未勾选「剧本」阶段且无剧本缓存，请先勾选剧本或加载已有项目"));
       }
     }
     logger.info("pipeline", "剧本阶段完成", { totalChapters: chapters.length });
@@ -2279,6 +2334,40 @@ export class Pipeline {
     });
     // 跨章场景 id 唯一化：LLM 不同章都输出 s1/s2… 时，背景图/配音/BGM 会互相覆盖
     dedupeSceneIdsAcrossChapters(chapters);
+
+    // 剧本实际使用情况写回卡片（#1576）：出图端据此只生成"剧本真的用得上"的表情/服装/动作。
+    // 必须写回**卡片**而不是作为构建参数传下去——同一个角色会被 6 条路径分别建任务
+    // （主管线/单章跳过判定/章节灯/素材页/重生成/补缺），只要判定依赖"本次传了哪些章节"，
+    // 两条路径就会算出不同的文件名清单（#1521 那族 bug：单章永远凑不齐成品、反复计费）。
+    // 只在"剧本齐全"时统计：缺章缓存时算出来的使用集合会偏小，写回卡片后会让那几章的
+    // 表情/服装/动作被当成"用不上"而不生成（渲染虽有回退，但会白跑一趟）。
+    if (cards && chapters.length && this.skippedScriptChapters.length === 0) {
+      const usage = attachCharacterImageUsage(cards, chapters);
+      if (usage.changed > 0) {
+        // 落盘工作副本：重启/切换项目后素材页与重生成路径读的是这份文件，
+        // 不落盘就会出现"这次按使用集合出图、下次按全量出图"的来回。
+        // _novelFp 必须原样保留：它是"这份卡片对应哪版原文"的判据，丢了会被当成过期缓存重新提取（付费）。
+        const cardsFile = `${input.outputDir}/.novel2vn/${demo ? "cards_demo" : "cards"}.json`;
+        const prevFp = (await this.readCachedJson<ExtractionResult & { _novelFp?: string }>(cardsFile))?._novelFp;
+        try {
+          await tauri.writeTextFile(
+            cardsFile,
+            JSON.stringify({ ...cards, ...(prevFp ? { _novelFp: prevFp } : {}) }, null, 2),
+          );
+        } catch (e) {
+          logger.warn("pipeline", "剧本使用情况写回 cards.json 失败（本次运行不受影响，下次可能多生成一些用不上的差分）", {
+            error: errMsg(e).slice(0, 200),
+          });
+        }
+        const report = imageUsageReport(cards.characters);
+        log({
+          step: "剧本",
+          message: `已按剧本统计各角色的实际使用：${usage.changed} 个角色的表情/服装/动作使用集合有更新（表情 ${report.emotions[0]}→${report.emotions[1]}、服装 ${report.costumes[0]}→${report.costumes[1]}、动作 ${report.actions[0]}→${report.actions[1]}）；图像阶段将只生成剧本真的用得到的差分`,
+          level: "info",
+          at: Date.now(),
+        });
+      }
+    }
 
     // 素材映射始终以磁盘已有内容为基础（合并而非覆盖）：
     // 即使本次勾选 image/voice 且中途失败/中断，也不会把之前已生成的图映射清空
@@ -2315,18 +2404,34 @@ export class Pipeline {
           const stat = pruneAssetRefs(assets, buildPruneKeepChapters(chapters, disabledScripts));
           const total = stat.bg + stat.cg + stat.vocal;
           if (total > 0 || stat.cgMigrated > 0) {
-            const backupName = await backupAssetMap(input.outputDir);
-            await updateAssetMap(input.outputDir, (m) => {
-              m.bg = assets.bg;
-              m.cg = assets.cg;
-              m.vocal = assets.vocal;
-            });
-            log({
-              step: "组装",
-              message: `素材映射已剪枝：清理过期引用 ${total} 项（背景 ${stat.bg}、CG ${stat.cg}、配音 ${stat.vocal}）${stat.cgMigrated > 0 ? `，迁移旧版 CG 键 ${stat.cgMigrated} 项` : ""}${backupName ? `（已备份 ${backupName}，误删可从素材页恢复）` : ""}；孤儿文件可用素材页「清理无效素材」删除`,
-              level: "info",
-              at: Date.now(),
-            });
+            // #1516：剪枝是破坏性写，必须先有回滚点。备份失败就整个跳过剪枝——
+            // 宁可留着过期引用（素材页可手工清理），也不要删掉唯一一份映射。
+            let backupName: string | null = null;
+            let backupFailed = false;
+            try {
+              backupName = await backupAssetMap(input.outputDir);
+            } catch (e) {
+              backupFailed = true;
+              log({
+                step: "组装",
+                message: `已跳过素材映射剪枝：备份失败，继续剪枝将无法回滚（${errMsg(e).slice(0, 80)}）`,
+                level: "warn",
+                at: Date.now(),
+              });
+            }
+            if (!backupFailed) {
+              await updateAssetMap(input.outputDir, (m) => {
+                m.bg = assets.bg;
+                m.cg = assets.cg;
+                m.vocal = assets.vocal;
+              });
+              log({
+                step: "组装",
+                message: `素材映射已剪枝：清理过期引用 ${total} 项（背景 ${stat.bg}、CG ${stat.cg}、配音 ${stat.vocal}）${stat.cgMigrated > 0 ? `，迁移旧版 CG 键 ${stat.cgMigrated} 项` : ""}${backupName ? `（已备份 ${backupName}，误删可从素材页恢复）` : ""}；孤儿文件可用素材页「清理无效素材」删除`,
+                level: "info",
+                at: Date.now(),
+              });
+            }
           }
         }
       }
@@ -2335,11 +2440,44 @@ export class Pipeline {
     /* ==================== ④ 图像 ==================== */
     if (stages.has("image")) {
       if (this.options.useImage) {
-        await assertVisualBibleReadyForImages(input.outputDir, input.visualBible, workingNovel, cards!.characters);
+        // 指纹必须用**原文**（input.novel）：视觉守门的指纹由「启用章节的 index+text」构成，
+        // 批准侧（VisualBiblePanel 的批准/刷新、stores/generate 的两处）全部用 projectState.novel
+        // 即原文。这里此前传的是翻译后的 workingNovel，于是只要开了目标语言，指纹恒不相等 →
+        // 每次跑图像都把用户批准好的守门刷成 stale 并抛错，重新批准也永远对不上（图像永远出不来）。
+        await assertVisualBibleReadyForImages(input.outputDir, input.visualBible, input.novel, cards!.characters);
         if (this.options.imageSelfCheck && !configIsUsable(input.vision, "vision")) {
           throw new Error("图像自检已启用，但图像识别 API 未配置或不可用；请先在 API 配置页完成配置");
         }
         log({ step: "图像", message: "开始处理图像素材…", level: "info", at: Date.now() });
+        // #1518：换装三视图锚点属于正式生成的内容。守门草稿只出「一个角色一张三视图」
+        // （守门是确认人物形象），锚点在这里——真正要用到时——才按需补建，不再压在批准之前。
+        // 缺失锚点时换装立绘本就回退默认装三视图，故补建失败不得阻断正式生成。
+        const anchorCfg = input.image;
+        if (anchorCfg) try {
+          const anchors = await ensureCostumeAnchors(
+            input.outputDir,
+            cards!.characters,
+            anchorCfg,
+            undefined,
+            (label) => log({ step: "图像", message: `补建换装三视图锚点：${label}`, level: "info", at: Date.now() }),
+            () => this.aborted,
+          );
+          if (anchors.created || anchors.adopted || anchors.failed) {
+            log({
+              step: "图像",
+              message: `换装三视图锚点补建完成：新建 ${anchors.created} 张${anchors.adopted ? `，免费认领 ${anchors.adopted} 张（上次未落盘的付费产物）` : ""}${anchors.failed ? `，失败 ${anchors.failed} 套（已回退默认装三视图）` : ""}`,
+              level: anchors.failed ? "warn" : "info",
+              at: Date.now(),
+            });
+          }
+        } catch (e) {
+          log({
+            step: "图像",
+            message: `换装三视图锚点补建失败，换装立绘将回退默认装三视图：${errMsg(e).slice(0, 200)}`,
+            level: "warn",
+            at: Date.now(),
+          });
+        }
         const imageFeedback = this.feedback.image;
         // 「跳过缓存（全量重跑）」必须对图像同样生效，否则用户勾选了全量却全部命中旧图（与 UI/日志承诺不符）
         const imageForce = !!imageFeedback || input.forceStages?.includes("image") || this.options.skipCache === true;
@@ -2406,6 +2544,9 @@ export class Pipeline {
           imageChapterScope,
           this.options.figureDetail ?? "full",
           imageChapterForce,
+          this.options.backgroundsPerLocation ?? 0,
+          // #1580 背景复用：与 buildImageTasks/章节灯/清理同口径（见 DEFAULT_BACKGROUND_REUSE 的说明）
+          this.options.backgroundReuse ?? DEFAULT_BACKGROUND_REUSE,
         );
         this.failedTasks.push(...failed);
         this.imageHadFailures = this.imageHadFailures || failed.length > 0;
@@ -2549,7 +2690,7 @@ export class Pipeline {
           sceneCount: chapters.reduce((n, c) => n + c.scenes.length, 0),
           lineCount: chapters.reduce((n, c) => n + c.scenes.reduce((m, s) => m + s.lines.length, 0), 0),
           outputDir: input.outputDir,
-          webgalVersion: "4.6.3",
+          webgalVersion: SUPPORTED_WEBGAL_VERSION,
           generatedAt: new Date().toISOString(),
         };
       }
@@ -2606,7 +2747,7 @@ export class Pipeline {
           sceneCount: chapters.reduce((n, c) => n + c.scenes.length, 0),
           lineCount: chapters.reduce((n, c) => n + c.scenes.reduce((m, s) => m + s.lines.length, 0), 0),
           outputDir: input.outputDir,
-          webgalVersion: "4.6.3",
+          webgalVersion: SUPPORTED_WEBGAL_VERSION,
           generatedAt: new Date().toISOString(),
         };
       }

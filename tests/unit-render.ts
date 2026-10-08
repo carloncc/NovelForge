@@ -62,8 +62,18 @@ function main(): void {
   assert(!out1.includes("\n第一句"), "换行被拆成新语句");
   assert(out1.includes("\\;"), "分号未转义");
   assert(out1.includes("\\:"), "冒号未转义");
-  assert(out1.includes("\\`"), "反引号未转义");
+  // 反引号**不**转义：引擎的还原表（WSe）只认 反斜杠/竖线/冒号/逗号/分号/句点 六条，
+  // 没有反引号规则，转义成反斜杠+反引号反而会在正文里多显示一个反斜杠。
+  assert(!out1.includes("\\`"), "反引号不应被转义（引擎没有对应还原规则）");
+  assert(out1.includes("`反引号`"), "反引号应原样保留");
   assert(out1.includes("\\\\"), "反斜杠未转义");
+  // 半角 [ ] 必须改全角：引擎的 qTe() 会把 [文本](值) 当增强文本解析成注音（ruby），
+  // 正文里偶然出现的 [笑](laughing) 会被渲染成「笑」上标 laughing。
+  const sB = makeScript();
+  sB.scenes[0].lines[0] = { type: "dialogue", characterId: "linche", text: "他说[笑](laughing)着", emotion: "normal" };
+  const outB = renderChapter(sB, { characters: cards.characters, items: cards.items, assets, introCard: false }, 1);
+  assert(!outB.includes("[笑](laughing)"), "半角方括号会被引擎当注音语法，必须改全角");
+  assert(outB.includes("［笑］"), "半角方括号应改写为全角");
   assert(nonCommentLines(out1).length === 16, "行数异常（label+清场3+bgm复位+film复位2+章节标题卡+changeBg+推近+changeFigure+取景+2句+end；#1328 后黄昏/夜晚不再误配 playEffect）");
 
   // 2) 恶意角色名 → 不产生裸分号注入
@@ -71,7 +81,7 @@ function main(): void {
   const evilChars = cards.characters.map((c) => ({ ...c, name: "林;澈:evil`\n" }));
   const out2 = renderChapter(s2, { characters: evilChars, items: cards.items, assets, introCard: false }, 1);
   const line2 = nonCommentLines(out2).find((l) => l.includes("evil"))!;
-  assert(line2.startsWith("林\\;澈：evil\\` :"), `角色名未正确转义（#1457：姓名内冒号转全角「：」避免被引擎拆成说话人分隔符）: ${line2}`);
+  assert(line2.startsWith("林\\;澈：evil` :"), `角色名未正确转义（#1457：姓名内冒号转全角「：」避免被引擎拆成说话人分隔符）: ${line2}`);
 
   // 3) 恶意 itemId → sanitize 进指令参数
   const s3 = makeScript({

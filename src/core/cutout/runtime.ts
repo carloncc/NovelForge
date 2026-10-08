@@ -7,7 +7,7 @@
 import { containSize, maskMetrics, type MaskMetrics } from "./mask";
 import { findCutoutModel, type CutoutModel } from "./models";
 
-export class ModelNotInstalledError extends Error {
+class ModelNotInstalledError extends Error {
   constructor(details = "缺少本地 AI 抠图模型") {
     super(`AI 抠图模型尚未安装：${details}`);
     this.name = "ModelNotInstalledError";
@@ -67,7 +67,7 @@ function minMaxToAlpha(values: Float32Array | number[]): Uint8ClampedArray {
   return alpha;
 }
 
-export interface CutoutMaskResult {
+interface CutoutMaskResult {
   alpha: Uint8ClampedArray;
   width: number;
   height: number;
@@ -75,7 +75,7 @@ export interface CutoutMaskResult {
   backend: "webgpu" | "wasm";
 }
 
-export interface CutoutRuntimeOptions {
+interface CutoutRuntimeOptions {
   model?: CutoutModel;
   modelUrl?: string;
 }

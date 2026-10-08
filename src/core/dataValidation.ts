@@ -54,7 +54,14 @@ export function parseChapterScript(input: unknown): ChapterScript {
     // 可选块结构校验：坏结构会导致 CG/分支/视频位静默丢失
     if (scene.cgEvent !== undefined && scene.cgEvent !== null) {
       const cg = record(scene.cgEvent, "chapter cgEvent");
-      if (typeof cg.imagePrompt !== "string") throw new Error("chapter cgEvent has an invalid imagePrompt");
+      // #1515：imagePrompt 缺失是「退化」不是「损坏」。
+      // 此前这里直接抛错，而本函数的调用点**全部是读缓存**（pipeline.readCachedScript 按
+      // cache-miss 重新付费生成、useChapterStatus 置 null 后界面显示"剧本未生成"、
+      // project.loadScriptForChapter、imageStory 载入）——一处可选字段缺失导致整章报废。
+      // 实测用户 30 章缓存里有 5 章（2/4/14/16/24）共 11 处 cgEvent 缺 imagePrompt，
+      // 这 5 章会被判为未生成并重新付费生成，而它们其余部分完好。
+      // 补成空串放行：图像阶段会按 CG 标题/描述回退，章节其余内容照常使用。
+      if (typeof cg.imagePrompt !== "string") cg.imagePrompt = "";
     }
     if (scene.choices !== undefined) {
       if (!Array.isArray(scene.choices)) throw new Error("chapter scene has an invalid choices");

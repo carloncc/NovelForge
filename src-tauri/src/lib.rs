@@ -84,24 +84,6 @@ fn template_stamp(text: &str) -> &str {
     }
 }
 
-#[cfg(test)]
-mod template_version_tests {
-    use super::template_stamp;
-
-    #[test]
-    fn stamp_detects_version_and_missing() {
-        assert_eq!(template_stamp("<!-- NovelForge appreciation template v3 -->"), "3");
-        assert_eq!(template_stamp("<html>no stamp</html>"), "");
-    }
-
-    #[test]
-    fn stamp_differs_across_versions() {
-        assert_ne!(
-            template_stamp("<!-- template v2 -->"),
-            template_stamp("<!-- template v3 -->")
-        );
-    }
-}
 
 fn extract_dir(dir: &Dir<'_>, root: &Path) -> std::io::Result<()> {
     for file in dir.files() {
@@ -143,6 +125,7 @@ pub fn run() {
             commands::bless_project_dir,
             commands::read_text_file,
             commands::write_text_file,
+            commands::set_file_executable,
             commands::append_text_file,
             commands::read_file_base64,
             commands::read_file_header,
@@ -192,4 +175,23 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod template_version_tests {
+    use super::template_stamp;
+
+    #[test]
+    fn stamp_detects_version_and_missing() {
+        assert_eq!(template_stamp("<!-- NovelForge appreciation template v3 -->"), "3");
+        assert_eq!(template_stamp("<html>no stamp</html>"), "");
+    }
+
+    #[test]
+    fn stamp_differs_across_versions() {
+        assert_ne!(
+            template_stamp("<!-- template v2 -->"),
+            template_stamp("<!-- template v3 -->")
+        );
+    }
 }

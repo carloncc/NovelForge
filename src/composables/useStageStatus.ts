@@ -1,7 +1,7 @@
 import { computed, reactive } from "vue";
 import type { ApiConfig, AssetMap, FailedTask, GenerationOptions, NovelDoc, PipelineResult, StageKey } from "../core/types";
 import { STAGE_ORDER, STEP_TO_STAGE } from "../core/types";
-import { buildImageTasks } from "../core/images";
+import { statusImageTasks, imageTaskHasAsset } from "../core/stageCascade";
 import { buildVoiceJobsOrEmpty } from "../core/voice";
 import { scriptCacheRest, scriptFingerprint, titleHash, cardsFingerprint } from "../core/cache";
 import { tauri } from "../utils/tauri";
@@ -9,7 +9,7 @@ import { parseAssetMap } from "../core/assetMap";
 
 export type StageState = "idle" | "running" | "done" | "failed";
 
-export interface StageStatusInput {
+interface StageStatusInput {
   getOutputDir: () => string;
   getNovel: () => NovelDoc | null;
   /** 当前目标语言（空 = 未启用翻译） */
@@ -132,23 +132,10 @@ export function useStageStatus(input: StageStatusInput) {
   function allExpectedImagesExist(map: AssetMap, result: PipelineResult, options: GenerationOptions): boolean {
     // 还没读到任何剧本（restore 后 chapters 为空）时不能判「完成」：Array.every 对空数组恒为 true
     if (!result.chapters.length) return false;
-    const tasks = buildImageTasks(result.chapters, result.cards, {
-      cgPerChapter: options.cgPerChapter ?? 0,
-      maxPerChapter: options.imageBudgetPerChapter ?? 0,
-      figureEmotions: options.figureEmotions,
-      detail: options.figureDetail ?? "full",
-      style: options.imageStyle,
-      threeView: options.characterPoses !== false,
-      actions: options.characterPoses !== false,
-      styleAnchor: options.styleAnchor !== false,
-    });
-    return tasks.every((task) => {
-      if (task.kind === "anchor") return true;
-      if (task.kind === "background") return Boolean(map.bg[task.id]);
-      if (task.kind === "cg") return Boolean(map.cg[task.id]);
-      if (task.kind === "item") return Boolean(map.item[task.id]);
-      return Boolean(map.figure[task.id]);
-    });
+    // #1518：走 stageCascade 导出的同口径封装，不再在此处复制一份 buildImageTasks 的选项映射
+    // 与资产命中判定。两份逐字相同的副本此刻是对的，但没有任何东西保证它们继续一样——
+    // 而 stageCascade.ts 的注释明写「两处必须一致，否则看板绿灯与级联计数会打架」。
+    return statusImageTasks(result.chapters, result.cards, options).every((task) => imageTaskHasAsset(task, map));
   }
 
   function allExpectedVoicesExist(map: AssetMap, result: PipelineResult, config: ApiConfig): boolean {
@@ -242,8 +229,11 @@ export function useStageStatus(input: StageStatusInput) {
     const running = new Set(input.getRunningStages());
     const out = {} as Record<StageKey, StageState>;
     for (const k of STAGE_ORDER) {
-      if (failedSet.value.has(k)) out[k] = "failed";
-      else if (running.has(k)) out[k] = "running";
+      // running 必须先判：failed.json 里的历史失败要等管线登记成功才销账（visibleFailedTasks），
+      // 若 failed 先判，整个重试过程该阶段都显示红色，用户会以为重试没启动。
+      // project.ts 的 pushLog 注释已把这条契约写明，此处此前与注释相反。
+      if (running.has(k)) out[k] = "running";
+      else if (failedSet.value.has(k)) out[k] = "failed";
       else out[k] = base[k] ? "done" : "idle";
     }
     return out;

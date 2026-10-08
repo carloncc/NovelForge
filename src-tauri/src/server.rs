@@ -127,12 +127,24 @@ fn preview_origin_allowed(value: Option<&str>, port: u16) -> bool {
         return true;
     };
     let v = raw.trim().to_ascii_lowercase();
+    // 归一化成 "scheme://authority"：Origin 不带路径，Referer 带（"http://127.0.0.1:17892/index.html"）
+    let origin = v.split(['/', '?', '#']).take(3).collect::<Vec<_>>().join("/");
+    // #1518：应用自身页面必须放行。预览页把游戏放进 iframe，浏览器默认会带上
+    // Referer=http://tauri.localhost/（Tauri webview）或 http://localhost:5173/（dev server），
+    // 两者都不在下面的白名单里 → 应用自己的预览 iframe 被 403 打不开（控制台只有 forbidden）。
+    // 放行这几个来源不削弱 DNS rebinding / 跨站读防护：外部站点不可能持有这些 origin。
+    if matches!(
+        origin.as_str(),
+        "http://tauri.localhost" | "tauri://localhost" | "http://localhost:5173" | "http://127.0.0.1:5173"
+    ) {
+        return true;
+    }
     // #1475：原实现用 starts_with("http://127.0.0.1:{port}") 做前缀比对，
     // 端口 ≤6553 时 "http://127.0.0.1:50001" 会被误判为同源（17892 这类 5 位端口碰巧躲过）。
     // 这里改为解析出 scheme/host/port 后精确比对。
     for authority in ["127.0.0.1", "localhost", "[::1]"] {
         let prefix = format!("http://{authority}");
-        let Some(rest) = v.strip_prefix(&prefix) else {
+        let Some(rest) = origin.strip_prefix(&prefix) else {
             continue;
         };
         // origin 必须是 host:port，且端口与本实例一致（split 至少产出一段，unwrap_or 仅兜底）
@@ -233,12 +245,14 @@ fn handle_request(root: &Path, request: tiny_http::Request, port: u16) {
     let range_header: Option<String> = request
         .headers()
         .iter()
-        .find(|h| h.field.as_str() == "Range")
+        // 头部字段名大小写不敏感（HTTP 规范）：有的客户端发 "range:"，只认 "Range" 会让
+        // 分片请求退化成整文件响应（视频拖拽/断点续传失效）。
+        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("Range"))
         .map(|h| h.value.as_str().to_string());
     let if_none_match: Option<String> = request
         .headers()
         .iter()
-        .find(|h| h.field.as_str() == "If-None-Match")
+        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("If-None-Match"))
         .map(|h| h.value.as_str().to_string());
     let path_part = url.split('?').next().unwrap_or("/");
     let decoded = percent_decode(path_part);
@@ -509,7 +523,7 @@ struct _MutexGuardGuard(Mutex<()>);
 
 #[cfg(test)]
 mod tests {
-    use super::{cache_control_for, content_type_for, http_date, is_preview_blocked, parse_range, preview_host_allowed, preview_origin_allowed, safe_file_path, start_with_server, validate_preview_root};
+    use super::{cache_control_for, content_type_for, http_date, is_preview_blocked, parse_range, preview_host_allowed, percent_decode, preview_origin_allowed, safe_file_path, start_with_server, validate_preview_root};
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpStream;
@@ -530,8 +544,59 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    fn parse_range_single_interval() {
+    /// #1537：parse_range 自身**不**把 end 收敛到 total-1（bytes=0-999999 配 200 字节文件
+/// 会得到 Some((0, 999999))），真正兜底的是 handle_request 里的 `e.min(file_len-1)`。
+/// 也就是说「超范围 end 不会让 length 爆成 u64::MAX、不会预分配巨量内存」这条安全性，
+/// 完全寄生在调用点那一行 clamp 上。这里把它连同 handle_request 的实际用法一起钉住，
+/// 免得将来有人删掉 clamp 又以为 parse_range 自己会收敛。
+#[test]
+fn parse_range_over_range_end_is_clamped_by_caller() {
+    // parse_range 本身不收敛：调用点必须自己夹
+    assert_eq!(parse_range("bytes=0-999999", 200), Some((0, 999999)));
+    // 复刻 handle_request:318-327 的那段逻辑
+    let file_len = 200u64;
+    let (s, e) = parse_range("bytes=0-999999", file_len).expect("应解析出区间");
+    let e = e.min(file_len.saturating_sub(1));
+    assert!(s <= e);
+    let length = e - s + 1;
+    assert_eq!(length, file_len, "超范围 end 必须被夹到整文件长度，不得溢出");
+    // u64::MAX 作为 end 同样只能被夹到文件大小（否则 length 计算会回绕）
+    let (s, e) = parse_range("bytes=0-18446744073709551615", file_len).expect("应解析出区间");
+    let e = e.min(file_len.saturating_sub(1));
+    assert_eq!(e - s + 1, file_len, "u64::MAX end 不得撑爆 length");
+    // 后缀区间已自带收敛（suffix.min(total)），不依赖调用点
+    assert_eq!(parse_range("bytes=-99999", 200), Some((0, 199)));
+}
+
+/// #1537：percent_decode 在 safe_file_path **之前**执行（handle_request:244 -> 259），
+/// 所以 %2e%2e%2f 这类编码过的穿越序列必须先被解码、再由 components() 判成 ParentDir 拦掉。
+/// 顺序若反过来（先按原始串判守卫、再解码），就成了绕过。
+#[test]
+fn percent_encoded_traversal_is_blocked() {
+    // 解码确实还原出 ../
+    assert_eq!(percent_decode("/%2e%2e%2f%2e%2e%2fetc/passwd"), "/../../etc/passwd");
+    let rel = percent_decode("/%2e%2e%2f%2e%2e%2fetc/passwd");
+    let rel = rel.trim_start_matches('/');
+    // 再走 safe_file_path 的守卫：ParentDir 必须被拒
+    assert!(
+        Path::new(&rel)
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir)),
+        "编码过的穿越必须被 components() 判为非 Normal/CurDir",
+    );
+    // 反斜杠编码同样是 ParentDir（Windows 上 \\ 是分隔符）
+    let rel2 = percent_decode("/%2e%2e%5c%2e%2e%5cboot.ini");
+    assert_eq!(rel2.trim_start_matches('/'), "..\\..\\boot.ini");
+    // 合法路径不得被误伤
+    assert_eq!(percent_decode("/game/scene%2Fstart.txt"), "/game/scene/start.txt");
+    // 非法/半截百分号按字面透传，不 panic（#1487 的多字节切分防护）
+    assert_eq!(percent_decode("/%E4%B8%AD"), "/中");
+    assert_eq!(percent_decode("/100%"), "/100%");
+    assert_eq!(percent_decode("/%zz"), "/%zz");
+    assert_eq!(percent_decode("/%2"), "/%2");
+}
+#[test]
+fn parse_range_single_interval() {
         assert_eq!(parse_range("bytes=0-99", 200), Some((0, 99)));
         assert_eq!(parse_range("bytes=100-", 200), Some((100, 199)));
         assert_eq!(parse_range("bytes=-50", 200), Some((150, 199)));
@@ -572,6 +637,86 @@ mod tests {
         assert_eq!(http_date(1_700_000_000), "Tue, 14 Nov 2023 22:13:20 GMT");
     }
 
+    /// #1537 集成回归：**真正打到 handle_request** 的超范围 Range。
+    /// 上面那个单元测试只是复刻了 clamp 的算式；真正保证「删掉 clamp 也不会出事」的是这条：
+    /// Range: bytes=0-18446744073709551615 打到 1000 字节文件，服务端必须回 206 +
+    /// Content-Range: bytes 0-999/1000 + 恰好 1000 字节，而不是把 length 算成 u64::MAX。
+    #[test]
+    fn range_request_with_over_range_end_is_clamped_end_to_end() {
+        let root = std::env::temp_dir().join(format!("novelforge-preview-range-clamp-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let payload: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+        fs::write(root.join("data.bin"), &payload).unwrap();
+        fs::write(root.join("index.html"), "<html></html>").unwrap();
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let handle = start_with_server(root.to_str().unwrap(), server).unwrap();
+
+        // (Range 头, 期望 Content-Range, 期望响应体起点, 期望响应体长度)
+        for (range, want_cr, want_start, want_len) in [
+            ("bytes=0-18446744073709551615", "bytes 0-999/1000", 0usize, 1000usize),
+            ("bytes=0-999999", "bytes 0-999/1000", 0, 1000),
+            ("bytes=900-999999", "bytes 900-999/1000", 900, 100),
+        ] {
+            let mut stream = TcpStream::connect(("127.0.0.1", handle.port())).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let req = format!("GET /data.bin HTTP/1.1\r\nHost: 127.0.0.1\r\nRange: {range}\r\nConnection: close\r\n\r\n");
+            stream.write_all(req.as_bytes()).unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).unwrap();
+
+            let head_end = response.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4).unwrap_or(response.len());
+            let head = String::from_utf8_lossy(&response[..head_end]);
+            assert!(head.starts_with("HTTP/1.1 206"), "{range} 应返回 206: {head}");
+            assert!(head.contains(&format!("Content-Range: {want_cr}")), "{range} 的 Content-Range 应为 {want_cr}: {head}");
+            let body = &response[head_end..];
+            assert_eq!(body.len(), want_len, "{range} 的响应体长度应为 {want_len}，实际 {}", body.len());
+
+            assert_eq!(body, &payload[want_start..want_start + want_len],
+                "{range} 的响应体应是 payload[{want_start}..{}]", want_start + want_len);
+        }
+
+        handle.stop();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// #1537 集成回归：编码过的穿越序列必须在解码之后被守卫拦下。
+    /// handle_request:244 先 percent_decode、259 才 safe_file_path，顺序反了就成了绕过。
+    #[test]
+    fn percent_encoded_traversal_returns_404_end_to_end() {
+        // root 外面放一个可读文件，若守卫失效就会被读到
+        let base = std::env::temp_dir().join(format!("novelforge-preview-esc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let root = base.join("root");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(base.join("secret.txt"), b"TOP-SECRET").unwrap();
+        fs::write(root.join("index.html"), "<html></html>").unwrap();
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let handle = start_with_server(root.to_str().unwrap(), server).unwrap();
+
+        for path in [
+            "/%2e%2e/secret.txt",
+            "/%2E%2E%2Fsecret.txt",
+            "/..%2fsecret.txt",
+            "/%2e%2e%5csecret.txt",
+            "/../secret.txt",
+        ] {
+            let mut stream = TcpStream::connect(("127.0.0.1", handle.port())).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+            stream.write_all(req.as_bytes()).unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).unwrap();
+            let text = String::from_utf8_lossy(&response);
+            assert!(text.starts_with("HTTP/1.1 404"), "{path} 必须 404: {}", &text[..text.len().min(60)]);
+            assert!(!text.contains("TOP-SECRET"), "{path} 泄漏了 root 外的文件内容");
+        }
+
+        handle.stop();
+        let _ = fs::remove_dir_all(&base);
+    }
     /// B113 集成回归：Range 请求应返回 206 + 正确 Content-Range + 精确区间字节
     #[test]
     fn range_request_returns_partial_content() {

@@ -4,7 +4,8 @@ import { tauri } from "../utils/tauri";
 import { errMsg } from "../utils/errors";
 import { extname, normalizePath, safeFilename } from "../utils/path";
 import { imageMimeForPath } from "../utils/mime";
-import { buildImageTasks, stripBackground } from "./images";
+import { t } from "../i18n";
+import { buildImageTasks, figureCostumeEntries, stripBackground } from "./images";
 import { sanitizePrompt, appendSafeStyleSuffix } from "../utils/promptRewriter";
 import { classifyError } from "../utils/errorClassifier";
 import { log as logger } from "../utils/logger";
@@ -12,6 +13,7 @@ import { concurrencyFor } from "../stores/configMigration";
 import type {
   ApiConfig,
   CharacterCard,
+  CharacterCostume,
   ExtractionResult,
   ImageReference,
   NovelDoc,
@@ -30,12 +32,12 @@ const NOVEL_CHUNK_LIMIT = 12_000;
 const SUMMARY_BATCH_LIMIT = 12_000;
 const MAX_IMAGE_BASE64_LENGTH = 48_000_000;
 
-export interface VisualBibleLoadResult {
+interface VisualBibleLoadResult {
   visualBible: ProjectVisualBible | null;
   warnings: string[];
 }
 
-export interface VisualBibleFingerprintInput {
+interface VisualBibleFingerprintInput {
   novel: NovelDoc;
   characters: CharacterCard[];
   styleSource: StyleSource;
@@ -44,7 +46,7 @@ export interface VisualBibleFingerprintInput {
   characterReferenceB64?: Record<string, string>;
 }
 
-export interface VisualBibleApprovalResult {
+interface VisualBibleApprovalResult {
   valid: boolean;
   errors: string[];
 }
@@ -102,11 +104,15 @@ interface VisualBibleDraftBase {
   characterReferences?: Record<string, VisualBibleImageInput>;
   /** 生成进度回调：phase 为 "style"（风格分析）| "threeview"（角色三视图） */
   onProgress?: (phase: "style" | "threeview", done: number, total: number) => void;
+  /** 每张成品图落盘后回调（画风基准 / 角色三视图 / 换装三视图）。
+   *  onProgress 按「角色」计数，反映不了换装三视图——草稿实际出图数远大于角色数
+   *  （25 角色 + 92 套服装 = 118 张），用户看不到真实进度与总量，故补一个按张计的通道。 */
+  onImageProgress?: (done: number, total: number, label: string) => void;
   /** 取消信号：返回 true 时在下一个调度点中止（已完成的内容按各自语义保留或丢弃） */
   isAborted?: () => boolean;
 }
 
-export type CreateVisualBibleDraftInput = VisualBibleDraftBase & (
+type CreateVisualBibleDraftInput = VisualBibleDraftBase & (
   | {
     styleSource: "reference_image";
     visionCfg: ApiConfig;
@@ -118,27 +124,27 @@ export type CreateVisualBibleDraftInput = VisualBibleDraftBase & (
   }
 );
 
-export interface StyleRewriteRequest {
+interface StyleRewriteRequest {
   llmCfg: ApiConfig;
   instruction?: string;
   dependencies?: VisualBibleServiceDependencies;
   currentFingerprint?: string;
 }
 
-export interface CharacterSheetRegenerationRequest {
+interface CharacterSheetRegenerationRequest {
   character: CharacterCard;
   imageCfg: ApiConfig;
   dependencies?: VisualBibleServiceDependencies;
 }
 
-export interface StyleReferenceReplacementRequest {
+interface StyleReferenceReplacementRequest {
   visionCfg: ApiConfig;
   image: VisualBibleImageInput;
   dependencies?: VisualBibleServiceDependencies;
   currentFingerprint?: string;
 }
 
-export interface VisualBibleApprovalRequest {
+interface VisualBibleApprovalRequest {
   novel: NovelDoc;
   characters: CharacterCard[];
   now?: () => string;
@@ -162,7 +168,7 @@ interface VisualBibleMutation {
 }
 
 /** B79：发布前检测到清单被并发写入且本事务基于旧快照时抛出，提示刷新重试而不是静默覆盖。 */
-export class VisualBibleConcurrencyError extends Error {
+class VisualBibleConcurrencyError extends Error {
   readonly code = "VISUAL_BIBLE_CONCURRENCY" as const;
 
   constructor(message: string) {
@@ -172,7 +178,7 @@ export class VisualBibleConcurrencyError extends Error {
 }
 
 /** B81：发布后拒绝（清单已落盘为 stale）的显式错误 */
-export class VisualBibleMutationRejectedError extends Error {
+class VisualBibleMutationRejectedError extends Error {
   readonly code = "VISUAL_BIBLE_MUTATION_REJECTED" as const;
 
   constructor(message: string) {
@@ -220,6 +226,86 @@ export function visualBibleManifestPath(outputDir: string): string {
 
 export function visualBiblePath(outputDir: string, storedPath: string): string {
   return visualBibleArtifactPath(visualBibleDir(outputDir), storedPath);
+}
+
+const VISUAL_BIBLE_IMAGE_RE = /\.(png|jpe?g|webp)$/i;
+
+/**
+ * 视觉守门目录里**当前清单不再引用**的产物（历史修订 / 孤儿文件）。
+ *
+ * 每次重跑守门（重建草稿、重生成某个角色、同步服装锚点）都会生成一批带新修订号的文件，
+ * 旧修订留在盘上不再被引用。实测某项目：169 张 / 228 MB 里只有 26 张 / 33 MB 是清单引用的，
+ * 其余 143 张（195 MB）全是历史修订——含每次重跑都存一份的 style-reference.jpg。
+ *
+ * 判据是"清单里出现过没有"：递归扫清单 JSON 里的所有图片路径字符串，
+ * 比逐个字段列举更不容易漏（三视图/服装锚点/参考图/风格参考/待失效条目都在里面）。
+ * 清单读不出来时**一个文件都不动**（未知即不删）。
+ */
+export async function listStaleVisualBibleArtifacts(
+  outputDir: string,
+): Promise<{ files: { path: string; size: number }[]; bytes: number }> {
+  const dir = visualBibleDir(outputDir);
+  if (!(await tauri.pathExists(dir).catch(() => false))) return { files: [], bytes: 0 };
+  const referenced = new Set<string>();
+  try {
+    const { text } = await tauri.readTextFile(visualBibleManifestPath(outputDir));
+    const walk = (value: unknown): void => {
+      if (typeof value === "string") {
+        if (VISUAL_BIBLE_IMAGE_RE.test(value)) {
+          const base = normalizePath(value).split("/").pop();
+          if (base) referenced.add(base);
+        }
+        return;
+      }
+      if (Array.isArray(value)) {
+        for (const item of value) walk(item);
+        return;
+      }
+      if (value && typeof value === "object") {
+        for (const item of Object.values(value as Record<string, unknown>)) walk(item);
+      }
+    };
+    walk(JSON.parse(text));
+  } catch {
+    return { files: [], bytes: 0 };
+  }
+  const files: { path: string; size: number }[] = [];
+  let bytes = 0;
+  const visit = async (current: string): Promise<void> => {
+    const entries = await tauri.listDir(current).catch(() => []);
+    for (const entry of entries) {
+      if (entry.isDir) {
+        await visit(entry.path);
+        continue;
+      }
+      if (!VISUAL_BIBLE_IMAGE_RE.test(entry.name) || referenced.has(entry.name)) continue;
+      const size = Number.isFinite(entry.size) ? entry.size : 0;
+      files.push({ path: entry.path, size });
+      bytes += size;
+    }
+  };
+  await visit(dir);
+  return { files, bytes };
+}
+
+/** 删除上一条列出的旧修订产物；逐个删除，失败的只计数不抛（不阻断其余清理） */
+export async function purgeStaleVisualBibleArtifacts(
+  outputDir: string,
+): Promise<{ deleted: number; bytes: number; failed: number }> {
+  const stale = await listStaleVisualBibleArtifacts(outputDir);
+  let deleted = 0;
+  let bytes = 0;
+  let failed = 0;
+  for (const file of stale.files) {
+    try {
+      await tauri.removePath(file.path);
+      deleted++;
+      bytes += file.size;
+    } catch {
+      failed++;
+    }
+  }
+  return { deleted, bytes, failed };
 }
 
 function visualBibleArtifactPath(artifactDir: string, storedPath: string): string {
@@ -520,11 +606,16 @@ async function generateCostumeSheets(
   artifactDir: string,
   artifactRevision: string,
   dependencies: VisualBibleServiceDependencies,
+  /** 每落盘一张图回调一次（草稿创建用来报「第 n 张 / 共 m 张」）；其他调用方不传即可 */
+  reportImage?: (label: string) => void,
 ): Promise<Record<string, VisualBibleCostumeSheet>> {
   const sheets: Record<string, VisualBibleCostumeSheet> = {};
   // B73：失败列表集中记录，循环后统一 warn（旧实现空 catch 吞错，锚点缺失且无任何原因可见）
   const failedCostumes: { costumeId: string; name: string; reason: string }[] = [];
-  for (const ct of card.costumes ?? []) {
+  // 只为**会产生换装立绘**的服装建锚点（角色图片档位预算，见 core/figureBudget.ts）：
+  // 次要角色/路人的服装差分本就被预算裁掉，给它们建锚点等于花三视图的钱买一张没人用的图。
+  // 与 buildImageTasks 的 figureCostumeEntries 是同一个函数，两边不可能对不上。
+  for (const ct of figureCostumeEntries(card, { detail: "full", threeView: true })) {
     const ctPrompt = normalizeStyleDescription(ct.prompt || "");
     if (!ctPrompt) continue;
     try {
@@ -547,6 +638,7 @@ async function generateCostumeSheets(
       const ctPath = revisionedArtifactPath(canonicalCostumeSheetPath(card.id, ct.id), artifactRevision);
       await writeGeneratedImage(visualBibleArtifactPath(artifactDir, ctPath), generated);
       sheets[ct.id] = { threeViewPath: ctPath, prompt: ctPrompt, revision: 1, approved: false };
+      reportImage?.(`${card.id}/${ct.id}`);
     } catch (e) {
       // 服装三视图失败不阻断：该服装换装立绘回退用默认装三视图
       failedCostumes.push({
@@ -565,12 +657,30 @@ async function generateCostumeSheets(
   return sheets;
 }
 
+/**
+ * 三视图提示词。
+ *
+ * ⚠️ 参考图的用途必须写在提示词里：参考图是以「裸 base64 数组」发给模型的
+ * （api/universal.ts 只发图、不发 role，routeImageReferences 的排序也只影响发送顺序），
+ * 模型自己分不清哪张是人物、哪张是画风。只写 "the same person" 时它会取两张的折中，
+ * 于是**带参考图的角色被那张参考图自己的配色/笔触/光照带跑，画风与不带参考图的角色不一致**。
+ *
+ * 调用点全部按 [身份?, 画风] 组装（与 providers.ts rolePriority identity→style→structure 一致），
+ * 即画风图恒在最后一张，故此处按位置描述是安全的；若将来加入 structure 参考图，
+ * 需同步调整下面的措辞（它会排在画风之后）。
+ */
 function characterThreeViewPrompt(identityPrompt: string, styleDescription: string): string {
   const identity = stripBackground(normalizeStyleDescription(identityPrompt));
   // 风格描述同样剥背景词：LLM 综合的风格里可能带 "soft gradient background" 之类，
   // 不剥会与后面的纯绿幕后缀冲突（环境采样图那边要完整风格，不动它，只在这里剥）
   const style = stripBackground(normalizeStyleDescription(styleDescription));
-  return `${identity}. ${style}. Character turnaround sheet showing exactly the same person in front, side, and back orthographic full-body views, neutral pose, consistent proportions and clothing, solid chroma key green background (pure #00FF00 green filling the entire background, no gradient, no pattern, no text), no extra figures, no text.`;
+  const referenceRoles =
+    "Reference images are attached in this order: the character identity reference(s) first, the art-style reference last. " +
+    "Take ONLY the person's face, hair, build and clothing from the identity reference(s). " +
+    "Take the art style — line work, palette, shading, rendering and lighting — exclusively from the art-style reference, " +
+    "and do not let the identity image's own art style, palette or lighting influence the result. " +
+    "All three views must share one single consistent art style.";
+  return `${identity}. ${style}. ${referenceRoles} Character turnaround sheet showing exactly the same person in front, side, and back orthographic full-body views, neutral pose, consistent proportions and clothing, solid chroma key green background (pure #00FF00 green filling the entire background, no gradient, no pattern, no text), no extra figures, no text.`;
 }
 
 /**
@@ -578,6 +688,29 @@ function characterThreeViewPrompt(identityPrompt: string, styleDescription: stri
  * 原提示词 → 规则改写（sanitizePrompt）→ 追加全年龄安全后缀，全程最多 3 次尝试。
  * 非审查错误直接抛出；改写后仍失败时抛出原错误（调用方展示原始 400 文案）。
  */
+/**
+ * 内容审查阶梯的「下一步提示词」纯函数（#1562，导出便于单测）。
+ *
+ * 返回 null 表示**这一阶改写没有推进**：此时再发一次就是同一个请求，必定同样被拒，
+ * 属纯烧钱的付费调用，调用方应直接抛出而不是重试。
+ *
+ * 背景：appendSafeStyleSuffix 自 #1560 起是幂等的，于是「后缀分支」
+ * （sanitizePrompt 没改动提示词——干净提示词的常见情形）在第 1 阶追加之后，
+ * 第 2 阶的追加是空操作。实测该分支下会发出 3 次请求而只有 2 份不同提示词。
+ *
+ * @param stage 当前阶（0 = 首次改写，其后为追加安全后缀）
+ * @param original 用户/任务给出的原始提示词（第 0 阶改写的输入）
+ * @param current 当前实际使用的提示词
+ */
+export function nextModerationPrompt(stage: number, original: string, current: string): string | null {
+  const next = stage === 0
+    ? (() => {
+        const { prompt: safe, replaced } = sanitizePrompt(original);
+        return replaced === 0 || safe === original ? appendSafeStyleSuffix(safe) : safe;
+      })()
+    : appendSafeStyleSuffix(current);
+  return next === current ? null : next;
+}
 async function generateImageWithModerationRetry(
   cfg: ApiConfig,
   prompt: string,
@@ -593,12 +726,10 @@ async function generateImageWithModerationRetry(
         ? (e as { status?: number }).status
         : undefined;
       if (classifyError(e, status) !== "content_moderation" || stage >= 2) throw e;
-      if (stage === 0) {
-        const { prompt: safe, replaced } = sanitizePrompt(prompt);
-        current = replaced === 0 || safe === prompt ? appendSafeStyleSuffix(safe) : safe;
-      } else {
-        current = appendSafeStyleSuffix(current);
-      }
+      // #1562：改写若没有推进，就**别再发一次**（见 nextModerationPrompt 的说明）。
+      const next = nextModerationPrompt(stage, prompt, current);
+      if (next === null) throw e;
+      current = next;
     }
   }
 }
@@ -718,6 +849,7 @@ async function createDraftStyle(
     dependencies,
   );
   await writeGeneratedImage(visualBibleArtifactPath(artifactDir, referencePath), sample);
+  logger.info("visualBible", "画风基准图已生成（草稿第 1 张）", { path: referencePath });
   return { description, referencePath };
 }
 
@@ -728,7 +860,7 @@ async function createDraftCharacters(
   dependencies: VisualBibleServiceDependencies,
   artifactDir: string,
   artifactRevision: string,
-): Promise<Record<string, VisualBibleCharacter>> {
+): Promise<{ characters: Record<string, VisualBibleCharacter>; failures: { id: string; name: string; reason: string }[] }> {
   const characters: Record<string, VisualBibleCharacter> = {};
   const canonicalIds = new Set<string>();
   for (const card of input.cards.characters) {
@@ -746,6 +878,39 @@ async function createDraftCharacters(
   };
   const concurrency = concurrencyFor(input.imageCfg, "image");
   const cards = input.cards.characters;
+  // 守门出图总数 = 1 张画风基准 + 每角色 1 张三视图（#1518）。
+  // 守门的职责是「确认人物形象」，一个角色一张图即可；换装三视图锚点属于正式生成的内容，
+  // 由 ensureCostumeAnchors 在图片阶段按需补建，不再压在批准之前（旧实现 25 角色 + 92 套服装 = 118 张）。
+  // #1519：草稿阶段免费认领孤儿三视图。
+  // 清单只在**全部**出图成功后才落盘（publishVisualBibleMutation 的 work() 返回后才写 manifest），
+  // 所以上一次草稿只要有一张图失败，整份就被丢弃——已付费生成的角色三视图会以孤儿文件
+  // 留在产物目录里、没有任何清单指向它们。旧实现每次都重新出图 ⇒ 用户重跑要再付一遍全款。
+  // （sync 路径早已用同一手法认领孤儿，草稿路径漏了。）
+  const orphans = new Map<string, string>();
+  for (const card of cards) {
+    const orphan = await findOrphanThreeViewSheet(artifactDir, card.id);
+    if (orphan) orphans.set(card.id, orphan);
+  }
+  if (orphans.size) {
+    logger.info(
+      "visualBible",
+      `草稿认领 ${orphans.size} 张已有三视图（免 ${orphans.size} 次图像生成；来自上次未落盘的草稿，请在面板确认画风与本次一致）`,
+      { adopted: [...orphans.keys()] },
+    );
+  }
+  // #1520：单角色出图失败不再让整份草稿作废。
+  // 旧实现一失全丢：清单只在**全部**角色成功后落盘，于是已付费的 N-1 张全部成孤儿，
+  // 而且只要那个角色一直失败（如撞内容政策），用户永远拿不到草稿、也就永远无法推进。
+  // 与 images.ts 图像阶段同口径（B74/2680：单任务失败只记录、继续跑完，结束前强制落盘）。
+  const failures: { id: string; name: string; reason: string }[] = [];
+  const imageTotal = 1 + (cards.length - orphans.size);
+  let imageDone = 1; // 画风基准图已在 createDraftStyle 阶段落盘
+  const reportImage = (label: string): void => {
+    imageDone += 1;
+    // 一张图一行日志：出图是长任务，用户要看到「第几张、哪一张」，而不是只有开始/结束两条
+    logger.info("visualBible", `出图 ${imageDone}/${imageTotal}：${label}`, { label, done: imageDone, total: imageTotal });
+    input.onImageProgress?.(imageDone, imageTotal, label);
+  };
   let idx = 0;
   const worker = async (): Promise<void> => {
     while (idx < cards.length) {
@@ -755,33 +920,53 @@ async function createDraftCharacters(
       const card = cards[pos];
       const reference = await resolveCharacterReference(input, card, artifactDir, artifactRevision);
       const prompt = normalizeStyleDescription(card.threeViewPrompt || card.imagePrompt);
-      const references: ImageReference[] = [
-        ...(reference.dataB64 ? [{
-          role: "identity" as const,
-          dataB64: reference.dataB64,
-          mime: reference.mime ?? "image/png",
-          sourcePath: reference.relativePath,
-          required: true,
-        }] : []),
-        { ...styleReference, required: !reference.dataB64 },
-      ];
-      const generated = await generateImageWithModerationRetry(input.imageCfg, characterThreeViewPrompt(prompt, styleDescription), {
-        references,
-        size: "1024x1024",
-      }, dependencies);
-      const threeViewPath = revisionedArtifactPath(canonicalThreeViewPath(card.id), artifactRevision);
-      await writeGeneratedImage(visualBibleArtifactPath(artifactDir, threeViewPath), generated);
-      // 每套服装独立三视图锚点（以默认装三视图为身份参考，换装立绘可引用）
-      const costumeSheets = await generateCostumeSheets(
-        input.imageCfg, card, threeViewPath, styleDescription, styleReference, artifactDir, artifactRevision, dependencies,
-      );
+      // #1518：守门草稿不再生成换装三视图锚点（784e8e2 曾在此为每套服装多画一张，
+      // 使 25 角色的草稿变成 118 张、全部发生在用户点「批准」之前）。
+      // 锚点改由正式生成的 ensureCostumeAnchors 按需补建；缺失时换装立绘自动回退默认装三视图。
       const sourceRevision = reference.relativePath ? 1 : 0;
       const actionIds = productionActionIds(card);
+      const adopted = orphans.get(card.id);
+      let threeViewPath: string;
+      if (adopted) {
+        // #1519：认领孤儿三视图——不调 API，条目直接指向上次草稿留下的已付费文件。
+        // 仍置 approved: false，画风是否合适由用户在面板逐张 accept 决定。
+        threeViewPath = adopted;
+      } else {
+        try {
+          const references: ImageReference[] = [
+            ...(reference.dataB64 ? [{
+              role: "identity" as const,
+              dataB64: reference.dataB64,
+              mime: reference.mime ?? "image/png",
+              sourcePath: reference.relativePath,
+              required: true,
+            }] : []),
+            { ...styleReference, required: !reference.dataB64 },
+          ];
+          const generated = await generateImageWithModerationRetry(input.imageCfg, characterThreeViewPrompt(prompt, styleDescription), {
+            references,
+            size: "1024x1024",
+          }, dependencies);
+          threeViewPath = revisionedArtifactPath(canonicalThreeViewPath(card.id), artifactRevision);
+          await writeGeneratedImage(visualBibleArtifactPath(artifactDir, threeViewPath), generated);
+          reportImage(card.id);
+        } catch (e) {
+          // #1520：记录并继续——其余角色照常出图，最后整份草稿照常落盘。
+          // 失败的角色不建条目，面板会显示「缺三视图」，可用单角色「重新生成」补；
+          // 下次重跑还会认领本批已落盘的图（#1519），不重复付费。
+          failures.push({ id: card.id, name: card.name || card.id, reason: errMsg(e).slice(0, 200) });
+          logger.warn("visualBible", `角色三视图生成失败（已跳过，其余角色照常出图）：${card.name || card.id}`, {
+            characterId: card.id,
+            error: errMsg(e).slice(0, 200),
+          });
+          input.onProgress?.("threeview", pos + 1, cards.length);
+          continue;
+        }
+      }
       characters[card.id] = {
         ...(reference.relativePath ? { sourceReferencePath: reference.relativePath } : {}),
         threeViewPath,
         prompt,
-        ...(Object.keys(costumeSheets).length ? { costumeSheets } : {}),
         ...(actionIds.length ? { actionIds } : {}),
         approved: false,
         revision: 1,
@@ -792,7 +977,14 @@ async function createDraftCharacters(
     }
   };
   await Promise.all(Array.from({ length: Math.min(concurrency, cards.length) }, () => worker()));
-  return characters;
+  if (failures.length) {
+    logger.warn(
+      "visualBible",
+      `草稿完成，但 ${failures.length}/${cards.length} 个角色出图失败（其余已落盘，不会重复付费）：${failures.map((f) => f.name).join("、")}`,
+      { failures },
+    );
+  }
+  return { characters, failures };
 }
 
 export async function createVisualBibleDraft(
@@ -807,10 +999,12 @@ export async function createVisualBibleDraft(
   }
   validateCharacterAssetKeys(input.cards.characters);
   if (input.isAborted?.()) throw new Error("已中止");
+  // #1520：部分失败时的取舍取决于磁盘上有没有清单（必须在 work 之前取，work 要跑几分钟）
+  const hadManifest = await tauri.pathExists(visualBibleManifestPath(input.outputDir)).catch(() => false);
   const published = await mutateAndPublishVisualBible(input.outputDir, async (artifactDir, artifactRevision) => {
     const style = await createDraftStyle(input, dependencies, artifactDir, artifactRevision);
     if (input.isAborted?.()) throw new Error("已中止");
-    const characters = await createDraftCharacters(
+    const { characters, failures } = await createDraftCharacters(
       input,
       style.description,
       style.referencePath,
@@ -818,6 +1012,17 @@ export async function createVisualBibleDraft(
       artifactDir,
       artifactRevision,
     );
+    // #1520：部分失败时的取舍——
+    // 磁盘上已有清单（含已批准）：保持旧行为整单不发布，绝不拿半套草稿冲掉用户的清单
+    //   （既有回归 testDraftAndManifestFailuresPreservePublishedBible 锁的就是这条）。
+    //   已付费的图仍是可认领的孤儿，下次重跑免费复用（#1519），不重复付费。
+    // 磁盘上什么都没有（首次草稿）：照常落盘已完成的部分——否则某个角色一直失败时
+    //   用户永远拿不到草稿、也永远无法在面板上单独补那一个。
+    if (failures.length && hadManifest) {
+      throw new Error(
+        `草稿创建失败：${failures.length} 个角色未出图（${failures.map((f) => `${f.name}：${f.reason}`).join("；")}）；已保留原有清单未改动。已生成的图片保留在磁盘，重跑会免费复用。`,
+      );
+    }
     // 1443：中止窗口——角色循环的中止检查只在每次迭代顶部，最后一个角色生成期间
     // 点「中止」时循环已结束、不再检查，Promise.all 正常 resolve 后草稿会被完整发布，
     // 而面板只看外部 flag 报「未保存任何内容」，用户重来再付一次全款。
@@ -847,6 +1052,113 @@ export async function createVisualBibleDraft(
     };
   });
   return published;
+}
+
+/**
+ * 正式生成阶段的换装锚点按需补建（#1518）。
+ *
+ * 守门草稿只出「一个角色一张三视图」——守门的职责是确认人物形象，一个角色一张图即可。
+ * 换装三视图锚点属于正式生成的内容：真正要用到时才补，避免批准前就为全部服装付费。
+ * （784e8e2 曾在草稿里为每套服装多画一张，25 角色 + 92 套服装 = 118 张，
+ *  全部发生在用户点「批准」之前。）
+ *
+ * 只补「有 prompt 且尚无锚点」的服装；锚点缺失时换装立绘本就会回退默认装三视图
+ * （images.ts resolveImageTaskReferences 的 candidates 回退链），故本函数失败不阻断正式生成。
+ *
+ * #1519：与草稿同一口径——先认领磁盘上已有的锚点文件（上一次因某套失败而整单未落盘的付费产物），
+ * 只对真正缺的服装发起生成，重跑不重复付费。
+ *
+ * @returns created 本次新建的锚点数；adopted 免费认领的锚点数；failed 有 prompt 但没画出来的服装数
+ */
+export async function ensureCostumeAnchors(
+  outputDir: string,
+  cards: CharacterCard[],
+  imageCfg: ApiConfig,
+  dependencies: VisualBibleServiceDependencies = DEFAULT_DEPENDENCIES,
+  onImage?: (label: string) => void,
+  isAborted?: () => boolean,
+): Promise<{ created: number; adopted: number; failed: number }> {
+  const loaded = await loadVisualBible(outputDir, cards.map((card) => card.id));
+  const bible = loaded.visualBible;
+  // 只有已批准的守门才有换装锚点可言；草稿/过期状态由既有流程（批准/重建）处理
+  if (!bible || bible.status !== "approved") return { created: 0, adopted: 0, failed: 0 };
+
+  const pendingFor = (card: CharacterCard): CharacterCostume[] => {
+    const character = bible.characters[card.id];
+    if (!character?.threeViewPath) return [];
+    // 与 generateCostumeSheets 同一份清单（含档位预算）：预算外的服装不在这里排队，
+    // 否则「缺锚点 → 补建 → 被预算跳过 → 下次仍算缺」会每轮重扫一遍却永远补不上。
+    return figureCostumeEntries(card, { detail: "full", threeView: true }).filter((ct) => {
+      const prompt = normalizeStyleDescription(ct.prompt || "");
+      return !!prompt && !character.costumeSheets?.[ct.id]?.threeViewPath;
+    });
+  };
+  if (!cards.some((card) => pendingFor(card).length > 0)) return { created: 0, adopted: 0, failed: 0 };
+
+  const styleReferencePath = visualBiblePath(outputDir, bible.styleReferencePath);
+  const styleReference = await readReferenceFile(styleReferencePath, "Global style reference");
+  let created = 0;
+  let adopted = 0;
+  let failed = 0;
+
+  await mutateAndPublishVisualBible(outputDir, async (artifactDir, artifactRevision) => {
+    const next = cloneVisualBible(bible);
+    // 列一次目录，供本轮所有换装锚点认领复用
+    const entries = await listArtifactNames(artifactDir);
+    for (const card of cards) {
+      if (isAborted?.()) break;
+      const character = next.characters[card.id];
+      if (!character?.threeViewPath) continue;
+      const pending = pendingFor(card);
+      if (!pending.length) continue;
+      // #1519：先认领已落盘的锚点（上一次整单未落盘时留下的付费产物），只对真缺的发请求
+      const claimed: Record<string, VisualBibleCostumeSheet> = {};
+      const missing: CharacterCostume[] = [];
+      for (const ct of pending) {
+        const orphan = pickLatestRevisionedArtifact(entries, canonicalCostumeSheetPath(card.id, ct.id));
+        if (orphan) {
+          claimed[ct.id] = {
+            threeViewPath: orphan,
+            prompt: normalizeStyleDescription(ct.prompt || ""),
+            revision: 1,
+            approved: false,
+          };
+        } else {
+          missing.push(ct);
+        }
+      }
+      if (Object.keys(claimed).length) {
+        adopted += Object.keys(claimed).length;
+        logger.info("visualBible", `认领已有换装锚点 ${Object.keys(claimed).length} 张：${card.name || card.id}（免生成，请确认画风与本次一致）`, {
+          characterId: card.id,
+          costumes: Object.keys(claimed),
+        });
+      }
+      const sheets = missing.length
+        ? await generateCostumeSheets(
+          imageCfg,
+          { ...card, costumes: missing },
+          character.threeViewPath,
+          next.styleDescription,
+          { role: "style", ...styleReference, sourcePath: styleReferencePath },
+          artifactDir,
+          artifactRevision,
+          dependencies,
+          onImage,
+        )
+        : {};
+      const merged = { ...claimed, ...sheets };
+      const keys = Object.keys(merged);
+      if (keys.length) {
+        character.costumeSheets = { ...(character.costumeSheets ?? {}), ...merged };
+        created += Object.keys(sheets).length;
+      }
+      failed += missing.filter((ct) => !sheets[ct.id]).length;
+    }
+    return { bible: next, cards };
+  });
+
+  return { created, adopted, failed };
 }
 
 export async function updateStyleDescription(
@@ -984,7 +1296,7 @@ export async function regenerateCharacterSheet(
     if (!storedCharacter) {
       const cardPrompt = normalizeStyleDescription(characterCard.threeViewPrompt || characterCard.imagePrompt);
       if (!cardPrompt) {
-        throw new Error(`Character ${characterId} 在视觉守门中缺失，且卡片缺少绘画提示词：请先点「重新生成描述」或去卡片编辑补写 imagePrompt`);
+        throw new Error(t("Character {id} 在视觉守门中缺失，且卡片缺少绘画提示词：请先点「重新生成描述」或去卡片编辑补写 imagePrompt", { id: characterId }));
       }
       promptForGen = cardPrompt;
     }
@@ -1054,7 +1366,7 @@ export async function regenerateCharacterSheet(
   return visualBiblePath(outputDir, published.characters[characterId].threeViewPath);
 }
 
-export interface RegenerateAllSheetsRequest {
+interface RegenerateAllSheetsRequest {
   characters: CharacterCard[];
   imageCfg: ApiConfig;
   /** 描述重写用的文本/视觉配置；不传则只重画三视图、不重写描述 */
@@ -1067,7 +1379,7 @@ export interface RegenerateAllSheetsRequest {
   isAborted?: () => boolean;
 }
 
-export interface RegenerateAllSheetsResult {
+interface RegenerateAllSheetsResult {
   /** 成功的角色 id */
   ok: string[];
   /** 失败的角色（单字符失败只记不抛，不中断其余） */
@@ -1140,7 +1452,7 @@ export async function regenerateAllCharacterSheets(
       if (!promptForGen) {
         const cardPrompt = normalizeStyleDescription(threeViewPrompt || imagePrompt || "");
         if (!cardPrompt) {
-          throw new Error(`Character ${characterCard.id} 在视觉守门中缺失，且卡片缺少绘画提示词：请先点「重新生成描述」或去卡片编辑补写 imagePrompt`);
+          throw new Error(t("Character {id} 在视觉守门中缺失，且卡片缺少绘画提示词：请先点「重新生成描述」或去卡片编辑补写 imagePrompt", { id: characterCard.id }));
         }
         promptForGen = cardPrompt;
       }
@@ -1254,7 +1566,7 @@ export async function regenerateAllCharacterSheets(
   return { ok: [...persistedIds], failed, updatedCards };
 }
 
-export interface BibleCharacterSyncRequest {
+interface BibleCharacterSyncRequest {
   characters: CharacterCard[];
   /** 缺失条目补建三视图时需要（调图像 API）；仅移除多余条目时可不传 */
   imageCfg?: ApiConfig;
@@ -1265,7 +1577,7 @@ export interface BibleCharacterSyncRequest {
   isAborted?: () => boolean;
 }
 
-export interface BibleCharacterSyncResult {
+interface BibleCharacterSyncResult {
   /** 新建条目的角色 id */
   added: string[];
   /** 复用孤儿三视图文件建条目的角色 id（免一次图像生成，需人工确认） */
@@ -1278,24 +1590,33 @@ export interface BibleCharacterSyncResult {
 
 /** 找同 id 的孤儿三视图文件（条目丢了但图还在，如北川丽音）：取最新 rev 版。
  * 复用前需人工确认（accept 流程），故只认领文件、不认领 approved 状态。 */
-async function findOrphanThreeViewSheet(artifactDir: string, characterId: string): Promise<string | null> {
-  const canonical = canonicalThreeViewPath(characterId);
+async function listArtifactNames(artifactDir: string): Promise<{ name: string; isDir: boolean }[]> {
+  try {
+    return await tauri.listDir(artifactDir);
+  } catch {
+    return [];
+  }
+}
+
+/** 纯匹配：在已列出的产物名里，取 canonical 对应的最新 rev 文件（rev 是 base36 时间戳，字典序即时间序）。 */
+function pickLatestRevisionedArtifact(
+  entries: { name: string; isDir: boolean }[],
+  canonical: string,
+): string | null {
   const dot = canonical.lastIndexOf(".");
   const stem = dot >= 0 ? canonical.slice(0, dot) : canonical;
   const ext = dot >= 0 ? canonical.slice(dot) : ".png";
   const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const re = new RegExp(`^${escapeRe(stem)}\\.rev-([A-Za-z0-9-]+)${escapeRe(ext)}$`);
-  try {
-    const entries = await tauri.listDir(artifactDir);
-    const hits = entries
-      .filter((e) => !e.isDir && re.test(e.name))
-      .map((e) => e.name)
-      .sort();
-    if (!hits.length) return null;
-    return hits[hits.length - 1];
-  } catch {
-    return null;
-  }
+  const hits = entries
+    .filter((e) => !e.isDir && re.test(e.name))
+    .map((e) => e.name)
+    .sort();
+  return hits.length ? hits[hits.length - 1] : null;
+}
+
+async function findOrphanThreeViewSheet(artifactDir: string, characterId: string): Promise<string | null> {
+  return pickLatestRevisionedArtifact(await listArtifactNames(artifactDir), canonicalThreeViewPath(characterId));
 }
 
 /**
@@ -1336,7 +1657,7 @@ export async function syncBibleCharactersWithCards(
           failed.push({
             id: card.id,
             name: label,
-            reason: "卡片缺少绘画提示词（imagePrompt/threeViewPrompt 均为空），请先点该角色「重新生成描述」或去卡片编辑补写",
+            reason: t("卡片缺少绘画提示词（imagePrompt/threeViewPrompt 均为空），请先点该角色「重新生成描述」或去卡片编辑补写"),
           });
           continue;
         }
@@ -1450,7 +1771,7 @@ export async function ensureBibleCharacterEntry(
   if (bible.characters[characterCard.id]) return;
   const finalPrompt = normalizeStyleDescription(prompt ?? characterCard.threeViewPrompt ?? characterCard.imagePrompt ?? "");
   if (!finalPrompt) {
-    throw new Error(`Character ${characterCard.id} 缺少绘画提示词：请先点「重新生成描述」或去卡片编辑补写 imagePrompt`);
+    throw new Error(t("Character {id} 缺少绘画提示词：请先点「重新生成描述」或去卡片编辑补写 imagePrompt", { id: characterCard.id }));
   }
   const actionIds = productionActionIds(characterCard);
   await mutateAndPublishVisualBible(outputDir, async () => {
@@ -2499,7 +2820,7 @@ async function gatherVisualInputPayloads(
  * 与出图输入一一对应的视觉签名（不含小说正文/分章）。
  * 批准时写进 ProjectVisualBible.visualInputs，之后指纹变化时用它判断影响范围。
  */
-export async function computeProjectVisualInputSignature(
+async function computeProjectVisualInputSignature(
   outputDir: string,
   bible: Pick<ProjectVisualBible, "styleSource" | "styleDescription" | "styleReferencePath" | "characters">,
   characters: readonly CharacterCard[],
@@ -2578,7 +2899,7 @@ export async function assertVisualBibleReadyForImages(
  * core 内原英文字符串保持不变（测试与日志口径依赖），只新增映射，不改抛错语义。
  * i18n 词典（en/ja/ko/zh-TW）由词典负责人补翻译，所需 key 见本函数返回与下方上报清单。
  */
-export interface LocalizedApprovalError {
+interface LocalizedApprovalError {
   key: string;
   params?: Record<string, string | number>;
   fallback: string;

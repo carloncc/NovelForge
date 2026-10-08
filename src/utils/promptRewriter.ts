@@ -3,7 +3,7 @@
  * 词表覆盖动漫/galgame 题材常见触发类目（暴力/武器/裸露/身体/年龄/性暗示），中英双语。
  */
 
-export interface RewriteResult {
+interface RewriteResult {
   prompt: string;
   replaced: number;
 }
@@ -118,10 +118,21 @@ export function sanitizePrompt(prompt: string): RewriteResult {
   return { prompt: out, replaced };
 }
 
-/** 追加"安全/适合全年龄"风格后缀（部分模型对全年龄描述更宽松） */
+/**
+ * 追加"安全/适合全年龄"风格后缀（部分模型对全年龄描述更宽松）。
+ *
+ * #1560：本函数必须**幂等**。images.ts 的内容审查改写阶梯会在第 1 阶与第 2 阶各调一次
+ * （未配置安全改写 LLM 时两阶都走「追加后缀」这条兜底），原实现无条件追加，于是：
+ *   1. 提示词里同一段安全后缀被写了两遍（畸形、浪费 token）；
+ *   2. **第 2 阶那次是白烧钱的付费重试**——它发出的请求与第 1 阶只差一段重复样板，
+ *      注定同样被拒。这与该阶梯自己的注释「不再白烧钱」正好相反。
+ * 加了「已含后缀则原样返回」后，第 2 阶不再产生新请求语义，阶梯随后按预期收束。
+ */
 export function appendSafeStyleSuffix(prompt: string): string {
   const safe =
     "anime style, wholesome, suitable for all audiences, family friendly, no explicit content";
+  // 幂等：已经带过这段后缀就不再追加（避免重复样板与注定失败的重试）
+  if (prompt.includes(safe)) return prompt;
   return prompt.endsWith(".")
     ? `${prompt} ${safe}.`
     : `${prompt}, ${safe}`;

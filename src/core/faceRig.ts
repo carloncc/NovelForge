@@ -11,8 +11,7 @@ import { tauri } from "../utils/tauri";
 import { log as logger } from "../utils/logger";
 import { stableHash } from "./ids";
 
-export const FACE_RIG_FILE = ".novel2vn/face-rig.json";
-export const FACE_RIG_VERSION = 1 as const;
+const FACE_RIG_VERSION = 1 as const;
 
 /** rig 部件：5 必需 + 2 红晕（embarrassed 类表情需要） */
 export type FaceRigPart =
@@ -24,8 +23,8 @@ export type FaceRigPart =
   | "blush_left"
   | "blush_right";
 
-export const REQUIRED_RIG_PARTS: FaceRigPart[] = ["brow_left", "brow_right", "eye_left", "eye_right", "mouth"];
-export const OPTIONAL_RIG_PARTS: FaceRigPart[] = ["blush_left", "blush_right"];
+const REQUIRED_RIG_PARTS: FaceRigPart[] = ["brow_left", "brow_right", "eye_left", "eye_right", "mouth"];
+const OPTIONAL_RIG_PARTS: FaceRigPart[] = ["blush_left", "blush_right"];
 const ALL_RIG_PARTS: FaceRigPart[] = [...REQUIRED_RIG_PARTS, ...OPTIONAL_RIG_PARTS];
 
 /** rig 椭圆 [cx,cy,rx,ry]：归一化坐标（0..1，相对整图），与分辨率无关 */
@@ -38,7 +37,7 @@ export interface NormalizedBbox {
   y1: number;
 }
 /** 归一化矩形（crop / 肤色采样区，分辨率无关） */
-export interface NormalizedRect {
+interface NormalizedRect {
   x: number;
   y: number;
   w: number;
@@ -67,11 +66,11 @@ export interface FaceRig {
 /** bbox 半宽/半高换算椭圆半径的系数（#1085：由 bbox 中心与尺寸推导） */
 export const RIG_ELLIPSE_K = 1.0;
 /** 默认羽化宽度（像素，1024 级立绘；可在校准文件里手改） */
-export const RIG_FEATHER_PX_DEFAULT = 12;
+const RIG_FEATHER_PX_DEFAULT = 12;
 /** 脸部裁切相对脸框的外扩边距（归一化比例） */
-export const RIG_CROP_MARGIN = 0.15;
+const RIG_CROP_MARGIN = 0.15;
 
-export class FaceRigError extends Error {
+class FaceRigError extends Error {
   readonly code = "FACE_RIG_INVALID" as const;
   constructor(message: string) {
     super(message);
@@ -230,12 +229,12 @@ export function needsRecalibration(saved: FaceRig | null, fingerprint: string): 
   }
 }
 
-export function rigFilePath(outputDir: string): string {
+function rigFilePath(outputDir: string): string {
   return `${outputDir.replace(/[\\/]+$/, "")}/.novel2vn/face-rig.json`;
 }
 
 /** 读 rig：文件缺失/解析失败/结构非法一律返回 null（由 ensureFaceRig 决定重标还是显式报错） */
-export async function readFaceRig(outputDir: string): Promise<FaceRig | null> {
+async function readFaceRig(outputDir: string): Promise<FaceRig | null> {
   try {
     const path = rigFilePath(outputDir);
     if (!(await tauri.pathExists(path).catch(() => false))) return null;
@@ -252,7 +251,7 @@ export async function readFaceRig(outputDir: string): Promise<FaceRig | null> {
 }
 
 /** 写 rig（供自动标定与后续手动校准编辑器复用同一文件） */
-export async function writeFaceRig(outputDir: string, rig: FaceRig): Promise<void> {
+async function writeFaceRig(outputDir: string, rig: FaceRig): Promise<void> {
   const dir = `${outputDir.replace(/[\\/]+$/, "")}/.novel2vn`;
   await tauri.mkdirAll(dir);
   await tauri.writeTextFile(rigFilePath(outputDir), JSON.stringify(rig, null, 2));
@@ -274,7 +273,7 @@ const RIG_VISION_SYSTEM = `你是立绘脸部标定器。用户给你一张动�
 3. 框必须在脸部内部且 x1>x0、y1>y0；看不清的部件也必须给最合理的估计框，绝不省略键（省略会导致整条链路显式失败）。`;
 
 /** 用 vision 通道标定单张 base 立绘（缺部件直接抛错，不静默降级） */
-export async function calibrateFaceRig(
+async function calibrateFaceRig(
   visionCfg: ApiConfig,
   baseB64: string,
   imageWidth: number,
@@ -293,7 +292,7 @@ export async function calibrateFaceRig(
   return rig;
 }
 
-export interface EnsureFaceRigOptions {
+interface EnsureFaceRigOptions {
   outputDir: string;
   baseB64: string;
   width: number;
@@ -327,14 +326,14 @@ export async function ensureFaceRig(opts: EnsureFaceRigOptions): Promise<{ rig: 
 
 /* ================= 归一化 rig → 像素坐标（合成/核验用） ================= */
 
-export interface PixelEllipse {
+interface PixelEllipse {
   cx: number;
   cy: number;
   rx: number;
   ry: number;
 }
 
-export interface PixelRect {
+interface PixelRect {
   x: number;
   y: number;
   w: number;

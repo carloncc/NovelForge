@@ -1,9 +1,13 @@
+import { isRef } from "vue";
 import { configState } from "../src/stores/config";
 import {
   decideNovelImport,
   removeProjectEntry,
   suggestProjectSubdirName,
   upsertProject,
+  truncateProjectList,
+  lastEvictedProjects,
+  PROJECT_LIST_LIMIT,
 } from "../src/stores/projects";
 
 function assert(condition: unknown, message: string): asserts condition {
@@ -45,6 +49,27 @@ async function main(): Promise<void> {
     "移除记录应只删指定条目",
   );
   configState.projects = [];
+
+  // ---- #1511：上限挤出必须留痕（此前内联 slice(0,30) 静默丢弃，且 lastEvictedProjects 是 export let，Vue 追踪不到）----
+  assert(isRef(lastEvictedProjects), "lastEvictedProjects 必须是 ref：模块级 export let 不会被 Vue 依赖收集，UI 提示永远不会出现");
+
+  const sample = Array.from({ length: PROJECT_LIST_LIMIT + 3 }, (_, i) => ({
+    id: `p${i}`, name: `n${i}`, outputDir: `D:/out/${i}`, novelFileName: "", novelTitle: "", updatedAt: "",
+  }));
+  const noEvict = truncateProjectList(sample.slice(0, PROJECT_LIST_LIMIT));
+  assert(noEvict.kept.length === PROJECT_LIST_LIMIT && noEvict.evicted.length === 0, "正好等于上限不应挤出任何条目");
+  const over = truncateProjectList(sample);
+  assert(over.kept.length === PROJECT_LIST_LIMIT, "超出上限应保留到上限条数");
+  assert(over.evicted.length === 3 && over.evicted[0].outputDir === "D:/out/" + PROJECT_LIST_LIMIT, "被挤出的应是最旧条目");
+
+  configState.projects = [];
+  lastEvictedProjects.value = [];
+  for (let i = 0; i <= PROJECT_LIST_LIMIT; i++) upsertProject(`D:/out/${i}`);
+  assert((configState.projects ?? []).length === PROJECT_LIST_LIMIT, "upsertProject 应按 PROJECT_LIST_LIMIT 截断（不是硬编码 30）");
+  assert(lastEvictedProjects.value.length === 1, `超出上限时应留痕被挤出的条目，实际 ${lastEvictedProjects.value.length}`);
+  assert(lastEvictedProjects.value[0].outputDir === "D:/out/0", "留痕的应是最旧那条");
+  configState.projects = [];
+  lastEvictedProjects.value = [];
 
   console.log("=== project registry tests passed ===");
 }

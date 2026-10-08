@@ -340,7 +340,7 @@ export async function restoreProjectState(outputDir: string): Promise<{
           }));
         } else {
           const saved = new Map(persistedState.novel!.chapters.map((c) => [c.index, c]));
-          fresh.chapters = fresh.chapters.map((ch, i) => {
+          fresh.chapters = fresh.chapters.map((ch) => {
             const s = saved.get(ch.index);
             if (s) {
               ch.title = s.title || ch.title;
@@ -362,7 +362,6 @@ export async function restoreProjectState(outputDir: string): Promise<{
     // 源文件缺失/不可读（重命名、移动、清理过下载目录，或导入时就没有真实路径）时，
     // 用分章缓存把小说重建出来，而不是让重启后的生成页丢掉整个「按章节生成」入口。
     let novelRestoredFromSplitCache = false;
-    let novelRestoredFromScriptCache = false;
     if (!novel) {
       novel = await restoreNovelFromSplitCache(
         outputDir,
@@ -375,7 +374,6 @@ export async function restoreProjectState(outputDir: string): Promise<{
       // 这些都是"开发到一半"的项目，novel 为 null 会让整个生成页失去入口。
       if (!novel) {
         novel = await restoreNovelFromScriptCache(outputDir);
-        novelRestoredFromScriptCache = !!novel;
       }
     }
 

@@ -48,6 +48,9 @@ import { projectState } from "../../stores/project";
         </span>
       </label>
     </div>
+    <p class="hint" style="margin-top: 10px">
+      {{ t("次要角色/路人按档位自动省图（表情/服装/动作张数上限）；要全量请在卡片编辑里把该角色的图片档位改成主要角色") }}
+    </p>
   </div>
 </template>
 

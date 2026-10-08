@@ -4,7 +4,7 @@ import { en } from "./en";
 import { ja } from "./ja";
 import { ko } from "./ko";
 
-export type LangCode = "zh-CN" | "zh-TW" | "en" | "ja" | "ko";
+type LangCode = "zh-CN" | "zh-TW" | "en" | "ja" | "ko";
 
 export const LANGS: { code: LangCode; label: string }[] = [
   { code: "zh-CN", label: "简体中文" },
@@ -26,7 +26,7 @@ const dicts: Record<LangCode, Record<string, string>> = {
 const storageKey = "novelforge:uiLang";
 
 /** 跟随系统语言（Tauri webview 与浏览器一致） */
-export function detectSystemLang(): LangCode {
+function detectSystemLang(): LangCode {
   try {
     const l = (navigator.language ?? "").toLowerCase();
     if (l.startsWith("zh")) return /hant|tw|hk|mo/.test(l) ? "zh-TW" : "zh-CN";
@@ -59,6 +59,21 @@ export function setLang(code: LangCode): void {
   }
 }
 
+/**
+ * 日志时间戳按**界面语言**本地化（#1525）。
+ *
+ * UI15 当初只把界面日志面板（LogPanel / FailedPanel / ImageStoryPage）改成了跟随界面语言，
+ * 三处日志导出（落盘 run-*.log、复制到剪贴板、保存诊断日志）仍是 toLocaleTimeString() 的无参形式，
+ * 走浏览器/系统默认语言。界面语言与系统语言不一致时（英文界面 + 中文系统，或反过来），
+ * 用户复制出去、发给别人的日志时间戳与屏幕上的对不上。
+ *
+ * 统一收口到这里：谁需要时间戳都走这一个函数，克隆体不会再各走各的。
+ */
+export function formatLogTime(ms: number): string {
+  const lang = currentLang.value;
+  return new Date(ms).toLocaleTimeString(lang === "zh-CN" ? "zh-CN" : lang);
+}
+
 /** 翻译：key = 中文原文，缺翻译自动回退原文；{name} 占位符插值 */
 export function t(key: string, params?: Record<string, string | number>): string {
   const dict = dicts[currentLang.value] ?? {};
@@ -87,6 +102,3 @@ export function syncDocumentLocale(): void {
   }
 }
 
-export function useI18n() {
-  return { t, currentLang, setLang, LANGS };
-}

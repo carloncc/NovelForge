@@ -15,7 +15,7 @@ const stopHandlers = new Map<RunSource, () => void>();
 
 /** #1319：两套付费管线（主管线 main / 图片小说 image）各写各的运行态，忙=或——
  *  一方结束写 idle 不再误清另一方的 busy（此前单槽 last-write-wins，侧栏指示与导入守卫失真）。 */
-export type RunSource = "main" | "image";
+type RunSource = "main" | "image";
 interface SourceState {
   busy: boolean;
   assetLabel: string;

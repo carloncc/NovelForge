@@ -1,6 +1,6 @@
-﻿import type { ChapterScript, ExtractionResult, ProjectMeta } from "./types";
+import type { ChapterScript, ExtractionResult, ProjectMeta } from "./types";
 import type { RenderAssets, WebgalLanguage } from "./render";
-import { renderChapter, renderConfig, renderStart, chapterDisplayTitle, sanitizeId, engineSafeFileName } from "./render";
+import { renderChapter, renderConfig, renderStart, chapterDisplayTitle, sanitizeId, engineSafeFileName, SUPPORTED_WEBGAL_VERSION } from "./render";
 import { tauri, type FsEntry } from "../utils/tauri";
 import { basename, joinPath, normalizePath } from "../utils/path";
 import { log } from "../utils/logger";
@@ -9,8 +9,9 @@ import { validateTemplateFill } from "../utils/template";
 import { ConcurrencyLimiter } from "../utils/performance";
 import { brandUrl, brandFooterHtml } from "../utils/branding";
 import { extractAccentFromImage, hslOf, type AccentPair } from "./themeColors";
+import { safeSlice } from "../utils/text";
 
-export interface AssembleInput {
+interface AssembleInput {
   outputDir: string;
   title: string;
   gameKey: string;
@@ -231,7 +232,8 @@ export async function assembleProject(input: AssembleInput): Promise<{ gameDir: 
       : pickTitleBgm(bgmMap);
   if (titleBgm) {
     try {
-      const exists = await tauri.pathExists(joinPath(normalizedOutputDir, "game/bgm", titleBgm));
+      // #1515：磁盘上的文件名是 engineSafeFileName 之后的，用原始名探测会误判「不存在」
+    const exists = await tauri.pathExists(joinPath(normalizedOutputDir, "game/bgm", engineSafeFileName(titleBgm)));
       if (!exists) {
         input.log(`警告：标题曲 ${titleBgm} 在 game/bgm/ 中不存在，已回退自动匹配`);
         titleBgm = pickTitleBgm(bgmMap);
@@ -249,6 +251,14 @@ export async function assembleProject(input: AssembleInput): Promise<{ gameDir: 
       appreciation: input.titleEnableAppreciation,
     }),
   );
+
+  // #1517：模板版本与渲染器已核实的版本不一致时明确报警。
+  // 模板由 fetch-webgal-template.mjs 独立升级，而渲染产物语法只对 SUPPORTED_WEBGAL_VERSION 成立；
+  // 此前没有任何地方比对二者，升级模板后游戏会「能生成但行为不对」，且无从追查。
+  const templateVersions = await readTemplateEngineVersions(input.templateDir);
+  if (templateVersions.some((v) => v !== SUPPORTED_WEBGAL_VERSION)) {
+    input.log(`模板引擎版本为 ${templateVersions.join(" / ")}，而本渲染器仅核实过 ${SUPPORTED_WEBGAL_VERSION} 的语法语义；建议用匹配版本的模板重新下载（scripts/fetch-webgal-template.mjs）`);
+  }
 
   input.log("复制素材…");
   await copyAssets(input.assets, normalizedOutputDir);
@@ -282,7 +292,7 @@ export async function assembleProject(input: AssembleInput): Promise<{ gameDir: 
       0,
     ),
     outputDir: normalizedOutputDir,
-    webgalVersion: "4.6.3",
+    webgalVersion: SUPPORTED_WEBGAL_VERSION,
     generatedAt: new Date().toISOString(),
   };
   
@@ -329,7 +339,9 @@ async function copyBuiltinSe(outputDir: string, input: AssembleInput): Promise<v
 
 /** 鉴赏室：生成素材清单数据（appreciation-data.js）+ 复制鉴赏页（立绘换装/表情/动作/缩放、CG/背景画廊、角色图鉴、BGM 试听） */
 async function writeAppreciation(outputDir: string, input: AssembleInput, bgmMap: Record<string, string>): Promise<void> {
-  const basename = (p?: string) => (p || "").split(/[\\/]/).pop() || "";
+  // #1515：鉴赏室的图/曲名必须与 copyAssets 落盘同名。此前这里取「原始 basename」，
+  // 而磁盘写的是 engineSafeFileName —— 含 ; | 或“ -”的素材会「画廊里有、磁盘上找不到」。
+  const basename = (p?: string) => engineSafeFileName(p || "");
   const stripExt = (f: string) => f.replace(/\.(png|jpg|jpeg|webp|gif)$/i, "");
   // 场景元数据：CG/背景的 assets key 已是 scene.id（images.ts），
   // 旧实现从 key 解析 `^(\d+)_` 章节号——CG 键改成 scene.id 后分组恒为 1、名称显示文件名（UI94）
@@ -342,7 +354,7 @@ async function writeAppreciation(outputDir: string, input: AssembleInput, bgmMap
         sceneMeta.set(s.id, { location: s.location, chapter: c.chapter + 1, cgTitle: s.cgEvent?.title });
       }
       for (const sh of s.shots ?? []) {
-        const note = (sh.note || "").trim().slice(0, 20);
+        const note = safeSlice((sh.note || "").trim(), 20);
         if (sh.id && note && !shotNote.has(sh.id)) shotNote.set(sh.id, note);
       }
     }
@@ -456,19 +468,28 @@ async function writeAppreciation(outputDir: string, input: AssembleInput, bgmMap
     const dest = joinPath(outputDir, "appreciation.html");
     // #1375：输出目录是构建产物，模板升级必须落盘才生效；但用户可能手改过 dest，
     // 无脑覆盖会吞掉定制。写入前比对：内容不一致则先备份旧文件（.bak），再覆盖并记日志明示。
+    let backupOk = true;
     try {
       const [tplText, destText] = await Promise.all([
         tauri.readTextFile(tpl).then((r) => r.text).catch(() => null),
         tauri.readTextFile(dest).then((r) => r.text).catch(() => null),
       ]);
       if (destText !== null && tplText !== null && destText !== tplText) {
-        await tauri.writeTextFile(`${dest}.bak`, destText).catch(() => undefined);
-        input.log("鉴赏页模板已升级：旧 appreciation.html 已备份为 appreciation.html.bak（曾被手动修改过）");
+        // #1516：备份失败必须 fail closed。旧实现 .catch(() => undefined) 后照常覆盖，
+        // 用户手改的 appreciation.html 被永久销毁，而日志还宣称「已备份」。
+        try {
+          await tauri.writeTextFile(`${dest}.bak`, destText);
+          input.log("鉴赏页模板已升级：旧 appreciation.html 已备份为 appreciation.html.bak（曾被手动修改过）");
+        } catch (backupErr) {
+          backupOk = false;
+          input.log(`鉴赏页模板未覆盖：备份旧 appreciation.html 失败（${errMsg(backupErr).slice(0, 80)}），已保留你手动修改过的版本`);
+        }
       }
     } catch {
       /* 比对失败不阻断复制 */
     }
-    await tauri.copyFile(tpl, dest);
+    // #1516：仅在「无需备份」或「备份成功」时才覆盖
+    if (backupOk) await tauri.copyFile(tpl, dest);
   } catch (e) {
     input.log(`鉴赏室资源写入失败（不影响游戏本体）：${errMsg(e).slice(0, 80)}`);
   }
@@ -839,6 +860,13 @@ async function writeStartScripts(outputDir: string): Promise<void> {
   try {
     await tauri.writeTextFile(joinPath(outputDir, "start_game.bat"), bat);
     await tauri.writeTextFile(joinPath(outputDir, "start_game.command"), sh);
+    // #1514：内容写完还不够——没有执行位时 macOS 双击这个 .command 根本不会运行。
+    // 失败不阻断组装（游戏本体仍可手动起服务），与本函数既有降级策略一致。
+    try {
+      await tauri.setExecutable(joinPath(outputDir, "start_game.command"));
+    } catch (e) {
+      log.warn("project", `start_game.command 执行位设置失败（macOS 双击可能无反应）：${errMsg(e).slice(0, 100)}`);
+    }
   } catch (e) {
     log.warn("project", `启动脚本写入失败（不影响游戏本体）：${errMsg(e).slice(0, 100)}`);
   }
@@ -921,7 +949,7 @@ async function patchManifestAndIcons(outputDir: string, title: string, coverName
     /* 模板缺 manifest 不影响游戏 */
   }
   if (!coverName) return;
-  const src = joinPath(outputDir, "game/background", coverName);
+  const src = joinPath(outputDir, "game/background", engineSafeFileName(coverName));
   try {
     const mime = /\.jpe?g$/i.test(coverName) ? "image/jpeg" : /\.webp$/i.test(coverName) ? "image/webp" : "image/png";
     const icons = await buildPwaIcons(await tauri.readFileBase64(src), mime);
@@ -938,6 +966,23 @@ async function patchManifestAndIcons(outputDir: string, title: string, coverName
     }
   } catch {
     /* 图标替换失败不影响游戏 */
+  }
+}
+
+/** 读模板自带 webgal-engine.json 里声明的版本（纯诊断，取不到返回空数组而非报错）。
+ *  #1517：该文件同时带 `version` 与 `webgalVersion` 两个字段，二者可以不一致；
+ *  只看其中一个会让「两个字段打架」完全不可见，故两个都收、如实回报。 */
+async function readTemplateEngineVersions(templateDir: string): Promise<string[]> {
+  try {
+    const { text } = await tauri.readTextFile(joinPath(templateDir, "webgal-engine.json"));
+    const parsed = JSON.parse(text) as { webgalVersion?: unknown; version?: unknown };
+    const out: string[] = [];
+    for (const v of [parsed.webgalVersion, parsed.version]) {
+      if (typeof v === "string" && v.trim() && !out.includes(v.trim())) out.push(v.trim());
+    }
+    return out;
+  } catch {
+    return [];
   }
 }
 
@@ -968,7 +1013,10 @@ async function copyAssets(assets: RenderAssets, outputDir: string): Promise<void
   const vocalDir = joinPath(outputDir, "game/vocal");
 
   const jobs: Array<Promise<void>> = [];
-  for (const p of Object.values(assets.bg)) jobs.push(copy(p, bgDir));
+  // #1580 背景复用：同一张图被多个 scene.id 引用（桶内所有场景都指向它），
+  // 直接按 values 复制会把同一个文件重复拷 1.8 倍（实测 502 个映射 → 269 个文件）。
+  // 按源路径去重，导出更快且行为不变。
+  for (const p of new Set(Object.values(assets.bg))) jobs.push(copy(p, bgDir));
   // 图片小说分镜：与背景同目录（WebGAL changeBg 从 game/background 解析）
   for (const p of Object.values(assets.shot ?? {})) jobs.push(copy(p, bgDir));
   for (const p of Object.values(assets.cg)) jobs.push(copy(p, bgDir));
@@ -1087,7 +1135,7 @@ const BGM_RULES: Array<[RegExp, string[]]> = [
 ];
 
 /** 稳定哈希（同一场景每次组装结果一致，避免重装后 BGM 乱跳） */
-function stableHash(s: string): number {
+function bgmPoolHash(s: string): number {
   let h = 0;
   for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
   return h;
@@ -1125,13 +1173,13 @@ async function detectBgm(
       if (want >= 0) {
         // 首选与描述同氛围的文件（多首按场景稳定轮换）
         const sameRule = files.filter((f) => fileRule.get(f) === want);
-        if (sameRule.length) hit = sameRule[stableHash(scene.id) % sameRule.length];
+        if (sameRule.length) hit = sameRule[bgmPoolHash(scene.id) % sameRule.length];
       }
       if (!hit) {
         // 描述无氛围词或该氛围暂无对应文件：在有分类的文件里稳定轮换，避免全场永远第一首
         const classified = files.filter((f) => (fileRule.get(f) ?? -1) >= 0);
         const pool = classified.length ? classified : files;
-        hit = pool[stableHash(scene.id) % pool.length];
+        hit = pool[bgmPoolHash(scene.id) % pool.length];
       }
       if (hit) bgmMap[scene.id] = joinPath(bgmDir, hit);
     }
@@ -1246,7 +1294,7 @@ async function writeExportGuide(outputDir: string, title: string): Promise<void>
 }
 
 /** 标题稳定哈希（FNV-1a + murmur3 收尾）：同一标题每次一致，不同标题高概率分散。
- *  与 detectBgm 的 stableHash 分开命名，避免语义混淆。 */
+ *  与其它同名哈希分开命名，避免语义混淆。 */
 function titleHash32(text: string): number {
   let h = 0x811c9dc5;
   for (let i = 0; i < text.length; i++) {

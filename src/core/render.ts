@@ -1,4 +1,5 @@
 import type { ChapterScript, CharacterCard, ItemCard, Line, SceneJSON } from "./types";
+import { safeSlice } from "../utils/text";
 
 export interface RenderAssets {
   bg: Record<string, string>;
@@ -11,7 +12,7 @@ export interface RenderAssets {
   shot?: Record<string, string>;
 }
 
-export interface RenderOptions {
+interface RenderOptions {
   characters: CharacterCard[];
   items: ItemCard[];
   assets: RenderAssets;
@@ -62,7 +63,7 @@ export function inferWebgalLanguage(text: string): WebgalLanguage {
  *  又让绝大多数（本就用 [A-Za-z0-9_-] 的）id 沿用历史键，旧配音文件无需迁移/重配。 */
 export function sceneVocalKey(chapter: number, sceneId: string, idx: number): string {
   const clean = sanitizeId(sceneId);
-  const suffix = clean === (sceneId || "") ? "" : `_${stableHash(sceneId).slice(0, 4)}`;
+  const suffix = clean === (sceneId || "") ? "" : `_${djb2Hash(sceneId).slice(0, 4)}`;
   return `ch${chapter}_${clean}${suffix}_${idx}`;
 }
 
@@ -82,18 +83,35 @@ export function splitLineForSpeech(text: string, maxChars = TTS_SPEECH_MAX_CHARS
   if (t.length <= maxChars) return [t];
   const out: string[] = [];
   let buf = "";
+  // #1545：长度按**码点**计，而不是 buf.length 的 UTF-16 码元数。
+  // for...of 是按码点迭代的，一个 emoji / 生僻字算 1 个字符却是 2 个码元；
+  // 旧实现 append 之后才判断 buf.length >= maxChars，于是 37 的上限能切出 38 长的一段。
+  let bufLen = 0;
   for (const ch of t) {
     buf += ch;
+    bufLen += 1;
+    // 断句阈值仍按码元算：它只是「已过半」的启发式，不是上限，不参与 ≤maxChars 的保证
     const atSentence = /[。！？…；!?;]/.test(ch) && buf.trim().length >= maxChars * 0.5;
-    if (atSentence || buf.length >= maxChars) {
+    if (atSentence || bufLen >= maxChars) {
       out.push(buf.trim());
       buf = "";
+      bufLen = 0;
     }
   }
   if (buf.trim()) out.push(buf.trim());
+  // #1545：短尾并入上一段时**必须同时守住 maxChars**。
+  // 旧实现无条件拼接：前一段正好切到 maxChars、尾部不足 8 字时，拼出来就是 maxChars+7——
+  // 直接违反上面「切成 ≤maxChars」的承诺（实测 500→503/507，maxChars=10 时更夸张到 16）。
+  // TTS 侧的按段上限正是靠这个函数兜的，超限段会被整段送去做合成、超出部分不再被拆。
+  // 尾部本来就只有几个字，与其拼出一个超限段，不如让它独立成段：短尾只是多一次合成，
+  // 超限则是实打实越过接口约束。
   if (out.length > 1 && out[out.length - 1].length < 8) {
     const tail = out.pop()!;
-    out[out.length - 1] += tail;
+    if (out[out.length - 1].length + tail.length <= maxChars) {
+      out[out.length - 1] += tail;
+    } else {
+      out.push(tail); // 上一段已贴近上限，拼不动就独立成段
+    }
   }
   return out.length ? out : [t];
 }
@@ -111,9 +129,14 @@ export function esc(text: string): string {
     .replace(/:/g, "\\:")
     .replace(/,/g, "\\,")
     .replace(/\./g, "\\.")
-    .replace(/`/g, "\\`")
+    // 反引号在引擎里不是元字符，其还原表（WSe）也只认 \\ \| \: \, \; \. 六条——
+    // 旧实现把它转义成 \` 却没有还原规则，正文里的反引号会原样多出一个反斜杠。
+    // 半角 [ ] 必须改全角：引擎的 qTe() 会把 [文本](值) 当增强文本解析成注音（ruby），
+    // 正文里偶然出现的 [笑](laughing) 会被渲染成「笑」上标 laughing。选择支早已这么做。
+    .replace(/\[/g, "［")
+    .replace(/\]/g, "］")
     // #1508：竖线必须转义。引擎的文本分页（Os）对**未转义**的 | 切段，而 NovelForge 自己又用 | 表示「分页」——
-    // 台词里出现字面竖线（表格/分隔符）时会被当成翻页符，超出 Max_line:2 的后续段落被静默丢弃。
+    // 台词里出现字面竖线（表格/分隔符）时会被当成翻页符，超出 Max_line 的后续段落被静默丢弃。
     // 引擎的还原表里有 \\| → |，转义后仍能正常显示为竖线。
     .replace(/\|/g, "\\|")
     // 空格+连字符会被引擎当成指令选项（`/ -/` 解析），导致该行文字从 " -" 处被腰斩；
@@ -123,11 +146,11 @@ export function esc(text: string): string {
 }
 
 function comment(text: string): string {
-  return (text || "").replace(/\r?\n/g, " ").slice(0, 80);
+  return safeSlice((text || "").replace(/\r?\n/g, " "), 80);
 }
 
 function sanitizeLabel(text: string): string {
-  return (text || "章节").replace(/[\\/:*?"<>|\r\n;]/g, "_").slice(0, 30);
+  return safeSlice((text || "章节").replace(/[\\/:*?"<>|\r\n;]/g, "_"), 30);
 }
 
 /** 章节显示标题（1354）：统一宽口径去重 + 统一用重编号。
@@ -139,6 +162,17 @@ export function chapterDisplayTitle(chapterNumber: number, title: string): strin
   if (/第\s*[0-9零〇一二三四五六七八九十百千万两]+\s*[章回节话篇部幕卷]/.test(raw)) return raw;
   return `第 ${chapterNumber} 章 · ${raw}`;
 }
+
+/**
+ * 渲染器已核实的 WebGAL 引擎版本（#1517）。
+ *
+ * 这是「渲染产物语法」的唯一事实来源：config.txt 的键集合、Max_line 的真实容量、
+ * setFilter/setTransform 的语义差异等结论都只对 4.6.3 成立（见下方各处注释）。
+ * 此前这个字面量在 pipeline.ts 两处 + project.ts 一处各写一遍，而模板版本由
+ * scripts/fetch-webgal-template.mjs 独立升级——两处各改各的，渲染器就会对着
+ * 未经核实的引擎语义生成游戏。故收敛到此处，并由组装阶段比对模板实际版本报警。
+ */
+export const SUPPORTED_WEBGAL_VERSION = "4.6.3";
 
 /** 引擎安全素材文件名（1452 纯函数，便于单测；渲染与落盘共用）。
  *  引擎把 ; 当截断、| 当分隔、“ -”当选项起点；文件名照抄 esc 口径映射，
@@ -158,9 +192,9 @@ function escName(text: string): string {
   return esc((text || "").replace(/:/g, "："));
 }
 
-/** 短哈希（1462）：sanitizeId 把非词字符折叠成 _，sc_a b 与 sc_a_b 会撞 label 与配音键。
+/** 短哈希（1462，djb2 变体）：sanitizeId 把非词字符折叠成 _，sc_a b 与 sc_a_b 会撞 label 与配音键。
  *  branchPrefix 与 sceneVocalKey 均追加本哈希；旧无哈希配音键由 legacySceneVocalKey 回退兼容。 */
-export function stableHash(s: string): string {
+export function djb2Hash(s: string): string {
   let h = 5381;
   for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
   return h.toString(36);
@@ -168,7 +202,7 @@ export function stableHash(s: string): string {
 
 /** 分支 label 前缀（1462）：ch{N}_{sanitizeId}_{hash4}，保证原始 id 不同则前缀不同。 */
 export function branchPrefix(chapterNumber: number, sceneId: string): string {
-  return `ch${chapterNumber}_${sanitizeId(sceneId)}_${stableHash(sceneId).slice(0, 4)}`;
+  return `ch${chapterNumber}_${sanitizeId(sceneId)}_${djb2Hash(sceneId).slice(0, 4)}`;
 }
 
 /** 选项文案清洗（1450）：WebGAL choose 按 -> 切分、按 (?<!\\): 切文本/目标，
@@ -344,8 +378,9 @@ export function renderSpokenText(text: string, maxChars = TEXTBOX_PAGE_MAX_CHARS
 }
 
 /** 文本框单页字符上限（UI99/1458）：引擎文本框 white-space:nowrap + overflow:hidden，
- *  每行仅约 32 中文字符、默认可见 2 行；旧 140 配 Max_line:8 会使第 3 分段起被丢弃。
- *  收紧到 64（2 行），配合 Max_line:2 与引擎真实容量对齐。 */
+ *  每行约 32 中文字符、可见 2 行，所以单页取 64 字（2 行）——超过就会溢出被裁。
+ *  注意这**只是单页容量**：页数上界由 Max_line 控制（引擎只保留前 Max_line 页），
+ *  两者必须一起看，见 renderConfig 里 Max_line 的推导。 */
 export const TEXTBOX_PAGE_MAX_CHARS = 64;
 export function paginateForTextBox(text: string, maxChars = TEXTBOX_PAGE_MAX_CHARS): string {
   const t = text || "";
@@ -367,12 +402,23 @@ export function paginateForTextBox(text: string, maxChars = TEXTBOX_PAGE_MAX_CHA
   return out.length ? out.join("|") : t;
 }
 
-/** 动作标签 → 情绪推断（与 script.ts emotionOf 同口径，供渲染层吸收动作标签时使用） */
+/**
+ * 动作标签 → 情绪推断（供渲染层吸收动作标签时使用）。
+ *
+ * #1567：**类别判定顺序必须与 script.ts 的 `emotionOf` 一致**（怒 → 笑 → 惊 → 叹）。
+ * 原实现把 sad 排在最前，与 `emotionOf` 相反；而关键词重叠时**顺序决定归属**——
+ * 于是同一条台词在「剧本期」（由台词文本推情绪）与「渲染期」（由动作标签推情绪）
+ * 可能被判成两种不同情绪，进而选出不同的表情差分图。原注释只写「同口径」，
+ * 但顺序并不一致，属注释承诺落空。
+ *
+ * 关键词是 `emotionOf` 的**超集**（渲染层额外吸收动作词：落寞/沉默/得意/暴/愣）——
+ * 这是有意为之的扩展，不违反本注释；被钉住的是**顺序**。
+ */
 function emotionFromTag(text: string): string | undefined {
-  if (/(叹|哀|难过|哭|忧|落寞|沉默)/.test(text)) return "sad";
-  if (/(笑|高兴|开心|喜|得意)/.test(text)) return "happy";
   if (/(怒|吼|咬牙|冷冷|斥|暴)/.test(text)) return "angry";
+  if (/(笑|高兴|开心|喜|得意)/.test(text)) return "happy";
   if (/(惊|怔|愕|愣)/.test(text)) return "surprised";
+  if (/(叹|哀|难过|哭|忧|落寞|沉默)/.test(text)) return "sad";
   return undefined;
 }
 
@@ -979,8 +1025,12 @@ function cleanConfigValue(text: string, isFile = false): string {
   // 1452：旧实现只清 ; 与换行，不清 | 与“ -”（同样截断引擎解析）；且无条件 slice(0,60)
   // 会把 Title_img/Game_Logo/Title_bgm 真实文件名截成不存在的路径（入口白屏/标题静音）。
   // 文件类值不再截断，只清洗；标题类保留 60 截断。
+  // #1515：文件类值此前把 ; | 替换成「空格」，而 copyAssets 落盘走 engineSafeFileName
+  // 映射成全角 ；｜。两边口径不同 → cover;art.png 在 config.txt 里变成 cover art.png，
+  // 引擎去 ./game/background/cover art.png 取图必然 404（标题页卡白遮罩）。
+  if (isFile) return engineSafeFileName((text || "").replace(/[\r\n]+/g, "")).trim();
   const s = (text || "").replace(/[;\r\n|]+/g, " ").replace(/ -/g, " ‑").trim();
-  return isFile ? s : s.slice(0, 60);
+  return safeSlice(s, 60);
 }
 
 export type WebgalLanguage = "zh_CN" | "zh_TW" | "en" | "ja" | "ko";
@@ -1008,11 +1058,16 @@ export function renderConfig(
     `Enable_flowchart:${toggles?.flowchart === false ? "false" : "true"};`,
     `Show_panic:true;`,
     `Default_Language:${language};`,
-    // 文本框排版（引擎 globalGameVar，UI99/1458）：Max_line 限制一句内 `|` 分段的最多行数。
-    // 1458：引擎文本框 white-space:nowrap + overflow:hidden，medium 默认只显示 2 行；
-    // 旧值 8 与实际 2 行差 3-4 倍，第 3 分段起被引擎丢弃。改为 2 与真实容量一致。
-    // Line_height 为行高（em），配合渲染层长台词 `|` 分页（PAGE=64）避免溢出对话框
-    `Max_line:2;`,
+    // 文本框排版（引擎 globalGameVar）。已核实 4.6.3 引擎实现（assets/index-*.js 的 Os）：
+    //   Os(text, Max_line) = text.split(/(?<!\\)\|/) … .slice(0, Max_line)
+    // 即 Max_line 是「一条消息最多保留几个 | 分页段」，**不是**文本框可见行数（可见行数由
+    // CSS white-space:nowrap + overflow:hidden 决定，与 Max_line 无关）。
+    // 1458 按「可见 2 行」把它设成 2，反而让第 3 页起被引擎静默丢弃：配音台词与独白按设计
+    // 不拆成多条消息（避免换页掐断语音），单条最长可达 TTS_SPEECH_MAX_CHARS(500) 字 →
+    // 按每页 64 字分页即 8 页，于是所有 >128 字的配音台词与独白在游戏里只显示前 128 字。
+    // 这里按「单条消息 ≤ 500 字、每页 ≤ 64 字」的渲染约定取上界，保证任何页都不会被丢。
+    // Line_height 为行高（em）。
+    `Max_line:${Math.ceil(TTS_SPEECH_MAX_CHARS / TEXTBOX_PAGE_MAX_CHARS)};`,
     `Line_height:1.6;`,
   ];
   if (titleImg) lines.push(`Title_img:${cleanConfigValue(titleImg, true)};`);

@@ -19,9 +19,6 @@ const CONNECT_TIMEOUT_MS = 30_000;
 const MAX_CONNECT_ATTEMPTS = 12;
 const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
 
-export function modelDir() {
-  return MODELS_DIR;
-}
 
 export function modelPath(filename) {
   return resolve(MODELS_DIR, filename);

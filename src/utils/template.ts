@@ -38,7 +38,7 @@ export function templateFillProblems(p: TemplateFillProbe): string[] {
 }
 
 /** 探测模板回填状态（读主题大小 + 清点内置 SE）；任何读取失败按缺失处理，不阻断 */
-export async function probeTemplateFill(templateDir: string): Promise<TemplateFillProbe> {
+async function probeTemplateFill(templateDir: string): Promise<TemplateFillProbe> {
   let themeExists = false;
   let themeBytes = 0;
   try {

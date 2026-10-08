@@ -25,6 +25,7 @@ import {
   visualBibleManifestPath,
   visualBiblePath,
   canonicalCostumeSheetPath,
+  ensureCostumeAnchors,
   type VisualBibleServiceDependencies,
 } from "../src/core/visualBible";
 import { ReferenceImageError } from "../src/api/openaiCompatible";
@@ -1184,8 +1185,28 @@ async function testCostumeSheetsGeneratedAndFingerprinted(): Promise<void> {
     llmCfg: apiConfig("text"),
   }, dependencies);
 
-  const battleSheet = draft.characters.alice.costumeSheets?.["battle"];
-  assert(battleSheet !== undefined, "costume sheet should be generated for each costume");
+  // #1518：守门草稿只出「一个角色一张三视图」——守门的职责是确认人物形象，一个角色一张图。
+  // 换装三视图锚点属于正式生成的内容，草稿里不再生成。
+  // （784e8e2 曾在此为每套服装多画一张：25 角色 + 92 套服装 = 118 张，全部发生在点「批准」之前。）
+  assert(
+    draft.characters.alice.costumeSheets === undefined,
+    "守门草稿不得生成换装三视图锚点（应留到正式生成阶段）",
+  );
+  assert(
+    generations.filter((g) => g.prompt.includes("battle armor") || g.prompt.includes("formal dress")).length === 0,
+    "守门草稿不得为服装发起任何图像请求",
+  );
+
+  // 锚点改由正式生成阶段的 ensureCostumeAnchors 按需补建
+  // 走真实批准流程：接受角色三视图 → 批准守门（ensureCostumeAnchors 只在已批准时工作）
+  await acceptCharacterSheet(ROOT, draft, "alice");
+  await approveVisualBible(ROOT, draft, { novel: novel(), characters: [aliceWithCostume] });
+  const ensured = await ensureCostumeAnchors(ROOT, [aliceWithCostume], apiConfig("image"), dependencies);
+  assert(ensured.created === 2, `应为 2 套服装补建锚点，实际 ${ensured.created}`);
+
+  const loaded = await loadVisualBible(ROOT);
+  const battleSheet = loaded.visualBible?.characters.alice.costumeSheets?.["battle"];
+  assert(battleSheet !== undefined, "ensureCostumeAnchors 应为每套服装补建锚点");
   assert(
     /^threeview_alice_ct_battle\.rev-[A-Za-z0-9-]+\.png$/.test(battleSheet.threeViewPath),
     `costume sheet should use canonical path: ${battleSheet.threeViewPath}`,
@@ -1193,7 +1214,7 @@ async function testCostumeSheetsGeneratedAndFingerprinted(): Promise<void> {
   assert(battleSheet.prompt.includes("battle armor"), "costume sheet prompt should be the costume prompt");
   assert(await tauri.pathExists(visualBiblePath(ROOT, battleSheet.threeViewPath)), "costume sheet artifact should exist on disk");
   assert(canonicalCostumeSheetPath("alice", "battle") === "threeview_alice_ct_battle.png", "canonical costume sheet path helper");
-  assert(draft.characters.alice.costumeSheets?.["formal"] !== undefined, "all costumes should get a sheet");
+  assert(loaded.visualBible?.characters.alice.costumeSheets?.["formal"] !== undefined, "all costumes should get a sheet");
 
   // 换装三视图的身份参考 = 默认装三视图（role identity 在前、style 在后）
   const costumeGeneration = generations.find((generation) => generation.prompt.includes("battle armor"));
@@ -1203,23 +1224,208 @@ async function testCostumeSheetsGeneratedAndFingerprinted(): Promise<void> {
     "costume sheet should reference base three-view identity + global style",
   );
 
-  // manifest 往返保留 costumeSheets
-  await saveVisualBible(ROOT, draft);
-  const loaded = await loadVisualBible(ROOT);
-  assert(
-    loaded.visualBible?.characters.alice.costumeSheets?.["battle"]?.threeViewPath === battleSheet.threeViewPath,
-    "costume sheets should round-trip through the manifest",
-  );
+  // 幂等：已有锚点时必须跳过，不得重复付费
+  const again = await ensureCostumeAnchors(ROOT, [aliceWithCostume], apiConfig("image"), dependencies);
+  assert(again.created === 0, "已有锚点时必须跳过，不得重复付费生成");
 
   // 服装三视图纳入指纹：存在时改变指纹
   const cards = [aliceWithCostume];
-  const fpWith = await computeProjectVisualBibleFingerprint(ROOT, draft, novel(), cards);
+  const approvedBible = loaded.visualBible!;
+  const fpWith = await computeProjectVisualBibleFingerprint(ROOT, approvedBible, novel(), cards);
   const withoutSheets = {
-    ...draft,
-    characters: { alice: { ...draft.characters.alice, costumeSheets: undefined } },
+    ...approvedBible,
+    characters: { alice: { ...approvedBible.characters.alice, costumeSheets: undefined } },
   };
   const fpWithout = await computeProjectVisualBibleFingerprint(ROOT, withoutSheets, novel(), cards);
   assert(fpWith !== fpWithout, "costume sheets should alter the visual-bible fingerprint");
+}
+
+/** #1519 回归：草稿阶段必须认领孤儿三视图，否则「上一次草稿失败 → 重跑」要再付一遍全款。 */
+async function testDraftAdoptsOrphanThreeViewsWithoutRegenerating(): Promise<void> {
+  await reset();
+  const generations: string[] = [];
+  const progress: { done: number; total: number }[] = [];
+  const dependencies: VisualBibleServiceDependencies = {
+    chatText: async (_cfg, _system, user) => user.includes("STYLE SUMMARIES")
+      ? "graphic novel, restrained red and teal palette, crisp inks"
+      : "era: contemporary; genre: thriller; mood: tense",
+    chatVision: async () => "unused",
+    generateImage: async (_cfg, prompt) => {
+      generations.push(prompt);
+      return { dataB64: PNG_B64, mime: "image/png" };
+    },
+  };
+  const cards = { title: "Book", characters: [character("alice"), character("bob")], scenes: [], items: [] };
+  const draftInput = {
+    outputDir: ROOT,
+    novel: novel(),
+    cards,
+    imageCfg: apiConfig("image"),
+    styleSource: "novel_analysis" as const,
+    llmCfg: apiConfig("text"),
+  };
+
+  const first = await createVisualBibleDraft(draftInput, dependencies);
+  assert(generations.length === 3, `首次草稿应为 1 张风格 + 2 张三视图，实际 ${generations.length}`);
+  const aliceSheet = first.characters.alice.threeViewPath;
+  assert(await tauri.pathExists(visualBiblePath(ROOT, aliceSheet)), "首次草稿的三视图应落盘");
+
+  // 模拟「上一次草稿因某张图失败而整份丢弃」：清单从未落盘，已付费的产物留在磁盘上
+  await tauri.removePath(visualBibleManifestPath(ROOT));
+  assert(!(await tauri.pathExists(visualBibleManifestPath(ROOT))), "清单应已被删除以复现失败场景");
+  generations.length = 0;
+
+  const second = await createVisualBibleDraft({
+    ...draftInput,
+    onImageProgress: (done, total) => progress.push({ done, total }),
+  }, dependencies);
+
+  assert(
+    generations.length === 1,
+    `重跑草稿只应重出风格图（孤儿三视图免费认领），实际出图 ${generations.length} 张`,
+  );
+  assert(
+    second.characters.alice.threeViewPath === aliceSheet,
+    `认领后应沿用原文件而不是新 revision：${second.characters.alice.threeViewPath} vs ${aliceSheet}`,
+  );
+  assert(second.characters.alice.approved === false, "认领的条目必须仍是待确认（不得顺带认领 approved）");
+  assert(
+    progress.every((p) => p.total === 1),
+    `认领后进度总数应只剩风格图 1 张，实际 ${JSON.stringify(progress)}`,
+  );
+  assert(
+    await tauri.pathExists(visualBiblePath(ROOT, second.characters.bob.threeViewPath)),
+    "bob 的三视图也应被认领且文件可读",
+  );
+}
+
+/** #1520 回归：单角色出图失败不得作废整份草稿（旧实现一失全丢，且该角色一直失败就永远拿不到草稿）。 */
+async function testDraftSurvivesSingleCharacterFailure(): Promise<void> {
+  await reset();
+  const dependencies: VisualBibleServiceDependencies = {
+    chatText: async (_cfg, _system, user) => user.includes("STYLE SUMMARIES")
+      ? "graphic novel, restrained red and teal palette, crisp inks"
+      : "era: contemporary; genre: thriller; mood: tense",
+    chatVision: async () => "unused",
+    generateImage: async (_cfg, prompt) => {
+      if (prompt.includes("bob")) throw new Error("API 错误 400: 内容政策");
+      return { dataB64: PNG_B64, mime: "image/png" };
+    },
+  };
+  const draft = await createVisualBibleDraft({
+    outputDir: ROOT,
+    novel: novel(),
+    cards: { title: "Book", characters: [character("alice"), character("bob"), character("carol")], scenes: [], items: [] },
+    imageCfg: apiConfig("image"),
+    styleSource: "novel_analysis",
+    llmCfg: apiConfig("text"),
+  }, dependencies);
+
+  assert(draft.characters.alice !== undefined, "失败角色之前的条目必须保留");
+  assert(
+    draft.characters.carol !== undefined,
+    "失败角色之后的角色也必须照常出图（单角色失败不得中断整批）",
+  );
+  assert(draft.characters.bob === undefined, "失败的角色不应建条目");
+  assert(
+    await tauri.pathExists(visualBibleManifestPath(ROOT)),
+    "整份草稿必须落盘——旧实现在这里磁盘上什么都没有，已付费的图全成孤儿",
+  );
+  const loaded = await loadVisualBible(ROOT);
+  assert(loaded.visualBible?.characters.carol !== undefined, "落盘的清单必须包含成功的角色");
+  assert(loaded.visualBible?.characters.bob === undefined, "落盘的清单不得含失败角色");
+}
+
+/** #1519 回归：换装锚点也必须认领磁盘上的孤儿，否则上次整单未落盘就重复付费。 */
+async function testEnsureCostumeAnchorsAdoptsOrphans(): Promise<void> {
+  await reset();
+  const generations: string[] = [];
+  const dependencies: VisualBibleServiceDependencies = {
+    chatText: async (_cfg, _system, user) => user.includes("STYLE SUMMARIES")
+      ? "graphic novel, restrained red and teal palette, crisp inks"
+      : "era: contemporary; genre: thriller; mood: tense",
+    chatVision: async () => "unused",
+    generateImage: async (_cfg, prompt) => {
+      generations.push(prompt);
+      return { dataB64: PNG_B64, mime: "image/png" };
+    },
+  };
+  const alice = character("alice");
+  alice.costumes = [
+    { id: "battle", name: "战斗服", prompt: "alice wearing battle armor, full body, anime style" },
+    { id: "formal", name: "礼服", prompt: "alice wearing a formal dress, full body, anime style" },
+  ];
+  const draft = await createVisualBibleDraft({
+    outputDir: ROOT,
+    novel: novel(),
+    cards: { title: "Book", characters: [alice], scenes: [], items: [] },
+    imageCfg: apiConfig("image"),
+    styleSource: "novel_analysis",
+    llmCfg: apiConfig("text"),
+  }, dependencies);
+  await acceptCharacterSheet(ROOT, draft, "alice");
+  await approveVisualBible(ROOT, draft, { novel: novel(), characters: [alice] });
+
+  // 模拟「上一次补建整单未落盘」：清单里没有锚点，但已付费的文件留在产物目录里
+  await tauri.writeFileBase64(visualBiblePath(ROOT, "threeview_alice_ct_battle.rev-probe1.png"), PNG_B64);
+  await tauri.writeFileBase64(visualBiblePath(ROOT, "threeview_alice_ct_formal.rev-probe1.png"), PNG_B64);
+  generations.length = 0;
+
+  const result = await ensureCostumeAnchors(ROOT, [alice], apiConfig("image"), dependencies);
+  assert(generations.length === 0, `孤儿锚点应被全部认领、不得重新出图，实际出图 ${generations.length} 张`);
+  assert(result.adopted === 2, `应认领 2 张，实际 ${result.adopted}`);
+  assert(result.created === 0, `不应新建，实际新建 ${result.created}`);
+
+  const loaded = await loadVisualBible(ROOT);
+  assert(
+    loaded.visualBible?.characters.alice.costumeSheets?.["battle"]?.threeViewPath ===
+      "threeview_alice_ct_battle.rev-probe1.png",
+    "认领后清单应指向已有文件",
+  );
+}
+
+/**
+ * 画风一致性回归：参考图是以「裸 base64 数组」发给模型的（api/universal.ts 只发图、不发 role），
+ * 模型看不到哪张是人物、哪张是画风。提示词若只说 "the same person"，两张图一起给时它会取折中，
+ * 于是**带参考图的角色被那张参考图自己的配色/笔触带跑，画风与不带参考图的角色不一致**。
+ */
+async function testThreeViewPromptSeparatesIdentityFromStyle(): Promise<void> {
+  await reset();
+  const prompts: string[] = [];
+  const dependencies: VisualBibleServiceDependencies = {
+    chatText: async (_cfg, _system, user) => user.includes("STYLE SUMMARIES")
+      ? "graphic novel, restrained red and teal palette, crisp inks"
+      : "era: contemporary; genre: thriller; mood: tense",
+    chatVision: async () => "unused",
+    generateImage: async (_cfg, prompt) => {
+      prompts.push(prompt);
+      return { dataB64: PNG_B64, mime: "image/png" };
+    },
+  };
+  // 带参考图的角色：身份图 + 画风图两张一起发，正是会互相污染的情形
+  await createVisualBibleDraft({
+    outputDir: ROOT,
+    novel: novel(),
+    cards: { title: "Book", characters: [character("alice", PNG_B64)], scenes: [], items: [] },
+    imageCfg: apiConfig("image"),
+    styleSource: "novel_analysis",
+    llmCfg: apiConfig("text"),
+  }, dependencies);
+
+  const threeView = prompts.find((p) => p.includes("Character turnaround sheet"));
+  assert(!!threeView, "应当生成过三视图");
+  assert(
+    threeView!.includes("art-style reference last"),
+    "必须按发送顺序告诉模型画风图是最后一张（模型看不到 role 标签）",
+  );
+  assert(
+    threeView!.includes("Take ONLY the person's face, hair, build and clothing from the identity reference"),
+    "必须限定身份图只提供长相/服装，不提供画风",
+  );
+  assert(
+    threeView!.includes("do not let the identity image's own art style, palette or lighting influence the result"),
+    "必须显式禁止身份图自己的画风影响结果——这正是画风不一致的成因",
+  );
 }
 
 async function main(): Promise<void> {
@@ -1245,6 +1451,10 @@ async function main(): Promise<void> {
   await testDraftAndManifestFailuresPreservePublishedBible();
   await testAnalysisUsesBoundedInputs();
   await testBothDraftSourcesCreateCanonicalArtifacts();
+  await testDraftAdoptsOrphanThreeViewsWithoutRegenerating();
+  await testDraftSurvivesSingleCharacterFailure();
+  await testEnsureCostumeAnchorsAdoptsOrphans();
+  await testThreeViewPromptSeparatesIdentityFromStyle();
   await testCostumeSheetsGeneratedAndFingerprinted();
   await testMissingStyleReferenceRejectsSheetRegeneration();
   await testRegenerateDescriptionToleratesTrailingChatter();

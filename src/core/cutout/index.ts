@@ -11,14 +11,14 @@ import { cutoutModelLocalUrl } from "./download";
 export * from "./models";
 export * from "./download";
 
-export interface AiCutoutResult {
+interface AiCutoutResult {
   dataB64: string;
   method: "ai";
   backend: "webgpu" | "wasm";
   coverage: number;
 }
 
-export interface AiCutoutOptions {
+interface AiCutoutOptions {
   /** 边缘去色（去背景色边），默认 true */
   despill?: boolean;
 }

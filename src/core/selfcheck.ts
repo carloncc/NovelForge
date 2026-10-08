@@ -2,12 +2,12 @@ import type { ApiConfig, ImageReference } from "./types";
 import { chatVision, VisionApiError } from "../api/openaiCompatible";
 import { log } from "../utils/logger";
 
-export interface SelfCheckResult {
+interface SelfCheckResult {
   ok: boolean;
   reason: string;
 }
 
-export interface SelfCheckOptions {
+interface SelfCheckOptions {
   onUsage?: (promptTokens: number, completionTokens: number) => void;
   references?: ImageReference[];
 }
@@ -48,8 +48,31 @@ const NEGATION_BEFORE_TERM = /(不|无|没|未)[^。！？!?；;，,、]{0,6}$/;
  * 早期实现按「含负面词即不通过」会把这些正向描述误判为失败（#780），
  * 这里改为：只有未被否定的负面词才判不通过。
  */
+
+/**
+ * #1552：取回覆开头的判定词，容忍 markdown 强调与「判定：」前缀。
+ *
+ * 原实现是硬 `/^符合/.test(trimmed)`。模型很爱把短答加粗、或写成「判定：符合」，
+ * 于是**合格图被判不合格** → 走失败分支重画。这个应用每张图都付费，误判的代价是实打实的钱。
+ *
+ * 关键约束：**绝不能把「不符合」判成通过**。所以
+ *   1) 前缀字符类显式排除「不」，保证不会把「不」当成前缀吃掉；
+ *   2) 交替分支把「不符合」放在「符合」前面（正则交替取最左优先，先匹配长的否定式）；
+ *   3) 「不完全符合」这类以「不」开头的串前缀只能匹配空串，因此原样返回、仍判不通过。
+ */
+function verdictHead(reply: string): string {
+  const stripped = reply.replace(/^[\s*_`#>\u3000]+/, "");
+  // 前缀放宽到 40 字并允许标点：旧实现是 {0,6} 且把标点也排除在字符类外，于是
+  // 「图片整体上完全符合要求」（"符合" 前 7 字）或「整体来看，这张图符合」（前缀含逗号）
+  // 都匹配不上 → 合格图被判不合格 → 走失败分支重画（每张图都付费）。
+  // 约束不变：字符类仍显式排除「不」，保证「不完全符合…」这类否定串只能匹配空前缀、
+  // 原样返回从而仍判不通过；交替分支仍把「不符合」放在「符合」前（最左优先取长的否定式）。
+  const m = /^[^。！？!?；;，,\n不]{0,40}?(不符合|符合)/.exec(stripped);
+  return m ? m[1] + stripped.slice(m[0].length) : stripped;
+}
 export function parseSelfCheckReply(reply: string): SelfCheckResult {
   const trimmed = reply.trim();
+  const head = verdictHead(trimmed);
   let failed = false;
   for (const term of NEGATIVE_TERMS) {
     let from = 0;
@@ -64,7 +87,7 @@ export function parseSelfCheckReply(reply: string): SelfCheckResult {
     }
     if (failed) break;
   }
-  return { ok: /^符合/.test(trimmed) && !failed, reason: trimmed.slice(0, 200) };
+  return { ok: /^符合/.test(head) && !failed, reason: trimmed.slice(0, 200) };
 }
 
 /** 用多模态模型核对生成图是否达标；判断结果正常返回，配置/能力/服务不可用错误向上抛出。 */

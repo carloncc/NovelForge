@@ -52,13 +52,13 @@ import { resolveTemplateDir } from "../utils/template";
 
 /* ==================== 状态 ==================== */
 
-export interface ImageStoryFailedItem {
+interface ImageStoryFailedItem {
   key: string;
   label: string;
   message: string;
 }
 
-export interface ImageStoryState {
+interface ImageStoryState {
   outputDir: string;
   options: ImageStoryOptions;
   /** 剧本/台词文风（#1098）：与图像画风 imageStyle 分离，只进剧本指纹与剧本提示词 */
@@ -142,7 +142,7 @@ function mainProjectKey(): string {
 }
 
 /** 输出的图片小说输出目录：默认与主项目同级的 `<书名>-图片版/`，可手动改 */
-export function defaultImageStoryDir(): string {
+function defaultImageStoryDir(): string {
   const title = projectState.novel?.fileName?.replace(/\.txt$/i, "") || t("未命名作品");
   return deriveImageStoryDir(projectState.outputDir || "", title);
 }
@@ -359,7 +359,7 @@ function applyMeta(meta: ImageStoryMeta | null): void {
 }
 
 /** 从磁盘恢复卡片/剧本/图片映射/日志/失败项（换目录或生成结束后调用） */
-export async function refreshFromDisk(): Promise<void> {
+async function refreshFromDisk(): Promise<void> {
   const dir = imageStoryState.outputDir;
   if (!dir) return;
   try {
@@ -836,7 +836,12 @@ async function runImageStage(cards: ExtractionResult, chapters: ChapterScript[])
   imageStoryState.plan = { shots: plan.shotCount, threeviews: plan.characterBaselineCount, items: plan.itemCount, total: plan.tasks.length, yuan: plan.estimatedYuan };
   pushLog("图片", `开始生成图片：分镜 ${plan.shotCount} 张 / 角色基准图 ${plan.characterBaselineCount} 张（分镜以基准图作参考锁定人物一致性，预计最多 ¥${plan.estimatedYuan}，命中缓存不重复计费；${concurrencyNote}，取自该图像 API 配置）`);
   const assets = await readAssetMap(dir);
-  await backupAssetMap(dir).catch(() => null);
+  // #1516：备份失败不再静默——本轮只往映射里「加」新条目（不删旧条目），
+  // 因此不阻断生成，但要如实告知用户这次没有回滚点。
+  await backupAssetMap(dir).catch((e: unknown) => {
+    pushLog("图片", `素材映射备份失败，本次生成没有回滚点（旧映射仍在，但无法一键还原）：${errMsg(e).slice(0, 120)}`, "warn");
+    return null;
+  });
   let done = 0;
   const result = await runImageStoryTasks({
     cfg: imageCfg,
@@ -1138,6 +1143,16 @@ export async function retryFailedImages(): Promise<void> {
 /** 单张分镜重生成（强制覆盖该张；依赖的三视图走缓存） */
 export async function regenerateShot(taskId: string): Promise<void> {
   if (imageStoryState.running) return;
+  // #1319 同口径：runImageStory / retryFailedImages 都在此处拦「主管线正在运行」，
+  // 单张重生成此前漏了这道守卫——主管线图像阶段正在逐张写 assets.json 时，这里会并发
+  // 发出第二个付费图像请求，并与主管线对同一个 assets.json 做读-改-写，后完成的一方
+  // 静默丢弃另一方的条目。
+  if (runIsBusy.value) {
+    const msg = t("主管线正在运行：请等待其结束或先停止，再重生成该分镜（避免两套付费管线并发）");
+    imageStoryState.lastError = msg;
+    pushLog("运行", msg, "warn");
+    return;
+  }
   const cards = imageStoryState.cards;
   const chapters = imageStoryState.chapters;
   const dir = imageStoryState.outputDir;
@@ -1163,17 +1178,31 @@ export async function regenerateShot(taskId: string): Promise<void> {
     pushLog("图片", msg, "warn");
     return;
   }
-  const assets = await readAssetMap(dir);
+  // 在第一个 await 之前占锁：此前 running=true 写在 readAssetMap 之后，那次 IPC 往返
+  // 窗口内再点一次别的分镜会穿过上面的守卫并发进来，两次运行的 finally 互相清状态，
+  // 先结束的那次还会把另一次的 abort 句柄一起注销，导致「停止」按了不生效。
+  // 与 generate.ts 的 regenMissingImages 同解法：预检期间同样占用 busy。
+  imageStoryState.running = true;
+  let assets: Awaited<ReturnType<typeof readAssetMap>>;
+  try {
+    assets = await readAssetMap(dir);
+  } catch (e) {
+    imageStoryState.running = false;
+    syncImageStoryRunStatus();
+    imageStoryState.lastError = errMsg(e).slice(0, 400);
+    return;
+  }
   const figureBase: Record<string, string> = {};
   for (const [id, path] of Object.entries(assets.figure)) figureBase[id] = path;
   // 依赖的三视图（角色基准图）缺失时不单张重生成（避免静默降级为纯文生图导致人物不一致）
   // #1133：多人分镜对每个出场角色都校验，不再只看第一个角色
   const missingChars = shotCharacterIdsOf(task).filter((id) => !figureBase[`${id}_threeview`]);
   if (missingChars.length) {
+    imageStoryState.running = false;
+    syncImageStoryRunStatus();
     pushLog("图片", `角色 ${missingChars.join("、")} 的基准图缺失：请先重跑图片阶段补齐角色基准图后再重生成该分镜`, "error");
     return;
   }
-  imageStoryState.running = true;
   // #1321：同 retry，复位停止/阶段/进度态，避免残留 stopping 导致本次无法停止。
   imageStoryState.stopping = false;
   imageStoryState.stage = "";

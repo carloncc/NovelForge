@@ -7,7 +7,7 @@ import { VisualBibleApprovalRequiredError } from "./visualBible";
 const TEXT_STAGE_SET = new Set<StageKey>(["split", "translate", "extract", "script"]);
 const RESUME_STAGE_SET = new Set<StageKey>(["image", "voice", "assemble"]);
 
-export interface VisualBibleErrorContext {
+interface VisualBibleErrorContext {
   imageModel?: string;
   visionModel?: string;
 }

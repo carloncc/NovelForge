@@ -10,9 +10,12 @@
 import type { ApiConfig, ChapterScript, ExtractionResult, ImageStoryOptions, ImageTask, PipelineEvent } from "./types";
 import { buildImageTasks, runImageTask, shotCharacterIdsOf } from "./images";
 import { errMsg } from "../utils/errors";
+import { DEFAULT_PRICES } from "./pipeline";
 
-/** 每张图片的预估单价（元）：与 pipeline 的 DEFAULT_PRICES.imageYuanEach 同口径 */
-export const IMAGE_YUAN_EACH = 0.3;
+/** 每张图片的预估单价（元）。**直接取自主管线的 DEFAULT_PRICES**，不再是另一份字面量：
+ *  原先这里写死 0.3 并在注释里声称「与 pipeline 同口径」，但两处字面量各改各的就会静默漂移，
+ *  表现为「图片小说页」与「主生成页」对同一批量报出不同费用。现在结构上不可能不一致。 */
+export const IMAGE_YUAN_EACH = DEFAULT_PRICES.imageYuanEach;
 
 /**
  * 图片小说输出目录（纯函数，#1101）：与主项目同级的 `<书名>-图片版/`。
@@ -27,7 +30,7 @@ export function deriveImageStoryDir(mainOutputDir: string, title: string): strin
 }
 
 /** 图片小说目录绑定：记录该目录属于哪个主项目，用于「换作品不残留」（#1101） */
-export interface ImageStoryDirLoadInput {
+interface ImageStoryDirLoadInput {
   /** 上次记录的目录（空=首次使用） */
   rememberedDir: string;
   /** 上次记录时是否自动跟随主项目（老版本记录没有该字段，按自动处理） */
@@ -44,7 +47,7 @@ export function resolveImageStoryDirOnLoad(input: ImageStoryDirLoadInput): { dir
 }
 
 /** 图片小说预估（纯函数，#1103）：无剧本时按「章节数 × 4 场景 × 每场景张数」粗估 */
-export interface ImageStoryEstimate {
+interface ImageStoryEstimate {
   total: number;
   yuan: number;
   exact: boolean;
@@ -75,7 +78,7 @@ export function estimateImageStoryPlan(
 }
 
 /** 分镜触发行号兜底记录（#1134）：供日志/核对报告标注「触发行号由系统兜底」 */
-export interface ShotTriggerRepair {
+interface ShotTriggerRepair {
   chapter: number;
   sceneId: string;
   before: number[];
@@ -110,7 +113,7 @@ export function normalizeShotTriggers(chapters: ChapterScript[]): { chapters: Ch
 }
 
 /** 组装前章节连续性计划（#1111/#1132） */
-export interface ChapterContinuityPlan {
+interface ChapterContinuityPlan {
   ok: boolean;
   /** 本次已拿到剧本的原始章号（升序） */
   present: number[];
@@ -139,7 +142,7 @@ export function planChapterContinuity(chapters: ChapterScript[], expectedChapter
   };
 }
 
-export interface ImageStoryTaskPlan {
+interface ImageStoryTaskPlan {
   tasks: ImageTask[];
   /** 角色基准图张数（imageOnly 下 kind:"threeview" 任务：单人正视全身，作分镜 identity 参考）。
    *  与 threeviewCount 同值，单独给出是为了让费用/文案如实说明"这些图是干什么的"。 */
@@ -233,7 +236,7 @@ export async function runOrderedPool<T, R>(
   return out;
 }
 
-export interface ImageStoryRunArgs {
+interface ImageStoryRunArgs {
   cfg: ApiConfig | undefined;
   tasks: ImageTask[];
   /** <outputDir>/.novel2vn/cache */

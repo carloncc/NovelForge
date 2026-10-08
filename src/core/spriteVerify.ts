@@ -12,7 +12,7 @@ import { log as logger } from "../utils/logger";
 /* ================= 掩膜参数（与校验阈值分离存放） =================
  * 纪律（借鉴其 AGENTS.md）：不得为了让校验通过而放宽掩膜；调掩膜只改本节，校验侧恒为逐像素精确一致。 */
 export const SPRITE_MASK_EXPAND = 1.08;
-export const SPRITE_MASK_FEATHER_PX_DEFAULT = 12;
+const SPRITE_MASK_FEATHER_PX_DEFAULT = 12;
 
 /** 允许区椭圆（像素坐标，相对整图左上角） */
 export interface SpriteEllipse {
@@ -22,7 +22,7 @@ export interface SpriteEllipse {
   ry: number;
 }
 
-export interface SpriteVerifyCounts {
+interface SpriteVerifyCounts {
   /** 画布尺寸是否不一致 */
   sizeMismatch: boolean;
   /** 整幅 alpha 与 base 不一致的像素数 */
@@ -35,7 +35,7 @@ export interface SpriteVerifyCounts {
   diffBbox: { x0: number; y0: number; x1: number; y1: number } | null;
 }
 
-export interface SpriteVerifyResult extends SpriteVerifyCounts {
+interface SpriteVerifyResult extends SpriteVerifyCounts {
   width: number;
   height: number;
   ok: boolean;
@@ -45,7 +45,7 @@ export interface SpriteVerifyResult extends SpriteVerifyCounts {
  * 核验容差（#1418）：允许区外像素的比对口径。缺省/严格模式三项均为 0 = 逐像素完全一致。
  * 生图/编辑路径是整幅扩散重绘 + 抠图，允许区外必然存在噪声，严格口径会系统性误杀。
  */
-export interface SpriteVerifyTolerance {
+interface SpriteVerifyTolerance {
   /** 每像素每通道允许的最大差值（0=严格逐像素）；差值 <= 该值不计失败 */
   channelTolerance: number;
   /** 允许的区外不一致像素数上限（0=不允许） */
@@ -71,7 +71,7 @@ export function diffusionToleranceFor(width: number, height: number): SpriteVeri
   return { channelTolerance: DIFFUSION_CHANNEL_TOLERANCE, maxOutsideMismatch: cap, maxAlphaMismatch: cap };
 }
 
-export function clamp01(v: number): number {
+function clamp01(v: number): number {
   return v <= 0 ? 0 : v >= 1 ? 1 : v;
 }
 
@@ -215,24 +215,10 @@ export function formatSpriteVerifyFailure(taskLabel: string, r: SpriteVerifyResu
 }
 
 /** 核验报告 JSON（纯函数，供 QA 报告/总览表后续落盘使用） */
-export function toVerifyReportJson(taskId: string, r: SpriteVerifyResult): string {
-  return JSON.stringify({
-    taskId,
-    ok: r.ok,
-    width: r.width,
-    height: r.height,
-    sizeMismatch: r.sizeMismatch,
-    alphaMismatch: r.alphaMismatch,
-    outsideMismatch: r.outsideMismatch,
-    diffPixels: r.diffPixels,
-    diffBbox: r.diffBbox,
-    at: new Date().toISOString(),
-  });
-}
 
 /* ================= 文件级核验（best-effort，只读） ================= */
 
-export interface DecodedRgba {
+interface DecodedRgba {
   data: Uint8ClampedArray;
   width: number;
   height: number;
@@ -272,7 +258,7 @@ function decodeDataUrlToRgba(dataUrl: string): Promise<DecodedRgba | null> {
 }
 
 /** 读图并解码为 RGBA；解码不可用/失败返回 null（调用方跳过，不记失败） */
-export async function loadImageRgba(path: string): Promise<DecodedRgba | null> {
+async function loadImageRgba(path: string): Promise<DecodedRgba | null> {
   try {
     const b64 = await tauri.readFileBase64(path);
     if (!b64 || !b64.trim()) return null;

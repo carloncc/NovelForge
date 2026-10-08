@@ -6,7 +6,7 @@ import type {
   ImageReference,
 } from "../core/types";
 
-export type ReferenceErrorCode = "REFERENCE_UNSUPPORTED" | "REFERENCE_MISSING";
+type ReferenceErrorCode = "REFERENCE_UNSUPPORTED" | "REFERENCE_MISSING";
 
 export class ReferenceImageError extends Error {
   constructor(
@@ -133,9 +133,6 @@ export function knownImageModelCapabilities(model: string): ImageModelCapabiliti
 }
 
 /** 能力表是否识别该模型（配置页据此提示「请点一次测试连接自动探测」，#1149b） */
-export function imageModelIsRecognized(model: string): boolean {
-  return knownImageModelCapabilities(model) !== undefined;
-}
 
 export function resolveImageModelCapabilities(config: ApiConfig): ImageModelCapabilities {
   const stored = customImageCapabilities(config.extra?.imageCapabilities);
@@ -244,17 +241,18 @@ export function protocolForConfig(config: ApiConfig, kind: ChannelKey): ApiProto
   return kind === "llm" || kind === "vision" ? "openai-chat" : "custom-json";
 }
 
-export function configIsUsable(config: ApiConfig | undefined, kind: ChannelKey): config is ApiConfig {
+/** 可用性只看 baseUrl/model/apiKey，与通道类型无关；`_kind` 保留在签名里以维持调用点的自述性。 */
+export function configIsUsable(config: ApiConfig | undefined, _kind: ChannelKey): config is ApiConfig {
   if (!config?.baseUrl?.trim() || !config.model?.trim()) return false;
   if (config.apiKey?.trim()) return true;
   const url = config.baseUrl.toLowerCase();
   return url.includes("localhost") || url.includes("127.0.0.1") || url.includes("::1") || config.extra?.apiKeyOptional === true;
 }
 
-export type ModelCapability = ChannelKey;
+type ModelCapability = ChannelKey;
 export type ProviderId = "siliconflow" | "openai" | "deepseek" | "dashscope" | "moonshot" | "ollama" | "minimax" | "custom";
 
-export interface ProviderPreset {
+interface ProviderPreset {
   id: ProviderId;
   name: string;
   baseUrl: string;
@@ -375,8 +373,13 @@ export function resolveContextLength(cfg: { model?: string; extra?: Record<strin
     const usable = discovered.filter((m) => typeof m.contextLength === "number");
     const hit = usable.find((m) => m.id === cfg.model)
       ?? usable.find((m) => normalizeModelId(m.id) === normalized)
-      // 前缀命中：探测列表里是完整 id（`Qwen/Qwen3-235B-A22B-Instruct`），配置里填的是族名
-      ?? usable.find((m) => normalizeModelId(m.id).startsWith(normalized) || normalized.startsWith(normalizeModelId(m.id)));
+      // 前缀命中：探测列表里是完整 id（`Qwen/Qwen3-235B-A22B-Instruct`），配置里填的是族名。
+      // 必须要求分隔符，否则配置 "gpt-4" 会命中探测到的 "gpt-4o"，拿 4o 的 128K 上下文去跑
+      // 8K 的 gpt-4 → 请求超限被 400 拒（invalid_param 不重试），或按错误预算切分文本。
+      ?? usable.find((m) => {
+        const id = normalizeModelId(m.id);
+        return id.startsWith(`${normalized}-`) || normalized.startsWith(`${id}-`);
+      });
     if (hit?.contextLength) return hit.contextLength;
     // 内置目录（已核实型号）：/models 不返回规格时也能自动带上正确上下文
     const spec = modelSpecFor(cfg.model);
@@ -433,7 +436,11 @@ export function resolveMaxOutputTokens(cfg: { model?: string; extra?: Record<str
     const usable = discovered.filter((m) => typeof m.maxOutputTokens === "number");
     const hit = usable.find((m) => m.id === cfg?.model)
       ?? usable.find((m) => normalizeModelId(m.id) === normalized)
-      ?? usable.find((m) => normalizeModelId(m.id).startsWith(normalized) || normalized.startsWith(normalizeModelId(m.id)));
+      // 同上：必须要求分隔符，避免 gpt-4 命中 gpt-4o 的 max_output_tokens
+      ?? usable.find((m) => {
+        const id = normalizeModelId(m.id);
+        return id.startsWith(`${normalized}-`) || normalized.startsWith(`${id}-`);
+      });
     if (hit?.maxOutputTokens) return clampMaxOutputTokens(hit.maxOutputTokens);
     // 内置目录（已核实型号）的最大输出
     const spec = modelSpecFor(cfg?.model);

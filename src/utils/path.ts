@@ -64,7 +64,10 @@ export function cleanPath(path: string): string {
  */
 export function safeFilename(name: string, maxLength = 60): string {
   return name
-    .replace(/[\\/:*?"<>|\s]+/g, "_")
+    // #1535：原先只洗分隔符与空白，NUL 等 C0 控制字符会原样留下。
+    // Windows 的 CreateFileW 按 NUL 截断路径，`a\u0000b` 实际落到磁盘上是 `a`，
+    // 于是两个不同名字映射到同一个文件、或按全名查找永远 miss。控制字符一并折成下划线。
+    .replace(/[\\/:*?"<>|\s\u0000-\u001f\u007f]+/g, "_")
     .replace(/^\.+/, "")
     .slice(0, maxLength);
 }

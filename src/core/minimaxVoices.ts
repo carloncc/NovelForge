@@ -4,7 +4,7 @@
  * 用于配置页音色库、角色卡音色选择与 AI 提取时的音色候选。
  */
 
-export interface MiniMaxVoice {
+interface MiniMaxVoice {
   id: string;
   name: string;
   gender: "male" | "female" | "other";

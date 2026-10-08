@@ -84,11 +84,17 @@ fn allowed_file_roots() -> Vec<PathBuf> {
     roots
 }
 
-fn canonical_roots() -> Vec<PathBuf> {
-    let mut roots: Vec<PathBuf> = allowed_file_roots()
+/// 环境根（工作目录/临时/家目录）：由进程环境决定，与用户授权无关。
+/// #1516：破坏性操作的守卫只看这一组，见 guard_against_wipe。
+fn ambient_roots() -> Vec<PathBuf> {
+    allowed_file_roots()
         .into_iter()
         .map(|r| r.canonicalize().unwrap_or(r))
-        .collect();
+        .collect()
+}
+
+fn canonical_roots() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = ambient_roots();
     // 用户自选目录（项目输出目录、对话框路径）：进程内登记，重启后由前端重新登记
     if let Ok(blessed) = blessed_dirs().lock() {
         roots.extend(blessed.iter().cloned());
@@ -122,10 +128,11 @@ pub fn bless_project_dir(path: String) -> Result<(), String> {
     if canon.parent().is_none() {
         return Err("不可登记文件系统根目录".to_string());
     }
-    // 盘符根（如 D:\）不予登记：项目必须放在文件夹里（也避免一次登记放行整盘）
-    if canon.parent().map(|p| p.parent().is_none()).unwrap_or(false) {
-        return Err("不可登记盘符根目录，请把项目放在文件夹内".to_string());
-    }
+    // 盘符根（如 D:\）已由上面 canon.parent().is_none() 拦掉（canonicalize 后
+    // "D:\" → "\\?\D:\"，其 parent() 为 None）。此前这里又判了「父目录的父目录为 None」，
+    // 而 D:\NovelForge 的父目录正是 D:\（parent() 为 None）→ 把「盘符根下的一级文件夹」
+    // 也一并拒了，用户把项目建在 D:\NovelForge 这种完全正常的路径上永远登记不上。
+    // 该分支对盘符根是冗余的，对一级文件夹是误伤，故删除。
     if let Ok(mut blessed) = blessed_dirs().lock() {
         blessed.insert(canon);
         return Ok(());
@@ -229,12 +236,18 @@ fn resolve_safe_path(raw: &str) -> Result<PathBuf, String> {
     Ok(canon)
 }
 
-/// 破坏性操作（删除/替换/清理）不得指向盘符根、文件系统根或允许根自身。
+/// 破坏性操作（删除/替换/清理）不得指向盘符根、文件系统根或**环境根**自身。
+///
+/// #1516：这里比对 ambient_roots()，**不含** blessed_dirs()。此前用 canonical_roots()，
+/// 于是 App.vue 启动流程「先 blessProjectDir(项目目录) → 再 cleanupStaleFiles(同一目录)」
+/// 必然自锁：该目录此刻已是"根"，守卫一律拒绝。实测日志里 74 次
+/// 「拒绝操作目录根自身，请指定其子路径」——崩溃残留清理从未真正执行过一次。
+/// 用户 bless 过的项目目录是他自己明示授权的工程目录，清理其崩溃残留正是本命令的用途。
 fn guard_against_wipe(canon: &Path) -> Result<(), String> {
     if canon.parent().is_none() {
         return Err("拒绝操作文件系统根目录".to_string());
     }
-    for root in canonical_roots() {
+    for root in ambient_roots() {
         if *canon == root {
             return Err("拒绝操作目录根自身，请指定其子路径".to_string());
         }
@@ -299,7 +312,7 @@ fn ssrf_reject_reason(url: &reqwest::Url, allow_lan: bool) -> Option<String> {
         .unwrap_or_default()
         .trim()
         .trim_start_matches('[')
-        .trim_end_matches(|c| c == ']' || c == '.')
+        .trim_end_matches([']', '.'])
         .to_ascii_lowercase();
     if host.is_empty() {
         return Some("缺少主机名，已拒绝".to_string());
@@ -695,6 +708,34 @@ pub async fn write_text_file(path: String, content: String) -> Result<(), String
     tauri::async_runtime::spawn_blocking(move || atomic_write(&safe, content.as_bytes()))
         .await
         .map_err(|e| format!("写入任务执行失败: {e}"))?
+}
+
+/// 给文件加执行位（#1514）。
+///
+/// 为什么需要：随包的 `start_game.command` 是「双击即玩」的入口，但 `write_text_file`
+/// 只写内容不设权限，落盘就是 0644。macOS Finder 双击无执行位的 .command 不会运行
+/// （报权限错误或用编辑器打开），于是 macOS 用户拿到的包「双击没反应」——
+/// 而 HOW_TO_PLAY 与导出说明都明确让用户双击它。
+///
+/// Windows 无执行位概念，直接返回 Ok；失败不阻断组装，只在日志里留痕。
+#[tauri::command]
+pub async fn set_file_executable(path: String) -> Result<(), String> {
+    let safe = resolve_safe_path(&path)?;
+    tauri::async_runtime::spawn_blocking(move || set_executable_blocking(&safe))
+        .await
+        .map_err(|e| format!("设置权限任务执行失败: {e}"))?
+}
+
+#[cfg(unix)]
+fn set_executable_blocking(path: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("设置执行权限失败: {e}"))
+}
+
+#[cfg(not(unix))]
+fn set_executable_blocking(_path: &std::path::Path) -> Result<(), String> {
+    Ok(())
 }
 
 /// 追加写入（#1502）。
@@ -1231,9 +1272,7 @@ pub async fn start_preview_server(root: String) -> Result<Value, String> {
 
 fn start_preview_server_blocking(root: &str) -> Result<Value, String> {
     // 校验期不持有锁、不碰旧实例：失败直接返回，旧预览保持可用（#1329 主路径）
-    if let Err(error) = server::validate_preview_root(root) {
-        return Err(error);
-    }
+    server::validate_preview_root(root)?;
     // 先释放旧实例再绑定端口（#782）：旧实现先 start 后 stop，连点「启动/刷新」时
     // 第二次绑定会在旧实例释放前失败，报「端口 17892 被占用」。
     //
@@ -1345,6 +1384,9 @@ fn try_linux_open(cmd: &str, target: &str) -> bool {
         .unwrap_or(false)
 }
 
+// 平台分支用 #[cfg] 各自 early-return：Windows 分支的 `return Ok(())` 后面
+// 还跟着（在别的平台上才存在的）分支与函数尾部，删掉 return 会让本平台下函数没有尾表达式。
+#[allow(clippy::needless_return)]
 #[tauri::command]
 pub fn open_in_explorer(path: String) -> Result<(), String> {
     let safe = resolve_safe_path(&path)?;
@@ -1393,6 +1435,8 @@ pub fn get_default_output_dir() -> String {
         .unwrap_or_else(|_| "output".to_string())
 }
 
+// 同 open_in_explorer：平台分支的 early-return 不能删（见上）。
+#[allow(clippy::needless_return)]
 #[tauri::command]
 pub fn open_url(url: String) -> Result<(), String> {
     // 只允许 http/https：旧实现把任意字符串交给 explorer/open，可借系统关联启动本地程序、
@@ -1593,6 +1637,9 @@ fn write_zip_contents(
     // 前端虽已拦截，Rust 侧仍需跳过正在写入的半成品；文件名按 canonical 路径比对）
     let target_canon = std::fs::canonicalize(zip_path).ok();
 
+    // 参数是「递归遍历 zip 打包」的天然输入（目录/相对路径/写入器/过滤/计数/目标路径），
+    // 收进结构体反而要把每个调用点都改一遍，收益低。
+    #[allow(clippy::too_many_arguments)]
     fn walk(
         dir: &std::path::Path,
         rel: &mut Vec<String>,
@@ -1613,7 +1660,17 @@ fn write_zip_contents(
                 eprintln!("[novelforge] 跳过符号链接: {}", path.display());
                 continue;
             }
-            rel.push(entry.file_name().to_string_lossy().to_string());
+            // #1522：点文件/点目录一律不进包。预览服务器的 is_preview_blocked 早已把「任一路径
+            // 组件以 . 开头」当作隐私（不对外提供），而打包器此前只排除调用方显式列出的前缀，
+            // 于是 .git / .env / .npmrc / .idea 这类东西会跟着发布包发出去——项目目录由用户
+            // 自选，挑在仓库里就会连整个 .git 一起吞进去（体积暴涨 + 历史泄露）。
+            // 口径与预览服务器对齐：游戏本体不依赖任何点文件（预览本就拒绝它们，照样能跑）。
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                eprintln!("[novelforge] 跳过点文件/点目录: {}", path.display());
+                continue;
+            }
+            rel.push(name);
             if is_excluded(rel, patterns) {
                 rel.pop();
                 continue;
@@ -1658,7 +1715,7 @@ fn write_zip_contents(
 
 #[cfg(test)]
 mod atomic_write_tests {
-    use super::{append_text_file, atomic_write, atomic_write_temp_path, bless_project_dir, cancel_http_request, cleanup_stale_dir, write_api_secrets_blocking, cleanup_stale_files, copy_file, display_path, guard_against_wipe, has_transparency, http_aborts, http_target, is_atomic_tmp_name, linux_open_args, linux_open_failed, list_dir, path_exists, path_within_home_credential_dir, reject_unsafe_path_syntax, replace_path, resolve_safe_path, ssrf_reject_reason, strip_verbatim_prefix, validate_secret_id, write_api_secrets, write_text_file, HttpRequestArgs};
+    use super::{append_text_file, atomic_write, atomic_write_temp_path, bless_project_dir, cancel_http_request, cleanup_stale_dir, write_api_secrets_blocking, cleanup_stale_files, copy_file, display_path, guard_against_wipe, has_transparency, http_aborts, http_target, is_atomic_tmp_name, linux_open_args, linux_open_failed, list_dir, path_exists, path_within_home_credential_dir, reject_unsafe_path_syntax, replace_path, resolve_safe_path, ssrf_reject_reason, strip_verbatim_prefix, validate_secret_id, write_text_file, HttpRequestArgs};
     use std::path::Path;
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use image::ImageEncoder as _;
@@ -1834,6 +1891,28 @@ mod atomic_write_tests {
         assert!(guard_against_wipe(&tmp_root).is_err());
         assert!(guard_against_wipe(&inner).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cleanup_guard_allows_blessed_project_dir() {
+        // #1516：App.vue 启动流程是「先 blessProjectDir(项目目录) → 再 cleanupStaleFiles(同一目录)」。
+        // 守卫此前用 canonical_roots()（含 blessed_dirs），该目录此刻已是"根"，一律拒绝 ——
+        // 实测日志里 74 次「拒绝操作目录根自身，请指定其子路径」，崩溃残留清理从未执行过一次。
+        let proj = std::env::temp_dir().join("novelforge_guard_blessed_test");
+        let _ = std::fs::remove_dir_all(&proj);
+        std::fs::create_dir_all(&proj).unwrap();
+        bless_project_dir(proj.to_string_lossy().to_string()).unwrap();
+        let canon = proj.canonicalize().unwrap();
+        assert!(
+            guard_against_wipe(&canon).is_ok(),
+            "bless 过的项目目录必须允许清理，否则「先 bless 再 cleanup」必然自锁"
+        );
+        // 放宽只针对 blessed 目录：环境根自身仍必须拒绝
+        let tmp_root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir());
+        assert!(guard_against_wipe(&tmp_root).is_err());
+        let _ = std::fs::remove_dir_all(&proj);
     }
 
     #[test]
@@ -2043,7 +2122,7 @@ mod atomic_write_tests {
         image::codecs::png::PngEncoder::new(&mut png)
             .write_image(rgba.as_raw(), 1, 1, image::ExtendedColorType::Rgba8)
             .unwrap();
-        assert_eq!(has_transparency(B64.encode(&png)).await.unwrap(), false);
+        assert!(!has_transparency(B64.encode(&png)).await.unwrap());
         // cleanup_stale_files：.tmp 删除、中断替换恢复
         std::fs::write(dir.join("x.json.1234.5.tmp"), b"partial").unwrap();
         std::fs::write(dir.join("orphan.bin.replace-backup"), b"old").unwrap();
@@ -2153,6 +2232,38 @@ mod http_stream_tests {
 
 #[cfg(test)]
 mod zip_tests {
+    #[test]
+    fn zip_exclude_matches_path_components_exactly() {
+        // B126 回归：排除 ".novel2vn" 不能误伤 "not.novel2vn" / "xnode_modules" 这类相似名
+        let dir = std::env::temp_dir().join("novelforge_zip_exclude_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".novel2vn")).unwrap();
+        std::fs::create_dir_all(dir.join("not.novel2vn")).unwrap();
+        std::fs::create_dir_all(dir.join("node_modules")).unwrap();
+        std::fs::write(dir.join(".novel2vn/cache.json"), "secret").unwrap();
+        std::fs::write(dir.join("not.novel2vn/keep.txt"), "keep").unwrap();
+        std::fs::write(dir.join("node_modules/keep.txt"), "keep").unwrap();
+        std::fs::write(dir.join("index.html"), "<html/>").unwrap();
+
+        let zip_path = dir.join("out.zip");
+        let res = build_zip_sync(
+            &dir.to_string_lossy(),
+            &zip_path.to_string_lossy(),
+            &[".novel2vn".to_string(), "node_modules".to_string()],
+        );
+        assert!(res.is_ok(), "build_zip 失败: {:?}", res.err());
+
+        let names = read_zip_names(&zip_path);
+        assert!(!names.iter().any(|n| n.starts_with(".novel2vn/")), "应排除 .novel2vn: {names:?}");
+        assert!(!names.iter().any(|n| n.starts_with("node_modules/")), "应排除 node_modules: {names:?}");
+        assert!(
+            names.iter().any(|n| n.starts_with("not.novel2vn/")),
+            "相似名目录被误伤: {names:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::build_zip_sync;
 
     fn read_zip_names(zip_path: &std::path::Path) -> Vec<String> {
@@ -2205,34 +2316,38 @@ mod zip_tests {
     }
 
     #[test]
-    fn zip_exclude_matches_path_components_exactly() {
-        // B126 回归：排除 ".novel2vn" 不能误伤 "not.novel2vn" / "xnode_modules" 这类相似名
-        let dir = std::env::temp_dir().join("novelforge_zip_exclude_test");
+    fn zip_skips_dot_files_and_dot_dirs() {
+        let dir = std::env::temp_dir().join("novelforge_zip_dot_test");
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join(".novel2vn")).unwrap();
-        std::fs::create_dir_all(dir.join("not.novel2vn")).unwrap();
-        std::fs::create_dir_all(dir.join("node_modules")).unwrap();
-        std::fs::write(dir.join(".novel2vn/cache.json"), "secret").unwrap();
-        std::fs::write(dir.join("not.novel2vn/keep.txt"), "keep").unwrap();
-        std::fs::write(dir.join("node_modules/keep.txt"), "keep").unwrap();
+        std::fs::create_dir_all(dir.join(".git/objects")).unwrap();
+        std::fs::create_dir_all(dir.join("game/.cache")).unwrap();
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
         std::fs::write(dir.join("index.html"), "<html/>").unwrap();
+        std::fs::write(dir.join("assets/bg.png"), "png").unwrap();
+        std::fs::write(dir.join(".env"), "SECRET=1").unwrap();
+        std::fs::write(dir.join(".git/config"), "[core]").unwrap();
+        std::fs::write(dir.join(".git/objects/ab"), "obj").unwrap();
+        std::fs::write(dir.join("game/.cache/token.json"), "secret").unwrap();
 
         let zip_path = dir.join("out.zip");
-        let res = build_zip_sync(
-            &dir.to_string_lossy(),
-            &zip_path.to_string_lossy(),
-            &[".novel2vn".to_string(), "node_modules".to_string()],
-        );
-        assert!(res.is_ok(), "build_zip 失败: {:?}", res.err());
-
+        build_zip_sync(dir.to_str().unwrap(), zip_path.to_str().unwrap(), &[]).unwrap();
         let names = read_zip_names(&zip_path);
-        assert!(!names.iter().any(|n| n.starts_with(".novel2vn/")), "应排除 .novel2vn: {names:?}");
-        assert!(!names.iter().any(|n| n.starts_with("node_modules/")), "应排除 node_modules: {names:?}");
-        assert!(
-            names.iter().any(|n| n.starts_with("not.novel2vn/")),
-            "相似名目录被误伤: {names:?}"
-        );
 
+        assert!(
+            names.iter().any(|n| n == "index.html"),
+            "普通文件必须进包：{names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.ends_with("assets/bg.png")),
+            "素材必须进包：{names:?}"
+        );
+        for leaked in [".env", ".git/config", ".git/objects/ab", "game/.cache/token.json"] {
+            assert!(
+                !names.iter().any(|n| n == leaked || n.ends_with(&format!("/{leaked}"))),
+                "点文件/点目录不得进入发布包，但 {leaked} 出现在 {names:?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
+
 }

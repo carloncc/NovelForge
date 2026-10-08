@@ -64,8 +64,8 @@ export function isAllowedResultUrl(resultUrl: string, cfgBaseUrl?: string): bool
 
 /* ============ 统一能力模型 ============ */
 
-export type Capability = "image" | "tts";
-export type AdapterMode = "sync" | "async";
+type Capability = "image" | "tts";
+type AdapterMode = "sync" | "async";
 
 export interface AdapterTemplate {
   id: string;
@@ -112,9 +112,9 @@ export interface AdapterTemplate {
   description?: string;
 }
 
-export type TemplateValue = string | { value: unknown } | { ref: string };
+type TemplateValue = string | { value: unknown } | { ref: string };
 
-export interface UnifiedImageInput {
+interface UnifiedImageInput {
   prompt: string;
   negativePrompt?: string;
   width?: number;
@@ -126,7 +126,7 @@ export interface UnifiedImageInput {
   format?: string;
 }
 
-export interface UnifiedTtsInput {
+interface UnifiedTtsInput {
   text: string;
   voice: string;
   format?: "mp3" | "ogg" | "wav" | "opus";
@@ -136,7 +136,7 @@ export interface UnifiedTtsInput {
   ttsEmotion?: string;
 }
 
-export interface UnifiedResult {
+interface UnifiedResult {
   dataB64: string;
   mime: string;
 }
@@ -214,18 +214,18 @@ export function setByPath(obj: Record<string, unknown>, path: string, value: unk
 
 /* ============ 尺寸转换 ============ */
 
-export function sizeRatio(width?: number, height?: number): string {
+function sizeRatio(width?: number, height?: number): string {
   if (!width || !height) return "1:1";
   const g = gcd(width, height);
   return `${width / g}:${height / g}`;
 }
 
-export function sizeString(width?: number, height?: number): string {
+function sizeString(width?: number, height?: number): string {
   if (!width || !height) return "1024*1024";
   return `${width}*${height}`;
 }
 
-export function sizeOpenAI(width?: number, height?: number): string {
+function sizeOpenAI(width?: number, height?: number): string {
   if (!width || !height) return "1024x1024";
   return `${width}x${height}`;
 }
@@ -437,8 +437,17 @@ async function decodeResult(
       return { dataB64: res.bodyBase64, mime: res.contentType.split(";")[0] || "application/octet-stream" };
     }
     // #1309：encoding none 的非 URL 值同样做载荷校验——模型拒答文本（如 MiniMax 的纯文本回复）
-    // 否则会被原样写盘成坏 PNG。data: URL 自描述，跳过不断言。
-    if (!value.startsWith("data:")) assertEncodedPayload(value, mime);
+    // 否则会被原样写盘成坏 PNG。
+    // data: URL 必须剥离前缀再返回：下游一律把 dataB64 当纯 base64 解码，
+    // 原样返回会写出「前缀文本 + 错位载荷」的损坏文件；且识别 data: 的分支同时
+    // 跳过断言，等于对这类输入完全不校验。剥完再走正常断言。
+    const dataUrl = /^data:([^;,]*)((?:;[^,]*)*),(.*)$/s.exec(value);
+    if (dataUrl) {
+      const inner = dataUrl[3];
+      assertEncodedPayload(inner, dataUrl[1] || mime);
+      return { dataB64: inner, mime: dataUrl[1] || mime || "application/octet-stream" };
+    }
+    assertEncodedPayload(value, mime);
     return { dataB64: value, mime: mime ?? "application/octet-stream" };
   }
   assertEncodedPayload(value, mime);
@@ -685,16 +694,26 @@ export function utf8FromB64(b64: string): string {
  * 这里仅对网络层错误/429/5xx 做有限退避重试（最多 GET_RETRY_COUNT 次），
  * 4xx（除 429）与响应解析失败属于永久错误，立即抛出不做无谓重试。
  */
-async function getJson(cfg: ApiConfig, url: string, template: AdapterTemplate, isAborted?: () => boolean): Promise<unknown> {
+async function getJson(
+  cfg: ApiConfig,
+  url: string,
+  template: AdapterTemplate,
+  isAborted?: () => boolean,
+  opts?: { signal?: AbortSignal; timeoutSecs?: number },
+): Promise<unknown> {
   let lastErr: unknown;
   for (let attempt = 0; attempt <= GET_RETRY_COUNT; attempt++) {
     try {
       const res = await tauri.http({
         method: "GET",
         url,
-        headers: { ...authHeaders(cfg, template), ...customHeadersFor(cfg) },
-        timeoutSecs: 60,
-      }, activeAbortSignal());
+        // 补 template.headers：POST 分支的 requestWithRetry 会带上它，GET 轮询此前不带，
+        // 需要自定义路由头的异步模板会在「提交成功、每次轮询失败」上翻车。
+        // 中止与超时同样透传：此前固定用 activeAbortSignal() + 60s，
+        // 未注册为全局槽的 run 级 signal 根本停不下来，停止后仍在轮询计费。
+        headers: { ...authHeaders(cfg, template), ...customHeadersFor(cfg), ...(template.headers ?? {}) },
+        timeoutSecs: opts?.timeoutSecs ?? 60,
+      }, opts?.signal ?? activeAbortSignal());
       const raw = utf8FromB64(res.bodyBase64);
       if (res.status >= 500 || res.status === 429) {
         throw httpStatusError(res.status, `HTTP ${res.status}`);
@@ -734,7 +753,7 @@ async function getJson(cfg: ApiConfig, url: string, template: AdapterTemplate, i
 
 /* ============ 通用调用入口 ============ */
 
-export interface CallContext {
+interface CallContext {
   cfg: ApiConfig;
   template: AdapterTemplate;
   vars: Record<string, unknown>;
@@ -853,7 +872,7 @@ async function callUnified(ctx: CallContext): Promise<UnifiedResult> {
       }
       statusJson = (await postJson(cfg, pollUrl, pollBody, template, { signal, timeoutSecs })).json;
     } else {
-      statusJson = await getJson(cfg, pollUrl, template, pollAborted);
+      statusJson = await getJson(cfg, pollUrl, template, pollAborted, { signal, timeoutSecs });
     }
     const status = getByPath(statusJson, poll.statusPath);
     if (isPollFailed(status)) {

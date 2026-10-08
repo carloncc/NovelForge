@@ -54,9 +54,18 @@ jobs:
         run: pnpm check:i18n
         timeout-minutes: 5
 
-      - name: Frontend unit tests
+      - name: Frontend unit + e2e tests
         run: pnpm test
         timeout-minutes: 15
+
+      # 浏览器端验收：装 Playwright 浏览器后跑 web-smoke / web-i18n-smoke / 懒加载缩略图 / 视觉守门
+      - name: Install Playwright browsers
+        run: pnpm exec playwright install --with-deps chromium
+        timeout-minutes: 15
+
+      - name: Browser e2e tests
+        run: pnpm test:e2e
+        timeout-minutes: 30
 
       - name: Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml

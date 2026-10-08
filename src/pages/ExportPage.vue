@@ -216,6 +216,8 @@ async function pickTitleFile(kind: "cover" | "logo"): Promise<void> {
     });
     const p = Array.isArray(picked) ? picked[0] : picked;
     if (!p) return;
+    // #1520：封面/Logo 路径会被组装阶段读取；先登记所在目录，否则白名单外的图片取不到
+    await blessParentDir(p);
     if (kind === "cover") {
       titleForm.value.coverPath = p;
       titleForm.value.coverMode = "custom";

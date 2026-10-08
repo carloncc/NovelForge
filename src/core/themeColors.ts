@@ -3,7 +3,7 @@
  * 纯函数部分（pickAccentColorsFromPixels）不依赖 DOM，便于单测；抽图部分在无 DOM 环境自动跳过。
  */
 
-export interface AccentColor {
+interface AccentColor {
   h: number;
   s: number;
   l: number;

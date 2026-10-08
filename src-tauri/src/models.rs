@@ -3,6 +3,7 @@
 //! - 断点续传（.part 文件 + Range 头）
 //! - 连接失败重试（指数退避，12 次封顶，可重试状态码 408/429/5xx）
 //! - md5 完整性校验（失败重下，3 轮）
+//!
 //! 模型文件保存在**用户可写目录**（app_data_dir/models，回退 app_config_dir）下，
 //! 经 model:// 自定义协议供前端 fetch；resource_dir/models 只作为旧版本迁移来源与只读查找路径。
 //! #1130：AppImage/deb/macOS .app 等安装形态下 resource_dir 只读，模型目录必须落在可写位置，
@@ -36,7 +37,11 @@ const ALLOWED_DOWNLOAD_HOSTS: &[&str] = &[
 ];
 /// github.com 上只放行 rembg release 的下载路径（其余路径一律拒绝）
 const REMBG_RELEASE_PATH_PREFIX: &str = "/danielgatis/rembg/releases/download/";
-/// 表外文件（未来新增模型）的统一大小上限：与前端 sizeMB 上限对齐（300MB）+10% 余量
+/// 表外文件（未来新增模型）的统一大小上限。
+/// 注意：前端 models.ts 里的 `sizeMB` 只是**每个模型的展示值**（168/170/214/5），
+/// 并非「上限」——本文件早先的注释把它误读成一个 300MB 上限，说的其实不存在。
+/// 330MB 的实际依据：略高于表内最大模型 BiRefNet 214MB，给未来更大的模型留出余量；
+/// 超过即拒绝，避免未知模型把磁盘写满。
 const MAX_UNKNOWN_MODEL_BYTES: u64 = 330 * 1024 * 1024;
 /// 可信模型的最小体积：小于此值必然不是模型（截断/占位文件）
 const MIN_MODEL_BYTES: u64 = 1024 * 1024;
@@ -219,7 +224,7 @@ fn migrate_legacy_models(target: &Path, sources: &[PathBuf], writable: bool) {
             if safe_model_filename(name_str).is_err() {
                 continue;
             }
-            let destination = target.join(&name);
+            let destination = target.join(name);
             if destination.exists() {
                 continue;
             }
@@ -496,10 +501,10 @@ async fn connect_with_retry(
                 eprintln!("[model-download] 第 {attempt}/{MAX_CONNECT_ATTEMPTS} 次连接失败：{error}");
             }
         }
-        if attempt < MAX_CONNECT_ATTEMPTS {
-            if sleep_cancellable(1000 * u64::from(attempt.min(8)), cancel).await {
-                return Err("下载已取消".to_string());
-            }
+        if attempt < MAX_CONNECT_ATTEMPTS
+            && sleep_cancellable(1000 * u64::from(attempt.min(8)), cancel).await
+        {
+            return Err("下载已取消".to_string());
         }
     }
     Err(last_error.unwrap_or_else(|| "无法连接下载源".to_string()))
@@ -676,7 +681,7 @@ impl Md5 {
             ]);
         }
         let (mut a, mut b, mut c, mut d) = (self.state[0], self.state[1], self.state[2], self.state[3]);
-        for i in 0..64 {
+        for (i, shift) in SHIFTS.iter().enumerate() {
             let (f, g) = match i / 16 {
                 0 => ((b & c) | ((!b) & d), i),
                 1 => ((d & b) | ((!d) & c), (5 * i + 1) % 16),
@@ -690,7 +695,7 @@ impl Md5 {
                 a.wrapping_add(f)
                     .wrapping_add(self.k[i])
                     .wrapping_add(m[g])
-                    .rotate_left(SHIFTS[i]),
+                    .rotate_left(*shift),
             );
             a = tmp;
         }
@@ -957,7 +962,7 @@ mod tests {
         sleep_cancellable, validate_download_url, Integrity, Md5, MAX_UNKNOWN_MODEL_BYTES,
     };
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
 
@@ -969,7 +974,7 @@ mod tests {
         dir
     }
 
-    fn write_model(dir: &PathBuf, filename: &str, size: usize, first_byte: u8) -> PathBuf {
+    fn write_model(dir: &Path, filename: &str, size: usize, first_byte: u8) -> PathBuf {
         let path = dir.join(filename);
         let mut bytes = vec![0u8; size];
         bytes[0] = first_byte;

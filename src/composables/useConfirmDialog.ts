@@ -15,7 +15,7 @@ import { t } from "../i18n";
  *   if (!(await confirmDialog({ title: t("删除该章节？"), message: t("删除后无法恢复。"), tone: "danger" }))) return;
  */
 
-export interface ConfirmOptions {
+interface ConfirmOptions {
   /** 标题（必填，作为可访问名称） */
   title: string;
   /** 正文说明 */
@@ -30,7 +30,7 @@ export interface ConfirmOptions {
   tone?: "primary" | "danger";
 }
 
-export interface PromptOptions extends Omit<ConfirmOptions, "confirmLabel"> {
+interface PromptOptions extends Omit<ConfirmOptions, "confirmLabel"> {
   /** 输入框占位符 */
   placeholder?: string;
   /** 已有值（编辑场景） */

@@ -2,6 +2,7 @@ import type { ApiConfig, ChapterInfo } from "./types";
 import { chatJson } from "../api/openaiCompatible";
 import { estimateCharsPerToken, resolveContextLength, MAX_INPUT_CHUNK_CHARS } from "../api/providers";
 import { log } from "../utils/logger";
+import { safeSlice } from "../utils/text";
 
 /**
  * 单章字数预算（模型自适应，不设固定字数上限）：单章不再受"单次输出"约束——
@@ -173,7 +174,7 @@ async function detectBeatCuts(
   for (const item of list) {
     const obj = item as { start?: unknown; title?: unknown };
     const n = Number(obj?.start);
-    const title = typeof obj?.title === "string" ? obj.title.trim().slice(0, 10) : "";
+    const title = typeof obj?.title === "string" ? safeSlice(obj.title.trim(), 10) : "";
     if (Number.isFinite(n) && n >= batchStart && n < batchStart + blocks.length) {
       segs.push({ start: n, title: title || `段${segs.length + 1}` });
     }
@@ -682,7 +683,11 @@ export function splitChaptersForFallback(fullText: string): ChapterInfo[] {
     merged.push({ index: merged.length, title: c.title.trim(), text, charCount: text.length });
   }
   if (!merged.length) {
-    merged.push({ index: 0, title: "第一章", text: fullText.trim(), charCount: fullText.length });
+    // #1527：charCount 必须与 text 对齐。此处此前用未裁剪的 fullText.length，
+    // 纯空白原文就会得到「text 为空、charCount 却记着空白字数」——而其余每一处构造
+    // （以及 chapters.ts 里的同款回退）一律是 charCount = text.length。
+    // 导入页的「字数」列、以及任何按字数做的预算都会因此算多。
+    merged.push({ index: 0, title: "第一章", text: fullText.trim(), charCount: fullText.trim().length });
   }
   return merged;
 }

@@ -9,6 +9,8 @@
     "build": "node scripts/check-template.mjs && node scripts/copy-ort-assets.mjs && vue-tsc --noEmit && vite build",
     "preview": "vite preview",
     "test": "node scripts/run-tests.mjs",
+    "test:e2e": "node scripts/run-tests.mjs --e2e",
+    "test:all": "node scripts/run-tests.mjs --all",
     "tauri": "tauri",
     "prepare:template": "node scripts/fetch-webgal-template.mjs",
     "check:template": "node scripts/check-template.mjs",
@@ -20,7 +22,6 @@
   "dependencies": {
     "@tauri-apps/api": "^2.9.0",
     "@tauri-apps/plugin-dialog": "^2.4.0",
-    "@tauri-apps/plugin-fs": "^2.4.0",
     "fflate": "^0.8.3",
     "onnxruntime-web": "^1.29.0",
     "vue": "^3.5.13"

@@ -5,10 +5,11 @@ import {
   chapterDisplayTitle,
   branchPrefix,
   sanitizeChoicePrompt,
-  stableHash,
+  djb2Hash,
   TEXTBOX_PAGE_MAX_CHARS,
   MESSAGE_MAX_CHARS,
   MESSAGE_MAX_CHARS_LATIN,
+  TTS_SPEECH_MAX_CHARS,
 } from "../src/core/render";
 import { buildFlowchartJson } from "../src/core/project";
 import type { ChapterScript } from "../src/core/types";
@@ -182,7 +183,7 @@ function main(): void {
   const p1 = branchPrefix(1, "sc_a b");
   const p2 = branchPrefix(1, "sc_a_b");
   assert(p1 !== p2, "1462 易撞 id 前缀应不同");
-  assert(stableHash("x").length > 0, "1462 哈希可用");
+  assert(djb2Hash("x").length > 0, "1462 哈希可用");
   assert(outCh.includes(`${p1}_c1`) || outCh.includes("_c1"), "1462 分支 label 应输出");
 
   // 1461：分支后舞台复原
@@ -234,7 +235,16 @@ function main(): void {
   assert(MESSAGE_MAX_CHARS === 32, "1458 单消息上限应为 32");
   assert(MESSAGE_MAX_CHARS_LATIN === 80, "1458 拉丁上限应为 80");
   const cfg = renderConfig("t", "k");
-  assert(cfg.includes("Max_line:2;"), "1458 Max_line 应与引擎可见行数一致");
+  // Max_line 是「一条消息最多保留几个 | 分页段」（引擎 Os 的实现是 .slice(0, Max_line)），
+  // 不是文本框可见行数（可见行数由 CSS 决定）。1458 按「可见 2 行」把它设成 2，反而让
+  // 第 3 页起被引擎静默丢弃：配音台词与独白按设计不拆成多条消息，单条最长 500 字 →
+  // 8 页，于是所有 >128 字的配音台词/独白在游戏里只显示前 128 字。
+  // 这里断言它覆盖「单条消息的全部页数」，即 ceil(TTS_SPEECH_MAX_CHARS / 单页容量)。
+  assert(
+    cfg.includes(`Max_line:${Math.ceil(TTS_SPEECH_MAX_CHARS / TEXTBOX_PAGE_MAX_CHARS)};`),
+    "Max_line 必须覆盖单条消息的全部分页，否则长台词被引擎静默截断",
+  );
+  assert(cfg.includes("Max_line:8;"), "500 字 ÷ 每页 64 字 = 8 页");
   const cfgFile = renderConfig("t", "k", "zh_CN", "超长封面文件名_0123456789_0123456789_0123456789_0123456789.png");
   assert(cfgFile.includes("超长封面文件名"), "1452 封面文件名不应被截断");
 

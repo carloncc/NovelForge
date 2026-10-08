@@ -189,6 +189,11 @@ watch(assetTab, () => {
             <span class="asset-name">{{ row.name }}</span>
             <span style="color: var(--text-faint); font-size: 11px">{{ row.id }}</span>
             <span v-if="row.hasRef" class="tag ok" :title="t('已在「卡片编辑」中为该角色设置参考图，三视图/动作将基于参考图生成')">{{ t("有参考图") }}</span>
+            <span
+              v-if="row.tier !== 'main'"
+              class="tag"
+              :title="t('图片档位决定该角色生成多少张立绘/表情/服装/动作：主要＝全量；次要＝表情 5 张、服装 1 套、动作 1 个；路人＝默认立绘＋1 张表情（无服装/动作）。渲染端对缺失差分有回退，不会出现空场。')"
+            >{{ row.tier === "cameo" ? t("路人") : t("次要角色") }}</span>
             <span class="asset-file">{{ fileExistsLabel(row.threeView) }}</span>
             <button class="btn small" :disabled="regenLocked" @click="confirmRegenThreeView(row.id, row.name)">{{ t("重新生成三视图（联动全部）") }}</button>
             <button class="btn secondary small" :disabled="regenLocked" @click="confirmRegenAllFigure(row.id, row.name)">{{ t("重新生成全部表情") }}</button>
@@ -199,7 +204,7 @@ watch(assetTab, () => {
               class="asset-thumb"
               :title="t('三视图（点击放大；有参考图时将基于参考图生成）')"
               v-bind="thumbA11y(row.threeView, `${row.name} · ${t('三视图')}`)"
-              @click="openPreview(row.threeView, `${row.name} · 三视图`)"
+              @click="openPreview(row.threeView, `${row.name} · ${t('三视图')}`)"
             >
               <label class="asset-sel" @click.stop><input type="checkbox" :aria-label="`${row.name} · ${t('三视图')}`" :checked="selected.has(`threeview:${row.id}`)" @change="toggleSelect(`threeview:${row.id}`)" /></label>
               <LazyThumb :path="row.threeView" :alt="t('三视图')" />
@@ -212,7 +217,7 @@ watch(assetTab, () => {
               :key="e.emo"
               class="asset-thumb"
               :class="{ missing: !e.file }"
-              :title="`${EMOTION_LABELS[e.emo] ?? e.emo}（点击放大）`"
+              :title="`${EMOTION_LABELS[e.emo] ?? e.emo}${t('（点击放大）')}`"
               v-bind="thumbA11y(e.file, `${row.name} · ${EMOTION_LABELS[e.emo] ?? e.emo}`)"
               @click="e.file && openPreview(e.file, `${row.name} · ${EMOTION_LABELS[e.emo] ?? e.emo}`)"
             >
@@ -233,7 +238,7 @@ watch(assetTab, () => {
                 :key="ct.id"
                 class="asset-thumb"
                 :class="{ missing: !ct.file }"
-                :title="`${ct.name}（点击放大）`"
+                :title="`${ct.name}${t('（点击放大）')}`"
                 v-bind="thumbA11y(ct.file, `${row.name} · ${ct.name}`)"
                 @click="ct.file && openPreview(ct.file, `${row.name} · ${ct.name}`)"
               >
@@ -255,7 +260,7 @@ watch(assetTab, () => {
                 :key="a.id"
                 class="asset-thumb"
                 :class="{ missing: !a.file }"
-                :title="`${a.name}（点击放大）`"
+                :title="`${a.name}${t('（点击放大）')}`"
                 v-bind="thumbA11y(a.file, `${row.name} · ${a.name}`)"
                 @click="a.file && openPreview(a.file, `${row.name} · ${a.name}`)"
               >

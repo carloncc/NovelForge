@@ -18,7 +18,7 @@ async function main(): Promise<void> {
   // 准备一个真实的小说源文件
   const novelPath = `${DIR}/小说.txt`;
   await writeFile(novelPath, "第一章 初见\n林澈:你好;\n第二章 再见\n苏晚晴:再见;", "utf-8");
-  const { importNovelFile, splitChapters } = await import("../src/core/chapters");
+  const { importNovelFile } = await import("../src/core/chapters");
 
   const novel = await importNovelFile(novelPath);
   novel.chapters[0].title = "第一章 改过的标题";

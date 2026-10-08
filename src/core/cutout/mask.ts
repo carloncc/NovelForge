@@ -2,7 +2,7 @@
  * Mask 几何与统计工具（移植自「抠图」项目 src/mask.js）。
  */
 
-export interface ContainSize {
+interface ContainSize {
   scale: number;
   scaledWidth: number;
   scaledHeight: number;

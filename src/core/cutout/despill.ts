@@ -82,7 +82,11 @@ export function estimateBackgroundColor(
     }
   }
 
-  if (rs.length < minSamples) return null;
+  // #1570：`!rs.length` 必须单独判——minSamples 可被 DespillOpts 覆盖，若调用方传 0，
+  // 则「一张全透明图」会让 rs 为空并一路走到 median([])：despill 的 median 没有空数组保护，
+  // 会返回 NaN（undefined + undefined），接着 `NaN > maxMAD` 为假、判不出「背景不均匀」，
+  // 于是把 [NaN, NaN, NaN] 当背景色返回。无样本 = 估不出背景 = 跳过，与「不足则跳过」同一语义。
+  if (!rs.length || rs.length < minSamples) return null;
 
   const bgR = median(rs);
   const bgG = median(gs);

@@ -54,12 +54,10 @@ export interface CutoutModelDownloadRequest {
   md5?: string;
 }
 
-function base64ToBuffer(b64: string): Uint8Array {
-  const bin = atob(b64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  return bytes;
-}
+// #1532：原本是一份只走 atob 的副本，与同文件下方 writeFileBase64Fallback 里的
+// `Buffer.from(x, "base64")` 各行其是（一个对非法输入抛错、一个静默返回 0 字节）。
+// 统一走 base64.ts 的严格解码。
+const base64ToBuffer = b64decode;
 
 /** 从文件头识别图片尺寸（支持 PNG / JPEG / WebP / GIF） */
 function detectImageSize(buf: Uint8Array): { width: number; height: number } | null {
@@ -227,13 +225,64 @@ export async function httpStream(
   }
 }
 
+/** Node 侧可试解的传统中文/日韩编码，按常见度排序 */
+const LEGACY_TEXT_ENCODINGS = ["gbk", "big5", "shift_jis", "euc-kr"] as const;
+
+/** 文本"像不像正常中文/日韩文"：含替换字符直接判负（该编码解释不了这份字节）。
+ *  只为在多个都能解码的候选（GBK 与 Big5 高度重叠）之间择优。 */
+function cjkPlausibility(text: string): number {
+  if (!text) return 0;
+  let cjk = 0;
+  let total = 0;
+  for (const ch of text) {
+    const cp = ch.codePointAt(0)!;
+    if (cp === 0xfffd) return -1;
+    if (cp < 0x20 && ch !== "\n" && ch !== "\r" && ch !== "\t") return -1;
+    total++;
+    if ((cp >= 0x4e00 && cp <= 0x9fff) || (cp >= 0x3040 && cp <= 0x30ff) || (cp >= 0xac00 && cp <= 0xd7af)) cjk++;
+  }
+  return total ? cjk / total : 0;
+}
+
+/**
+ * Node 侧文本解码：与 Rust 的 read_text_file（src-tauri/src/commands.rs）同口径。
+ *
+ * 旧实现是 \`new TextDecoder("utf-8").decode(data)\` 且恒定返回 \`encoding: "UTF-8"\` ——
+ * 对 GBK/Shift_JIS 等非 UTF-8 文件既产出乱码、又**谎报**编码。这不是"少个功能"：
+ * ① 分章快照指纹是 \`\${fullText.length}:\${hash}\`，乱码长度对不上 → 快照被判为"源文件已变"而丢弃，
+ *    AI 分好的章节退回正则重切；
+ * ② 任何 Node 侧无头验证（测试/脚本）都会得出与应用内**相反**的结论 —— 本次排查就用它
+ *    复现出过"30 章变 1 章"的假 bug，差点当成真缺陷上报。
+ * Rust 侧走 chardetng；这里没有统计模型，退化为「严格 UTF-8 → 传统编码试解 → 择优」，
+ * 覆盖 GBK/Big5/Shift_JIS/EUC-KR；仍无法判定时与 Rust 一致返回 lossy + "unknown"。
+ */
+function decodeTextLikeBackend(data: Uint8Array): { text: string; encoding: string } {
+  try {
+    return { text: new TextDecoder("utf-8", { fatal: true }).decode(data), encoding: "UTF-8" };
+  } catch {
+    /* 不是合法 UTF-8，继续探测传统编码 */
+  }
+  let best: { text: string; encoding: string; score: number } | null = null;
+  for (const enc of LEGACY_TEXT_ENCODINGS) {
+    let text: string;
+    try {
+      text = new TextDecoder(enc, { fatal: true }).decode(data);
+    } catch {
+      continue; // 该编码无法解释这份字节
+    }
+    const score = cjkPlausibility(text);
+    if (score < 0) continue;
+    if (!best || score > best.score) best = { text, encoding: enc.toUpperCase(), score };
+  }
+  if (best && best.score > 0.3) return { text: best.text, encoding: best.encoding };
+  return { text: new TextDecoder("utf-8").decode(data), encoding: "unknown" };
+}
+
 async function readTextFallback(path: string): Promise<{ text: string; encoding: string }> {
   if (isWebRuntime()) return (await webRuntime()).webReadTextFile(path);
   const fs = await import("node:fs/promises");
   const data = await fs.readFile(path);
-  const decoder = new TextDecoder("utf-8");
-  const text = decoder.decode(data);
-  return { text, encoding: "UTF-8" };
+  return decodeTextLikeBackend(data);
 }
 
 async function writeTextFallback(path: string, content: string): Promise<void> {
@@ -266,7 +315,8 @@ async function readFileBase64Fallback(path: string): Promise<string> {
 async function writeFileBase64Fallback(path: string, dataB64: string): Promise<void> {
   if (isWebRuntime()) return (await webRuntime()).webWriteFileBase64(path, dataB64);
   const fs = await import("node:fs/promises");
-  const buf = Buffer.from(dataB64, "base64");
+  // #1532：与 base64ToBuffer 统一，避免同一文件里两种解码行为
+  const buf = b64decode(dataB64);
   await fs.mkdir(path.substring(0, path.lastIndexOf("/")), { recursive: true });
   await fs.writeFile(path, buf);
 }
@@ -356,11 +406,17 @@ function safeCallResult(name: string, result: unknown): unknown {
   return truncate(result);
 }
 
-/** 决定 tauri 调用失败的日志级别：文件不存在/网络瞬时失败为低级别，其余为 ERROR */
-function failureLogLevel(name: string, errText: string): "error" | "warn" | "debug" {
+/** 决定 tauri 调用失败的日志级别：文件不存在/网络瞬时失败为低级别，其余为 ERROR。
+ *  导出仅为让单测能直接锁住判定表（本函数是纯函数，无副作用）。 */
+export function failureLogLevel(name: string, errText: string): "error" | "warn" | "debug" {
   if (
     (name === "readTextFile" || name === "readFileBase64" || name === "hasTransparency" || name === "pathExists")
-    && /ENOENT|os error 2|No such file|找不到指定的文件|不存在/i.test(errText)
+    // #1514：Windows 上「文件/目录不存在」返回的是 os error 3（ERROR_PATH_NOT_FOUND，
+    // 中文「系统找不到指定的路径。」），不是 os error 2（ERROR_FILE_NOT_FOUND）。
+    // 实测全量日志：os error 3 出现 790 次、os error 2 一次都没有 —— 说明这条降级分支
+    // 在 Windows 上原本是死代码，探针式的缓存读取（每章一个 script_chN_*.json）
+    // 全部以红色 ERROR 刷屏，把真正的错误淹掉。
+    && /ENOENT|os error 2|os error 3|No such file|找不到指定的文件|找不到指定的路径|不存在/i.test(errText)
   ) {
     return "debug";
   }
@@ -417,6 +473,13 @@ export const tauri = {
   writeTextFile: wrap("writeTextFile", (path: string, content: string): Promise<void> => {
     if (isTauri()) return invoke("write_text_file", { path, content });
     return writeTextFallback(path, content);
+  }),
+  /** #1514：给随包脚本加执行位。macOS 的 .command 没有执行位时，Finder 双击不会运行，
+   *  只会报权限错误或用编辑器打开——而导出说明恰恰让用户双击它。
+   *  Web 端文件系统（IndexedDB）无权限位概念，直接成功返回。 */
+  setExecutable: wrap("setExecutable", (path: string): Promise<void> => {
+    if (isTauri()) return invoke("set_file_executable", { path });
+    return Promise.resolve();
   }),
   /** #1502：追加写入。日志落盘用它取代「读全量 + 写全量」，成本与新增行数成正比。
    *  无 append 能力的后端自动退化为读改写。 */
@@ -658,8 +721,15 @@ export const tauri = {
   }),
 };
 
-/** 解析图片尺寸所需的最大头部字节数（与 Rust 侧 read_file_header 的封顶一致） */
-const IMAGE_HEADER_BYTES = 65536;
+/**
+ * 解析图片尺寸所需的最大头部字节数。
+ *
+ * **与 Rust 侧 `READ_FILE_HEADER_LIMIT`（commands.rs:20，`64 * 1024`）是一对跨语言常量**：
+ * 原来这里只是注释声称「与 Rust 封顶一致」，没有东西保证。跨语言没法共享常量，
+ * 所以改为导出、并由 tests/unit-cross-lang-constants.ts 读 Rust 源码求值后比对——
+ * 任何一侧被改而另一侧没跟，门禁就会红。（同会话 #1548/#1536/#1565 都是「口径一致只靠注释」栽的坑。）
+ */
+export const IMAGE_HEADER_BYTES = 65536;
 
 /**
  * 从 base64 字符串中截出「足够解析文件头」的前缀（#1503）。

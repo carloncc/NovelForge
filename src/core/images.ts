@@ -1,9 +1,13 @@
 import type {
+  BackgroundReuseMode,
   ChapterScript,
+  CharacterAction,
   CharacterCard,
+  CharacterCostume,
   ExtractionResult,
   FailedTask,
   FigureDetail,
+  FigureTier,
   ImageReference,
   ImageTask,
   ItemCard,
@@ -13,6 +17,7 @@ import type {
   VisualBibleCacheBinding,
 } from "./types";
 import type { ApiConfig } from "./types";
+import { DEFAULT_BACKGROUND_REUSE } from "./types";
 import { generateImage, ReferenceImageError, VisionApiError, setImageConcurrency, chatCompletion } from "../api/openaiCompatible";
 import { referenceRouteRejection, resolveImageModelCapabilities } from "../api/providers";
 import { editImageVariant, editImageWithReferences, supportsImageEdits } from "../api/imageEdits";
@@ -27,12 +32,16 @@ import { sanitizePrompt, appendSafeStyleSuffix } from "../utils/promptRewriter";
 import { cutoutErrorHint } from "../utils/cutoutErrorHint";
 import { imageMimeForPath } from "../utils/mime";
 import { configState } from "../stores/config";
-import { cacheDirFor, cacheHit } from "./cache";
+import { cacheDirFor, cacheHit, IMAGE_EXTS } from "./cache";
 import { sanitizeId } from "./render";
 import { log as logger } from "../utils/logger";
 import { readAssetMap, updateAssetMap } from "./assetMap";
+import { safeSlice } from "../utils/text";
+import { capByBudget, figureBudgetFor, resolveFigureTier } from "./figureBudget";
+import { imageUsageReport, usageIsKnown } from "./imageUsage";
+import { stableHash } from "./ids";
 
-export interface ImageResultMap {
+interface ImageResultMap {
   bg: Record<string, string>;
   cg: Record<string, string>;
   figure: Record<string, string>;
@@ -41,7 +50,7 @@ export interface ImageResultMap {
 
 /** B77：figure 映射被 threeview/figure/action 三类任务共用键空间，同键任务互相覆盖且只事后告警。
  *  构建期显式抛错并带上冲突键与来源，便于定位是角色 id / 表情 id / 动作 id 的哪组撞了。 */
-export class ImageTaskKeyConflictError extends Error {
+class ImageTaskKeyConflictError extends Error {
   readonly code = "IMAGE_TASK_KEY_CONFLICT" as const;
   readonly key: string;
   readonly sources: string[];
@@ -58,7 +67,8 @@ function nameContains(name: string, keywords: string[]): boolean {
   return keywords.some((k) => k && name.includes(k));
 }
 
-const FIGURE_EMOTIONS = ["normal", "happy", "sad", "angry", "surprised"];
+/** 标准 5 表情（core 档与「角色卡没有自定义表情集」时的缺省；导出供素材页等共用，避免多处各抄一份） */
+export const FIGURE_EMOTIONS = ["normal", "happy", "sad", "angry", "surprised"];
 
 /**
  * 本章出现的角色 id：台词说话人（含分支选项）＋场景出场表；旁白不算。
@@ -96,16 +106,16 @@ export function chapterItemIds(chapter: ChapterScript): Set<string> {
 }
 
 /** 分镜出场角色命中的是哪一层：declared=分镜自报，scene-figures=场景出场表，scene-inferred=场景级推断，none=查不到 */
-export type ShotCharacterSource = "declared" | "scene-figures" | "scene-inferred" | "none";
+type ShotCharacterSource = "declared" | "scene-figures" | "scene-inferred" | "none";
 
-export interface ShotCharacterResolution {
+interface ShotCharacterResolution {
   /** 有效角色 id（已过滤无效 id；顺序稳定：声明序 → 场景表序 → 同场分镜序 → 说话人序） */
   ids: string[];
   source: ShotCharacterSource;
 }
 
 /** 兜底推断可用的场景结构（结构化类型，纯函数单测可直接喂字面量） */
-export interface ShotCharacterScene {
+interface ShotCharacterScene {
   figures?: string[];
   shots?: { characters?: string[] }[];
   lines?: { type?: string; characterId?: string }[];
@@ -184,7 +194,7 @@ export function shotCharacterIdsOfTask(
  * 口径与分镜任务构建完全一致（resolveShotCharacters，含同一份 allowSceneInference 开关），
  * 否则会出现"分镜要参考、基准图没建"的断链。
  */
-export function imageOnlyBaselineCharacterIds(
+function imageOnlyBaselineCharacterIds(
   chapters: ChapterScript[],
   validIds: Set<string>,
   chapterIndexes?: Set<number>,
@@ -575,7 +585,144 @@ async function safeRewritePrompt(cfg: ApiConfig, prompt: string): Promise<string
   }
 }
 
-export interface BuildImageTaskOptions {
+/**
+ * 背景「同一地点」的归并键（纯函数，只看场景自身）。
+ *
+ * LLM 常把场景 id 写进 location（实测某项目 502 个场景里 234 个如此，如 `satoru_apartment_3`），
+ * 同一间公寓因此同时以 `satoru_apartment`、`satoru_apartment_3`、"聪的一室一厅公寓"三种标签出现。
+ * 这里只做**场景自身**能定的归并：去掉 id 尾部的 _数字 后缀与 ch<章>_ 前缀；
+ * 不查场景卡（章节灯/单章补缺只拿到部分卡片，查卡会让两条路径算出不同的键）。
+ */
+function backgroundLocationKey(scene: { id: string; location?: string }): string {
+  const raw = (scene.location || "").trim();
+  // 纯 id 形态（含 LLM 把 id 当 location 写的情况）：剥掉 _数字 后缀与章前缀，归并到同一地点
+  if (raw && /^[a-z0-9_]+$/i.test(raw)) return raw.replace(/_\d+$/, "").replace(/^ch\d+_/, "");
+  if (raw) return raw;
+  return (scene.id || "").replace(/_\d+$/, "").replace(/^ch\d+_/, "");
+}
+
+/* ---------- #1580：背景复用分桶（地点 × 昼夜 × 天气） ---------- */
+
+/** 昼夜桶；unspecified = 场景文案里没有可判定的时间线索（不猜，单独成桶） */
+type BackgroundTimeOfDay = "morning" | "day" | "dusk" | "night" | "unspecified";
+/** 天气桶；clear 兜底（含"没写天气"） */
+type BackgroundWeather = "clear" | "rain" | "snow";
+
+/**
+ * 昼夜判定（纯函数，只看场景自身的 time/atmosphere/bgPrompt）。
+ *
+ * 为什么从文案里判而不是让 LLM 输出新字段：剧本缓存键含提示词指纹，改剧本 prompt 会让
+ * 存量项目 30 章剧本缓存全部作废、必须重跑（真金白银 + 几十分钟）。这里从既有字段推断，
+ * 存量项目**零成本**立即生效；新项目将来若要加显式字段，也只需在本函数里优先读它。
+ *
+ * 优先级 night > dusk > morning > day：一条文案同时出现「深夜」「傍晚」时按更具体的夜间处理
+ * （实测 time 字段形如「夏夜深夜」「同日傍晚」「深夜，接近凌晨三点」）。
+ * 注意**不匹配裸「日」**：time 里大量「3月3日」会被误判成白天。
+ */
+const TOD_RULES: { key: BackgroundTimeOfDay; re: RegExp }[] = [
+  { key: "night", re: /\b(night|nighttime|midnight|moonlit|starry|starlit|moonlight)\b|深夜|午夜|半夜|凌晨|夜晚|夜里|夜色|夜间|入夜|夜幕|彻夜|月光|星空|夜/u },
+  { key: "dusk", re: /\b(dusk|twilight|sunset|sundown|evening|golden hour)\b|傍晚|黄昏|日落|夕照|日暮|向晚/u },
+  { key: "morning", re: /\b(morning|dawn|sunrise|daybreak)\b|清晨|早晨|早上|一早|黎明|拂晓|上午/u },
+  { key: "day", re: /\b(daytime|daylight|afternoon|midday|noon|sunny|sunlit|sunlight|bright)\b|白天|正午|中午|午后|下午|日间|晴朗|阳光/u },
+];
+
+/** 天气判定（纯函数）：雨/雪各自成桶，其余（含没写）归 clear。
+ *  刻意**不把 winter/冬**当雪：那是季节不是天气，"冬末初春"的室内场景没有雪。 */
+const WEATHER_RULES: { key: BackgroundWeather; re: RegExp }[] = [
+  { key: "rain", re: /\b(rain|rainy|raining|downpour|drizzle|storm|stormy|shower|wet)\b|雨|雷雨|暴雨|阴雨/u },
+  { key: "snow", re: /\b(snow|snowy|snowing|snowfall|blizzard)\b|雪|积雪|风雪/u },
+];
+
+/** 场景的昼夜桶（纯函数；同一场景任何调用方结果一致） */
+export function backgroundTimeOfDay(scene: { id: string; location?: string; time?: string; atmosphere?: string; bgPrompt?: string }): BackgroundTimeOfDay {
+  const text = `${scene.bgPrompt || ""} ${scene.atmosphere || ""} ${scene.time || ""}`;
+  for (const rule of TOD_RULES) if (rule.re.test(text)) return rule.key;
+  return "unspecified";
+}
+
+/** 场景的天气桶（纯函数） */
+export function backgroundWeather(scene: { id: string; location?: string; time?: string; atmosphere?: string; bgPrompt?: string }): BackgroundWeather {
+  const text = `${scene.bgPrompt || ""} ${scene.atmosphere || ""} ${scene.time || ""}`;
+  for (const rule of WEATHER_RULES) if (rule.re.test(text)) return rule.key;
+  return "clear";
+}
+
+/**
+ * 背景复用的**桶键**（纯函数，只吃场景自身字段）——同键即同一张图。
+ *
+ * off 时返回地点键（仅用于日志，不参与复用）；location/locationTime/locationTimeWeather
+ * 逐级细分。键里不含章号、不含场景序号、不含"本次传了哪些章节"：单章构建与整本构建必然一致。
+ */
+export function backgroundBucketKey(
+  scene: { id: string; location?: string; time?: string; atmosphere?: string; bgPrompt?: string },
+  mode: BackgroundReuseMode,
+): string {
+  const loc = backgroundLocationKey(scene);
+  if (mode === "off" || mode === "location") return loc;
+  const parts = [loc, backgroundTimeOfDay(scene)];
+  if (mode === "locationTimeWeather") parts.push(backgroundWeather(scene));
+  return parts.join("|");
+}
+
+/**
+ * 背景文件名（纯函数）：**由桶键决定，与"哪个场景当代表"无关**。
+ *
+ * 这一点是复用能省钱的前提：同一桶无论由第一章还是第 24 章的场景代表，文件名与种子都一样，
+ * 于是「先跑单章、再跑全书」不会各画一张、也不会互相覆盖。
+ *
+ * 非 ASCII 地点（LLM 常把 location 写成中文，如「聪的一室一厅公寓」）不能直接 sanitize：
+ * 每个汉字都会变成一个下划线，两个字数相同的中文地点会撞成同一个文件（见 #1547 的同一族问题）。
+ * 故沿用 ids.ts 的约定：非 ASCII → `loc_<stableHash>`，同一输入跨运行稳定且不碰撞。
+ */
+export function backgroundBucketFileName(
+  scene: { id: string; location?: string; time?: string; atmosphere?: string; bgPrompt?: string },
+  mode: BackgroundReuseMode,
+): string {
+  if (mode === "off") return `bg_${sanitizeId(scene.id)}.png`;
+  const loc = backgroundLocationKey(scene);
+  const slug = /^[A-Za-z0-9_-]+$/.test(loc) ? loc.slice(0, 48) : `loc_${stableHash(loc)}`;
+  const parts = [slug];
+  if (mode !== "location") parts.push(backgroundTimeOfDay(scene));
+  if (mode === "locationTimeWeather") parts.push(backgroundWeather(scene));
+  return `bg_${parts.join("_")}.png`;
+}
+
+/**
+ * 本章实际要出图的背景场景 + 被裁掉的数量。
+ *
+ * 口径：**每个地点在本章内最多 `perLocation` 张**（0=不限）。为什么按章而不是全书——
+ * 章节灯与单章补缺只拿得到一章，按全书统计会让"整本构建"和"单章构建"算出不同清单，
+ * 正是 #1521 那族 bug（单章永远凑不齐成品、反复计费）的复现条件。
+ * 实测某 30 章项目：502 张背景里同一间公寓 79 张、一个"秘密写作据点"单章内 21 张。
+ */
+export function selectBackgroundScenes(
+  chapter: ChapterScript,
+  perLocation: number,
+  reuse: BackgroundReuseMode = "off",
+): { scenes: ChapterScript["scenes"]; skipped: number } {
+  // #1580：开了背景复用后，「每章同地点上限」必须整体失效——它当初就是为"同一间房被画 79 次"
+  // 打的补丁，而复用已经从根上消除重复；继续叠加只会把昼夜/天气差分也裁掉，
+  // 更糟的是：被裁掉的场景没有映射，会退回"沿用上一张背景"（夜里显示白天的图）。
+  // 这里返回**本章全部场景**：保留集口径随之变宽，剪枝/清理才不会把复用文件当孤儿删掉。
+  if (reuse !== "off") return { scenes: chapter.scenes ?? [], skipped: 0 };
+  if (!(perLocation > 0)) return { scenes: chapter.scenes ?? [], skipped: 0 };
+  const seen = new Map<string, number>();
+  const scenes: ChapterScript["scenes"] = [];
+  let skipped = 0;
+  for (const scene of chapter.scenes ?? []) {
+    const key = backgroundLocationKey(scene);
+    const used = seen.get(key) ?? 0;
+    if (used >= perLocation) {
+      skipped++;
+      continue;
+    }
+    seen.set(key, used + 1);
+    scenes.push(scene);
+  }
+  return { scenes, skipped };
+}
+
+interface BuildImageTaskOptions {
   cgPerChapter?: number;
   maxPerChapter?: number;
   figureEmotions?: boolean;
@@ -587,8 +734,23 @@ export interface BuildImageTaskOptions {
   threeView?: boolean;
   /** 基于三视图生成角色动作立绘 */
   actions?: boolean;
-  /** 每个角色默认生成的动作数量；0 表示在手动重生成时包含全部动作 */
+  /**
+   * 每个角色的动作立绘数量上限；0 = 调用方不额外限制（手动重生成/补缺覆盖全部）。
+   * 缺省不传时：有剧本使用记录 → 按用量降序取到档位预算（主要角色 5）；无记录 → 卡面前 2 个。
+   */
   maxActionsPerCharacter?: number;
+  /**
+   * 同一地点在**单章内**的背景图上限（0/缺省 = 不限）。
+   * 实测 502 张背景里同一间公寓被画了 79 次（每个场景实例一条独一无二的氛围）；
+   * 口径按章计，保证「整本构建」与「单章构建（章节灯/单章补缺）」算出同一份任务清单。
+   */
+  backgroundsPerLocation?: number;
+  /**
+   * 背景复用口径（#1580，缺省 DEFAULT_BACKGROUND_REUSE=地点×昼夜×天气）：同桶场景共用一张图。
+   * 缺省刻意与项目默认值一致——任何调用方忘了传也拿到同一份清单，不会复现 #1521
+   * （两处口径不同 → 单章永远凑不齐、反复计费）。要旧行为请显式传 "off"。
+   */
+  backgroundReuse?: BackgroundReuseMode;
   /** 确定性种子基数：为每个任务分配 baseSeed+i 的固定种子（同一项目重跑结果稳定） */
   baseSeed?: number;
   /** 风格锚点：先生成画风基准图，背景/CG 以其为参考图统一画风 */
@@ -629,7 +791,7 @@ export interface BuildImageTaskOptions {
 }
 
 /** 图片小说分镜任务的附加字段（#1133）：多人同框时除主身份外的其余角色基准图作追加 identity 参考 */
-export interface ShotImageTask extends ImageTask {
+interface ShotImageTask extends ImageTask {
   /** 该分镜的全部出场角色卡片 id（按剧本顺序，已过滤无效 id）：守卫与日志用 */
   shotCharacterIds?: string[];
   /** 除主身份外还需追加基准图参考的任务 id（`<角色id>_threeview`，按顺序） */
@@ -637,7 +799,7 @@ export interface ShotImageTask extends ImageTask {
 }
 
 /** 立绘版 CG 任务的附加字段：与分镜同口径（主身份 + 追加身份），身份来源见 resolveShotCharacters 空声明复用 */
-export interface CgImageTask extends ImageTask {
+interface CgImageTask extends ImageTask {
   /** 该 CG 场景的全部出场角色卡片 id（按 scene.figures 顺序，已过滤无效 id）：守卫与日志用 */
   cgCharacterIds?: string[];
   /** 除主身份外还需追加三视图参考的任务 id（`<角色id>_threeview`，按顺序） */
@@ -658,6 +820,125 @@ export function cgCharacterIdsOf(task: ImageTask): string[] {
   return task.characterId ? [task.characterId] : [];
 }
 
+/**
+ * 立绘/表情/服装/动作清单的**唯一实现**（#1575）。
+ *
+ * 以前这三份清单在 `buildImageTasks` 里内联，素材页（stores/generate 的 figureRows）另抄了一份
+ * 「关闭表情→仅默认 / 核心档→标准 5 / 完整档→角色自定义表情」的口径——两处靠注释约定一致。
+ * 档位预算（次要角色/路人的张数上限）一旦只加在管线侧，素材页就会给永远不生成的图
+ * 显示「缺图」，用户点「补全缺失图片」也补不回来。故清单派生收口到本文件，两边共用。
+ *
+ * 三份清单都按角色档位预算裁剪（core/figureBudget.ts）。预算判定只吃角色卡字段，
+ * 因此任何调用方（主管线、单章跳过判定、章节灯、素材页、重生成）拿到的是同一份清单。
+ */
+export function figureEmotionEntries(
+  char: CharacterCard,
+  opts: { figureEmotions?: boolean; detail?: FigureDetail } = {},
+): { raw: string; id: string }[] {
+  const useEmotions = opts.figureEmotions !== false;
+  const detail = opts.detail ?? "full";
+  // 剧本使用记录（card.imageUsage，由剧本阶段写回）：有记录就**只出剧本真用到的表情**。
+  // 实测某 30 章项目：9862 行台词里 emotion 只有 5 种标准值，而提取端给每角色 7~10 个自定义表情，
+  // full 档全量生成 → 160 张里 115 张永远不会出现在任何一句台词上。
+  //
+  // 判据是**字段存在性**而不是 length（见 imageUsage.usageIsKnown）：
+  //   · 无记录 = 剧本阶段没统计过（旧项目/只跑了提取）→ 回退卡片全量，宁可多出也不漏图；
+  //   · 有记录但为空 = 统计过、剧本真没用 → 只留 normal 默认立绘，不再全量出图。
+  //   实测某 30 章项目：9 个零台词角色若被当成"没统计"，会多出 63 张永远不上屏的差分。
+  const usageKnown = usageIsKnown(char);
+  const used = char.imageUsage?.emotions;
+  // core 档：只用标准 5 表情（忽略 AI 自定义大表情集，省图）；
+  // full 档：优先剧本真用到的表情，其次角色自定义表情集（AI 按剧情提取），缺省用标准 5 表情
+  const baseEmotions = !useEmotions
+    ? ["normal"]
+    : detail === "core"
+      ? FIGURE_EMOTIONS
+      : (usageKnown ? (used ?? []) : (char.emotions?.length ? char.emotions : FIGURE_EMOTIONS));
+  // 强制包含 normal 并去重/消毒：表情集缺 normal 会导致默认立绘整张缺失、所有差分 refFromTask 断链；
+  // 自定义表情名含中文/符号时旧实现直接拼文件名（可能路径穿越/覆盖），按动作同一口径 sanitize（原值保留给提示词）
+  const list: { raw: string; id: string }[] = [];
+  const seen = new Set<string>();
+  for (const raw of ["normal", ...baseEmotions]) {
+    const id = sanitizeId(String(raw)) || "normal";
+    if (seen.has(id)) continue;
+    seen.add(id);
+    list.push({ raw: String(raw), id });
+  }
+  // 去重之后再裁：中文表情名可能被消毒成同一个 id，先裁后去重会让「预算 5 张」实际只剩 3 张。
+  // 上限至少为 1，保证 normal（默认立绘）永远在——它是全部差分与渲染兜底的锚点。
+  const budget = figureBudgetFor(char);
+  return capByBudget(list, Math.max(1, budget.emotions));
+}
+
+/**
+ * 服装差分清单：仅完整档 + 开三视图时产出（core 档跳过以省图），且受档位预算约束。
+ * 有剧本使用记录时**只出剧情真穿过的服装**（实测某项目 80 张服装差分里只有 6 套被穿上；
+ * 换装图缺失时渲染会回退默认立绘，所以裁掉不会有空场，只是那种换装看不到）。
+ */
+export function figureCostumeEntries(
+  char: CharacterCard,
+  opts: { detail?: FigureDetail; threeView?: boolean } = {},
+): CharacterCostume[] {
+  if (opts.threeView === false) return [];
+  if ((opts.detail ?? "full") === "core") return [];
+  if (!Array.isArray(char.costumes)) return [];
+  // 判据是字段存在性：有记录但为空 = 剧本确认这套角色一次都没换过装 → 一套都不出。
+  // 实测某 30 章项目：13 个角色「剧本确认 0 套换装」仍被回退成卡片全量，白出 43 张；
+  // 全项目 59 张服装差分里 52 张从未被穿上。
+  if (usageIsKnown(char)) {
+    const used = char.imageUsage?.costumes ?? [];
+    const worn = used.map((id) => char.costumes!.find((ct) => String(ct.id) === id)).filter(Boolean) as CharacterCostume[];
+    return capByBudget(worn, figureBudgetFor(char).costumes);
+  }
+  return capByBudget(char.costumes, figureBudgetFor(char).costumes);
+}
+
+/**
+ * 动作立绘清单。
+ * `maxActionsPerCharacter: 0` 表示**调用方不额外限制**（手动重生成/补缺要覆盖全部动作），
+ * 但档位预算是硬上限：否则「补全缺失图片」会把路人的动作又一张张补回来，档位等于没设，
+ * 而两条路径的文件名清单也会随之不一致（#1521 的复现条件）。
+ */
+export function figureActionEntries(
+  char: CharacterCard,
+  opts: { actions?: boolean; threeView?: boolean; maxActionsPerCharacter?: number } = {},
+): CharacterAction[] {
+  if (opts.threeView === false || opts.actions === false) return [];
+  if (!Array.isArray(char.actions)) return [];
+  // 有剧本使用记录：按**使用次数降序**挑（每张都用得上），而不是取卡面前 N 个——
+  // 实测某项目出图端取前 2 个、剧本端从整表挑，结果 32 张里 15 张用不到，
+  // 同时 69 处台词标注的动作根本没图（渲染回退默认立绘）。
+  //
+  // 判据是**字段存在性**而不是 length：`used?.length` 会把"统计过但一次没标注动作"的 NPC
+  // 判成"没统计"，于是盲选卡面前 2 个动作（实测某 30 章项目 11 张纯浪费）。
+  const usageKnown = usageIsKnown(char);
+  const used = char.imageUsage?.actions;
+  const ordered = usageKnown
+    ? (used ?? []).map((id) => char.actions!.find((a) => String(a.id) === id)).filter(Boolean) as CharacterAction[]
+    : char.actions;
+  // 手动旋钮：>0 时按其裁剪；0 = 调用方不额外限制（重生成/补缺要覆盖全部）。
+  // 缺省（未传）时：有使用记录则交给档位预算收口（主要角色 5 个），没有记录沿用旧的 2 个。
+  const max = opts.maxActionsPerCharacter ?? (usageKnown ? 0 : 2);
+  const manual = max > 0 ? ordered.slice(0, max) : ordered;
+  return capByBudget(manual, figureBudgetFor(char).actions);
+}
+
+/** 档位预算汇总（日志用）：各档角色数 + 相比「全部角色按主要档出图」省下的差分张数 */
+export function figureBudgetReport(
+  cards: CharacterCard[],
+  opts: { figureEmotions?: boolean; detail?: FigureDetail; threeView?: boolean; actions?: boolean; maxActionsPerCharacter?: number } = {},
+): { byTier: Record<FigureTier, number>; saved: number } {
+  const byTier: Record<FigureTier, number> = { main: 0, supporting: 0, cameo: 0 };
+  let saved = 0;
+  const count = (c: CharacterCard): number =>
+    figureEmotionEntries(c, opts).length + figureCostumeEntries(c, opts).length + figureActionEntries(c, opts).length;
+  for (const char of cards) {
+    byTier[resolveFigureTier(char)]++;
+    saved += count({ ...char, figureTier: "main" }) - count(char);
+  }
+  return { byTier, saved };
+}
+
 export function buildImageTasks(
   chapters: ChapterScript[],
   cards: ExtractionResult,
@@ -670,7 +951,12 @@ export function buildImageTasks(
   const detail = opts.detail ?? "full";
   const threeView = opts.threeView !== false;
   const withActions = opts.actions !== false;
-  const maxActionsPerCharacter = opts.maxActionsPerCharacter ?? 2;
+  // 不在这里兜底成 2：动作挑选交给 figureActionEntries——有剧本使用记录时按用量降序取
+  // （档位预算收口，主要角色 5 个），没有记录时才沿用旧的「卡面前 2 个」。
+  const maxActionsPerCharacter = opts.maxActionsPerCharacter;
+  const backgroundsPerLocation = opts.backgroundsPerLocation ?? 0;
+  // 缺省与项目默认值一致（不是 "off"）：调用方忘了传也必须和主管线算出同一份清单
+  const backgroundReuse = opts.backgroundReuse ?? DEFAULT_BACKGROUND_REUSE;
   const baseStyle = styleSuffix(opts.style);
   const style = opts.feedback ? `${baseStyle}, ${opts.feedback.trim().replace(/[。.]$/, "")}` : baseStyle;
   // 绿幕类提示词专用风格：人物/三视图/动作/服装/物品一律纯绿幕，风格文本里若带背景词
@@ -755,20 +1041,9 @@ export function buildImageTasks(
     // ② 立绘/表情/动作/服装差分：图片小说模式一律不产出（#809：无立绘、无人物演出 UI）
     if (!imageOnly) {
       // ② 立绘（默认姿态）→ 以三视图为参考图
-      // core 档：只用标准 5 表情（忽略 AI 自定义大表情集，省图）；
-      // full 档：优先角色自定义表情集（AI 按剧情提取），缺省用标准 5 表情
-      const baseEmotions = !useEmotions ? ["normal"] : detail === "core" ? FIGURE_EMOTIONS : (char.emotions?.length ? char.emotions : FIGURE_EMOTIONS);
-      // 强制包含 normal 并去重/消毒：表情集缺 normal 会导致默认立绘整张缺失、所有差分 refFromTask 断链；
-      // 自定义表情名含中文/符号时旧实现直接拼文件名（可能路径穿越/覆盖），按动作同一口径 sanitize（原值保留给提示词）
-      const emoList: { raw: string; id: string }[] = [];
-      const seenEmo = new Set<string>();
-      for (const raw of ["normal", ...baseEmotions]) {
-        const id = sanitizeId(String(raw)) || "normal";
-        if (seenEmo.has(id)) continue;
-        seenEmo.add(id);
-        emoList.push({ raw: String(raw), id });
-      }
-      for (const { raw: emoRaw, id: emoId } of emoList) {
+      // 表情清单（含 normal 强制、消毒去重、档位预算）见 figureEmotionEntries —— 唯一实现，
+      // 素材页与这里共用，避免两处口径漂移（次要角色/路人的预算只加在一边会导致「界面恒缺图」）
+      for (const { raw: emoRaw, id: emoId } of figureEmotionEntries(char, { figureEmotions: useEmotions, detail })) {
         const isNormal = emoId === "normal";
         tasks.push({
           kind: "figure",
@@ -786,41 +1061,36 @@ export function buildImageTasks(
         });
       }
       // ②b 服装差分立绘（基于三视图图生图；full 档才生成，core 档跳过以省图；
-      //    每套只生成 normal 姿态作为换装底图，其余表情沿用当前服装）
-      if (threeView && detail !== "core" && Array.isArray(char.costumes)) {
-        for (const ct of char.costumes) {
-          tasks.push({
-            kind: "figure",
-            id: `${char.id}_ct_${ct.id}`,
-            characterId: char.id,
-            emotion: "normal",
-            costume: ct.id,
-            prompt: stripBackground(ct.prompt) + REF_HINT + figureStyle + FIGURE_BG_SUFFIX,
-            refFromTask: `${char.id}_threeview`,
-            fileName: `figure_${sanitizeId(char.id)}_ct_${sanitizeId(ct.id)}_normal.png`,
-            width: 1024,
-            height: 1024,
-            usage: `立绘-${char.name}-${ct.name}`,
-          });
-        }
+      //    每套只生成 normal 姿态作为换装底图，其余表情沿用当前服装；档位预算见 figureCostumeEntries）
+      for (const ct of figureCostumeEntries(char, { detail, threeView })) {
+        tasks.push({
+          kind: "figure",
+          id: `${char.id}_ct_${ct.id}`,
+          characterId: char.id,
+          emotion: "normal",
+          costume: ct.id,
+          prompt: stripBackground(ct.prompt) + REF_HINT + figureStyle + FIGURE_BG_SUFFIX,
+          refFromTask: `${char.id}_threeview`,
+          fileName: `figure_${sanitizeId(char.id)}_ct_${sanitizeId(ct.id)}_normal.png`,
+          width: 1024,
+          height: 1024,
+          usage: `立绘-${char.name}-${ct.name}`,
+        });
       }
-      // ③ 动作立绘（基于三视图图生图；动作数量不限，按角色卡片提取）
-      if (threeView && withActions && Array.isArray(char.actions)) {
-        const actions = maxActionsPerCharacter > 0 ? char.actions.slice(0, maxActionsPerCharacter) : char.actions;
-        for (const a of actions) {
-          tasks.push({
-            kind: "action",
-            id: `${char.id}_act_${a.id}`,
-            characterId: char.id,
-            actionId: a.id,
-            prompt: stripBackground(a.prompt) + ACTION_CLARITY_HINT + REF_HINT + figureStyle + FIGURE_BG_SUFFIX,
-            refFromTask: `${char.id}_threeview`,
-            fileName: `figure_${sanitizeId(char.id)}_act_${sanitizeId(a.id)}.png`,
-            width: 1024,
-            height: 1024,
-            usage: `动作-${char.name}-${a.name}`,
-          });
-        }
+      // ③ 动作立绘（基于三视图图生图；按角色卡片提取，张数受 maxActionsPerCharacter 与档位预算双重约束）
+      for (const a of figureActionEntries(char, { actions: withActions, threeView, maxActionsPerCharacter })) {
+        tasks.push({
+          kind: "action",
+          id: `${char.id}_act_${a.id}`,
+          characterId: char.id,
+          actionId: a.id,
+          prompt: stripBackground(a.prompt) + ACTION_CLARITY_HINT + REF_HINT + figureStyle + FIGURE_BG_SUFFIX,
+          refFromTask: `${char.id}_threeview`,
+          fileName: `figure_${sanitizeId(char.id)}_act_${sanitizeId(a.id)}.png`,
+          width: 1024,
+          height: 1024,
+          usage: `动作-${char.name}-${a.name}`,
+        });
       }
     }
   }
@@ -854,6 +1124,108 @@ export function buildImageTasks(
   // 立绘版 CG 统计（构建期聚合告警，不逐张刷屏）：有角色=挂三视图参考 + 外貌锁定 + edit；
   // 无角色（scene.figures 为空）= 保持纯文本生图
   let cgWithoutCharacters = 0;
+  /** 因「同一地点每章上限」被裁掉的背景数（构建期聚合告警，不逐张刷屏） */
+  let bgCapped = 0;
+  /** #1580：背景复用省下的场景数（502 个场景实例 → N 张图），构建期聚合告警 */
+  let bgReusedScenes = 0;
+  /** #1580：复用口径下背景图总数（= 桶数），用于日志与「每章背景数上限」说明 */
+  let bgBucketCount = 0;
+  /** CG 事件缺提示词、已用场景背景+氛围兜底的数量（#1515 的坏缓存：cgEvent 只有 triggerIndex） */
+  let cgMissingPrompt = 0;
+
+  // 背景任务（立绘版）：两种口径
+  //  · off  = 旧行为：一个场景实例一张图，由「每章同地点上限」收敛
+  //  · 复用 = #1580：按「地点[×昼夜[×天气]]」分桶，一个桶一张图，桶内所有场景共用该文件
+  // 复用路径必须**跨章**分组，所以放在章循环之外；CG 仍按章构建（在下面的章循环里）。
+  if (!imageOnly) {
+    if (backgroundReuse === "off") {
+      for (const chapter of chapters) {
+        // 单章节模式：只构建选中章节的背景，其余章节复用已有映射
+        if (opts.chapterIndexes && !opts.chapterIndexes.has(chapter.chapter)) continue;
+        let count = 0;
+        // 同一地点在**本章内**最多出几张（见 selectBackgroundScenes 的说明）
+        const bgSelection = selectBackgroundScenes(chapter, backgroundsPerLocation, backgroundReuse);
+        bgCapped += bgSelection.skipped;
+        for (const scene of bgSelection.scenes) {
+          if (maxPerChapter > 0 && count >= maxPerChapter) break;
+          tasks.push({
+            kind: "background",
+            id: scene.id,
+            chapter: chapter.chapter,
+            prompt: (scene.bgPrompt || `${scene.location} ${scene.atmosphere}, anime background`) + style + (useAnchor ? STYLE_ANCHOR_HINT : "") + BACKGROUND_EMPTY_SUFFIX,
+            fileName: backgroundBucketFileName(scene, backgroundReuse),
+            width: 1536,
+            height: 1024,
+            usage: `背景-${scene.location}`,
+          });
+          count++;
+        }
+      }
+    } else {
+      // 桶的**首次出现**（故事顺序）决定代表场景、任务 id 与提示词；文件名与种子只看桶键，
+      // 与代表是谁无关——这是「先跑单章、后跑全书」不会重复计费的前提。
+      const bucketOrder: string[] = [];
+      const buckets = new Map<string, { rep: ChapterScript["scenes"][number]; chapter: number; sceneIds: string[]; chapters: number[] }>();
+      let sceneTotal = 0;
+      let dropped = 0;
+      for (const chapter of chapters) {
+        if (opts.chapterIndexes && !opts.chapterIndexes.has(chapter.chapter)) continue;
+        let opened = 0;
+        for (const scene of chapter.scenes) {
+          sceneTotal++;
+          const key = backgroundBucketKey(scene, backgroundReuse);
+          const hit = buckets.get(key);
+          if (hit) {
+            // 同桶：并进已有的那张图（跨章也并——这正是省图的地方）
+            hit.sceneIds.push(scene.id);
+            if (!hit.chapters.includes(chapter.chapter)) hit.chapters.push(chapter.chapter);
+            continue;
+          }
+          // 「每章背景数上限」在复用口径下按**本章新开的桶数**计（旧口径是场景数）
+          if (maxPerChapter > 0 && opened >= maxPerChapter) {
+            // 被裁的场景**必须并入已开的桶**（或自己开一个桶），不能直接丢掉：
+            // 没有映射的场景在渲染端会退回"沿用上一张背景"，同一间房白天/夜里串图。
+            // 这里改为并进**本章最后一个已开的桶**（同章内时间上最接近的一张），
+            // 于是被裁的场景仍有图可查，且复用口径下不再产生"无映射场景"。
+            const fallbackKey = bucketOrder[bucketOrder.length - 1];
+            const target = fallbackKey ? buckets.get(fallbackKey) : undefined;
+            if (target) {
+              target.sceneIds.push(scene.id);
+              if (!target.chapters.includes(chapter.chapter)) target.chapters.push(chapter.chapter);
+            } else {
+              // 本章第一个场景就撞上限（maxPerChapter 不可能小于 1，理论上不可达）：仍然开桶，宁可多一张也不留无映射场景
+              bucketOrder.push(key);
+              buckets.set(key, { rep: scene, chapter: chapter.chapter, sceneIds: [scene.id], chapters: [chapter.chapter] });
+            }
+            dropped++;
+            continue;
+          }
+          opened++;
+          bucketOrder.push(key);
+          buckets.set(key, { rep: scene, chapter: chapter.chapter, sceneIds: [scene.id], chapters: [chapter.chapter] });
+        }
+      }
+      for (const key of bucketOrder) {
+        const b = buckets.get(key)!;
+        tasks.push({
+          kind: "background",
+          id: b.rep.id,
+          chapter: b.chapter,
+          bgSceneIds: b.sceneIds,
+          bgChapters: b.chapters,
+          prompt: (b.rep.bgPrompt || `${b.rep.location} ${b.rep.atmosphere}, anime background`) + style + (useAnchor ? STYLE_ANCHOR_HINT : "") + BACKGROUND_EMPTY_SUFFIX,
+          fileName: backgroundBucketFileName(b.rep, backgroundReuse),
+          width: 1536,
+          height: 1024,
+          usage: `背景-${b.rep.location}`,
+        });
+      }
+      bgBucketCount = bucketOrder.length;
+      // 省下的张数 = 场景数 − 桶数 − 被「每章背景数上限」跳过的场景数（后者没被复用，只是没出图）
+      bgReusedScenes = sceneTotal - bucketOrder.length - dropped;
+      bgCapped += dropped;
+    }
+  }
 
   for (const chapter of chapters) {
     // 图片小说（#809）：只构建分镜任务（kind:"shot"）——画面由 shot 承担，
@@ -923,21 +1295,7 @@ export function buildImageTasks(
     }
     // 单章节模式：只构建选中章节的背景/CG 任务，其余章节复用已有映射
     if (opts.chapterIndexes && !opts.chapterIndexes.has(chapter.chapter)) continue;
-    let count = 0;
-    for (const scene of chapter.scenes) {
-      if (maxPerChapter > 0 && count >= maxPerChapter) break;
-      tasks.push({
-        kind: "background",
-        id: scene.id,
-        chapter: chapter.chapter,
-        prompt: (scene.bgPrompt || `${scene.location} ${scene.atmosphere}, anime background`) + style + (useAnchor ? STYLE_ANCHOR_HINT : "") + BACKGROUND_EMPTY_SUFFIX,
-        fileName: `bg_${sanitizeId(scene.id)}.png`,
-        width: 1536,
-        height: 1024,
-        usage: `背景-${scene.location}`,
-      });
-      count++;
-    }
+    // 背景任务已在上面的章循环之外构建（复用口径要跨章分桶）
     let cgCount = 0;
     for (const scene of chapter.scenes) {
       if (cgPerChapter > 0 && cgCount >= cgPerChapter) break;
@@ -954,6 +1312,14 @@ export function buildImageTasks(
         const cgExtraIdentities = cgCharacters.slice(1);
         const cgCards = cgCharacters.map((id) => cardById.get(id)!).filter(Boolean);
         const cgStyle = style + (useAnchor ? STYLE_ANCHOR_HINT : "");
+        // 提示词兜底（#1576）：cgEvent 可能只有 triggerIndex——模型漏 imagePrompt 时，
+        // 旧代码把 undefined 写进缓存（#1515），读回来就是空串。空提示词会让 CG 只剩
+        // 「人物外貌锚点 + 画风」而没有任何场景内容：实测 11 张 CG 里 7 张提示词**逐字相同**。
+        // 这里用场景自身的背景提示词 + 地点/氛围/时间兜底，让每张 CG 至少是"这一场戏"。
+        const cgBody = (scene.cgEvent.imagePrompt || "").trim();
+        const cgFallback = !cgBody;
+        if (cgFallback) cgMissingPrompt++;
+        const cgPromptBody = cgFallback ? cgFallbackPromptBody(scene) : cgBody;
         const cgTask: CgImageTask = {
           kind: "cg",
           id: scene.id,
@@ -964,16 +1330,19 @@ export function buildImageTasks(
           // 有角色才可能走三视图编辑（editVariant=scene）；无角色时只能是纯文生图
           ...(cgCharacters.length ? { editVariant: "scene" as const } : {}),
           // 提示词约束版本：只作用于有角色的 CG（存量旧 CG 缓存判失效重画一次）；
-          // 无角色 CG 提示词逐字不变，缓存继续复用
-          ...(cgCharacters.length ? { promptVersion: CG_PROMPT_VERSION } : {}),
+          // 无角色 CG 提示词逐字不变，缓存继续复用。兜底提示词另给一个版本号：
+          // meta 里不含提示词正文，不升版本号的话"空提示词的旧 CG"会被当成缓存命中继续复用。
+          ...(cgFallback
+            ? { promptVersion: CG_FALLBACK_PROMPT_VERSION }
+            : (cgCharacters.length ? { promptVersion: CG_PROMPT_VERSION } : {})),
           // 有角色=同一套外貌锁定 + 反设定稿硬约束；无角色=沿用旧纯文本生图口径（逐字不变）
           prompt: cgCharacters.length
-            ? buildCgPrompt(scene.cgEvent.imagePrompt, cgStyle, cgCards)
-            : scene.cgEvent.imagePrompt + style + (useAnchor ? STYLE_ANCHOR_HINT : ""),
+            ? buildCgPrompt(cgPromptBody, cgStyle, cgCards)
+            : cgPromptBody + style + (useAnchor ? STYLE_ANCHOR_HINT : ""),
           fileName: `cg_${sanitizeId(scene.id)}.png`,
           width: 1536,
           height: 1024,
-          usage: `CG-${scene.cgEvent.title}`,
+          usage: `CG-${scene.cgEvent.title || scene.location || scene.id}`,
         };
         tasks.push(cgTask);
         cgCount++;
@@ -1007,6 +1376,39 @@ export function buildImageTasks(
       { cg: cgWithoutCharacters },
     );
   }
+  // CG 缺提示词聚合告警（#1576）：这些 CG 的 cgEvent 只有 triggerIndex（模型漏 imagePrompt，
+  // 旧代码把 undefined 写进了剧本缓存），已用场景背景+氛围兜底——不至于 11 张画成同一张，
+  // 但比模型自己写的提示词弱，如实告知可重跑那几章剧本
+  if (!imageOnly && cgMissingPrompt > 0) {
+    logger.warn(
+      "images",
+      `有 ${cgMissingPrompt} 张 CG 的场景提示词为空（cgEvent 只有 triggerIndex，多为旧版缓存里的坏数据）：已用「场景背景 + 地点/氛围/时间」兜底生成，画面不会重复但贴合度弱于模型自写；重跑对应章节的剧本可恢复`,
+      { cg: cgMissingPrompt },
+    );
+  }
+  // 背景「同一地点」收敛告警：让用户知道被裁了多少、为什么（复用口径下这条已失效，见下）
+  if (!imageOnly && bgCapped > 0 && backgroundReuse === "off") {
+    logger.warn(
+      "images",
+      `同一地点的背景已按「每章最多 ${backgroundsPerLocation} 张」收敛，本次少生成 ${bgCapped} 张（实测同地点最多被画过 79 次）；要保留全部氛围图，请在生成设置里把「同一地点背景上限」设为 0`,
+      { skipped: bgCapped, perLocation: backgroundsPerLocation },
+    );
+  }
+  // 背景复用（#1580）的可见性：502 个场景实例为什么只出 300 张，必须在日志里说清楚
+  if (!imageOnly && backgroundReuse !== "off" && bgBucketCount > 0) {
+    const modeLabel = backgroundReuse === "location" ? "地点"
+      : backgroundReuse === "locationTime" ? "地点 × 昼夜"
+      : "地点 × 昼夜 × 天气";
+    logger.info("images", "背景复用已生效", { mode: backgroundReuse, buckets: bgBucketCount, scenes: bgBucketCount + bgReusedScenes, reusedScenes: bgReusedScenes });
+    logger.info(
+      "images",
+      `背景复用（按「${modeLabel}」分桶）：${bgBucketCount + bgReusedScenes} 个场景实例 → ${bgBucketCount} 张背景图，同桶场景共用一张、少生成 ${bgReusedScenes} 张（每张仍会被这些场景引用，不是丢弃）；要恢复"一个场景一张"，请在生成设置里把「背景复用」改为「关闭」`,
+      { buckets: bgBucketCount, reusedScenes: bgReusedScenes, mode: backgroundReuse },
+    );
+  }
+  if (!imageOnly && backgroundReuse !== "off" && bgCapped > 0) {
+    logger.warn("images", `背景复用口径下仍有 ${bgCapped} 个场景因「每章背景数上限」被跳过（按本章新开的桶数计），它们会沿用上一张背景`, { skipped: bgCapped, maxPerChapter });
+  }
 
   // B77：figure 键唯一性断言。threeview/figure/action 都会写 result.figure，同 id 会互相覆盖——
   // 例如角色 "alice_threeview" 的立绘 id 与角色 "alice" 的三视图 id 相同，实际只留下一张图。
@@ -1027,7 +1429,12 @@ export function buildImageTasks(
   if (opts.baseSeed !== undefined) {
     const seen = new Map<string, number>();
     for (const t of tasks) {
-      const key = `${t.kind}:${t.id}`;
+      // 背景复用（#1580）：种子必须由**桶**决定而不是代表场景——
+      // 同一桶在「单章构建」与「整本构建」里的代表场景不同（各自范围的首个场景），
+      // 若按 id 派生种子，同一张图在两次运行里会拿到不同种子 → 画风不一致、还会绕过缓存。
+      const key = t.kind === "background" && backgroundReuse !== "off"
+        ? `background:${t.fileName}`
+        : `${t.kind}:${t.id}`;
       const n = (seen.get(key) ?? 0) + 1;
       seen.set(key, n);
       // 种子输入含 kind：background:s1 与 cg:s1 同 scene.id 不能同种子
@@ -1186,7 +1593,7 @@ async function tryAiCutout(
   }
 }
 
-export interface ImageRunOptions {
+interface ImageRunOptions {
   materials?: MaterialAsset[];
   /** 跳过缓存强制重生成（会覆盖同一文件名的缓存文件） */
   force?: boolean;
@@ -1215,7 +1622,7 @@ export interface ImageRunOptions {
   isAborted?: () => boolean;
 }
 
-export interface ImageReferenceResolutionContext {
+interface ImageReferenceResolutionContext {
   outputDir: string;
   visualBible?: ProjectVisualBible;
   figureBase?: Record<string, string>;
@@ -1427,9 +1834,9 @@ export function fitImagePrompt(prompt: string, maxChars: number): string {
     headLimit = maxChars - tail.length;
   }
   if (headLimit <= 160) {
-    return tail ? tail.slice(-maxChars) : prompt.slice(0, maxChars);
+    return tail ? safeSlice(tail, maxChars) : safeSlice(prompt, maxChars);
   }
-  let head = (constraintIdx >= 0 ? prompt.slice(0, constraintIdx) : prompt).slice(0, headLimit);
+  let head = safeSlice(constraintIdx >= 0 ? safeSlice(prompt, constraintIdx) : prompt, headLimit);
   const lastComma = head.lastIndexOf(", ");
   if (lastComma > headLimit * 0.5) head = head.slice(0, lastComma);
   head = head.replace(/[,;，；\s]+$/, "");
@@ -1464,6 +1871,40 @@ const CHARACTER_BASELINE_PROMPT_VERSION = 2;
 /** 立绘版 CG 提示词约束版本：① 复用分镜同一套外貌锁定 + 反设定稿硬约束 ② 走三视图 edit。
  *  只写在有角色的 CG 任务上（无角色 CG 提示词逐字不变、不带版本号）：存量有角色 CG 缓存判失效重画一次。 */
 export const CG_PROMPT_VERSION = 1;
+
+/**
+ * CG 提示词兜底版本（#1576）：cgEvent 缺 imagePrompt 时改用「场景背景 + 地点/氛围/时间」兜底。
+ * meta 摘要里不含提示词正文，必须另给版本号才能让"空提示词的存量 CG"判失效重画一次。
+ */
+const CG_FALLBACK_PROMPT_VERSION = CG_PROMPT_VERSION + 1;
+
+/** 剥掉背景提示词里的「无人物/空镜」措辞：CG 里要有人，不能把"empty, no people"原样带进去 */
+function stripEmptyBackgroundWording(prompt: string): string {
+  return prompt
+    .replace(/\bno (people|person|persons|characters?|humans?|human figures?|figures?|silhouettes?)\b/gi, "")
+    .replace(/\bwithout (people|person|characters?|humans?)\b/gi, "")
+    .replace(/\b(uninhabited|unoccupied|deserted|empty of people)\b/gi, "")
+    .replace(/\bempty\b/gi, "")
+    .replace(/\s*,\s*(?=,)/g, ", ")
+    .replace(/\s{2,}/g, " ")
+    .replace(/^[\s,]+|[\s,]+$/g, "");
+}
+
+/**
+ * CG 缺提示词时的兜底正文（纯函数，供单测）：用场景自己的 bgPrompt（英文环境描述，剥掉"空镜"措辞）
+ * 加地点/氛围/时间（中文情绪线索），再补一句"人物在场、电影感构图"。
+ * 目标不是比模型写得好，而是让 11 张 CG 各不相同、至少是"这一场戏"，而不是同一张画风图。
+ */
+export function cgFallbackPromptBody(scene: { location?: string; atmosphere?: string; time?: string; bgPrompt?: string }): string {
+  const env = stripEmptyBackgroundWording((scene.bgPrompt || "").trim());
+  const context = [scene.location, scene.atmosphere, scene.time].filter((s) => !!s && String(s).trim()).join("；");
+  return [
+    "Anime-style cinematic key visual of this exact scene",
+    env ? ` — environment: ${env}` : "",
+    context ? `. Scene context: ${context}` : "",
+    ", the characters are present and acting out the moment, dramatic composition, 16:9 cinematic framing",
+  ].join("");
+}
 
 /** 本次任务对应的生成参数摘要（不写入 prompt：调用方可能只改反馈词，内容复用由调用方决定） */
 function imageMetaForTask(task: ImageTask, cfg: ApiConfig | undefined, negativePrompt: string | undefined): ImageArtifactMeta {
@@ -1895,15 +2336,28 @@ export async function runImageTask(
           // 提示词超长（如「prompt length must be less than 1500」）：按服务端上限压缩重试 1 次
           const limit = promptLimitFromError(rawMessage);
           if (limit > 0 && !promptFitted) {
-            prompt = fitImagePrompt(prompt, limit);
-            promptFitted = true;
+            // #1561：必须确认**真的压短了**才重试。fitImagePrompt 在 prompt.length <= maxChars 时
+            // 原样返回（:1421），而服务端的「长度」可能是 token 或 UTF-8 字节，与我们数的 JS 字符不同口径——
+            // 中文提示词按字节算时服务端的上限数字会大于我们的字符数，于是这里会**原样重发同一个请求**：
+            // 一次注定同样失败的付费调用。与预算升级阶梯的 `next <= budget` 守卫同一个道理。
+            const fitted = fitImagePrompt(prompt, limit);
+            if (fitted.length < prompt.length) {
+              prompt = fitted;
+              promptFitted = true;
+              log({
+                step: "图像",
+                message: `提示词超长（服务端上限 ${limit} 字符），已压缩重试：${task.usage}`,
+                level: "warn",
+                at: Date.now(),
+              });
+              continue;
+            }
             log({
               step: "图像",
-              message: `提示词超长（服务端上限 ${limit} 字符），已压缩重试：${task.usage}`,
+              message: `提示词超长，但按 ${limit} 压缩后没有变短（疑为 token/字节与字符口径不同），不重发以免白烧一次调用：${task.usage}`,
               level: "warn",
               at: Date.now(),
             });
-            continue;
           }
 
           const cls = classifyError(e, status);
@@ -1923,6 +2377,11 @@ export async function runImageTask(
           // 内容审查：阶梯式改写提示词重试，最大化过审概率（严格模型连「战斗」「剑」都拒）
           if (cls === "content_moderation" && moderationStage < 3) {
             moderationStage++;
+            // #1563：记录本阶改写前的提示词，用于判定「有没有推进」。appendSafeStyleSuffix 自 #1560 起
+            // 幂等，于是第 2 阶在「未配置安全改写 LLM」或「LLM 返回空」时会变成空操作——
+            // 那时 continue 重发的是与上一阶**逐字节相同**的请求，必定同样被拒，纯粹烧掉一次付费图像调用。
+            // （与 #1562 在 visualBible 修的是同一个坑，但那是另一份阶梯实现。）
+            const promptBeforeStage = prompt;
             if (moderationStage === 1) {
               // 第 1 阶：规则改写（快、零成本）；规则没命中时若配了文本 LLM 则顺带完成第 2 阶改写
               const { prompt: safe, replaced } = sanitizePrompt(finalPrompt);
@@ -1953,13 +2412,23 @@ export async function runImageTask(
               // 第 3 阶：追加全年龄安全后缀
               prompt = appendSafeStyleSuffix(prompt);
             }
-            log({
-              step: "图像",
-              message: `检测到内容审查，已改写提示词重试（第 ${moderationStage} 阶）：${task.usage}`,
-              level: "warn",
-              at: Date.now(),
-            });
-            continue;
+            if (prompt === promptBeforeStage) {
+              // 没推进：再发一次是同一个请求，纯烧钱。落到下面的「用尽」分支抛出。
+              log({
+                step: "图像",
+                message: `内容审查改写未推进（第 ${moderationStage} 阶提示词无变化），不再重发以免白烧一次调用：${task.usage}`,
+                level: "warn",
+                at: Date.now(),
+              });
+            } else {
+              log({
+                step: "图像",
+                message: `检测到内容审查，已改写提示词重试（第 ${moderationStage} 阶）：${task.usage}`,
+                level: "warn",
+                at: Date.now(),
+              });
+              continue;
+            }
           }
 
           // 内容审查改写全部用尽后仍失败 → 抛出（不再白烧钱）
@@ -2119,6 +2588,16 @@ export async function generateImages(
   figureDetail: FigureDetail = "full",
   /** 单章强制：这些章节（与 chapterScope 同口径的章节编号）的背景/CG 跳过缓存直接重画（人物/物品不受影响） */
   chapterForce: Set<number> = new Set(),
+  /**
+   * 同一地点在单章内的背景上限（0=不限，见 BuildImageTaskOptions.backgroundsPerLocation）。
+   * 放在参数表**末尾**：本函数在管线与多个测试里是长位置参数调用，插在中间会静默错位。
+   */
+  backgroundsPerLocation = 0,
+  /**
+   * 背景复用口径（#1580，见 BuildImageTaskOptions.backgroundReuse）。
+   * 同样放在**末尾**：长位置参数调用插在中间会静默错位（上面那条注释的教训）。
+   */
+  backgroundReuse: BackgroundReuseMode = DEFAULT_BACKGROUND_REUSE,
 ): Promise<{ images: ImageResultMap; failed: FailedTask[]; generated: number }> {
   const result: ImageResultMap = { bg: {}, cg: {}, figure: {}, item: {} };
   const failed: FailedTask[] = [];
@@ -2181,43 +2660,20 @@ export async function generateImages(
     }
   }
   if (chapterScope && !force && !feedback && globalCacheCurrent) {
-    /** 该角色在完整档下应有的全部差分/服装/动作文件名（与 buildImageTasks 命名逐字一致）。 */
-    const derivativeFileNames = (c: CharacterCard): string[] => {
-      const names: string[] = [];
-      const emoList = !figureEmotions
-        ? ["normal"]
-        : figureDetail === "core"
-          ? FIGURE_EMOTIONS
-          : (c.emotions?.length ? c.emotions : FIGURE_EMOTIONS);
-      // #1493：必须与 buildImageTasks 逐字一致——
-      // ① 表情名要 sanitizeId（那边文件名用的是消毒后的 id，这里旧实现直接用原始名，
-      //    AI 返回中文表情时清单恒判"缺图"，导致单章「已全部生成、0 计费跳过」永远不生效）；
-      // ② 必须强制包含 normal（缺了它，默认立绘缺失反而会被判成"完整"而跳过补图）；
-      // ③ 消毒后同 id 要去重（「微笑/大笑」这类同长度中文会撞成同一个文件名）。
-      const seenEmo = new Set<string>();
-      for (const raw of ["normal", ...emoList]) {
-        const id = sanitizeId(String(raw)) || "normal";
-        if (seenEmo.has(id)) continue;
-        seenEmo.add(id);
-        names.push(`figure_${sanitizeId(c.id)}_${id}.png`);
-      }
-      if (threeView && figureDetail !== "core") {
-        for (const ct of c.costumes ?? []) names.push(`figure_${sanitizeId(c.id)}_ct_${sanitizeId(ct.id)}_normal.png`);
-      }
-      if (threeView && withActions) {
-        for (const a of c.actions ?? []) names.push(`figure_${sanitizeId(c.id)}_act_${sanitizeId(a.id)}.png`);
-      }
-      return names;
-    };
-    const keepChars: CharacterCard[] = [];
-    let skippedChars = 0;
-    // B69：裁剪判定同时校验旁路参数 meta——模型/种子/负面词变化后旧缓存不算「已有成品」，
-    // 否则单章模式会因"文件在"直接跳过构建，参数不匹配的旧图永远不重生成。
-    const expectedCharacterMetas = (c: CharacterCard): Map<string, ImageArtifactMeta> => {
-      const metas = new Map<string, ImageArtifactMeta>();
-      if (!cfg) return metas;
+    // #1521：这个角色的任务**只有一个来源**——就地调 buildImageTasks，文件名与任务 id 都用它产出。
+    //
+    // 旧实现有一份手写的 `derivativeFileNames`，把表情/服装/动作的命名规则抄了一遍，
+    // 并且**漏掉了 maxActionsPerCharacter**：
+    //   · buildImageTasks 对动作有 `opts.maxActionsPerCharacter ?? 2` 的上限（images.ts:673），
+    //     而主生成路径（下方 buildImageTasks 调用）没有传这个参数 → 实际只生成前 2 个动作；
+    //   · 手写清单却按 `for (const a of c.actions ?? [])` 列了**全部**动作。
+    // 于是动作超过 2 个的角色永远凑不齐「已有成品」→ 单章模式每次都重建它的三视图与全部差分，
+    // 日志承诺的「未重生成、0 计费」对这类角色永远不成立——反复真金白银地重跑。
+    // （regenerate.ts 与 generate.ts 的重生成路径传的是 0=全量，与主路径本就不一致，
+    //  更说明这份手写清单不可能靠自觉跟上。）
+    const builtCharacterTasks = (c: CharacterCard): ImageTask[] => {
       try {
-        const built = buildImageTasks([], { title: "", characters: [c], scenes: [], items: [] }, {
+        return buildImageTasks([], { title: "", characters: [c], scenes: [], items: [] }, {
           figureEmotions,
           detail: figureDetail,
           threeView,
@@ -2225,9 +2681,22 @@ export async function generateImages(
           baseSeed,
           styleAnchor: approvedBible ? false : styleAnchor,
         });
-        for (const t of built) if (t.fileName) metas.set(t.fileName, imageMetaForTask(t, cfg, effectiveNegative(t, DEFAULT_NEGATIVE)));
       } catch {
         /* 单角色任务构建失败时退回旧行为（无 meta 视为命中），主流程构建会再抛 */
+        return [];
+      }
+    };
+    const derivativeFileNames = (c: CharacterCard): string[] =>
+      builtCharacterTasks(c).map((t) => t.fileName).filter((n): n is string => !!n);
+    const keepChars: CharacterCard[] = [];
+    let skippedChars = 0;
+    // B69：裁剪判定同时校验旁路参数 meta——模型/种子/负面词变化后旧缓存不算「已有成品」，
+    // 否则单章模式会因"文件在"直接跳过构建，参数不匹配的旧图永远不重生成。
+    const expectedCharacterMetas = (c: CharacterCard): Map<string, ImageArtifactMeta> => {
+      const metas = new Map<string, ImageArtifactMeta>();
+      if (!cfg) return metas;
+      for (const t of builtCharacterTasks(c)) {
+        if (t.fileName) metas.set(t.fileName, imageMetaForTask(t, cfg, effectiveNegative(t, DEFAULT_NEGATIVE)));
       }
       return metas;
     };
@@ -2300,6 +2769,8 @@ export async function generateImages(
     baseSeed,
     styleAnchor: approvedBible ? false : styleAnchor,
     chapterIndexes: chapterScope,
+    backgroundsPerLocation,
+    backgroundReuse,
   });
 
   await tauri.mkdirAll(cacheDirFor(cacheRoot, "images"));
@@ -2308,10 +2779,44 @@ export async function generateImages(
     // 单章强制：只重画点名章节的背景/CG（人物/物品是项目级的，不动）
     if (chapterForce.size > 0 && (task.kind === "background" || task.kind === "cg")
       && task.chapter !== undefined && chapterForce.has(task.chapter)) return true;
+    // #1580：背景复用后一张图服务多个章节，被点名的章节可能不是代表所在章——
+    // 只按 task.chapter 判定会让「重画这一章」对跨章共享的背景完全失效。
+    if (chapterForce.size > 0 && task.kind === "background"
+      && (task.bgChapters ?? []).some((c) => chapterForce.has(c))) return true;
     if (!task.characterId || !approvedCacheBinding) return false;
     return storedCacheBinding?.characterRevisions[task.characterId]
       !== approvedCacheBinding.characterRevisions[task.characterId];
   };
+  // 档位预算的可见性：次要角色/路人被压掉多少张，必须在日志里说清楚——
+  // 用户看到的是「图少了」，得能一眼对上是哪些角色、为什么，而不是怀疑漏生成。
+  const budgetReport = figureBudgetReport(taskCards.characters, {
+    figureEmotions,
+    detail: figureDetail,
+    threeView,
+    actions: withActions,
+  });
+  if (budgetReport.saved > 0) {
+    log({
+      step: "图像",
+      message: `角色图片档位：主要角色 ${budgetReport.byTier.main} 人（全量）、次要角色 ${budgetReport.byTier.supporting} 人（表情≤5/服装≤1/动作≤1）、路人 ${budgetReport.byTier.cameo} 人（默认立绘+1 表情，无服装/动作）——共少生成 ${budgetReport.saved} 张差分；如需某角色全量，请在卡片编辑里把它的「图片档位」改回主要角色`,
+      level: "info",
+      at: Date.now(),
+    });
+  }
+  // 「按剧本实际使用出图」的可见性：用户看到图变少，要能一眼对上是哪些差分被省掉了
+  const usageReport = imageUsageReport(taskCards.characters);
+  if (usageReport.characters > 0) {
+    const savedUsage =
+      Math.max(0, usageReport.emotions[0] - usageReport.emotions[1])
+      + Math.max(0, usageReport.costumes[0] - usageReport.costumes[1])
+      + Math.max(0, usageReport.actions[0] - usageReport.actions[1]);
+    log({
+      step: "图像",
+      message: `按剧本实际使用出图（${usageReport.characters} 个角色有使用记录）：表情 ${usageReport.emotions[0]}→${usageReport.emotions[1]}、服装 ${usageReport.costumes[0]}→${usageReport.costumes[1]}、动作 ${usageReport.actions[0]}→${usageReport.actions[1]}（动作改为按剧本用量挑选，剧本里用到的动作不再缺图）${savedUsage > 0 ? `——共少生成 ${savedUsage} 张永远用不上的差分` : ""}`,
+      level: "info",
+      at: Date.now(),
+    });
+  }
   logger.info("images", "开始生成图像素材", {
     totalTasks: tasks.length,
     anchor: tasks.filter((t) => t.kind === "anchor").length,
@@ -2321,6 +2826,15 @@ export async function generateImages(
     cg: tasks.filter((t) => t.kind === "cg").length,
     figure: tasks.filter((t) => t.kind === "figure").length,
     item: tasks.filter((t) => t.kind === "item").length,
+    tierMain: budgetReport.byTier.main,
+    tierSupporting: budgetReport.byTier.supporting,
+    tierCameo: budgetReport.byTier.cameo,
+    tierSavedFigures: budgetReport.saved,
+    usageCharacters: usageReport.characters,
+    usageEmotions: usageReport.emotions,
+    usageCostumes: usageReport.costumes,
+    usageActions: usageReport.actions,
+    backgroundsPerLocation,
     cfg: !!cfg,
     figureEmotions,
     threeView,
@@ -2390,7 +2904,18 @@ export async function generateImages(
       : null;
     if (map && map[task.id] !== undefined && map[task.id] !== path) overwriteCount++;
     switch (task.kind) {
-      case "background": result.bg[task.id] = path; break;
+      case "background": {
+        result.bg[task.id] = path;
+        // #1580：同桶场景共用本任务的文件——渲染端逐场景查 assets.bg[scene.id]，
+        // 别名不写进去就会退回"沿用上一张背景"（同一个房间白天/夜里串图）。
+        // 别名与代表指向同一路径，不额外计费、不额外占盘。
+        for (const sid of task.bgSceneIds ?? []) {
+          if (sid === task.id || result.bg[sid] === path) continue;
+          if (result.bg[sid] !== undefined) overwriteCount++;
+          result.bg[sid] = path;
+        }
+        break;
+      }
       case "cg": result.cg[task.id] = path; break;
       case "figure": result.figure[task.id] = path; break;
       case "threeview": result.figure[task.id] = path; break;
@@ -2808,7 +3333,7 @@ export async function reCutoutAsset(
   }
 }
 
-export interface RepairImageReport {
+interface RepairImageReport {
   /** 剪掉的过期映射条目（当前剧本/卡片不再引用） */
   prunedRefs: number;
   /** 迁移的旧版 CG（映射键＋文件改名复用） */
@@ -2842,6 +3367,10 @@ export async function repairImageAssets(
     withActions?: boolean;
     cgPerChapter?: number;
     maxPerChapter?: number;
+    /** 与主管线同口径的「同一地点每章背景上限」：口径不一致会把还在用的背景当垃圾剪掉 */
+    backgroundsPerLocation?: number;
+    /** 与主管线同口径的背景复用（#1580）：复用开启时保留集是**全部场景**，否则会把别名映射当过期剪掉 */
+    backgroundReuse?: BackgroundReuseMode;
   },
   log: (ev: PipelineEvent) => void,
   isAborted?: () => boolean,
@@ -2866,10 +3395,10 @@ export async function repairImageAssets(
     bgKeep = new Set();
     cgKeep = new Set();
     for (const ch of opts.chapters) {
-      for (const s of ch.scenes) {
-        bgKeep.add(s.id);
-        if (s.cgEvent) cgKeep.add(s.id);
-      }
+      // 背景保留集必须与主管线同口径（含「同一地点每章上限」/背景复用）：口径不一致会把还在用的背景
+      // 当过期条目剪掉、再当孤儿文件删掉，而下次生成又要重新付费画回来。
+      for (const s of selectBackgroundScenes(ch, opts.backgroundsPerLocation ?? 0, opts.backgroundReuse ?? DEFAULT_BACKGROUND_REUSE).scenes) bgKeep.add(s.id);
+      for (const s of ch.scenes) if (s.cgEvent) cgKeep.add(s.id);
     }
   }
   if (opts.cards) {
@@ -2880,8 +3409,11 @@ export async function repairImageAssets(
       detail: opts.figureDetail ?? "full",
       threeView: opts.threeView,
       actions: opts.withActions,
-      // 必须覆盖全部动作：缺了会把第 3 个起的动作当过期剪映射、再当孤儿删文件
+      // 0 = 不额外限制：有剧本使用记录时按用量降序取到档位预算，没有记录时覆盖卡面全部动作。
+      // 缺了会把第 3 个起的动作当过期剪映射、再当孤儿删文件（与主管线同口径）。
       maxActionsPerCharacter: 0,
+      backgroundsPerLocation: opts.backgroundsPerLocation ?? 0,
+      backgroundReuse: opts.backgroundReuse ?? DEFAULT_BACKGROUND_REUSE,
     });
     figureKeep = new Set(tasks.filter((t) => t.kind === "figure" || t.kind === "threeview" || t.kind === "action").map((t) => t.id));
     itemKeep = new Set(tasks.filter((t) => t.kind === "item").map((t) => t.id));
@@ -2899,7 +3431,7 @@ export async function repairImageAssets(
       }
       const base = p.replace(/\.(png|jpg|jpeg|webp)$/i, "");
       let fixed: string | null = null;
-      for (const ext of ["png", "jpg", "jpeg", "webp"]) {
+      for (const ext of IMAGE_EXTS) {
         const candidate = `${base}.${ext}`;
         if (candidate === p) continue;
         try {

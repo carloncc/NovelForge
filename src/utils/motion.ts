@@ -8,7 +8,7 @@
  */
 
 /** 用户是否要求减少动效（无 matchMedia/无 window 时按"否"处理，绝不抛错） */
-export function prefersReducedMotion(): boolean {
+function prefersReducedMotion(): boolean {
   try {
     return (
       typeof window !== "undefined" &&
@@ -21,7 +21,7 @@ export function prefersReducedMotion(): boolean {
 }
 
 /** 滚动行为：尊重 reduce-motion（开启时用 instant，避免强制动画） */
-export function scrollBehavior(): ScrollBehavior {
+function scrollBehavior(): ScrollBehavior {
   return prefersReducedMotion() ? ("instant" as ScrollBehavior) : "smooth";
 }
 

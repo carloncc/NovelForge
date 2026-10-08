@@ -6,6 +6,8 @@ import { pickVoiceForGender, voiceGenderOf } from "./minimaxVoices";
 import { normalizeEntityId } from "./ids";
 import { normalizeCharacterEmotions } from "./emotions";
 import type { ApiConfig } from "./types";
+import { safeSlice } from "../utils/text";
+import { sanitizeId } from "./render";
 
 const SYSTEM_PROMPT = `你是视觉小说制作人。从小说文本中提取制作视觉小说所需的结构化信息。
 要求：
@@ -46,8 +48,17 @@ const SYSTEM_PROMPT = `你是视觉小说制作人。从小说文本中提取制
 
 只输出 JSON，不要输出任何其他文字。`;
 
+/**
+ * 截断小说正文用于提示词。
+ *
+ * #1571：改用 `safeSlice`——正文是**用户文本**，可能含 emoji/增补平面字符，
+ * 裸 `slice(0, maxChars)` 会把代理对劈开、留下落单代理（#1551 已在 extractAgent 的 clip、
+ * render/script 等处修过，本文件这一处当时漏了）。
+ * 影响面说明：这里截的是**提示词**不是落盘数据，所以不会产生「文件里的 �」，
+ * 但坏串会随请求体发出去，部分服务端会替换成 U+FFFD 或直接 400。属低危，修它是为口径统一。
+ */
 function truncate(text: string, maxChars: number): string {
-  return text.length > maxChars ? text.slice(0, maxChars) + "\n……(截断)" : text;
+  return text.length > maxChars ? safeSlice(text, maxChars) + "\n……(截断)" : text;
 }
 
 /** 名称归一化（与 extractAgent.normalizeName 同口径；本文件内联避免循环依赖） */
@@ -55,11 +66,20 @@ function normName(name: string): string {
   return (name || "").trim().toLowerCase().replace(/\s+/g, "");
 }
 
-/** id 查重：冲突按出现顺序加稳定后缀 _2/_3…（同一输入重复运行结果一致） */
+/** id 查重：冲突按出现顺序加稳定后缀 _2/_3…（同一输入重复运行结果一致）。
+ *  判重必须按 **sanitizeId 之后的形态**：sanitizeId 把非 [a-zA-Z0-9_-] 全折叠成 "_"，
+ *  「林澈」「苏晚」都变成 "__"，于是两个角色的 threeview__.png / figure___normal.png
+ *  互相覆盖——两个人在游戏里长同一张脸（ids.ts 的注释里记着同一类坑）。
+ *  "_2" 后缀含 "_" 与数字，sanitizeId 会保留，所以清洗后形态也跟着变，不会继续撞。 */
 function uniqueId(want: string, used: Set<string>): string {
+  const taken = (id: string): boolean => {
+    const clean = sanitizeId(id);
+    for (const u of used) if (sanitizeId(u) === clean) return true;
+    return false;
+  };
   let id = want;
   let n = 2;
-  while (used.has(id)) id = `${want}_${n++}`;
+  while (taken(id)) id = `${want}_${n++}`;
   used.add(id);
   return id;
 }
@@ -74,6 +94,7 @@ function mergeDupCharacter(target: CharacterCard, source: CharacterCard): void {
     if (!target[k] && source[k]) (target as unknown as Record<string, unknown>)[k] = source[k];
   }
   if (target.isNpc == null && source.isNpc != null) target.isNpc = source.isNpc;
+  if (target.figureTier == null && source.figureTier != null) target.figureTier = source.figureTier;
   // 数组字段做 Array.isArray 防护：模型可能把数组写成字符串/对象，直接展开会抛错或清空已有数据
   const actionMap = new Map<string, CharacterAction>();
   for (const a of [
@@ -241,7 +262,8 @@ export async function extractFromNovel(
   return normalizeExtractionResult(result, lib, title);
 }
 
-export function demoExtract(novelText: string, title: string): ExtractionResult {
+/** demo 卡片为内置固定数据，与传入正文无关（`_novelText` 仅为与真实提取同签名）。 */
+export function demoExtract(_novelText: string, title: string): ExtractionResult {
   const characters: CharacterCard[] = [
     {
       id: "linche",

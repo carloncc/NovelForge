@@ -5,7 +5,22 @@ export function cacheDirFor(cacheRoot: string, section: string): string {
   return cleanPath(`${cacheRoot}/${section}`);
 }
 
-const IMAGE_EXTS = ["png", "jpg", "jpeg", "webp"];
+/**
+ * 可落盘的图片扩展名全集。
+ *
+ * #1539：原先是 ["png","jpg","jpeg","webp"]，漏了 gif。但 detectedImageExtension 认得 GIF
+ * （images.ts 的 `0x47 0x49 0x46` 分支），withDetectedExt 会把 API 返回的 GIF 字节改写成
+ * `.gif` 落盘。于是命中链成了死循环：cacheHit(dir, "cg_1_x.png") 精确未命中 → 按 basename
+ * 探测四种扩展名 → 磁盘上是 .gif，全都找不到 → 每次重跑都重新生成、重新付费。
+ * 这正是本函数当初要解决的那类问题（注释里写的「用户报告每次都要重新生成」），只是漏了一种格式。
+ * project.ts 的 stripExt 早已把 gif 算进去，也印证了 gif 确实会落到磁盘上。
+ */
+export const IMAGE_EXTS = ["png", "jpg", "jpeg", "webp", "gif"] as const;
+
+/** 去掉图片扩展名（大小写不敏感）；无已知扩展名时原样返回。与 IMAGE_EXTS 严格同源。 */
+export function stripImageExt(fileName: string): string {
+  return fileName.replace(/\.(png|jpg|jpeg|webp|gif)$/i, "");
+}
 
 /**
  * 缓存命中：优先精确文件名；否则按 basename 匹配常见图片扩展名（.png/.jpg/.jpeg/.webp）。
@@ -19,7 +34,7 @@ export async function cacheHit(dir: string, fileName: string): Promise<string | 
   } catch {
     /* ignore */
   }
-  const base = fileName.replace(/\.(png|jpg|jpeg|webp)$/i, "");
+  const base = stripImageExt(fileName);
   for (const ext of IMAGE_EXTS) {
     const candidate = `${dir}/${base}.${ext}`;
     if (candidate === path) continue;
@@ -41,7 +56,7 @@ export function titleHash(title: string): string {
   return h.toString(36);
 }
 
-export interface ScriptFingerprintInput {
+interface ScriptFingerprintInput {
   /** 剧本文风：留空不调整 */
   style?: string;
   /** 旁白压缩开关（#801）：开=精简提炼旁白；关（默认）=忠实保留全文旁白 */
@@ -154,7 +169,7 @@ export function parseScriptPartFileName(name: string): {
   };
 }
 
-export interface ScriptPartScanResult {
+interface ScriptPartScanResult {
   /** 段号(1-based) → 文件路径：rest 与总数都匹配、可直接复用 */
   hits: Map<number, string>;
   /** 同章同模式但 rest/总数失配的旧段文件路径：调用方删除（只删本章的段文件） */

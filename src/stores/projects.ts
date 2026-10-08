@@ -1,5 +1,5 @@
+import { ref } from "vue";
 import { configState } from "./config";
-import { projectState } from "./project";
 import { tauri } from "../utils/tauri";
 import { stateFile } from "../utils/persist";
 import type { ProjectEntry } from "./configMigration";
@@ -16,8 +16,10 @@ function displayNameOf(fileName: string, fallback: string): string {
 /** #1417：项目注册表上限（超出后最旧条目被挤出，文件不丢，可用新建项目对话框导航回来） */
 export const PROJECT_LIST_LIMIT = 30;
 
-/** #1417：最近一次因上限被挤出的条目（供列表尾部提示，不落盘） */
-export let lastEvictedProjects: ProjectEntry[] = [];
+/** #1417/#1511：最近一次因上限被挤出的条目（供列表尾部提示，不落盘）。
+ *  必须用 ref：模块级 `export let` 是普通变量，Vue 的依赖收集不会追踪它——
+ *  原写法即便在 upsertProject 里赋值，列表也不会重渲染，提示等于永远不出现。 */
+export const lastEvictedProjects = ref<ProjectEntry[]>([]);
 
 /** #1417：截断纯函数（可单测）：保留前 LIMIT 条，返回被挤出的旧条目供提示/恢复 */
 export function truncateProjectList(list: ProjectEntry[]): { kept: ProjectEntry[]; evicted: ProjectEntry[] } {
@@ -40,6 +42,14 @@ export function upsertProject(outputDir: string, novel?: { fileName: string; tit
     }
     if (title) existing.novelTitle = title;
     existing.updatedAt = new Date().toISOString();
+    // 最近使用优先：只更新 updatedAt 而不移动位置的话，列表顺序恒等于「首次登记顺序」，
+    // 而 truncateProjectList 截的是前 30 条 —— 刚用过的项目会被后来的登记挤出列表，
+    // 反而留下长期没动过的旧条目（文件还在，但用户得重新按目录找）。
+    const at = list.indexOf(existing);
+    if (at > 0) {
+      list.splice(at, 1);
+      list.unshift(existing);
+    }
   } else {
     list.unshift({
       id: makeProjectId(),
@@ -50,7 +60,11 @@ export function upsertProject(outputDir: string, novel?: { fileName: string; tit
       updatedAt: new Date().toISOString(),
     });
   }
-  configState.projects = list.slice(0, 30);
+  // #1511：走 truncateProjectList 而不是内联 slice(0, 30)——上限常量与实现此前各写一份，
+  // 改 PROJECT_LIST_LIMIT 不会同步；这里同时把被挤出的条目留痕，供 UI 提示而非静默消失。
+  const { kept, evicted } = truncateProjectList(list);
+  configState.projects = kept;
+  if (evicted.length) lastEvictedProjects.value = evicted;
 }
 
 /** 仅移除注册记录，不删目录文件 */
@@ -59,13 +73,8 @@ export function removeProjectEntry(id: string): void {
 }
 
 /** 当前输出目录对应的项目（没有则返回 undefined） */
-export function activeProject(): ProjectEntry | undefined {
-  const dir = projectState.outputDir;
-  if (!dir) return undefined;
-  return (configState.projects ?? []).find((p) => p.outputDir === dir);
-}
 
-export interface DirNovelIdentity {
+interface DirNovelIdentity {
   fileName: string;
   /** 章节标题签名（标题用 | 连接），用于区分同名不同内容 */
   titleSig: string;
@@ -86,7 +95,7 @@ export async function readDirNovelIdentity(outputDir: string): Promise<DirNovelI
   }
 }
 
-export type NovelImportDecision = "empty" | "same" | "different";
+type NovelImportDecision = "empty" | "same" | "different";
 
 /** 导入保护（纯函数）：目录里已有别的小说快照时判 different，调用方弹窗分流。
  *  #1364：同文件名即判 same——titleSig 含 AI 分章后标题/用户改名，同书重导必然不一致，

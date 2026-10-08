@@ -1,6 +1,6 @@
-﻿# 🛠️ 开发者工具指南
+# 🛠️ 开发者工具指南
 
-NovelForge 提供了一套强大的开发者工具，帮助你构建更稳定、更高效的应用。
+NovelForge 提供了一套开发者工具，帮助你构建更稳定、更高效的应用。
 
 ## 📦 工具模块
 
@@ -38,57 +38,50 @@ const safe = safeFilename("file:name*.txt"); // -> "file_name_.txt"
 
 ### 🛡️ 错误处理 (`src/utils/errors.ts`)
 
-结构化错误处理，提供用户友好的错误消息。
+`errMsg(e)`：从任意异常取值（Tauri invoke 常以纯字符串 reject，直接读 `Error.message` 会得到 undefined）。
+这是全仓通用的取值入口。
 
 ```typescript
-import { createError, ErrorCode, formatError, retry } from "./utils/errors";
+import { errMsg } from "./utils/errors";
 
-// 创建结构化错误
-throw createError(ErrorCode.FILE_NOT_FOUND, {
-  path: filePath
-});
-
-// 格式化错误消息（自动附加建议）
-const message = formatError(error);
-
-// 自动重试
-const result = await retry(
-  () => apiCall(),
-  { maxAttempts: 3, delayMs: 1000 }
-);
+try {
+  await run();
+} catch (e) {
+  log.error("stage", errMsg(e));
+}
 ```
+
+`ErrorCode` / `createError()` / `safeAsync()` 是结构化错误包装，目前只有 `TEMPLATE_NOT_FOUND`
+一处调用（`src/utils/template.ts` 的模板解析）。新增错误码时请一并补 `ERROR_MESSAGES` 文案。
 
 ---
 
-### ⚡ 性能工具 (`src/utils/performance.ts`)
-
-性能优化工具集，提升应用响应速度。
+### ⚡ 并发控制 (`src/utils/performance.ts`)
 
 ```typescript
-import {
-  debounce,
-  throttle,
-  memoize,
-  createTimer,
-  ConcurrencyLimiter
-} from "./utils/performance";
+import { ConcurrencyLimiter } from "./utils/performance";
 
-// 防抖（延迟执行）
-const debouncedSearch = debounce((query) => {
-  performSearch(query);
-}, 300);
-
-// 性能监控
-const timer = createTimer("项目生成");
-timer.mark("模板加载");
-timer.summary();
-
-// 并发控制
-const limiter = new ConcurrencyLimiter(3);
+const limiter = new ConcurrencyLimiter(3); // 上限会被夹到 >= 1（NaN / 0 / 负数一律退回 1）
 await limiter.run(() => executeTask());
+limiter.setMaxConcurrent(8); // 动态调整：增大立即生效，减小后运行数自然回落
 ```
 
 ---
 
-**更新日期：** 2026-08-06  
-**版本：** v0.1.1
+### 🧪 测试与校验脚本
+
+| 命令 | 说明 |
+| --- | --- |
+| `pnpm test` | 单元 + 离线端到端（`node scripts/run-tests.mjs`） |
+| `pnpm test:e2e` | 追加 Playwright 浏览器端用例（需先 `pnpm exec playwright install`） |
+| `pnpm typecheck:tests` | `tests/` 的类型检查（`tsconfig.tests.json`） |
+| `pnpm check:i18n` | 校验各语言词典与 `scripts/i18n-keys.txt` 键集一致 |
+| `pnpm check:template` | 校验 WebGAL 模板是否已回填（构建前必跑） |
+
+需要人工条件（API 密钥 / 已生成游戏目录）的用例不参与自动门禁，但会被 runner 显式列出：
+`tests/stage-runner.ts`、`tests/engine-check.ts`、`tests/screenshot.ts`、`tests/_probe-render.ts`。
+
+---
+
+**更新日期：** 2026-10-07
+**版本：** v0.3.0

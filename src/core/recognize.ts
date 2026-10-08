@@ -45,7 +45,7 @@ const REFERENCE_DESC_SYSTEM = `你是视觉小说风格分析助手。根据用�
   "prompt": "cel-shaded anime style, cool navy-and-violet palette, clean crisp linework, soft backlit rim lighting, dramatic moody atmosphere"
 }`;
 
-export interface RecognizedCharacter {
+interface RecognizedCharacter {
   name?: string;
   appearance?: string;
   clothing?: string;

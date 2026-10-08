@@ -1,9 +1,10 @@
-import { buildImageTasks } from "../src/core/images";
+import { buildImageTasks, backgroundBucketKey } from "../src/core/images";
 import { demoExtract } from "../src/core/extract";
 import { demoScriptAll } from "../src/core/script";
 import { splitChapters } from "../src/core/chapters";
 import { DEMO_NOVEL } from "../src/core/demoNovel";
 import { scriptCacheFileName, scriptCacheRest } from "../src/core/cache";
+import { DEFAULT_BACKGROUND_REUSE } from "../src/core/types";
 
 function assert(cond: boolean, msg: string): void {
   if (!cond) throw new Error(msg);
@@ -18,10 +19,35 @@ function bgCount(tasks: { kind: string }[]): number {
   return tasks.filter((t) => t.kind === "background").length;
 }
 
-// 不过滤：背景数＝各章场景数之和
+/** 场景集合按「地点[×昼夜[×天气]]」分桶后的桶数（与被测实现的独立口径） */
+function bucketCount(scenes: { id: string; location?: string; time?: string; atmosphere?: string; bgPrompt?: string }[], mode = DEFAULT_BACKGROUND_REUSE): number {
+  return new Set(scenes.map((s) => backgroundBucketKey(s, mode))).size;
+}
+
+// 不过滤：背景数＝全书分桶数（#1580 复用：同桶场景共用一张图），而不是场景数
+const allScenes = scripts.flatMap((s) => s.scenes);
 const all = buildImageTasks(scripts, cards, { cgPerChapter: 0, maxPerChapter: 0 });
-const expectAll = scripts.reduce((n, s) => n + s.scenes.length, 0);
-assert(bgCount(all) === expectAll, `全量背景数应为 ${expectAll}，实际 ${bgCount(all)}`);
+const expectAll = bucketCount(allScenes);
+assert(bgCount(all) === expectAll, `全量背景数应为分桶数 ${expectAll}，实际 ${bgCount(all)}`);
+assert(expectAll < allScenes.length, `示例数据应存在同桶场景（否则本用例失去意义）：${expectAll} vs ${allScenes.length}`);
+
+// 关闭复用＝旧口径：一个场景实例一张（回归保护，确认开关真的能回到旧行为）
+const offAll = buildImageTasks(scripts, cards, { cgPerChapter: 0, maxPerChapter: 0, backgroundReuse: "off" });
+assert(
+  bgCount(offAll) === allScenes.length,
+  `关闭背景复用时背景数应等于场景数 ${allScenes.length}，实际 ${bgCount(offAll)}`,
+);
+assert(
+  offAll.filter((t) => t.kind === "background").every((t) => (t.fileName as string).startsWith("bg_") && !t.bgSceneIds),
+  "关闭复用时不应带同桶别名（旧行为：一场景一文件）",
+);
+
+// 复用任务必须覆盖本范围内的**全部**场景（漏掉会让那些场景退回"沿用上一张背景"）
+const covered = new Set(all.filter((t) => t.kind === "background").flatMap((t) => t.bgSceneIds ?? []));
+assert(
+  covered.size >= new Set(allScenes.map((s) => s.id)).size,
+  `复用别名应覆盖全部场景 id：${covered.size} vs ${new Set(allScenes.map((s) => s.id)).size}`,
+);
 
 // 单章过滤：只保留目标章背景，全局任务（锚点/三视图/立绘/物品）不受影响
 const target = scripts[1];
@@ -30,7 +56,18 @@ const scoped = buildImageTasks(scripts, cards, {
   maxPerChapter: 0,
   chapterIndexes: new Set([target.chapter]),
 });
-assert(bgCount(scoped) === target.scenes.length, `单章背景数应为 ${target.scenes.length}，实际 ${bgCount(scoped)}`);
+assert(
+  bgCount(scoped) === bucketCount(target.scenes),
+  `单章背景数应为该章分桶数 ${bucketCount(target.scenes)}，实际 ${bgCount(scoped)}`,
+);
+const targetSceneIds = new Set(target.scenes.map((s) => s.id));
+for (const t of scoped.filter((t) => t.kind === "background")) {
+  assert(targetSceneIds.has(t.id), `单章背景任务应属于目标章节场景：${t.id}`);
+  for (const sid of t.bgSceneIds ?? []) {
+    assert(targetSceneIds.has(sid), `单章背景别名应属于目标章节场景：${sid}（${t.id}）`);
+  }
+  assert(!!t.bgChapters?.includes(target.chapter), `单章背景任务应记录所属章节：${t.id}`);
+}
 const kinds = (tasks: { kind: string }[]): Record<string, number> => {
   const m = new Map<string, number>();
   for (const t of tasks) m.set(t.kind, (m.get(t.kind) || 0) + 1);

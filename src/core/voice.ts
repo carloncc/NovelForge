@@ -8,8 +8,9 @@ import { ttsConfigById, requireVoiceLibrary, voiceLibraryFor, voiceProfileById }
 import { pickVoiceForGender, voiceGenderOf } from "./minimaxVoices";
 import { log as logger } from "../utils/logger";
 import { readAssetMap, updateAssetMap } from "./assetMap";
+import { classifyError } from "../utils/errorClassifier";
 
-export interface VoiceJob {
+interface VoiceJob {
   key: string;
   file: string;
   text: string;
@@ -47,9 +48,22 @@ function minimaxTtsThrottle<T>(fn: () => Promise<T>): Promise<T> {
   return next;
 }
 
-/** 判断是否 MiniMax 限流错误（code 1002 / rate limit） */
+/**
+ * 判断是否 MiniMax 限流错误。
+ *
+ * #1556：原实现是 `/1002|rate\s*limit|RPM|限流/`，比项目自己的错误分类器**窄得多**。
+ * 于是 MiniMax 若把限流写成 `429`、`Too many requests`、`请求过于频繁`、`频率超限` 等
+ * （分类器认、这条正则不认）的措辞，语音合成就会**跳过专门的退避重试**，
+ * 直接落到兜底音色路径——结果是这一句要么用**错的音色**（音色不一致），要么整句失败进失败清单。
+ * 而这几秒退避本来就能让它成功。
+ *
+ * 现在与 classifyError 的 rate_limit 口径对齐，保留 MiniMax 专有的 1002 / RPM。
+ * classifyError 对字符串入参可直接使用（内部按 message 取文本）。
+ */
 export function isRateLimitError(message: string): boolean {
-  return /1002|rate\s*limit|RPM|限流/.test(message);
+  // \b 边界：避免把 10025 / 请求号 req_100234 这类含 1002 子串的串误判为限流
+  if (/\b1002\b|RPM/.test(message)) return true;
+  return classifyError(message) === "rate_limit";
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -152,7 +166,14 @@ function actualVoiceFileName(job: VoiceJob, voice: string): string {
   const from = voiceFingerprint(job.voice, job.ttsConfigId);
   const to = voiceFingerprint(voice, voice === job.voice ? job.ttsConfigId : undefined);
   if (from === to) return job.file;
-  return job.file.replace(`_${from}_`, `_${to}_`);
+  // 复用 splitVocalFileName 这一唯一解析口径：key 可含下划线而 fp/hash 是 base36，
+  // 所以必须「从右切最后两段」。朴素的 job.file.replace(`_${from}_`, ...) 会命中第一处，
+  // 当 from 短到与 key 内片段相撞时改坏的是 key 而不是音色指纹段。
+  const parsed = splitVocalFileName(job.file);
+  if (!parsed || parsed.fp !== from.toLowerCase()) return job.file;
+  const ext = /\.[A-Za-z0-9]+$/.exec(job.file)?.[0] ?? ".mp3";
+  const key = job.file.slice(0, job.file.length - parsed.fp.length - parsed.hash.length - 3 - ext.length);
+  return `${key}_${to}_${parsed.hash}${ext}`;
 }
 
 /** 按当前剧本算出全部配音 key（与 buildVoiceJobs 的 key 公式同源，供映射剪枝用）。
@@ -496,11 +517,13 @@ export async function generateVoice(
       const path = await runVoiceJob(cfg, job, cacheRoot, log, force, isAborted, (n) => {
         synthChars += n;
       });
+      // 中止且本任务未产出：不计进度、不上屏（与 images 的「已中止且本任务未产出」同口径）。
+      // 旧实现先 emitProgress 再判中止，于是点停止后进度条还会前进、日志还会打出
+      // 从未合成过的句子的「进度 N/M」。
+      if (!path && isAborted?.()) return;
       emitProgress(job);
       if (path) {
         vocal[job.key] = path;
-      } else if (isAborted?.()) {
-        return; // 中止：不计失败、不再派发（避免停止后失败数虚增）
       } else {
         failed.push({
           id: `vocal_${job.key}`,

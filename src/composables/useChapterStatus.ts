@@ -2,7 +2,7 @@ import { reactive } from "vue";
 import type { ApiConfig, ChapterScript, GenerationOptions, NovelDoc, PipelineResult } from "../core/types";
 import { chapterScopeImageTasks } from "../core/chapterAssets";
 import { buildVoiceJobs } from "../core/voice";
-import { scriptCacheRest, scriptFingerprint, titleHash, cardsFingerprint } from "../core/cache";
+import { scriptCacheRest, scriptFingerprint, titleHash, cardsFingerprint, isScriptPartFileName } from "../core/cache";
 import { parseChapterScript } from "../core/dataValidation";
 import { readAssetMap } from "../core/assetMap";
 import { tauri } from "../utils/tauri";
@@ -15,6 +15,14 @@ export interface ChapterLight {
   legacyScript: boolean;
   imageDone: number;
   imageTotal: number;
+  /**
+   * 本章覆盖到的图像任务 id。全局总账靠它**按 id 去重**：
+   * 角色三视图/立绘/表情/动作是项目级资产，同一张图会被多个章节同时"覆盖"，
+   * 各章灯直接相加会把它重复计入（实测某项目 30 章相加 3566，实际只有 857 张）。
+   */
+  imageIds: string[];
+  /** imageIds 中已生成的子集（同样用于去重统计） */
+  imageDoneIds: string[];
   voiceDone: number;
   voiceTotal: number;
   /** 无 TTS 配置时为 true（配音灯不参与完成判定） */
@@ -26,6 +34,8 @@ export const emptyChapterLight = (): ChapterLight => ({
   legacyScript: false,
   imageDone: 0,
   imageTotal: 0,
+  imageIds: [],
+  imageDoneIds: [],
   voiceDone: 0,
   voiceTotal: 0,
   voiceSkipped: true,
@@ -36,7 +46,7 @@ export function isChapterContentComplete(l: ChapterLight): boolean {
   return l.script && (l.imageTotal === 0 || l.imageDone >= l.imageTotal);
 }
 
-export interface ChapterStatusInput {
+interface ChapterStatusInput {
   getOutputDir: () => string;
   getNovel: () => NovelDoc | null;
   getOptions: () => GenerationOptions;
@@ -130,7 +140,13 @@ export function useChapterStatus(input: ChapterStatusInput) {
     const token = ++refreshToken;
     const dir = input.getOutputDir();
     const novel = input.getNovel();
-    if (!dir || !novel) return;
+    if (!dir || !novel) {
+      // 不能直接 return：清灯逻辑在函数末尾，无项目时会留着上一个项目的章节灯，
+      // 而 lights 按章节 index 索引，下一个项目重叠的 index 会显示上一个项目的状态。
+      for (const k of Object.keys(lights).map(Number)) delete lights[k];
+      legacy.count = 0;
+      return;
+    }
     const options = input.getOptions();
     const enabled = novel.chapters.filter((c) => c.enabled !== false);
     const demo = !input.getLlmAvailable();
@@ -163,7 +179,12 @@ export function useChapterStatus(input: ChapterStatusInput) {
     const picked = new Map<number, ScriptCacheEntry>();
     let legacyCount = 0;
     for (const e of entries
-      .filter((x) => !x.isDir && /^script(_demo)?_ch\d+_/.test(x.name))
+      // #1538：显式排除段缓存。pipeline.ts::classifyScriptCache 走的是 isScriptPartFileName 这道显式
+      // 拦截，这里原先没有——只是因为段缓存的 rest 里必然含 _t（scriptCacheRest 的 `${hash}_t${hash}`
+      // 格式），才被下面的「失配新格式＝stale」顺带忽略掉。两个实现今天结论一致，但机制不同：
+      // 哪天为了缩短文件名去掉 _t，界面就会把 script_ch1_partKofT_*.json 当整章剧本选中，
+      // 拿半章内容算素材引用，整章报「假缺失」（用户报告 76/91）。这里与管线对齐成同一机制。
+      .filter((x) => !x.isDir && !isScriptPartFileName(x.name) && /^script(_demo)?_ch\d+_/.test(x.name))
       .sort((a, b) => a.name.localeCompare(b.name))) {
       const m = e.name.match(/^script(_demo)?_ch(\d+)_(.+)\.json$/);
       if (!m) continue;
@@ -231,16 +252,22 @@ export function useChapterStatus(input: ChapterStatusInput) {
           if (options.useImage === false || !imageAvailable) {
             light.imageTotal = 0;
             light.imageDone = 0;
+            light.imageIds = [];
+            light.imageDoneIds = [];
           } else {
             try {
               const tasks = chapterScopeImageTasks(script, { title: "", characters, scenes: [], items } as never, options);
               light.imageTotal = tasks.length;
-              light.imageDone = tasks.filter((t) => {
-                if (t.kind === "background") return Boolean(assets.bg[t.id]);
-                if (t.kind === "cg") return Boolean(assets.cg[t.id]);
-                if (t.kind === "item") return Boolean(assets.item[t.id]);
-                return Boolean(assets.figure[t.id]);
-              }).length;
+              light.imageIds = tasks.map((t) => t.id);
+              light.imageDoneIds = tasks
+                .filter((t) => {
+                  if (t.kind === "background") return Boolean(assets.bg[t.id]);
+                  if (t.kind === "cg") return Boolean(assets.cg[t.id]);
+                  if (t.kind === "item") return Boolean(assets.item[t.id]);
+                  return Boolean(assets.figure[t.id]);
+                })
+                .map((t) => t.id);
+              light.imageDone = light.imageDoneIds.length;
             } catch {
               /* 任务构建失败则保持 0 */
             }

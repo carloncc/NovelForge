@@ -276,7 +276,6 @@ async function main(): Promise<void> {
 
   // ---------- 11. Stability：multipart form + 原始二进制响应 + Authorization 头 ----------
   routes.length = 0;
-  let stabHeaders: Record<string, string> = {};
   let stabBody = "";
   routes.push({
     match: (u, b) => {

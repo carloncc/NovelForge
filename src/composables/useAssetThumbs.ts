@@ -324,8 +324,12 @@ async function loadOne(job: LoadJob, generation: number, pathGeneration: number)
     const failures = (retryCounts.get(p) ?? 0) + 1;
     retryCounts.set(p, failures);
     if (failures >= MAX_FAILURES) return;
+    // 同一路径可能同时有缩略图与全图两个任务失败：先清掉旧定时器，否则后者覆盖 map 里的句柄，
+    // 旧回调触发时又会删掉**新**句柄，clearThumbCache 就再也取消不掉这个定时器。
+    const prevTimer = retryTimers.get(p);
+    if (prevTimer !== undefined) window.clearTimeout(prevTimer);
     const t = window.setTimeout(() => {
-      retryTimers.delete(p);
+      if (retryTimers.get(p) === t) retryTimers.delete(p);
       if (loadIsCurrent(p, generation, pathGeneration) && !thumbStore.data.value[p] && !inflight.has(jobKey({ path: p, full: false }))) {
         failed.delete(p);
         pending.push({ path: p, full: false });
@@ -390,9 +394,9 @@ export function useAssetThumbs() {
  * - evicted：LRU 因内存淘汰——不得重读（否则形成淘汰→重读→再淘汰的无限环路）；
  * - entered-view / path-change：进入视口 / 路径切换——受节流保护。
  */
-export type ThumbReloadReason = "explicit" | "evicted" | "entered-view" | "path-change";
+type ThumbReloadReason = "explicit" | "evicted" | "entered-view" | "path-change";
 
-export interface ThumbReloadState {
+interface ThumbReloadState {
   reason: ThumbReloadReason;
   inView: boolean;
   hasValue: boolean;

@@ -103,7 +103,7 @@ const notice = computed<{ kind: string; title: string; text: string; action: str
       text: t("统一风格与角色三视图尚未批准，图像阶段将在此等待批准后继续。"),
       action: t("去确认"),
       run: () => {
-        tab.value = "settings";
+        tab.value = "bible";
         focusResults("#visual-bible-anchor");
       },
     };

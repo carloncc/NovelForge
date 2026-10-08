@@ -1,7 +1,7 @@
 import type { ChapterLight } from "../composables/useChapterStatus";
 
 /** 图片计划统计（生成前总账）：按章节灯聚合「共多少张 / 已生成 / 待生成」 */
-export interface ImagePlanSummary {
+interface ImagePlanSummary {
   total: number;
   done: number;
   missing: number;
@@ -11,7 +11,7 @@ export interface ImagePlanSummary {
   unknownChapters: number;
 }
 
-export function emptyImagePlanSummary(): ImagePlanSummary {
+function emptyImagePlanSummary(): ImagePlanSummary {
   return { total: 0, done: 0, missing: 0, knownChapters: 0, unknownChapters: 0 };
 }
 
@@ -24,6 +24,11 @@ export function summarizeImagePlan(
   chapterIndices: number[],
 ): ImagePlanSummary {
   const out = emptyImagePlanSummary();
+  // 必须按任务 id 去重，不能各章相加：角色三视图/立绘/表情/动作是**项目级资产**，
+  // 同一个角色的立绘会被它出场的每一章同时计入。实测某项目 30 章灯相加得 3566，
+  // 而全局唯一任务只有 857 —— 相加会让"图片共 N 张"虚高约 4 倍，把成本说错。
+  const seen = new Set<string>();
+  const done = new Set<string>();
   for (const index of chapterIndices) {
     const light = lights[index];
     if (!light || !light.script) {
@@ -31,9 +36,11 @@ export function summarizeImagePlan(
       continue;
     }
     out.knownChapters++;
-    out.total += light.imageTotal;
-    out.done += light.imageDone;
+    for (const id of light.imageIds ?? []) seen.add(id);
+    for (const id of light.imageDoneIds ?? []) done.add(id);
   }
+  out.total = seen.size;
+  out.done = done.size;
   out.missing = Math.max(0, out.total - out.done);
   return out;
 }
@@ -43,10 +50,14 @@ export function missingImagesInChapters(
   lights: Record<number, ChapterLight | undefined>,
   chapterIndices: number[],
 ): number {
-  let missing = 0;
+  // 同样按 id 去重，与 summarizeImagePlan 口径一致：批量运行确认里的
+  // "图像待生成约 N 张"是给用户看的成本提示，各章相加同样会虚高。
+  const missing = new Set<string>();
   for (const index of chapterIndices) {
     const light = lights[index];
-    if (light) missing += Math.max(0, light.imageTotal - light.imageDone);
+    if (!light) continue;
+    const done = new Set(light.imageDoneIds ?? []);
+    for (const id of light.imageIds ?? []) if (!done.has(id)) missing.add(id);
   }
-  return missing;
+  return missing.size;
 }

@@ -42,6 +42,13 @@ async function download(url, dest) {
     const res = await fetch(url, { signal: controller.signal });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     await pipeline(res.body, createWriteStream(dest));
+  } catch (e) {
+    // 中断/超时/连接重置都会在半截文件上失败：verifyZipHash 只在完整流之后才会跑，
+    // 所以半截文件永远不会被校验、也永远不会被识别为坏文件，却会一直占着
+    // .template-cache/ 的磁盘（120MB 的包传到 60MB 就断是常见情况）。
+    // 失败即清掉，绝不把残留文件留给下一次运行。
+    await rm(dest, { force: true }).catch(() => {});
+    throw e;
   } finally {
     clearTimeout(timer);
   }
