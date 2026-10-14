@@ -66,22 +66,40 @@ async function clearScriptOpinions(): Promise<void> {
   chapterForce.value = {};
 }
 
-/** 网页版 openInExplorer 是静默 no-op：给明确提示 + 可复制路径，避免像点了空气 */
+/** 网页版 openInExplorer 是静默 no-op：给明确提示 + 可复制路径，避免像点了空气。
+ *  提示一律走应用内无障碍弹层（role=dialog + 焦点陷阱 + Esc + 主题化）：
+ *  原生 window.alert 会同步阻塞主线程，生成运行中弹出会把进度/日志刷新一起卡住。 */
 async function openScriptFolder(): Promise<void> {
   const dir = `${projectState.outputDir}/game/scene`;
   if (isTauri()) {
     try {
       await tauri.openInExplorer(dir);
     } catch (e) {
-      window.alert(`${t("打开文件夹失败")}: ${e instanceof Error ? e.message : String(e)}\n${dir}`);
+      await confirmDialog({
+        title: t("打开文件夹失败"),
+        message: `${e instanceof Error ? e.message : String(e)}`,
+        detail: dir,
+        confirmLabel: t("知道了"),
+        cancelLabel: t("关闭"),
+      });
     }
     return;
   }
   try {
     await navigator.clipboard.writeText(dir);
-    window.alert(`${t("网页版无法直接打开本地文件夹，路径已复制")}\n${dir}`);
+    await confirmDialog({
+      title: t("网页版无法直接打开本地文件夹，路径已复制"),
+      detail: dir,
+      confirmLabel: t("知道了"),
+      cancelLabel: t("关闭"),
+    });
   } catch {
-    window.alert(`${t("网页版无法直接打开本地文件夹，请手动打开")}\n${dir}`);
+    await confirmDialog({
+      title: t("网页版无法直接打开本地文件夹，请手动打开"),
+      detail: dir,
+      confirmLabel: t("知道了"),
+      cancelLabel: t("关闭"),
+    });
   }
 }
 </script>

@@ -887,6 +887,7 @@ export const en: Record<string, string> = {
   "旧配置已恢复，但迁移结果暂时无法保存：{error}": "The old config has been restored, but the migration result cannot be saved for now: {error}",
   "未录制到音频": "No audio was recorded",
   "未捕获到系统音频（请在选择共享内容时勾选「分享音频」）": "No system audio captured (tick \"Share audio\" when choosing what to share)",
+  "系统共享已结束（录音已停止计时）：可点「停止并克隆」使用已录到的音频，或点「取消」放弃": "Screen sharing ended (recording timer stopped): click \"Stop and clone\" to use the audio recorded so far, or \"Cancel\" to discard it",
   "未知错误": "Unknown error",
   "检查失败：请查看日志": "Check failed: see the logs",
   "模型下载启动失败 {status}": "Failed to start model download {status}",

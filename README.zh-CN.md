@@ -245,26 +245,43 @@ NovelForge 内置**配置驱动的通用适配器引擎**（`sync`/`async` 两�
 
 ## 开发与测试
 
+以下命令均在仓库根目录执行。**默认门禁一条命令就够：**
+
 ```bash
-# 单元与端到端测试（Node）
-npx tsx tests/unit-render.ts      # 渲染注入边界
-npx tsx tests/unit-chapters.ts    # 章节切分边界
-npx tsx tests/unit-cache.ts       # 缓存/断点续跑一致性
-npx tsx tests/unit-tasks.ts       # 图像任务构建
-npx tsx tests/unit-material.ts    # 素材优先匹配
-npx tsx tests/unit-features.ts    # 登场资料卡/表情/BGM/视频位
-npx tsx tests/unit-persist.ts     # 状态持久化
-npx tsx tests/unit-retry.ts       # API 重试机制
-npx tsx tests/unit-dedupe.ts      # 场景 id 去重
-npx tsx tests/unit-universal.ts   # 通用适配器引擎（全厂商模板）
-npx tsx tests/unit-vfs.ts         # IndexedDB 虚拟文件系统
-npx tsx tests/e2e-demo.ts         # 端到端管线（示例小说）
+pnpm test        # 单元测试（206 个文件）+ 离线端到端（1 个文件）；不联网、不需要 API key
+```
 
-# 引擎实机验证（无头浏览器加载 WebGAL 播放生成的游戏）
-npx tsx tests/engine-check.ts <项目目录>
+### 分层说明
 
-# Rust 侧测试（色度键抠图）
-cd src-tauri && cargo test
+| 命令 | 跑什么 | 额外要求 |
+|---|---|---|
+| `pnpm test` | 单元测试（`tests/unit-*.ts`）+ 离线端到端（`tests/e2e-demo.ts`） | 无 |
+| `pnpm test:e2e` | 以上 **加上** 浏览器端到端（`web-smoke`、`web-i18n-smoke`、`lazy-thumb-acceptance`、`visual-bible-acceptance`） | 需先 `pnpm exec playwright install` |
+| `pnpm test:all` | 与 `test:e2e` 相同（全部层） | 同上 |
+
+执行器（`scripts/run-tests.mjs`）会**显式打印**每一个被跳过的层——浏览器层被跳过时不会静默变绿。
+
+### 自动门禁
+
+`.github/workflows/build.yml` 在每次 PR / push 上跑下列检查，提 PR 前请本地先跑一遍：
+
+```bash
+pnpm exec vue-tsc --noEmit                                   # 应用类型检查
+pnpm typecheck:tests                                         # 测试类型检查（硬门禁）
+pnpm check:i18n                                              # i18n 词典完整性
+cargo test --manifest-path src-tauri/Cargo.toml              # Rust 侧（色度键抠图、文件读写）
+```
+
+`tests/engine-check.ts`（无头浏览器加载生成的游戏做引擎实机验证）**已接入自动门禁**，不再需要手工执行。
+
+### 单文件调试
+
+迭代时可直接跑单个测试文件，这是最快的回路：
+
+```bash
+npx tsx tests/unit-render.ts        # 任意 tests/unit-*.ts
+npx tsx tests/e2e-demo.ts           # 离线端到端管线
+npx tsx tests/engine-check.ts <项目目录>   # 人工，针对已生成的游戏目录
 ```
 
 ## 技术架构
@@ -283,7 +300,8 @@ cd src-tauri && cargo test
 └───────────────┬────────────────────────────┘
                 ▼ 产出标准 WebGAL 项目
 ┌────────────────────────────────────────────┐
-│  WebGAL 引擎（MPL-2.0，不改源码）            │
+│  WebGAL 引擎（MPL-2.0，已修改）              │
+│  修改清单见 THIRD_PARTY_MODIFICATIONS.md    │
 │  预览（内嵌）/ exe（Terre）/ APK（官方工具）  │
 └────────────────────────────────────────────┘
 ```
@@ -321,7 +339,7 @@ cd src-tauri && cargo test
 
 ## 致谢与许可
 
-- [WebGAL](https://github.com/OpenWebGAL/WebGAL) —— 视觉小说引擎（MPL-2.0），详见 [THIRD_PARTY_NOTICE](./THIRD_PARTY_NOTICE)
+- [WebGAL](https://github.com/OpenWebGAL/WebGAL) —— 视觉小说引擎（MPL-2.0）。随包模板**经过修改**（配音中断默认值、`index.html` 的 file:// 探测、界面样式覆盖），并在模板根目录随附 WebGAL 的 LICENSE：逐文件修改清单见 [THIRD_PARTY_MODIFICATIONS.md](./THIRD_PARTY_MODIFICATIONS.md)，其它第三方声明见 [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md)
 - NovelForge 本体采用 [GNU GPL v3](./LICENSE) 许可：可自由使用、修改、分发；修改后的版本须以相同许可开源
 - **导出内容**：你使用 NovelForge 生成/导出的游戏、剧本、小说、图片等内容**归你所有**，不受 NovelForge 许可约束
 - 使用 NovelForge 发布作品时须保留 WebGAL 版权声明；游戏内容版权归创作者所有

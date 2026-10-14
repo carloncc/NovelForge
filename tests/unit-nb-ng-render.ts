@@ -10,6 +10,9 @@ import {
   MESSAGE_MAX_CHARS,
   MESSAGE_MAX_CHARS_LATIN,
   TTS_SPEECH_MAX_CHARS,
+  textboxCharsPerLine,
+  textboxVisibleLines,
+  textboxCapacityChars,
 } from "../src/core/render";
 import { buildFlowchartJson } from "../src/core/project";
 import type { ChapterScript } from "../src/core/types";
@@ -231,20 +234,36 @@ function main(): void {
   assert(outBgm.includes("unlockBgm:calm_piano.mp3"), "1507 unlockBgm 必须是裸文件名（引擎解析期补 ./game/bgm/）");
 
   // 1458：分页与行容量收紧 + Max_line 对齐引擎
-  assert(TEXTBOX_PAGE_MAX_CHARS === 64, "1458 单页上限应为 64");
+  // 三个常量都由 textbox.scss 的几何推导而来（render.ts 顶部「文本框容量」一节）：
+  //   每行字数 = (舞台宽 − 左右内缩 − 左右内边距) ÷ 字号；可见行数 = (框高 − 上下内边距) ÷ 行高。
+  // 这里断言的是**不变量**（页容量 = 一行、页数 × 页容量 ≥ 单条消息上限），不再钉死历史字面量。
+  assert(
+    TEXTBOX_PAGE_MAX_CHARS === textboxCharsPerLine(),
+    `单页上限必须等于一行能放下的字数（nowrap 下超出即被裁），实际 ${TEXTBOX_PAGE_MAX_CHARS} vs ${textboxCharsPerLine()}`,
+  );
+  assert(
+    TEXTBOX_PAGE_MAX_CHARS >= MESSAGE_MAX_CHARS,
+    `单页容量必须 ≥ 单条消息上限（否则一条消息自己就跨页），实际 ${TEXTBOX_PAGE_MAX_CHARS} vs ${MESSAGE_MAX_CHARS}`,
+  );
   assert(MESSAGE_MAX_CHARS === 32, "1458 单消息上限应为 32");
   assert(MESSAGE_MAX_CHARS_LATIN === 80, "1458 拉丁上限应为 80");
   const cfg = renderConfig("t", "k");
-  // Max_line 是「一条消息最多保留几个 | 分页段」（引擎 Os 的实现是 .slice(0, Max_line)），
-  // 不是文本框可见行数（可见行数由 CSS 决定）。1458 按「可见 2 行」把它设成 2，反而让
-  // 第 3 页起被引擎静默丢弃：配音台词与独白按设计不拆成多条消息，单条最长 500 字 →
-  // 8 页，于是所有 >128 字的配音台词/独白在游戏里只显示前 128 字。
-  // 这里断言它覆盖「单条消息的全部页数」，即 ceil(TTS_SPEECH_MAX_CHARS / 单页容量)。
+  // Max_line 就是引擎铺出来的行数（Os 先按 | 切段再 .slice(0, Max_line)，每段一个 div），
+  // 所以它必须**同时**满足两件事：① 覆盖单条消息的全部分页（否则尾部被引擎丢弃）；
+  // ② 不超过文本框能完整显示的整行数（否则多余的行被 overflow:hidden 裁掉，玩家看不到）。
+  const neededLines = Math.ceil(TTS_SPEECH_MAX_CHARS / TEXTBOX_PAGE_MAX_CHARS);
   assert(
-    cfg.includes(`Max_line:${Math.ceil(TTS_SPEECH_MAX_CHARS / TEXTBOX_PAGE_MAX_CHARS)};`),
-    "Max_line 必须覆盖单条消息的全部分页，否则长台词被引擎静默截断",
+    cfg.includes(`Max_line:${neededLines};`),
+    `Max_line 必须覆盖单条消息的全部分页（${neededLines} 行），否则长台词被引擎静默截断`,
   );
-  assert(cfg.includes("Max_line:8;"), "500 字 ÷ 每页 64 字 = 8 页");
+  assert(
+    neededLines <= textboxVisibleLines(),
+    `Max_line(${neededLines}) 不得超过文本框可见整行数(${textboxVisibleLines()})，否则末尾几行被裁掉而 TTS 已念完`,
+  );
+  assert(
+    TTS_SPEECH_MAX_CHARS === textboxCapacityChars(),
+    `TTS 单条上限必须等于一屏可见字数，实际 ${TTS_SPEECH_MAX_CHARS} vs ${textboxCapacityChars()}`,
+  );
   const cfgFile = renderConfig("t", "k", "zh_CN", "超长封面文件名_0123456789_0123456789_0123456789_0123456789.png");
   assert(cfgFile.includes("超长封面文件名"), "1452 封面文件名不应被截断");
 

@@ -1,5 +1,6 @@
 import type { ChapterScript, CharacterCard, PipelineEvent, ApiConfig, FailedTask } from "./types";
 import { ttsSpeech } from "../api/openaiCompatible";
+import { DEFAULT_TTS_FORMAT, DEFAULT_TTS_SPEED } from "../api/universal";
 import { tauri } from "../utils/tauri";
 import { errMsg } from "../utils/errors";
 import { cacheDirFor } from "./cache";
@@ -18,10 +19,13 @@ interface VoiceJob {
   charId: string;
   ttsConfigId?: string;
   cloned: boolean;
-  /** 每句语速（0.5-2），来自剧本标注；缺省用全局配置 */
+  /** 有效语速（0.5-2）：每句标注优先，其次该 job 绑定 TTS 配置的全局值。
+   *  在 buildVoiceJobs 阶段就解析成定值，缓存键与实际下发值因此天然同源（见 globalTtsParams）。 */
   speed?: number;
-  /** 每句配音情绪，来自剧本标注；缺省用全局配置 */
+  /** 有效配音情绪：每句标注优先，其次全局配置；同样在构建期解析 */
   ttsEmotion?: string;
+  /** 有效输出格式（mp3/wav/…）：决定文件扩展名并计入缓存键——改输出格式必须换文件 */
+  format: string;
 }
 
 /* ===== MiniMax TTS 限速：RPM（每分钟请求数）极低（免费 10 / 充值 20），
@@ -97,6 +101,13 @@ export function splitVocalFileName(fileName: string): { key: string; fp: string;
 
 const VOCAL_EXTS = ["mp3", "ogg", "opus", "wav", "flac", "m4a"];
 
+/** 输出格式 → 文件扩展名。只认已知音频扩展名，未知格式一律回退 mp3：
+ *  否则 splitVocalFileName 的扩展名剥离会失配（如 .mpeg），把扩展名当成 hash 段解析。 */
+function vocalExtForFormat(format: string | undefined): string {
+  const normalized = (format ?? "").trim().toLowerCase().replace(/^\./, "");
+  return VOCAL_EXTS.includes(normalized) ? normalized : DEFAULT_TTS_FORMAT;
+}
+
 /** 配音缓存命中：精确文件名优先，否则按 stem 匹配音频扩展名。
  * runVoiceJob 会按 mime 落 ogg 等扩展名，只查 .mp3 会导致每次都 miss 重合成。 */
 export async function vocalHit(dir: string, fileName: string): Promise<string | null> {
@@ -137,23 +148,61 @@ export async function buildVocalContentIndex(vocalCacheDir: string): Promise<Map
   return index;
 }
 
-/** 配音文件名按「位置 key + 音色 + 文本 + 语速 + 情绪」内容寻址。
+/** 配音文件名按「位置 key + 音色 + 文本 + 有效语速 + 有效情绪 + 输出格式」内容寻址。
  * 之前只按 key+音色命名：剧本改文字后 key 不变，旧 mp3 被缓存命中，
- * 游戏里显示新台词、放出来却是旧语音。文本/参数任一变化都会落新文件，旧音频自然作废。 */
+ * 游戏里显示新台词、放出来却是旧语音。文本/参数任一变化都会落新文件，旧音频自然作废。
+ *
+ * #发现2：语速/情绪/格式必须用**实际下发的有效值**（见 globalTtsParams）——旧实现只哈希
+ * 每句标注（绝大多数台词没有标注，两项都是 undefined），于是用户在「API 配置 > TTS」改全局语速
+ * 或输出格式后，旧音频照旧按同名命中（vocalHit 还会跨扩展名探测），日志宣称"全部命中缓存（0 计费）"，
+ * 改动完全无效。 */
 /** 未标注 speed 时下游（universal.ts 的 ttsSpeech）会兜底成这个值——缓存 key 必须用同一个数字，
- *  否则「没标注语速」与「显式标注 1.1」会算出两个不同的文件名、重复计费；而改动默认值也不会失效。 */
-const DEFAULT_SPEECH_SPEED = 1.1;
+ *  否则「没标注语速」与「显式标注 1.1」会算出两个不同的文件名、重复计费；而改动默认值也不会失效。
+ *  现在直接复用 universal.ts 的唯一真源，避免两处各写一个 1.1 后再次漂移。 */
+const DEFAULT_SPEECH_SPEED = DEFAULT_TTS_SPEED;
 
 function voiceFileName(
   key: string,
   voice: string,
   ttsConfigId: string | undefined,
   text: string,
-  speed?: number,
-  ttsEmotion?: string,
+  speed: number | undefined,
+  ttsEmotion: string | undefined,
+  format: string,
 ): string {
   const effectiveSpeed = typeof speed === "number" ? speed : DEFAULT_SPEECH_SPEED;
-  return `v_${key}_${voiceFingerprint(voice, ttsConfigId)}_${fnv1a([text, effectiveSpeed, ttsEmotion])}.mp3`;
+  const ext = vocalExtForFormat(format);
+  // 为什么 mp3 不额外并入哈希：mp3 是历史默认格式，保持哈希输入不变可以让升级前的旧缓存
+  // （它们本就是 speed=1.1、无情绪、mp3 下生成的）继续命中，避免一次全库重配的无效计费。
+  // 其它格式**必须**进哈希：否则 vocalHit 的跨扩展名探测会把旧 .mp3 当成新 .wav 的产物返回
+  //（这正是 #发现2 里"改成 wav 却拿到 mp3 旧音频"的机制）。
+  const hash = format === DEFAULT_TTS_FORMAT
+    ? fnv1a([text, effectiveSpeed, ttsEmotion])
+    : fnv1a([text, effectiveSpeed, ttsEmotion, format]);
+  return `v_${key}_${voiceFingerprint(voice, ttsConfigId)}_${hash}.${ext}`;
+}
+
+/** 该 job 实际生效的全局 TTS 参数（每句未标注时兜底）。
+ *
+ * 解析口径必须与 universal.ts 的 unifiedTts 逐字一致（每句优先 → 全局 → 默认值），
+ * 否则缓存键与实际下发值错位，就是「改了全局参数旧音频照样命中」的根因。
+ * 取 job 自己绑定的 TTS 配置（克隆音色可能挂在另一个配置上），与 runVoiceJob 的
+ * `job.ttsConfigId ? ttsConfigById(job.ttsConfigId) : cfg` 同源。 */
+function globalTtsParams(cfg: ApiConfig | undefined): { speed: number; emotion?: string; format: string } {
+  const extra = (cfg?.extra ?? {}) as Record<string, unknown>;
+  // 格式做大小写/空白归一化：用户把 "mp3" 改成 "MP3" 不该换文件名（那是无谓的重配计费）；
+  // 扩展名另经 vocalExtForFormat 收敛到已知音频扩展名。
+  const rawFormat = typeof extra.ttsFormat === "string" ? extra.ttsFormat.trim().toLowerCase() : "";
+  return {
+    speed: typeof extra.speed === "number" ? extra.speed : DEFAULT_SPEECH_SPEED,
+    emotion: typeof extra.emotion === "string" && extra.emotion ? extra.emotion : undefined,
+    format: rawFormat || DEFAULT_TTS_FORMAT,
+  };
+}
+
+/** 某条 job 使用的 TTS 配置（与 runVoiceJob 的 jobConfig 同源） */
+function ttsConfigForJob(cfg: ApiConfig, ttsConfigId: string | undefined): ApiConfig {
+  return (ttsConfigId ? ttsConfigById(ttsConfigId) : undefined) ?? cfg;
 }
 
 /** 本次实际要落盘的文件名。
@@ -171,9 +220,16 @@ function actualVoiceFileName(job: VoiceJob, voice: string): string {
   // 当 from 短到与 key 内片段相撞时改坏的是 key 而不是音色指纹段。
   const parsed = splitVocalFileName(job.file);
   if (!parsed || parsed.fp !== from.toLowerCase()) return job.file;
-  const ext = /\.[A-Za-z0-9]+$/.exec(job.file)?.[0] ?? ".mp3";
+  const ext = /\.[A-Za-z0-9]+$/.exec(job.file)?.[0] ?? `.${DEFAULT_TTS_FORMAT}`;
   const key = job.file.slice(0, job.file.length - parsed.fp.length - parsed.hash.length - 3 - ext.length);
   return `${key}_${to}_${parsed.hash}${ext}`;
+}
+
+/** 把文件名末尾的扩展名换成实际落盘编码（响应 Content-Type 推出的扩展名）。
+ *  请求 wav 而服务端回 mp3 时，写 .wav 会得到一个"名字骗人"的文件；缓存键已含输出格式
+ *  （见 voiceFileName），改格式必然换名，所以这里按实际编码落盘不会再被旧文件冒充。 */
+function withVocalExt(file: string, ext: string): string {
+  return file.replace(/\.[A-Za-z0-9]+$/, `.${ext}`);
 }
 
 /** 按当前剧本算出全部配音 key（与 buildVoiceJobs 的 key 公式同源，供映射剪枝用）。
@@ -258,11 +314,15 @@ export function buildVoiceJobs(  cfg: ApiConfig,
           const key = sceneVocalKeyPart(baseKey, si, parts.length);
           if (line.type === "dialogue") {
             const selected = voiceName(line.characterId);
-            const speed = typeof line.speed === "number" ? line.speed : undefined;
-            const ttsEmotion = typeof line.ttsEmotion === "string" && line.ttsEmotion ? line.ttsEmotion : undefined;
+            // 有效参数在此解析：每句标注优先，其次该音色绑定配置的全局值。
+            // 解析后的值同时进缓存键与实际请求（runVoiceJob 把 job.speed/ttsEmotion 原样下发），
+            // 两者天然同源——改全局语速/情绪/格式就必然换文件名。
+            const globals = globalTtsParams(ttsConfigForJob(cfg, selected.ttsConfigId));
+            const speed = typeof line.speed === "number" ? line.speed : globals.speed;
+            const ttsEmotion = typeof line.ttsEmotion === "string" && line.ttsEmotion ? line.ttsEmotion : globals.emotion;
             jobs.push({
               key,
-              file: voiceFileName(key, selected.voice, selected.ttsConfigId, text, speed, ttsEmotion),
+              file: voiceFileName(key, selected.voice, selected.ttsConfigId, text, speed, ttsEmotion, globals.format),
               text,
               voice: selected.voice,
               charId: line.characterId,
@@ -270,22 +330,26 @@ export function buildVoiceJobs(  cfg: ApiConfig,
               cloned: selected.cloned,
               speed,
               ttsEmotion,
+              format: globals.format,
             });
           } else {
             // 旁白/独白：NarrationLine 无 speed/ttsEmotion 标注，用全局 TTS 默认值
             if (text.length > 200) {
               logger.info("voice", "旁白超长（快进易截断，建议拆句）", { key, len: text.length });
             }
+            // 旁白的下发值同样是「全局配置」：缓存键必须一起用全局值，否则改语速后旁白音频照旧命中
+            const globals = globalTtsParams(cfg);
             jobs.push({
               key,
-              file: voiceFileName(key, fallbackVoice, undefined, text),
+              file: voiceFileName(key, fallbackVoice, undefined, text, globals.speed, globals.emotion, globals.format),
               text,
               voice: fallbackVoice,
               charId: "narrator",
               ttsConfigId: undefined,
               cloned: false,
-              speed: undefined,
-              ttsEmotion: undefined,
+              speed: globals.speed,
+              ttsEmotion: globals.emotion,
+              format: globals.format,
             });
           }
         });
@@ -299,11 +363,12 @@ export function buildVoiceJobs(  cfg: ApiConfig,
             const key = sceneVocalKeyPart(baseKey, si, parts.length);
             if (line.type === "dialogue") {
               const selected = voiceName(line.characterId);
-              const speed = typeof line.speed === "number" ? line.speed : undefined;
-              const ttsEmotion = typeof line.ttsEmotion === "string" && line.ttsEmotion ? line.ttsEmotion : undefined;
+              const globals = globalTtsParams(ttsConfigForJob(cfg, selected.ttsConfigId));
+              const speed = typeof line.speed === "number" ? line.speed : globals.speed;
+              const ttsEmotion = typeof line.ttsEmotion === "string" && line.ttsEmotion ? line.ttsEmotion : globals.emotion;
               jobs.push({
                 key,
-                file: voiceFileName(key, selected.voice, selected.ttsConfigId, text, speed, ttsEmotion),
+                file: voiceFileName(key, selected.voice, selected.ttsConfigId, text, speed, ttsEmotion, globals.format),
                 text,
                 voice: selected.voice,
                 charId: line.characterId,
@@ -311,18 +376,21 @@ export function buildVoiceJobs(  cfg: ApiConfig,
                 cloned: selected.cloned,
                 speed,
                 ttsEmotion,
+                format: globals.format,
               });
             } else {
+              const globals = globalTtsParams(cfg);
               jobs.push({
                 key,
-                file: voiceFileName(key, fallbackVoice, undefined, text),
+                file: voiceFileName(key, fallbackVoice, undefined, text, globals.speed, globals.emotion, globals.format),
                 text,
                 voice: fallbackVoice,
                 charId: "narrator",
                 ttsConfigId: undefined,
                 cloned: false,
-                speed: undefined,
-                ttsEmotion: undefined,
+                speed: globals.speed,
+                ttsEmotion: globals.emotion,
+                format: globals.format,
               });
             }
           });
@@ -331,6 +399,23 @@ export function buildVoiceJobs(  cfg: ApiConfig,
     }
   }
   return jobs;
+}
+
+/** 单句配音落盘上限（base64 字符数）。
+ *
+ *  #发现6：与抠图路径的 CUTOUT_MAX_INPUT_B64_BYTES（utils/webRuntime.ts）同一口径——
+ *  厂商/中转线路把超规格音频原样返回时不能"照单全收"：它会进 assets.json、被组装进游戏包、
+ *  在 Web 版被整段解码，把项目目录撑爆，而日志显示"生成成功"。
+ *  24MB base64 ≈ 18MB 音频：单句台词（≤500 字，wav 也就几 MB）远远够用，只有异常响应会撞到。 */
+export const MAX_VOICE_B64_BYTES = 24 * 1024 * 1024;
+
+/** 配音载荷超限。单独成型是为了让它**不触发回退音色重试**：
+ *  体积超限与音色无关，回退到默认音色只会再花一次钱拿到同样超限的响应。 */
+export class VoicePayloadTooLargeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "VoicePayloadTooLargeError";
+  }
 }
 
 /** 执行单个配音任务（管线批处理与单句重配共用）。
@@ -375,10 +460,16 @@ export async function runVoiceJob(
     const res = isMiniMax
       ? await minimaxTtsThrottle(() => ttsSpeech(jobConfig, job.text, voice, 120, { speed: job.speed, ttsEmotion: job.ttsEmotion }))
       : await ttsSpeech(jobConfig, job.text, voice, 120, { speed: job.speed, ttsEmotion: job.ttsEmotion });
-    const ext = res.mime.includes("ogg") ? "ogg" : res.mime.includes("opus") ? "opus" : res.mime.includes("wav") ? "wav" : res.mime.includes("flac") ? "flac" : "mp3";
+    const ext = res.mime.includes("ogg") ? "ogg" : res.mime.includes("opus") ? "opus" : res.mime.includes("wav") ? "wav" : res.mime.includes("flac") ? "flac" : DEFAULT_TTS_FORMAT;
     // #1488：按本次实际使用的音色取文件名（回退音色不能占用原音色的缓存槽）
-    const file = actualVoiceFileName(job, voice).replace(/\.mp3$/, `.${ext}`);
+    const file = withVocalExt(actualVoiceFileName(job, voice), ext);
     const path = `${cacheDir}/${file}`;
+    // 落盘前的体积闸门（#发现6）：超限**记失败项而不是成功**——写进去的就是"看起来生成成功"的坏产物
+    if (res.dataB64.length > MAX_VOICE_B64_BYTES) {
+      throw new VoicePayloadTooLargeError(
+        `配音音频过大（${(res.dataB64.length / 1048576).toFixed(1)} MB，上限 ${MAX_VOICE_B64_BYTES / 1048576} MB），已拒绝落盘：${job.text.slice(0, 20)}…`,
+      );
+    }
     await tauri.writeFileBase64(path, res.dataB64);
     return path;
   };
@@ -398,6 +489,8 @@ export async function runVoiceJob(
         return await speak(voice);
       } catch (e) {
         lastError = e;
+        // 载荷超限与限流无关：重试只会再拿一份同样超限的响应，而且每次都要计费
+        if (e instanceof VoicePayloadTooLargeError) throw e;
         if (!isRateLimitError(errMsg(e))) throw e;
         // 继续下一轮重试
       }
@@ -407,7 +500,8 @@ export async function runVoiceJob(
   try {
     return await speakWithRetry(job.voice);
   } catch (e) {
-    if (!job.cloned && job.voice !== fallbackVoice) {
+    // 载荷超限与音色无关（#发现6）：回退默认音色只会再计费一次、再拿一份同样超限的响应。
+    if (!(e instanceof VoicePayloadTooLargeError) && !job.cloned && job.voice !== fallbackVoice) {
       log({
         step: "配音",
         message: `音色 ${job.voice} 失败，回退默认音色重试：${errMsg(e).slice(0, 100)}`,

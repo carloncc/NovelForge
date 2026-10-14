@@ -174,7 +174,8 @@ onMounted(async () => {
       <button class="btn danger small" :disabled="runIsStopping" @click="requestRunStop()">{{ runIsStopping ? t("正在停止…") : t("停止") }}</button>
     </div>
     <div class="sidebar-footer">
-      <select :value="currentLang" class="lang-select" @change="onLangChange">
+      <!-- 语言下拉必须有可访问名称：否则读屏只念「组合框 简体中文」，用户无从知道这是界面语言切换 -->
+      <select :value="currentLang" class="lang-select" :aria-label="t('界面语言')" @change="onLangChange">
         <option v-for="l in LANGS" :key="l.code" :value="l.code">{{ l.label }}</option>
       </select>
       <span class="version">{{ versionText }}</span>

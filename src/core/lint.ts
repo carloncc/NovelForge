@@ -73,8 +73,17 @@ export function buildExportOverridePrompt(report: LintReport): string {
   ].join("\n");
 }
 
-// 白名单 = render.ts 实际会输出的指令集合（含 filmMode/setFilter），避免把指令误判成台词。
-const CMD_RE = /^(changeBg|changeFigure|intro|bgm|playEffect|end|changeScene|unlockCg|unlockBgm|label|jumpLabel|choose|playVideo|filmMode|setFilter|setAnimation|setTempAnimation|setTransform):.*;$/;
+// 白名单 = render.ts 实际会输出的指令集合，避免把指令误判成台词。
+// pixiInit/pixiPerform 是天气粒子特效（4.6.6 官方命令索引内的正式指令），必须纳入白名单。
+// setFilter **不在**白名单里：它虽在引擎命令表中注册，但处理器是空实现（`setFilter:It(ct.setFilter,_Ee)`
+// 且 `const _Ee=e=>Er()` 直接返回），官方命令索引里也已移除；放行它等于让手写脚本静默失效。
+const CMD_RE = /^(changeBg|changeFigure|intro|bgm|playEffect|changeScene|unlockCg|unlockBgm|label|jumpLabel|choose|playVideo|filmMode|pixiPerform|setAnimation|setTempAnimation|setTransform):.*;$/;
+/** 不带参数的指令（引擎里就是裸 `名字;`）：`end` 与天气特效的 `pixiInit`。
+ *  pixiInit 没有冒号，若只放进 CMD_RE 会落进「无法解析」把整个导出挡下来。 */
+const BARE_CMD_RE = /^(end|pixiInit);$/;
+/** 已知但不可用的指令：给出明确原因，而不是让它落到「无法解析的语句」那条泛化错误里
+ *  （用户看到「无法解析」会以为是转义/格式问题，实际是指令本身在 4.6.x 无效）。 */
+const KNOWN_DEAD_CMD_RE = /^(setFilter):/;
 const END_RE = /^end;$/;
 const LINE_RE = /^(?:[^:;\\]|\\[:;,\.`\\])*:(.*);$/;
 // 1449：引擎裸选项白名单只认 ogg/mp3/wav/opus（bundle match(/.ogg|.mp3|.wav|.opus/)，flac 0 命中）。
@@ -167,7 +176,19 @@ export async function lintProject(outputDir: string): Promise<LintReport> {
       }
       if (line.startsWith(";")) continue;
 
-      if (END_RE.test(line) || CMD_RE.test(line)) {
+      // setFilter 必须**先于** LINE_RE 拦下：它的形状是 `setFilter:{...} -target=bg-main -next;`，
+      // 完全符合 `名字:内容;` 的台词形状，放到最后会被当成一句台词静默放行（正是这条白名单要防的反面）。
+      if (KNOWN_DEAD_CMD_RE.test(line)) {
+        // setFilter 在 WebGAL 4.6.x 是空实现（处理器直接返回、不解析参数），且已从官方命令索引移除。
+        // 滤镜必须走 setTransform 的同名键（render.ts 就是这么做的），否则玩家看不到任何变化却毫无提示。
+        err(
+          `语法(${f.name})`,
+          `指令无效：setFilter 在 WebGAL 4.6.x 为空实现且未文档化（滤镜请改用 setTransform 的同名键，如 setTransform:{"oldFilm":0.35} -target=bg-main;）`,
+        );
+        continue;
+      }
+
+      if (END_RE.test(line) || BARE_CMD_RE.test(line) || CMD_RE.test(line)) {
         if (END_RE.test(line)) fileHasEnd.add(f.name);
         if (line.startsWith("label:")) {
           const name = line.slice(6, -1).trim();
@@ -234,6 +255,26 @@ export async function lintProject(outputDir: string): Promise<LintReport> {
         if (textPart.length > TTS_SPEECH_MAX_CHARS) {
           warn(`体验(${f.name})`, `超长台词（${textPart.length}字 > ${TTS_SPEECH_MAX_CHARS}）：已按句自动拆分配音，仍建议拆句`);
         }
+        continue;
+      }
+
+      if (KNOWN_DEAD_CMD_RE.test(line)) {
+        // setFilter 在 WebGAL 4.6.x 是空实现（处理器直接返回、不解析参数），且已从官方命令索引移除。
+        // 滤镜必须走 setTransform 的同名键（render.ts 就是这么做的），否则玩家看不到任何变化却毫无提示。
+        err(
+          `语法(${f.name})`,
+          `指令无效：setFilter 在 WebGAL 4.6.x 为空实现且未文档化（滤镜请改用 setTransform 的同名键，如 setTransform:{"oldFilm":0.35} -target=bg-main;）`,
+        );
+        continue;
+      }
+
+      if (KNOWN_DEAD_CMD_RE.test(line)) {
+        // setFilter 在 WebGAL 4.6.x 是空实现（处理器直接返回、不解析参数），且已从官方命令索引移除。
+        // 滤镜必须走 setTransform 的同名键（render.ts 就是这么做的），否则玩家看不到任何变化却毫无提示。
+        err(
+          `语法(${f.name})`,
+          `指令无效：setFilter 在 WebGAL 4.6.x 为空实现且未文档化（滤镜请改用 setTransform 的同名键，如 setTransform:{"oldFilm":0.35} -target=bg-main;）`,
+        );
         continue;
       }
 

@@ -185,8 +185,10 @@ async function regenSelectedPart(part: "script" | "image" | "voice"): Promise<vo
   if (batchBusy.value || locked.value) return;
   const idxs = selectedEnabled.value;
   // #1421：选中集全为停用章时给明确反馈，不再静默返回。
+  // 用应用内弹层而不是 window.alert：原生 alert 无 role=dialog、不可主题化，而且会
+  // 同步阻塞主线程——生成运行中弹出时进度条/日志刷新会一起卡住（见 useConfirmDialog 注释）。
   if (!idxs.length) {
-    window.alert(t("选中的均为停用章，无法重跑：请先用「启用选中」启用后再试"));
+    await confirmDialog({ title: t("选中的均为停用章，无法重跑：请先用「启用选中」启用后再试"), confirmLabel: t("知道了"), cancelLabel: t("关闭") });
     return;
   }
   // #1334：一次聚合确认（取消则整批不执行），循环内跳过逐章确认——此前取消第 1 章仍继续弹第 2 章
@@ -209,9 +211,9 @@ async function regenSelectedPart(part: "script" | "image" | "voice"): Promise<vo
 async function regenSelectedFull(): Promise<void> {
   if (batchBusy.value || locked.value) return;
   const idxs = selectedEnabled.value;
-  // #1421：选中集全为停用章时给明确反馈，不再静默返回。
+  // #1421：选中集全为停用章时给明确反馈，不再静默返回。同上：改用无障碍弹层。
   if (!idxs.length) {
-    window.alert(t("选中的均为停用章，无法重跑：请先用「启用选中」启用后再试"));
+    await confirmDialog({ title: t("选中的均为停用章，无法重跑：请先用「启用选中」启用后再试"), confirmLabel: t("知道了"), cancelLabel: t("关闭") });
     return;
   }
   // #1334：同上，一次聚合确认；各章「全量」勾选照常分别生效（行为不变，只收敛确认）

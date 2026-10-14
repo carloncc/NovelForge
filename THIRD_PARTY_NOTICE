@@ -9,7 +9,10 @@ WebGAL
 - Project: https://github.com/OpenWebGAL/WebGAL
 - License: Mozilla Public License 2.0 (MPL-2.0)
 - Bundled location: src-tauri/templates/webgal/
-- Usage: WebGAL is used unmodified as the runtime engine for generated games.
+- Usage: WebGAL is bundled as the runtime engine for generated games, with
+  template-level modifications applied by NovelForge (engine JS bundle itself is
+  unmodified; game template files are patched). The exact list of modified files
+  is in THIRD_PARTY_MODIFICATIONS.md; see also THIRD_PARTY_NOTICES.md.
   Games published with NovelForge must retain WebGAL copyright notices, per
   WebGAL license terms. Game content itself is owned by the game author.
 

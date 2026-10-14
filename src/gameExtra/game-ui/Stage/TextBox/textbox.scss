@@ -4,8 +4,14 @@
 .TextBox_main {
   z-index: 3;
   position: absolute;
+  /* UI109：min/max-height 与 render.ts 的 TEXTBOX_GEOMETRY.boxHeightPx 是一组不变量：
+     render.ts 用「框高 − 上下内边距(62+46) ÷ 行高(1.6em×52.48px)」算出可见整行数，
+     再据此定 Max_line（config.txt）、单页字数与 TTS 单条上限。
+     430px 只装得下 3 行（≈123 字），长台词的后半截会被 overflow:hidden 裁掉而配音已念完；
+     590px 正好装下 5 行（≈205 字），是「一屏一句」与「框不遮住立绘上半身」的折中。
+     改这里必须同步改 render.ts 的 TEXTBOX_GEOMETRY（tests/unit-fix-render.ts 会读本文件重算并失败）。 */
   min-height: 320px;
-  max-height: 430px;
+  max-height: 590px;
   background-blend-mode: darken;
   border-radius: 20px;
   bottom: 40px;
@@ -173,7 +179,9 @@
 .text {
   /* UI99：引擎内联样式本就设 overflow:hidden，旧实现用 visible !important 打开溢出，
      导致长台词盖出对话框。改回 hidden，配合渲染层长台词按 `|` 分段（render.ts paginateForTextBox）
-     与 config 的 Max_line 行数上限，从根上避免超长文本溢出。 */
+     与 config 的 Max_line 行数上限，从根上避免超长文本溢出。
+     注意：引擎把一个 `|` 分段渲染成一个 nowrap 的 div，所以「一页 = 一行」——
+     页容量（TEXTBOX_PAGE_MAX_CHARS）与行数（Max_line）都必须按本文件几何算，见 render.ts 顶部注释。 */
   overflow: hidden !important;
   white-space: pre-wrap;
   word-break: break-word;

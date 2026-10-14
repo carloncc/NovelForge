@@ -68,7 +68,7 @@ import {
 } from "../core/visualBible";
 import { emptyAssetMap, parseAssetMap, updateAssetMap, listAssetBackups, restoreAssetBackup } from "../core/assetMap";
 import { parseChapterScript } from "../core/dataValidation";
-import { scriptCacheFileName, scriptCacheRest, scriptFingerprint, titleHash, cardsFingerprint , IMAGE_EXTS} from "../core/cache";
+import { scriptCacheFileName, scriptCacheRest, scriptFingerprint, titleHash, cardsFingerprint , IMAGE_EXTS, alignChaptersToKeys, readChapterKeys} from "../core/cache";
 import { mergeFailedTasks, mutateFailedTasks, readFailedTasks, visibleFailedTasks } from "../core/failedTasks";
 import {
   applySpeakerFix,
@@ -2398,7 +2398,10 @@ async function runStageRegen(stage: StageKey): Promise<void> {
       // 没有 key 闸门（走的是视觉圣经审批闸门），提前掐掉会漏掉那条提示路径。
       enabled: { image: projectState.options.useImage, voice: projectState.options.useTts && !!activeConfig("tts")?.apiKey },
       trigger,
-      chapters: result.chapters,
+      // 重启后 lastResult.chapters 来自磁盘（chapter 是 novel index、scene.id 是去重前的），
+      // 而 assets.json 的键是产出形态 —— 不对齐会把已存在的配音算成缺失，
+      // 于是每次单阶段重跑都提示「还有 N 句待补齐」，用户确认后白花一次钱。
+      chapters: alignChaptersToKeys(result.chapters, await readChapterKeys(projectState.outputDir)),
       cards: result.cards,
       options: projectState.options,
       assets: assetMap.value ?? undefined,

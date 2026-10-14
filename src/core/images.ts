@@ -270,8 +270,9 @@ const DEFAULT_STYLE =
   "unified Japanese anime style, cel shading, clean line art, cohesive color palette, high quality illustration, no text, no writing, no signs, no letters";
 const STYLE_HINT = "consistent art direction, same visual style, no dimension change";
 
-// 统一负面提示词：避免低质量/畸形/水印等破坏画风与观感的元素
-const DEFAULT_NEGATIVE =
+// 统一负面提示词：避免低质量/畸形/水印等破坏画风与观感的元素。
+// 导出供单测逐字比对 `<图>.meta.json` 的 negativePrompt（缓存命中判据的一部分，见 imageMetaForTask）。
+export const DEFAULT_NEGATIVE =
   "lowres, bad anatomy, bad hands, extra fingers, mutated hands, deformed, disfigured, missing fingers, extra digit, watermark, signature, text, logo, jpeg artifacts, blurry, noise, low quality, worst quality, black background, dark background, white background, gray background, plain background, solid color background, gradient background, empty background, scenery, landscape";
 
 // 立绘/物品强制纯色背景：生成纯色底，色度键可稳定抠出透明底（统一使用亮绿色 chroma key green）
@@ -295,6 +296,38 @@ const FIGURE_KINDS = new Set<ImageTask["kind"]>(["figure", "action", "threeview"
 function effectiveNegative(task: ImageTask, negativePrompt: string | undefined): string | undefined {
   const parts = [negativePrompt?.trim(), FIGURE_KINDS.has(task.kind) ? FIGURE_NEGATIVE : ""].filter(Boolean);
   return parts.length ? parts.join(", ") : undefined;
+}
+
+/**
+ * 单张素材的 base64 体积上限（**字符数**，含 base64 的 4/3 膨胀）。
+ *
+ * 量级对齐抠图入口的 `CUTOUT_MAX_INPUT_B64_BYTES`（32MB，见 utils/webRuntime.ts 与 Rust 侧
+ * cutout.rs 的 decode_guarded）：32MB base64 ≈ 24MB 图片。合法产物远低于此——
+ * 1024² / 1536×1024 的 PNG 通常 1~4MB——所以这个闸门只拦「厂商返回了超规格响应」
+ * 这种异常，不会误伤正常出图。
+ */
+export const MAX_IMAGE_B64_BYTES = 32 * 1024 * 1024;
+
+/**
+ * 落盘前的单张素材体积校验（纯函数，供单测）：超限即抛出。
+ *
+ * 为什么是抛出而不是「记 warn 后照写」：超限的图会被写进 assets.json → 组装 → zip 全链路搬运，
+ * 调用方还会在日志里看到"生成成功"，用户根本不知道项目目录里躺着一张几十 MB 的素材。
+ * 抛出后由 runImageTask 的调用方按失败项处理（可逐条重试/补图），与「失败项」口径一致。
+ * 错误文案里带「图片数据过大」是为了命中 errorClassifier 的**永久错误**正则
+ * （见 utils/errorClassifier.ts：这类错误重试多少次都一样，不该再烧一次付费调用）。
+ */
+export function assertImageSizeWithinLimit(
+  dataB64: string,
+  task: { id: string; usage?: string },
+  maxBytes: number = MAX_IMAGE_B64_BYTES,
+): void {
+  const size = dataB64.length;
+  if (size <= maxBytes) return;
+  const mb = (n: number): string => (n / 1048576).toFixed(1);
+  throw new Error(
+    `图片数据过大（${mb(size)} MB），超过单张上限 ${mb(maxBytes)} MB，已拒绝落盘：${task.usage ?? task.id}`,
+  );
 }
 
 /** 三视图绿幕背景后缀：三视图同样强制纯绿幕，与立绘/动作保持一致（作抠图与图生图参考）
@@ -618,19 +651,50 @@ type BackgroundWeather = "clear" | "rain" | "snow";
  * 优先级 night > dusk > morning > day：一条文案同时出现「深夜」「傍晚」时按更具体的夜间处理
  * （实测 time 字段形如「夏夜深夜」「同日傍晚」「深夜，接近凌晨三点」）。
  * 注意**不匹配裸「日」**：time 里大量「3月3日」会被误判成白天。
+ *
+ * 【大小写】英文线索一律带 `i` 标志：bgPrompt 由 LLM 生成，首字母大写的
+ * "Night" / "Dusk" / "Morning" / "Rain" / "Snow" 极常见，旧实现（无 i）把它们全部漏掉——
+ * 实测「Anime-style apartment at Night」判成 unspecified、「rainy Night」的 Night 也判不出来，
+ * 于是同一地点白天/夜里/雨雪天共用一张背景（复用反而成了串图）。
+ *
+ * 【入夜前 ≠ 夜间】中文「入夜」在旧实现里直接落 night，而「入夜前」的语义是**天还没黑**（黄昏），
+ * 于是黄昏场景被塞进夜间桶、和真正的深夜共用一张图。现在只有「入夜前 / 入夜之前」判 dusk，
+ * 裸「入夜」（天刚黑）仍是 night。
+ *
+ * 词表刻意保守：「dark/dim」这类**同时能形容白天室内**的形容词不入表（"a dim classroom" 是白天），
+ * 宁可落 unspecified（多出一张，不串图）也不把白天误判成夜里。
  */
 const TOD_RULES: { key: BackgroundTimeOfDay; re: RegExp }[] = [
-  { key: "night", re: /\b(night|nighttime|midnight|moonlit|starry|starlit|moonlight)\b|深夜|午夜|半夜|凌晨|夜晚|夜里|夜色|夜间|入夜|夜幕|彻夜|月光|星空|夜/u },
-  { key: "dusk", re: /\b(dusk|twilight|sunset|sundown|evening|golden hour)\b|傍晚|黄昏|日落|夕照|日暮|向晚/u },
-  { key: "morning", re: /\b(morning|dawn|sunrise|daybreak)\b|清晨|早晨|早上|一早|黎明|拂晓|上午/u },
-  { key: "day", re: /\b(daytime|daylight|afternoon|midday|noon|sunny|sunlit|sunlight|bright)\b|白天|正午|中午|午后|下午|日间|晴朗|阳光/u },
+  {
+    key: "night",
+    // 「入夜前 / 入夜之前」的语义是**天还没黑**（黄昏），故交给下面 dusk 桶：
+    // 这两个写法用带边界的前瞻挡掉，裸「入夜」（天刚黑）仍是 night。
+    // 裸「夜」用 `(?<!入|幕)夜(?!…|前|之)` 兜其余含「夜」的写法（一夜未眠/今夜/长夜/雨夜…）——
+    // 前瞻**必须**同时挡住「前/之」，否则「入夜前」会在第二个字符上被裸「夜」抢走判成夜间；
+    // 前瞻之后不再让裸「夜」重复匹配已单列的固定词（晚/里/色/间/空/深）。
+    re: /\b(night|nighttime|nightfall|midnight|moonlit|moonlight|moonless|starry|starlit|lamplight|lantern|streetlight|city\s*lights)\b|深夜|午夜|半夜|凌晨|夜晚|夜里|夜色|夜间|彻夜|月光|星空|(?<!入)入夜(?!前|之前)|(?<!入|幕)夜(?!晚|里|色|间|空|深|前|之)|灯火|灯下/iu,
+  },
+  {
+    key: "dusk",
+    re: /\b(dusk|twilight|sunset|sundown|evening|golden\s*hour|nightfall)\b|傍晚|黄昏|日落|夕照|夕阳|日暮|向晚|薄暮|暮色|余晖|入夜|夜幕/iu,
+  },
+  { key: "morning", re: /\b(morning|dawn|sunrise|daybreak|sunup)\b|清晨|早晨|早上|一早|黎明|拂晓|破晓|晨曦|上午/iu },
+  {
+    key: "day",
+    re: /\b(daytime|daylight|afternoon|midday|noon|sunny|sunlit|sunlight|bright)\b|白天|正午|中午|午后|下午|日间|晴朗|阳光/iu,
+  },
 ];
 
 /** 天气判定（纯函数）：雨/雪各自成桶，其余（含没写）归 clear。
- *  刻意**不把 winter/冬**当雪：那是季节不是天气，"冬末初春"的室内场景没有雪。 */
+ *  刻意**不把 winter/冬**当雪：那是季节不是天气，"冬末初春"的室内场景没有雪。
+ *  同 TOD_RULES 一律带 `i`（"Rain" / "Snow" / "Snowy" 由 LLM 生成时首字母大写极常见）。
+ *  注意 `\brain\b` 匹配不到 "rainy"（词尾边界），故把 -y/-ing 派生词一并列出。 */
 const WEATHER_RULES: { key: BackgroundWeather; re: RegExp }[] = [
-  { key: "rain", re: /\b(rain|rainy|raining|downpour|drizzle|storm|stormy|shower|wet)\b|雨|雷雨|暴雨|阴雨/u },
-  { key: "snow", re: /\b(snow|snowy|snowing|snowfall|blizzard)\b|雪|积雪|风雪/u },
+  {
+    key: "rain",
+    re: /\b(rain|rainy|raining|rainfall|downpour|drizzle|storm|stormy|shower|thunderstorm|wet)\b|雨|雷雨|暴雨|阴雨|小雨|大雨|阵雨/iu,
+  },
+  { key: "snow", re: /\b(snow|snowy|snowing|snowfall|blizzard|sleet|hail)\b|雪|积雪|风雪|飘雪|大雪|暴雪/iu },
 ];
 
 /** 场景的昼夜桶（纯函数；同一场景任何调用方结果一致） */
@@ -821,6 +885,43 @@ export function cgCharacterIdsOf(task: ImageTask): string[] {
 }
 
 /**
+ * 使用集合 + 卡片全量 → 出图顺序（**排序提示**，不是白名单）。
+ *
+ * 为什么不能当白名单用：`imageUsage` 是「上一次统计时的剧本用量」，而卡片是用户随时会编辑的。
+ * 旧实现 `usageKnown ? (used ?? []) : 卡片全量` 会让用户后来在卡片里补的表情/服装/动作
+ * **永远不出图**（哪怕剧本里已经标注了它们，渲染端只能回退默认立绘），而且没有任何提示——
+ * 用户看到的是「我明明加了，素材页却写着不需要这张」。实测：某角色使用集合被写成 `["happy"]`，
+ * 之后补的 sad/angry 再也不会被构建。
+ *
+ * 新口径：先按用量降序排「用过的」（每张都真的会上屏），再追加卡片里存在但没被统计到的
+ * （新加的、以及上次统计时剧本还没写到的那部分），最后由档位预算裁剪。
+ * 预算（figureBudgetFor）仍是硬上限，所以「补进来的」不会让张数失控。
+ *
+ * `used` 为空数组时**不追加**：那是「统计过、剧本确实一次没用」的省图凭据
+ * （见 imageUsage.usageIsKnown），把它重新展开成卡片全量会让 #1576 省下的图全部回来。
+ * 代价是「剧本零使用 + 卡片后加差分」仍不出图，这一点在日志与文档里如实说明。
+ */
+function prioritizeByUsage(used: readonly string[] | undefined, all: readonly string[]): string[] {
+  if (!used?.length) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const id of used) {
+    const key = String(id);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(key);
+  }
+  // 追加卡片里存在但从未被统计到的项：保持卡片原顺序（同一次构建结果确定，不会来回漂移）
+  for (const item of all) {
+    const key = String(item);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(key);
+  }
+  return out;
+}
+
+/**
  * 立绘/表情/服装/动作清单的**唯一实现**（#1575）。
  *
  * 以前这三份清单在 `buildImageTasks` 里内联，素材页（stores/generate 的 figureRows）另抄了一份
@@ -853,7 +954,7 @@ export function figureEmotionEntries(
     ? ["normal"]
     : detail === "core"
       ? FIGURE_EMOTIONS
-      : (usageKnown ? (used ?? []) : (char.emotions?.length ? char.emotions : FIGURE_EMOTIONS));
+      : (usageKnown ? prioritizeByUsage(used, char.emotions ?? []) : (char.emotions?.length ? char.emotions : FIGURE_EMOTIONS));
   // 强制包含 normal 并去重/消毒：表情集缺 normal 会导致默认立绘整张缺失、所有差分 refFromTask 断链；
   // 自定义表情名含中文/符号时旧实现直接拼文件名（可能路径穿越/覆盖），按动作同一口径 sanitize（原值保留给提示词）
   const list: { raw: string; id: string }[] = [];
@@ -885,10 +986,17 @@ export function figureCostumeEntries(
   // 判据是字段存在性：有记录但为空 = 剧本确认这套角色一次都没换过装 → 一套都不出。
   // 实测某 30 章项目：13 个角色「剧本确认 0 套换装」仍被回退成卡片全量，白出 43 张；
   // 全项目 59 张服装差分里 52 张从未被穿上。
+  //
+  // 有记录时把使用集合当**排序提示**（见 prioritizeByUsage）：剧情真穿过的排在前，
+  // 卡片里新加/上次没统计到的接在后面，最后才按档位预算裁剪——否则用户后来补的服装
+  // 永远不会被构建（剧本已经标注了换装，渲染端却只能回退默认立绘）。
   if (usageIsKnown(char)) {
     const used = char.imageUsage?.costumes ?? [];
-    const worn = used.map((id) => char.costumes!.find((ct) => String(ct.id) === id)).filter(Boolean) as CharacterCostume[];
-    return capByBudget(worn, figureBudgetFor(char).costumes);
+    const byId = new Map(char.costumes!.map((ct) => [String(ct.id), ct]));
+    const ordered = prioritizeByUsage(used, char.costumes!.map((ct) => String(ct.id)))
+      .map((id) => byId.get(id))
+      .filter(Boolean) as CharacterCostume[];
+    return capByBudget(ordered, figureBudgetFor(char).costumes);
   }
   return capByBudget(char.costumes, figureBudgetFor(char).costumes);
 }
@@ -913,8 +1021,13 @@ export function figureActionEntries(
   // 判成"没统计"，于是盲选卡面前 2 个动作（实测某 30 章项目 11 张纯浪费）。
   const usageKnown = usageIsKnown(char);
   const used = char.imageUsage?.actions;
+  // 有记录：使用集合是**排序提示**（剧情用过的按用量降序在前，卡片里新加/上次没统计到的接在后面），
+  // 最后由档位预算裁剪。旧实现只用使用集合，卡片后加的动作永远不出图。
+  // 没记录：沿用旧的「卡面前 2 个」。
   const ordered = usageKnown
-    ? (used ?? []).map((id) => char.actions!.find((a) => String(a.id) === id)).filter(Boolean) as CharacterAction[]
+    ? (prioritizeByUsage(used, char.actions!.map((a) => String(a.id)))
+        .map((id) => char.actions!.find((a) => String(a.id) === id))
+        .filter(Boolean) as CharacterAction[])
     : char.actions;
   // 手动旋钮：>0 时按其裁剪；0 = 调用方不额外限制（重生成/补缺要覆盖全部）。
   // 缺省（未传）时：有使用记录则交给档位预算收口（主要角色 5 个），没有记录沿用旧的 2 个。
@@ -1610,10 +1723,19 @@ interface ImageRunOptions {
   safeRewriteCfg?: ApiConfig;
   /** 风格锚点图路径：背景/CG 以其为参考图统一画风（仅当任务无其它参考图时生效） */
   styleAnchorPath?: string;
-  /** 负面提示词（走适配器模板 $negativePrompt，模板未映射则忽略） */
+  /**
+   * 负面提示词（走适配器模板 $negativePrompt，模板未映射则忽略）。
+   * 缺省即 DEFAULT_NEGATIVE——见 runImageTask 内部 `resolvedNegative` 的说明：
+   * 默认值写在执行侧而不是各调用方，结构上消除「某个调用方忘了传」。
+   */
   negativePrompt?: string;
   /** 生成失败重试次数（默认 3 次，含首次；网络/临时错误自动重试） */
   retryCount?: number;
+  /**
+   * 单张素材 base64 体积上限（缺省 MAX_IMAGE_B64_BYTES）。
+   * 只给单测用来构造「超规格响应」而不用真的造 32MB 载荷；产品路径不要传。
+   */
+  maxImageBytes?: number;
   /**
    * 协作式中止检查（与 generateImages 同口径）：返回 true 时不再发起任何新的付费请求
    * （参考图描述 / 图像生成 / 提示词改写 / 退避重试 / 自检）。已在途的请求无法撤回，
@@ -1998,6 +2120,18 @@ export async function runImageTask(
   /** 协作式中止：已中止则整任务直接跳过（管线会统一给出中止说明，这里不重复刷日志） */
   const aborted = (): boolean => opts.isAborted?.() === true;
   if (aborted()) return null;
+  /**
+   * 有效负面词（本次任务的唯一口径）：调用方没传就用 DEFAULT_NEGATIVE。
+   *
+   * 为什么默认值必须写在这里而不是各调用方：负面词是缓存命中判据的一部分
+   * （`<图>.meta.json` 的 negativePrompt，见 imageMetaForTask / imageMetaMatches），
+   * 而**未传**会被元数据写成 null、与主管线期望的 DEFAULT_NEGATIVE 不相等 →
+   * 该图被判「生成参数不一致」重新生成。单张重生成（regenerate.ts）/ 图片小说（imageStory.ts）
+   * 这两条路径此前正是漏传者：用户点一次「重新生成」= 这张已付费的图下次跑主管线时再画一次，
+   * 第三次才稳定命中。默认值收口到执行侧后，「调用方忘了传」在结构上不再可能。
+   * 下面所有内部引用都必须走这个变量，不能再读 opts.negativePrompt（否则两处口径又会分叉）。
+   */
+  const resolvedNegative = opts.negativePrompt ?? DEFAULT_NEGATIVE;
   const cacheDir = cacheDirFor(cacheRoot, "images");
   await tauri.mkdirAll(cacheDir);
   let path: string | null = null;
@@ -2024,7 +2158,7 @@ export async function runImageTask(
   const cached = opts.force ? null : await cacheHit(cacheDir, task.fileName);
   if (cached) {
     // B69：旁路参数校验（模型/种子/负面词/尺寸）。无 cfg 时无法重新生成，跳过校验保持旧行为。
-    const metaOk = !cfg || await cachedImageMetaMatches(cached, imageMetaForTask(task, cfg, effectiveNegative(task, opts.negativePrompt)));
+    const metaOk = !cfg || await cachedImageMetaMatches(cached, imageMetaForTask(task, cfg, effectiveNegative(task, resolvedNegative)));
     if (!metaOk) {
       logger.info("images", "缓存图生成参数（模型/种子/负面词/尺寸）与当前任务不一致，重新生成", {
         id: task.id,
@@ -2324,7 +2458,7 @@ export async function runImageTask(
             references: resolvedReferences,
             size: `${task.width}x${task.height}`,
             seed: task.seed,
-            negativePrompt: effectiveNegative(task, opts.negativePrompt),
+            negativePrompt: effectiveNegative(task, resolvedNegative),
           });
           break;
         } catch (e) {
@@ -2480,6 +2614,12 @@ export async function runImageTask(
       const file = detected
         ? withDetectedExt(task.fileName, img.dataB64)
         : task.fileName.replace(/\.png$/, `.${img.mime.includes("jpeg") ? "jpg" : "png"}`);
+      // #1580 同族：单张素材体积闸门（对照抠图入口的 CUTOUT_MAX_INPUT_B64_BYTES）。
+      // 为什么必须在落盘前拦：中转线路可能把 1024² 的请求返回成 4K 无损 PNG，
+      // 而这张图会被写进 assets.json → 组装 → zip 全链路搬运，Web 端还会在缩略图/预览里整张解码；
+      // 多张叠加直接把项目目录撑爆，日志却显示"生成成功"。
+      // 超限**记为失败项**（抛出，由调用方登记到失败清单可逐条重试），不落盘、不进映射。
+      assertImageSizeWithinLimit(img.dataB64, task, opts.maxImageBytes);
       path = `${cacheDir}/${file}`;
       await tauri.writeFileBase64(path, img.dataB64);
       source = "AI 生成";
@@ -2552,7 +2692,7 @@ export async function runImageTask(
     }
     // B69：AI 生成结果写入旁路参数元数据（供下次命中校验）；用户素材拷贝不写，按旧缓存兼容处理。
     if (source.startsWith("AI 生成") && cfg) {
-      await writeImageArtifactMeta(path, imageMetaForTask(task, cfg, effectiveNegative(task, opts.negativePrompt)));
+      await writeImageArtifactMeta(path, imageMetaForTask(task, cfg, effectiveNegative(task, resolvedNegative)));
     }
     const prefix = source === "缓存" ? "[缓存] " : source.startsWith("用户素材") ? `[用户素材] ` : "";
     log({ step: "图像", message: `${prefix}${task.usage}${source.startsWith("用户素材") ? ` <- ${source.replace("用户素材 ", "")}` : ""}`, level: "success", at: Date.now() });

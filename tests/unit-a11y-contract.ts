@@ -1,4 +1,5 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
+import { extname, join } from "node:path";
 
 /**
  * 无障碍弹层的"契约"回归（#1475/#1484）。
@@ -10,6 +11,29 @@ import { readFileSync } from "node:fs";
 
 function assert(cond: boolean, msg: string): void {
   if (!cond) throw new Error(msg);
+}
+
+/** 递归收集 src/ 下所有 .ts/.vue（原生弹层门禁必须覆盖全仓，不能只枚举几个文件）。
+ *  注意不跳过点文件：临时/隐藏源文件照样会被打包进产物，跳过等于给门禁留后门。 */
+function walkSrc(dir: string, out: string[] = []): string[] {
+  for (const e of readdirSync(dir, { withFileTypes: true })) {
+    if (e.name === "node_modules") continue;
+    const p = join(dir, e.name);
+    if (e.isDirectory()) walkSrc(p, out);
+    else if ([".ts", ".vue"].includes(extname(e.name))) out.push(p);
+  }
+  return out;
+}
+
+/** 取包含 needle 的那一行（属性是否挂在正确的元素上，比"文件里出现过"更强） */
+function lineWith(src: string, needle: string): string {
+  return src.split("\n").find((line) => line.includes(needle)) ?? "";
+}
+
+/** 同 lineWith，但先排除注释行：注释里会写反例说明（"没有 role=dialog"），
+ *  否则契约会被注释里的字符串"满足"——断言看似在跑，其实什么都没锁住。 */
+function codeLineWith(src: string, needle: string): string {
+  return src.split("\n").find((line) => !/^\s*(\/\/|\*|\/\*)/.test(line) && line.includes(needle)) ?? "";
 }
 
 const dialog = readFileSync("src/components/AppDialog.vue", "utf-8");
@@ -38,7 +62,6 @@ function main(): void {
   assert(host.includes("submitInput"), "输入弹层必须能把文本交回 Promise");
   assert(host.includes("placeholder"), "输入弹层必须有占位符（说明要填什么）");
   assert(app.includes("<ConfirmDialogHost"), "全局宿主必须挂载在 App 上，否则弹层永远不显示");
-  assert(app.includes("AppDialog") === false || true, "");
 
   // ---- 组合式：队列串行化 + 空输入归一 ----
   assert(composable.includes("queue.push"), "并发请求必须排队，不能覆盖当前弹层");
@@ -47,17 +70,48 @@ function main(): void {
   assert(composable.includes("export function promptDialog"), "必须导出 promptDialog（替代 window.prompt）");
 
   // ---- 全仓不得再出现原生阻塞弹层 ----
-  const files = [
-    "src/stores/generate.ts",
-    "src/pages/ImportPage.vue",
-    "src/components/EditCards.vue",
-    "src/components/VisualBiblePanel.vue",
-  ];
-  for (const f of files) {
+  // 旧实现只枚举 4 个文件（stores/generate.ts、ImportPage.vue、EditCards.vue、VisualBiblePanel.vue），
+  // 而注释写的是"全仓"——ChapterWorkbench.vue / ScriptPanel.vue 里的 5 处 window.alert
+  // 因此永远不会被这条门禁发现（假门禁）。改为递归扫描 src/ 全部 .ts/.vue。
+  const nativeCalls: string[] = [];
+  for (const f of walkSrc("src")) {
     const src = readFileSync(f, "utf-8");
-    const blocked = src.match(/window\.(confirm|prompt|alert)\s*\(/g) ?? [];
-    assert(blocked.length === 0, `${f} 仍有原生阻塞弹层调用：${blocked.join(", ")}`);
+    src.split("\n").forEach((line, i) => {
+      // 注释行不算调用：说明性注释里会写反例（如"原实现用 window.prompt"）
+      if (/^\s*(\/\/|\*|\/\*)/.test(line)) return;
+      const blocked = line.match(/window\.(confirm|prompt|alert)\s*\(/g) ?? [];
+      for (const b of blocked) nativeCalls.push(`${f}:${i + 1} ${b}`);
+    });
   }
+  assert(
+    nativeCalls.length === 0,
+    `全仓不得再出现原生阻塞弹层（无 role=dialog/焦点陷阱，且同步阻塞主线程）：\n  ${nativeCalls.join("\n  ")}`,
+  );
+
+  // ---- 自建模态（关于 / 大图预览）同样要有对话框语义与焦点管理 ----
+  // 这两处此前只做 Esc + 点遮罩关闭，读屏不宣告对话框、Tab 会跑到背景页（见 F6）。
+  for (const [name, file] of [
+    ["AboutDialog.vue", "src/components/AboutDialog.vue"],
+    ["AssetPreview.vue", "src/components/AssetPreview.vue"],
+  ] as const) {
+    const src = readFileSync(file, "utf-8");
+    const maskLine = codeLineWith(src, "modal-mask") || codeLineWith(src, "asset-preview");
+    assert(codeLineWith(src, 'role="dialog"').length > 0, `${name} 的弹层容器必须有 role=dialog`);
+    assert(codeLineWith(src, 'aria-modal="true"').length > 0, `${name} 的弹层容器必须标记 aria-modal`);
+    assert(codeLineWith(src, ":aria-labelledby").length > 0, `${name} 必须用 aria-labelledby 关联可访问名称`);
+    assert(codeLineWith(src, "ref=\"maskEl\"").length > 0, `${name} 必须持有弹层容器引用（焦点收拢/陷阱的前提）`);
+    assert(codeLineWith(src, 'tabindex="-1"').length > 0, `${name} 的弹层容器必须可聚焦`);
+    assert(src.includes("focusables"), `${name} 必须有可聚焦元素集合（焦点陷阱）`);
+    assert(/e\.shiftKey/.test(src), `${name} 的焦点陷阱必须处理 Shift+Tab 反向循环`);
+    assert(src.includes("lastFocused"), `${name} 必须记录触发元素并把焦点收进弹层`);
+    assert(/lastFocused\?\.focus/.test(src), `${name} 关闭后必须把焦点还给触发元素`);
+    assert(maskLine.length > 0, `${name} 的遮罩元素定位失败（契约测试失效）`);
+  }
+
+  // ---- 语言下拉必须有可访问名称（否则读屏只念"组合框 简体中文"）----
+  const langSelect = lineWith(app, "lang-select");
+  assert(langSelect.includes("aria-label"), "语言下拉必须带 aria-label（否则无可访问名称）");
+  assert(/t\(['"]界面语言['"]\)/.test(langSelect), "语言下拉的 aria-label 文案必须进四语词典（t('界面语言')）");
 
   // ---- 缩略图必须键盘可达（div + @click 对键盘用户等于不存在）----
   const asset = readFileSync("src/components/generate/result/AssetPanel.vue", "utf-8");

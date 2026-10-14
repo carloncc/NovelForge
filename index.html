@@ -3,6 +3,33 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      #1549：Web 模式（pnpm dev / pnpm preview）此前完全没有 CSP —— 全仓 grep
+      Content-Security-Policy 零命中，只有 tauri.conf.json 里那份桌面端 CSP。
+      这个页面持有会话 token，能驱动 /__novelforge/proxy、/preview、/template、/model，
+      一旦出现 HTML/属性注入（markdown 渲染、素材名注入等），脚本可直接滥用这些同源服务。
+      这份 meta 同时作用于 Web 与桌面（桌面端还会与 tauri.conf.json 的 CSP 取交集，
+      只会更严，不会更松）。各来源为什么这么写：
+      - script-src 'self'：与桌面端一致；本项目没有 new Function/eval，Vue SFC 由
+        @vitejs/plugin-vue 预编译，不需要 'unsafe-eval'。
+      - style-src 保留 'unsafe-inline'：Vite dev 与 Vue 动态样式靠注入 <style>，去掉会白屏。
+      - connect-src 'self'：覆盖 Web 模式的 /__novelforge/proxy、/preview、/template、
+        /model、/onnx 等全部同源服务；ipc: / http://ipc.localhost / model://localhost 是
+        桌面端 Tauri IPC 与模型协议；ws://localhost:* 是 Vite dev 的 HMR 通道（删掉热更新即死）。
+      - http://127.0.0.1:* / http://localhost:*：Web 模式预览服务器是 server.listen(0) 的
+        **随机端口**（不是 17892），预览页 iframe 与本地模型服务（Ollama 11434）都要用到。
+      - worker-src 'self' blob:：onnxruntime-web 的 wasm 胶水模块（当前 numThreads=1，兜底用）。
+      - object-src 'none' / base-uri 'self'：本次补的收紧项 —— 禁插件内容、禁 <base> 劫持相对 URL。
+      frame-ancestors 写在 meta 里会被浏览器忽略（规范如此，还会打控制台警告），
+      因此只放在 tauri.conf.json 的桌面 CSP 里。
+      取舍：connect-src 不放开任意外域 —— Web 模式的浏览器直连兜底（webRuntime 的
+      directFetch）因此只对本地目标有效，云端直连会被 CSP 拦住；这正是 CSP 的目的
+      （注入脚本无法把数据外带出去），代理通道（同源 /proxy）不受影响。
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: http://127.0.0.1:17892 http://127.0.0.1:* http://localhost:*; media-src 'self' data: blob: http://127.0.0.1:17892 http://127.0.0.1:* http://localhost:*; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:17892 model://localhost http://127.0.0.1:* http://localhost:* ws://localhost:* ws://127.0.0.1:* wss://localhost:* wss://127.0.0.1:*; frame-src http://127.0.0.1:17892 http://127.0.0.1:* http://localhost:*; worker-src 'self' blob:; object-src 'none'; base-uri 'self'"
+    />
     <link rel="icon" type="image/png" href="/src/assets/logo.png" />
     <title>NovelForge - AI 视觉小说转换工具</title>
   </head>

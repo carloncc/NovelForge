@@ -49,7 +49,32 @@ interface AssembleInput {
   styleReferencePath?: string;
   /** 视觉模式（#810）：sprite=立绘版（默认）；imageOnly=图片小说（渲染无立绘、按分镜切图） */
   mode?: "sprite" | "imageOnly";
+  /** 本次运行的文本 LLM 通道（只读 apiKey）：用于判定 demo 模式，决定卡片工作副本写哪个文件。
+   *  口径与 pipeline（`const demo = !input.llm?.apiKey`）、stores/generate 完全一致。
+   *  该字段不在 types.ts 的 AssembleInput 里（types.ts 不在本次改动范围），故在此就地声明形状。 */
+  llm?: { apiKey?: string };
   log: (msg: string) => void;
+}
+
+/**
+ * 组装侧写卡片工作副本前的指纹兜底：内存对象上已有 _novelFp 时原样返回；
+ * 没有时才从同文件读回旧指纹（卡片来自磁盘快照的旧项目走这条）。
+ * 不无条件保留旧指纹——那会把「小说已重导」的新卡片钉在旧指纹上，反而让下一次运行误判过期。
+ */
+async function withPreservedNovelFp<T extends object>(
+  cardsFile: string,
+  cards: T,
+): Promise<T & { _novelFp?: string }> {
+  const existing = (cards as { _novelFp?: string })._novelFp;
+  if (existing) return cards as T & { _novelFp?: string };
+  try {
+    const { text } = await tauri.readTextFile(cardsFile);
+    const prevFp = (JSON.parse(text) as { _novelFp?: string })._novelFp;
+    if (prevFp) return { ...cards, _novelFp: prevFp };
+  } catch {
+    /* 无旧文件/读不出：保持原样 */
+  }
+  return cards as T & { _novelFp?: string };
 }
 
 /** 场景文件 swap 计划（1303 纯函数，供单测）：只删多余旧文件，不先清空。 */
@@ -300,10 +325,18 @@ export async function assembleProject(input: AssembleInput): Promise<{ gameDir: 
     joinPath(normalizedOutputDir, ".novel2vn/meta.json"),
     JSON.stringify(meta, null, 2),
   );
-  await tauri.writeTextFile(
-    joinPath(normalizedOutputDir, ".novel2vn/cards.json"),
-    JSON.stringify(input.cards, null, 2),
-  );
+  // 卡片工作副本的组装侧写回：按**当前模式**写对应文件，绝不跨模式覆写。
+  // 旧实现无条件写 cards.json，有两个后果：
+  //  ① 演示模式（未配置文本 API）把演示卡片写进正式工作副本 cards.json，正式模式下次运行读到演示卡片；
+  //  ② 更贵的一条：写的是内存对象，而内存对象此前**没有** _novelFp（指纹只在提取写盘时拼进去），
+  //     于是刚生成的指纹被抹掉 → 下次运行判「小说内容变化」→ 整本重新提取（LLM 付费），
+  //     并连带按 imagePrompt 差分把立绘/三视图移入回收站重画（图像付费），每轮组装再抹一次，永不收敛。
+  // 内存卡片的 _novelFp 现由 pipeline.setCardsNovelFp 直接写在对象上，这里照原样落盘即可；
+  // 仅在内存对象确实没有指纹时（卡片来自磁盘快照的旧项目）才从同文件读回旧指纹兜底。
+  const demo = !input.llm?.apiKey;
+  const cardsFile = joinPath(normalizedOutputDir, `.novel2vn/${demo ? "cards_demo" : "cards"}.json`);
+  const cardsPayload = await withPreservedNovelFp(cardsFile, input.cards);
+  await tauri.writeTextFile(cardsFile, JSON.stringify(cardsPayload, null, 2));
   // 构建信息 + PWA 名称/图标跟随作品
   await writeBuildInfo(normalizedOutputDir, meta);
   await patchManifestAndIcons(normalizedOutputDir, title, titleImg);
@@ -780,6 +813,20 @@ html, body, .Title_buttonList { font-family: ${font} !important; }
 /* 窄屏：快捷栏只留图标，避免多项文字横向溢出 */
 @media (max-width: 900px) {
   ._button_text_rdjpk_23 { display: none; }
+}
+/* 尊重系统的「减少动态效果」设置（UI 无障碍）：用户开启后关掉全部动画与过渡。
+   导出的游戏此前完全忽略该偏好，前庭敏感玩家会被转场/呼吸/震动效果持续干扰。
+   用 !important 是因为要覆盖模板 userStyleSheet 与引擎内联样式（引擎动画多为内联 transition/animation）。
+   注：不做 display:none——保留元素可见性，只去掉运动本身。 */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    transition-delay: 0ms !important;
+    scroll-behavior: auto !important;
+  }
+  .Title_buttonList, .title-enter-container { animation: none !important; transition: none !important; }
 }
 `;
 }

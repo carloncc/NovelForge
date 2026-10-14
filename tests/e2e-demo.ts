@@ -9,9 +9,27 @@ import { mkdtemp } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
+/**
+ * 保留临时组装目录（供人工排查 / engine-check 之类的后续消费者读取）。
+ * scripts/run-tests.mjs 在「要把本用例产出的游戏目录交给 engine-check 时」会置 1。
+ */
+const KEEP_DIR = process.env.NF_KEEP_E2E_DIR === "1";
+
+/**
+ * 组装产物路径的唯一输出格式。
+ * scripts/run-tests.mjs 用 /^\[5\] 组装完成:\s*(.+)$/ 解析这一行，拿到目录后交给 tests/engine-check.ts。
+ * 改动本行格式等于破坏 runner 与 engine-check 之间的契约 —— tests/unit-fix-gates.ts 钉住了该格式。
+ */
+const ASSEMBLED_LINE = (dir: string): string => `[5] 组装完成: ${dir}`;
+
+let tmpRoot: string | undefined;
+
 async function main(): Promise<void> {
-  const out = `${(await mkdtemp(join(tmpdir(), "novelforge-e2e-"))).replace(/\\/g, "/")}/game`;
-  await tauri.removePath(out).catch(() => {});
+  // 临时根目录：组装产物直接落在它下面（assembleProject 会自行 mkdirAll）。
+  // 旧实现在 :14 只删了 <root>/game 子目录，而且删在组装之前 —— 组装产物照旧残留，
+  // 且成功路径从不删根目录：本机实测堆了 196 个目录 / 7.68GB。现在整个根目录由 finally 统一收尾。
+  tmpRoot = (await mkdtemp(join(tmpdir(), "novelforge-e2e-"))).replace(/\\/g, "/");
+  const out = tmpRoot;
 
   const chapters = splitChapters(DEMO_NOVEL, "星陨之城的守夜人");
   console.log(`[1] 章节切分: ${chapters.length} 章 ->`, chapters.map((c) => `${c.title}(${c.charCount}字)`).join(", "));
@@ -44,7 +62,7 @@ async function main(): Promise<void> {
     assets,
     log: () => {},
   });
-  console.log(`[5] 组装完成: ${out}`);
+  console.log(ASSEMBLED_LINE(out));
   console.log("    meta:", JSON.stringify(meta));
 
   const sceneDir = `${out}/game/scene`;
@@ -86,7 +104,28 @@ function checkBalance(txt: string, fileName: string): void {
   if (open !== close) throw new Error(`${fileName}: 引号不匹配 ${open} vs ${close}`);
 }
 
-main().catch((e) => {
+try {
+  await main();
+} catch (e) {
   console.error("验证失败:", e);
-  process.exit(1);
-});
+  // 失败时保留现场：组装到一半的游戏目录是排查「哪一步断的」的唯一证据，删了就没了。
+  // 代价是失败会占盘，由 run-tests.mjs 的孤儿清扫（按前缀 + 目录年龄）兜底回收。
+  if (tmpRoot) {
+    console.error(`[保留现场] 临时目录未删除（便于排查）: ${tmpRoot}`);
+    console.error(`           排查完成后可手动删除：rm -rf "${tmpRoot}"`);
+  }
+  process.exitCode = 1;
+} finally {
+  // 成功即递归删除临时根目录；失败保留现场（见上）。
+  // NF_KEEP_E2E_DIR=1 用于「产物还要给别的用例/人工看」的场景（runner 接 engine-check 时会置 1）。
+  if (tmpRoot) {
+    if (process.exitCode === 1) {
+      console.log(`[清理] 失败，已保留临时目录: ${tmpRoot}`);
+    } else if (KEEP_DIR) {
+      console.log(`[清理] 已保留临时目录（NF_KEEP_E2E_DIR=1）: ${tmpRoot}`);
+    } else {
+      await tauri.removePath(tmpRoot).catch(() => {});
+      console.log(`[清理] 已删除临时目录: ${tmpRoot}`);
+    }
+  }
+}

@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "default capability for main window",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:default", "fs:default"]
+  "permissions": ["core:default", "dialog:default", "fs:default", "core:window:allow-destroy"]
 }

@@ -595,8 +595,141 @@ async function handlePreviewUpload(req: IncomingMessage, res: ServerResponse): P
   }
 }
 
+/** 预览静态资源服务的请求闸门（#1549，与 Rust 侧 server.rs 的 preview_host_allowed /
+ *  preview_origin_allowed 同口径）：
+ *  - Host 必须指向本机预览端口（DNS rebinding：攻击者域名解析到 127.0.0.1 时 Host 是攻击者域名 → 403）
+ *  - Origin 若存在必须是**本机同端口**来源（跨站页面借 fetch/XHR 读预览内容 → 403）
+ *  - Referer 若存在必须是本机来源（端口不限：Web 模式的预览页是应用页 window.open 打开的
+ *    顶层导航，浏览器必然带上应用页 Referer，端口是 dev server 端口；Rust 侧预览由系统浏览器
+ *    新开、无 Referer，故那里可以要求端口相等，这里不能照抄）
+ *  - Sec-Fetch-Site 若存在且为 cross-site → 403（浏览器自己发的、页面脚本无法伪造；
+ *    攻击者页面加 Referrer-Policy: no-referrer 时 Referer 缺失，靠这条兜住）
+ *  缺失 Host/Origin/Referer 时放行：顶层导航（用户在地址栏或外部浏览器直接打开预览 URL）
+ *  本就不带这些头，与本机非浏览器客户端直连同属「本地预览」的设计取舍（Rust 侧 #1446 同口径）。
+ *
+ *  为什么不加 token：预览页是浏览器**顶层导航**打开的（用户可以复制 URL 到外部浏览器/播放器），
+ *  导航请求无法附加自定义头；Rust 预览服务器也已在 #1446 删除从未被校验的 token。
+ *  这里保持同一口径，避免「Web 模式预览打不开」的功能回归。 */
+export function previewRequestAllowed(req: IncomingMessage, port: number): boolean {
+  const host = req.headers.host;
+  if (!host) return true;
+  const hostParts = splitAuthority(String(host));
+  if (!hostParts) return false;
+  if (!isLocalHostName(hostParts.name)) return false;
+  // 带端口时必须与本实例端口一致（测试直连/HTTP1.0 省略端口时放行，与 Rust 侧一致）
+  if (hostParts.port !== null && hostParts.port !== port) return false;
+
+  const origin = req.headers.origin as string | undefined;
+  if (origin && !localSourceAllowed(origin, port, true)) return false;
+  const referer = req.headers.referer as string | undefined;
+  if (referer && !localSourceAllowed(referer, port, false)) return false;
+
+  const site = req.headers["sec-fetch-site"];
+  if (site && String(site).trim().toLowerCase() === "cross-site") return false;
+  return true;
+}
+
+/** 拆 "host:port"（含 IPv6 的 "[::1]:port"）；畸形返回 null。端口缺省为 null。 */
+function splitAuthority(raw: string): { name: string; port: number | null } | null {
+  const value = raw.trim().toLowerCase().replace(/\.$/, "");
+  if (!value) return null;
+  if (value.startsWith("[")) {
+    const end = value.indexOf("]");
+    if (end < 0) return null;
+    const name = value.slice(1, end);
+    const rest = value.slice(end + 1);
+    if (rest === "") return { name, port: null };
+    if (!rest.startsWith(":")) return null;
+    const port = Number(rest.slice(1));
+    return Number.isInteger(port) ? { name, port } : null;
+  }
+  const idx = value.lastIndexOf(":");
+  if (idx < 0) return { name: value, port: null };
+  const port = Number(value.slice(idx + 1));
+  if (!Number.isInteger(port)) return { name: value, port: null };
+  return { name: value.slice(0, idx), port };
+}
+
+function isLocalHostName(name: string): boolean {
+  return name === "localhost" || name === "127.0.0.1" || name === "::1";
+}
+
+/** Origin/Referer 是否为本机来源。requirePort=true 时端口必须与预览实例一致。 */
+function localSourceAllowed(value: string, port: number, requirePort: boolean): boolean {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return false;
+  }
+  const name = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (!isLocalHostName(name)) return false;
+  if (requirePort) {
+    const effective = url.port ? Number(url.port) : url.protocol === "https:" ? 443 : 80;
+    if (effective !== port) return false;
+  }
+  return true;
+}
+
+/** 解析单区间 Range 头（bytes=start-end / bytes=start- / bytes=-suffix），
+ *  与 Rust 侧 server.rs 的 parse_range 同口径：非法/越界一律 null → 退化成整文件 200。 */
+export function parseRangeHeader(value: string | undefined, size: number): [number, number] | null {
+  if (!value || size <= 0) return null;
+  const spec = value.trim();
+  const eq = spec.indexOf("bytes=");
+  if (eq !== 0) return null;
+  const dash = spec.indexOf("-", 6);
+  if (dash < 0) return null;
+  const startStr = spec.slice(6, dash).trim();
+  const endStr = spec.slice(dash + 1).trim();
+  if (startStr === "") {
+    // bytes=-N：取尾部 N 字节
+    const suffix = Number(endStr);
+    if (!Number.isInteger(suffix) || suffix <= 0) return null;
+    const take = Math.min(suffix, size);
+    return [size - take, size - 1];
+  }
+  const start = Number(startStr);
+  if (!Number.isInteger(start) || start < 0 || start >= size) return null;
+  if (endStr === "") return [start, size - 1];
+  const end = Number(endStr);
+  if (!Number.isInteger(end) || end < start) return null;
+  // 上界由调用方按文件大小裁剪（与 Rust 侧 parse_range 的调用点一致）
+  return [start, end];
+}
+
+/** 流式发送文件（Range 命中时按 start/end 切片）。旧实现 readFile 把整个文件读进内存：
+ *  预览目录允许单文件 256MB（PREVIEW_FILE_SIZE_LIMIT），几个并发 <video> 就能把
+ *  dev/preview 进程撑到 OOM；且没有 Accept-Ranges，视频拖动只能整包重下。 */
+function streamPreviewFile(
+  res: ServerResponse,
+  file: string,
+  range: [number, number] | null,
+): void {
+  const stream = range ? createReadStream(file, { start: range[0], end: range[1] }) : createReadStream(file);
+  // 读取中途失败（文件被删/磁盘错误）不能让 'error' 变成未处理事件打挂 dev/preview 进程
+  stream.on("error", () => {
+    if (!res.headersSent) res.statusCode = 500;
+    res.destroy();
+  });
+  res.on("close", () => stream.destroy());
+  stream.pipe(res);
+}
+
 /** 预览静态资源服务 */
 async function handlePreviewStatic(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    res.statusCode = 405;
+    res.end();
+    return;
+  }
+  // #1549：此前这里没有任何 Host/Origin 校验（本机任意进程、任意跨站页面都能 GET 预览内容），
+  // 与 Rust 预览服务器口径不一致；现在同口径拒绝
+  if (!previewRequestAllowed(req, previewPort)) {
+    res.statusCode = 403;
+    res.end("forbidden");
+    return;
+  }
   const u = parseRequestUrl(req);
   if (!u) {
     res.statusCode = 400;
@@ -624,21 +757,48 @@ async function handlePreviewStatic(req: IncomingMessage, res: ServerResponse): P
     if (st.isDirectory()) {
       full = join(full, "index.html");
     }
-    const buf = await readFile(full);
-    res.statusCode = 200;
+    const info = await stat(full);
+    if (!info.isFile()) throw new Error("not a file");
     const ext = extname(full).toLowerCase();
     res.setHeader("Content-Type", MIME[ext] ?? "application/octet-stream");
     res.setHeader("Cache-Control", previewCacheControl(ext));
     res.setHeader("X-Content-Type-Options", "nosniff");
-    res.end(buf);
+    // 声明断点续播能力，浏览器音频/视频标签才会发 Range 快进
+    res.setHeader("Accept-Ranges", "bytes");
+    const size = info.size;
+    const range = parseRangeHeader(req.headers.range as string | undefined, size);
+    if (range) {
+      const end = Math.min(range[1], size - 1);
+      if (end >= range[0]) {
+        res.statusCode = 206;
+        res.setHeader("Content-Range", `bytes ${range[0]}-${end}/${size}`);
+        res.setHeader("Content-Length", end - range[0] + 1);
+        if (req.method === "HEAD") {
+          res.end();
+          return;
+        }
+        streamPreviewFile(res, full, [range[0], end]);
+        return;
+      }
+    }
+    res.statusCode = 200;
+    res.setHeader("Content-Length", size);
+    if (req.method === "HEAD") {
+      res.end();
+      return;
+    }
+    streamPreviewFile(res, full, null);
   } catch {
     res.statusCode = 404;
     res.end("not found");
   }
 }
 
-function ensurePreviewServer(): Promise<void> {
-  if (previewServer && previewPort) return Promise.resolve();
+/** 启动（或复用）预览静态服务，返回其端口。
+ *  返回端口而不是 void：#1549 的单测要直连该端口验证 Host/Origin 闸门与 Range 支持，
+ *  端口此前只存在模块级 previewPort 里，外部拿不到。 */
+export function ensurePreviewServer(): Promise<number> {
+  if (previewServer && previewPort) return Promise.resolve(previewPort);
   return new Promise((resolve, reject) => {
     const server = createServer(safeHandler(handlePreviewStatic));
     server.once("error", reject);
@@ -651,9 +811,16 @@ function ensurePreviewServer(): Promise<void> {
       }
       previewServer = server;
       previewPort = address.port;
-      resolve();
+      resolve(address.port);
     });
   });
+}
+
+/** 关闭预览静态服务：dev/preview server 关闭时调用，也供单测释放监听端口（否则测试进程不退出）。 */
+export function closePreviewServer(): void {
+  previewServer?.close();
+  previewServer = undefined;
+  previewPort = 0;
 }
 
 /** onnxruntime-web 运行时资源：绕过 vite 模块转换按静态文件原样返回。
@@ -735,9 +902,8 @@ function webPlugin(): Plugin {
     });
     server.middlewares.use("/__novelforge/model", safeHandler(handleModelRequest));
     server.httpServer?.once("close", () => {
-      previewServer?.close();
-      previewServer = undefined;
-      previewPort = 0;
+      // 端口与句柄一并释放（#1329 的"先释放再绑定"依赖这里把 previewPort 归零）
+      closePreviewServer();
     });
   };
   return {

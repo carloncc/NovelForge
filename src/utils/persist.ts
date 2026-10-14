@@ -9,6 +9,7 @@ import {
   validateCharacterAssetKeys,
 } from "../core/visualBible";
 import { tauri } from "./tauri";
+import { markSkeletonNovel } from "../core/cache";
 
 interface PersistedState {
   novel?: {
@@ -193,13 +194,17 @@ async function restoreNovelFromScriptCache(outputDir: string): Promise<NovelDoc 
       enabled: true,
     };
   });
-  return {
+  // 显式骨架标记：这段正文是占位串，**不是**原文。没有标记时它会和真原文完全同形，
+  // 用户点「开始生成」就会把占位串送去 AI 分章/提取/剧本（真实计费），
+  // 并把 split.json 整份覆写成占位串（而它往往是原文正文的最后一处副本）。
+  // 标记由 pipeline 入口（isSkeletonNovel）与界面共同消费。
+  return markSkeletonNovel({
     fileName: "已生成项目",
     sourcePath: "",
     encoding: "utf-8",
     fullText: chapters.map((chapter) => chapter.text).join("\n\n"),
     chapters,
-  };
+  });
 }
 
 export async function saveProjectState(state: {
@@ -362,6 +367,7 @@ export async function restoreProjectState(outputDir: string): Promise<{
     // 源文件缺失/不可读（重命名、移动、清理过下载目录，或导入时就没有真实路径）时，
     // 用分章缓存把小说重建出来，而不是让重启后的生成页丢掉整个「按章节生成」入口。
     let novelRestoredFromSplitCache = false;
+    let novelRestoredFromScriptSkeleton = false;
     if (!novel) {
       novel = await restoreNovelFromSplitCache(
         outputDir,
@@ -374,6 +380,7 @@ export async function restoreProjectState(outputDir: string): Promise<{
       // 这些都是"开发到一半"的项目，novel 为 null 会让整个生成页失去入口。
       if (!novel) {
         novel = await restoreNovelFromScriptCache(outputDir);
+        novelRestoredFromScriptSkeleton = !!novel;
       }
     }
 
@@ -383,6 +390,14 @@ export async function restoreProjectState(outputDir: string): Promise<{
         importError
           ? `源小说文件导入失败（${importError}），已用分章缓存重建小说：分章/剧本/图像/逐章生成可继续使用，但「重新分章」等依赖原文的操作需要重新导入小说`
           : "源小说文件不可读，已用分章缓存重建小说：分章/剧本/图像/逐章生成可继续使用，但「重新分章」等依赖原文的操作需要重新导入小说",
+      );
+    } else if (novelRestoredFromScriptSkeleton) {
+      // 骨架分支此前**不推任何 warning**：用户只看到一个"正常"的章节列表，
+      // 完全不知道正文是「分章缓存缺失」占位串，一点生成就在占位文本上烧一整套付费调用。
+      warnings.push(
+        importError
+          ? `源小说文件导入失败（${importError}），且分章缓存不可用：已用剧本缓存重建章节骨架，但章节正文是占位文本、不是原文。请重新导入小说后再生成（逐章重跑/单素材重生成仍可用）`
+          : "源小说文件不可读，且分章缓存不可用：已用剧本缓存重建章节骨架，但章节正文是占位文本、不是原文。请重新导入小说后再生成（逐章重跑/单素材重生成仍可用）",
       );
     } else if (!novel && (importError || persistedState.novel)) {
       // B100：完全无缓存时给出明确 warning（旧实现静默返回 novel=null，用户只看到「还没有小说」）

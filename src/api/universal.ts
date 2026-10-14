@@ -6,6 +6,38 @@ import { log } from "../utils/logger";
 import { classifyError } from "../utils/errorClassifier";
 import { normalizeProviderBaseUrl, customHeadersFor, joinApiPath } from "./baseUrl";
 
+/**
+ * TTS 情绪白名单（按模板 id）：剧本提示词与全局配置允许的情绪值**不等于**厂商支持的值。
+ *
+ * 实测（2026-10-14，用户真实项目日志）：MiniMax speech-2.8 对 `whisper` 直接回
+ * `400 invalid params, speech 2.8 don't support whisper（code 2013）` —— 而剧本提示词
+ * 把 whisper/calm 列在允许值里、配置页也提供「耳语」选项，于是这些台词**每次合成都失败**。
+ * 这里在**厂商边界**过滤：不支持的值不下发（而不是让整句付费请求 400），
+ * 并打一条 warn 说明被忽略/替换成了什么（静默丢弃是上一轮审计点名的问题）。
+ */
+const TTS_EMOTION_WHITELIST: Record<string, string[]> = {
+  // MiniMax T2A v2 / speech-2.x 文档情绪集（无 whisper / calm，平静用 neutral）
+  "minimax-tts": ["happy", "sad", "angry", "fearful", "disgusted", "surprised", "neutral"],
+};
+
+/** 语义最接近的替代值：厂商不支持时用它兜底，而不是把请求打回 400 */
+const TTS_EMOTION_FALLBACK: Record<string, string> = { calm: "neutral", whisper: "neutral" };
+
+/** 过滤厂商不支持的情绪（返回 undefined = 不下发该字段）；没有白名单的模板保持原行为 */
+export function sanitizeTtsEmotion(templateId: string, emotion: string | undefined): string | undefined {
+  if (!emotion) return undefined;
+  const allow = TTS_EMOTION_WHITELIST[templateId];
+  if (!allow) return emotion;
+  if (allow.includes(emotion)) return emotion;
+  const fallback = TTS_EMOTION_FALLBACK[emotion];
+  const mapped = fallback && allow.includes(fallback) ? fallback : undefined;
+  log.warn(
+    "tts",
+    `当前 TTS 线路不支持情绪「${emotion}」，已${mapped ? `改用「${mapped}」` : "忽略该情绪"}（否则整句合成会 400 失败）`,
+  );
+  return mapped;
+}
+
 /** HTTP 状态错误（1317）：禁止 throw 裸对象，统一挂 status 的 Error（保栈、可被 classifyError 双信号分类）。 */
 export function httpStatusError(status: number, message: string): Error {
   const e = new Error(message);
@@ -125,6 +157,15 @@ interface UnifiedImageInput {
   seed?: number;
   format?: string;
 }
+
+/**
+ * TTS 全局默认值（唯一真源）。
+ * 配音缓存键（core/voice.ts 的 voiceFileName）必须用同一组默认值：否则「没标注语速」与
+ * 「显式标注 1.1」会算出两个文件名而重复计费，且改动默认值不会让旧缓存失效。
+ * 语速 1.1：官方默认 1.0 对中文朗读偏慢、像念字；格式 mp3：所有厂商都支持。
+ */
+export const DEFAULT_TTS_SPEED = 1.1;
+export const DEFAULT_TTS_FORMAT = "mp3";
 
 interface UnifiedTtsInput {
   text: string;
@@ -268,6 +309,67 @@ export function buildRequestBody(
     setByPath(body, path, evalValue(value, vars));
   }
   return body;
+}
+
+/** 模板 requestMap 里真正被引用的变量名（`$var` 与 `{ref:"var"}` 两种写法）。 */
+function consumedVarNames(template: AdapterTemplate): Set<string> {
+  const used = new Set<string>();
+  for (const value of Object.values(template.requestMap ?? {})) {
+    if (typeof value === "string") {
+      if (value.startsWith("$")) used.add(value.slice(1));
+    } else if (value && typeof value === "object" && "ref" in value && typeof value.ref === "string") {
+      used.add(value.ref);
+    }
+  }
+  return used;
+}
+
+/** TTS 线路「每句语速/情绪」对应的变量名（与 unifiedTts 的 vars 同源）。 */
+const TTS_LINE_VAR_NAMES = ["speed", "emotion"] as const;
+
+/**
+ * 找出「带了用户意图、但模板根本没引用」的 TTS 变量。
+ *
+ * 为什么需要：请求体只按 requestMap 构造（buildRequestBody），模板没写的键永远不会进请求体。
+ * 于是剧本里标注的每句语速/情绪，在未映射该字段的线路（如 dashscope-tts）上被**静默丢弃**——
+ * 用户在 UI 里拉语速、剧本里标情绪，成片却一个语速，日志里也找不到任何线索。
+ *
+ * 只报告「确实带了意图」的变量：emotion 非空即算；speed 只有偏离中性默认值（1.1）才算——
+ * 否则默认值本身就会在每条不支持 speed 的线路上刷告警（配音按句请求，一次运行上千条）。
+ */
+export function unconsumedTtsVars(template: AdapterTemplate, vars: Record<string, unknown>): string[] {
+  if (template.capability !== "tts") return [];
+  const used = consumedVarNames(template);
+  const dropped: string[] = [];
+  for (const name of TTS_LINE_VAR_NAMES) {
+    const value = vars[name];
+    if (value === undefined || value === null || value === "") continue;
+    if (name === "speed" && (typeof value !== "number" || value === DEFAULT_TTS_SPEED)) continue;
+    if (!used.has(name)) dropped.push(name);
+  }
+  return dropped;
+}
+
+/** 未消费变量告警去重：配音按句请求，同一模板一次运行会命中成百上千次，
+ *  不去重会把日志刷满同一句告警（真正的错误反而被淹没）。每个「模板+变量组合」只提醒一次。 */
+const warnedUnconsumedTtsVars = new Set<string>();
+
+/** 复位告警去重状态（仅测试用：否则同一进程内的后续用例看不到已发过的告警）。 */
+export function resetUnconsumedTtsWarnings(): void {
+  warnedUnconsumedTtsVars.clear();
+}
+
+function warnUnconsumedTtsVars(template: AdapterTemplate, dropped: string[]): void {
+  const key = `${template.id}:${dropped.join(",")}`;
+  if (warnedUnconsumedTtsVars.has(key)) return;
+  warnedUnconsumedTtsVars.add(key);
+  const labels: Record<string, string> = { speed: "每句语速", emotion: "每句情绪" };
+  const names = dropped.map((name) => labels[name] ?? name).join("、");
+  log.warn(
+    "api",
+    `当前 TTS 线路「${template.name || template.id}」不支持${names}，已忽略：该模板未映射 $${dropped.join(" / $")}。` +
+      "如需按句调节语速/情绪，请改用 MiniMax 语音等支持该参数的线路，或在自定义模板中补上厂商字段。",
+  );
 }
 
 /* ============ 结果解码 ============ */
@@ -796,6 +898,9 @@ async function callUnified(ctx: CallContext): Promise<UnifiedResult> {
   const base = normalizeProviderBaseUrl(cfg.baseUrl, (cfg.extra?.pathPrefix as string) || undefined);
   const url = joinUrl(base, template.endpoint.replace("{model}", String(vars.model ?? "")));
   const body = buildRequestBody(template, vars);
+  // 请求体只由 requestMap 决定：模板没引用的变量会被静默丢弃，这里显式告知（见 unconsumedTtsVars）。
+  const droppedTtsVars = unconsumedTtsVars(template, vars);
+  if (droppedTtsVars.length) warnUnconsumedTtsVars(template, droppedTtsVars);
   // B102：官方 OpenAI 图像通道不支持 response_format 字段，带上会 400 unknown_parameter，组装后剔除；
   // 中转站/其它线路仍需 b64_json 指定返回格式，保持原样。
   if (template.capability === "image" && isOfficialOpenAIImage(cfg) && "response_format" in body) {
@@ -974,12 +1079,16 @@ export async function unifiedTts(
       text: input.text,
       model: cfg.model,
       voice: input.voice,
-      format: (typeof extra.ttsFormat === "string" && extra.ttsFormat) ? extra.ttsFormat : input.format ?? "mp3",
+      format: (typeof extra.ttsFormat === "string" && extra.ttsFormat) ? extra.ttsFormat : input.format ?? DEFAULT_TTS_FORMAT,
       // 每句标注优先，其次全局配置；缺省语速 1.1（官方默认 1.0 对中文朗读偏慢、像念字）
-      emotion: typeof input.ttsEmotion === "string" && input.ttsEmotion
-        ? input.ttsEmotion
-        : typeof extra.emotion === "string" && extra.emotion ? extra.emotion : undefined,
-      speed: typeof input.speed === "number" ? input.speed : typeof extra.speed === "number" ? extra.speed : 1.1,
+      // 情绪还要过一遍厂商白名单：提示词/配置页允许的值不等于厂商支持的值（见 sanitizeTtsEmotion）
+      emotion: sanitizeTtsEmotion(
+        template.id,
+        typeof input.ttsEmotion === "string" && input.ttsEmotion
+          ? input.ttsEmotion
+          : typeof extra.emotion === "string" && extra.emotion ? extra.emotion : undefined,
+      ),
+      speed: typeof input.speed === "number" ? input.speed : typeof extra.speed === "number" ? extra.speed : DEFAULT_TTS_SPEED,
       vol: typeof extra.vol === "number" ? extra.vol : 1,
       pitch: typeof extra.pitch === "number" ? extra.pitch : 0,
     },

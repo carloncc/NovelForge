@@ -17,6 +17,15 @@ tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# #1549：reqwest 保持 0.12（直用）。核查报告 F6 提出的「升 0.13 消除双版本」经复核不成立：
+# Cargo.lock 里的 reqwest 0.13.4 是 tauri 的 target-gated 依赖（cfg(android | apple-non-macos)），
+# `cargo tree -i reqwest@0.13.4` 在 Windows/macOS/Linux 桌面目标上无输出 —— 桌面根本不编译它，
+# 因此不存在「第二个绕过加固的 HTTP 栈」。而升级 0.13 的代价是实打实的：0.13 已无 rustls-tls
+# 特性（改名 rustls），rustls 特性拉 aws-lc-rs（Windows 上需要 CMake，本机没有），
+# 另一条路 rustls-no-provider 要自装进程级 CryptoProvider 并把根证书来源从内置 webpki 换成
+# 系统信任库 —— 这些都无法用 cargo test 验证（单测不跑真实 TLS 握手）。
+# 结论：网络策略（SSRF/禁重定向/超时/64MB 上限）**只在 commands.rs 的 http_request 命令内生效**；
+# 谁升级版本，谁必须同步复核该前提（单测 outbound_http_only_through_hardened_clients 会拦住）。
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 tiny_http = "0.12"
 mime_guess = "2"

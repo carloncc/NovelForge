@@ -1,5 +1,5 @@
 import { join, normalize } from "node:path";
-import { isPathInside, validateProxyUrl } from "../vite.config";
+import { isPathInside, parseRangeHeader, previewRequestAllowed, validateProxyUrl } from "../vite.config";
 import { ProxyHttpError, webHttp } from "../src/utils/webRuntime";
 
 function assert(condition: boolean, message: string): void {
@@ -10,6 +10,26 @@ const base = normalize(join(process.cwd(), ".tmp-preview", "game"));
 assert(isPathInside(base, join(base, "index.html")), "a child path must be accepted");
 assert(!isPathInside(base, `${base}-sibling/index.html`), "a sibling sharing the same string prefix must be rejected");
 assert(!isPathInside(base, join(base, "..", "outside.txt")), "parent traversal must be rejected");
+
+// #1549：预览静态服务此前没有任何 Host/Origin 校验（与 Rust 预览服务器口径不一致）。
+// 这里只钉住闸门本身；真实的 403/206 端到端断言在 tests/unit-fix-security.ts 里直连端口验证。
+{
+  const PORT = 54321;
+  const req = (headers: Record<string, string>) => ({ headers, method: "GET" }) as never;
+  assert(previewRequestAllowed(req({ host: `127.0.0.1:${PORT}` }), PORT), "本机 Host 的顶层导航必须放行");
+  assert(!previewRequestAllowed(req({ host: `evil.com:${PORT}` }), PORT), "非本机 Host（DNS rebinding）必须拒绝");
+  assert(
+    !previewRequestAllowed(req({ host: `127.0.0.1:${PORT}`, origin: "https://evil.com" }), PORT),
+    "跨站 Origin 必须拒绝",
+  );
+  assert(
+    previewRequestAllowed(req({ host: `127.0.0.1:${PORT}`, referer: "http://127.0.0.1:5173/" }), PORT),
+    "应用页 Referer（Web 模式 window.open 预览）必须放行",
+  );
+  assert(parseRangeHeader("bytes=100-", 1000)?.join(",") === "100,999", "开区间 Range 必须解析到文件末尾");
+  assert(parseRangeHeader("bytes=-50", 1000)?.join(",") === "950,999", "后缀 Range 必须取尾部 N 字节");
+  assert(parseRangeHeader("bytes=5000-", 1000) === null, "越界 Range 必须退化成整文件 200");
+}
 
 assert(validateProxyUrl("https://api.example.com/v1").protocol === "https:", "HTTPS proxy targets must be accepted");
 assert(validateProxyUrl("http://127.0.0.1:11434/v1").hostname === "127.0.0.1", "local HTTP targets must remain available for Ollama");

@@ -11,7 +11,9 @@ jobs:
   # 质量门禁：PR / 主分支 / tag 都跑前端与 Rust 单测（构建发布前先过测试）
   test:
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    # 30 → 40 分钟：browser 层现在多跑 engine-check（真启 chromium 加载成品游戏，约 1-2 分钟），
+    # 而 playwright install --with-deps 在冷缓存上最多要 15 分钟，30 分钟余量不足。
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
@@ -58,12 +60,16 @@ jobs:
         run: pnpm test
         timeout-minutes: 15
 
-      # 浏览器端验收：装 Playwright 浏览器后跑 web-smoke / web-i18n-smoke / 懒加载缩略图 / 视觉守门
+      # 浏览器端验收：装 Playwright 浏览器后跑 web-smoke / web-i18n-smoke / 懒加载缩略图 / 视觉守门，
+      # 以及 engine-check（唯一验证「组装出的成品真能在 WebGAL 引擎里跑起来」的用例）。
+      # engine-check 的入参是 e2e-demo 产出的游戏目录：runner 先跑 pnpm test 里的 e2e-demo
+      # （置 NF_KEEP_E2E_DIR=1 保留目录），解析其 stdout 的「[5] 组装完成: <path>」再传给 engine-check。
+      # 所以本步骤隐含依赖「Fetch WebGAL engine template」已回填模板。
       - name: Install Playwright browsers
         run: pnpm exec playwright install --with-deps chromium
         timeout-minutes: 15
 
-      - name: Browser e2e tests
+      - name: Browser e2e tests (+ engine-check on assembled game)
         run: pnpm test:e2e
         timeout-minutes: 30
 

@@ -148,6 +148,33 @@ const OPTS = { cgPerChapter: 0, maxPerChapter: 0, styleAnchor: false } as const;
   eq(wx("3月3日"), "clear", "无天气线索→clear");
 }
 
+/* ---------- ⑤b 大小写与「入夜前」：LLM 生成的 bgPrompt 首字母大写极常见 ---------- */
+{
+  // 旧实现的正则没有 `i` 标志：大写 Night/NIGHT/Dusk/Morning/Rain/Snow 全部漏判，
+  // 于是「同一地点白天/夜里/雨雪天」被当成同一个桶共用一张背景（复用反而串图）。
+  const tod = (t: string, bg = ""): string => backgroundTimeOfDay(scene("x", "L", { time: t, bgPrompt: bg }));
+  const wx = (t: string, bg = ""): string => backgroundWeather(scene("x", "L", { time: t, bgPrompt: bg }));
+  eq(tod("", "Anime-style apartment at Night"), "night", "大写 Night 必须判 night");
+  eq(tod("", "NIGHT street, nobody around"), "night", "全大写 NIGHT 必须判 night");
+  eq(tod("", "school rooftop at Dusk"), "dusk", "大写 Dusk 必须判 dusk");
+  eq(tod("", "Morning light through the curtains"), "morning", "大写 Morning 必须判 morning");
+  eq(tod("nightfall"), "night", "nightfall 必须判 night（旧词表漏了它）");
+  eq(tod("", "under the streetlight"), "night", "streetlight 是夜间线索");
+  eq(tod("", "warm lamplight on the desk"), "night", "lamplight 是夜间线索");
+  eq(tod("破晓时分"), "morning", "破晓→morning");
+  // 「入夜前」语义是天还没黑（黄昏），旧实现裸匹配「入夜」判成 night → 黄昏与深夜共用一张图
+  eq(tod("入夜前"), "dusk", "入夜前→dusk（不是 night）");
+  eq(tod("入夜之前"), "dusk", "入夜之前→dusk（不是 night）");
+  eq(tod("入夜"), "night", "裸「入夜」仍是 night");
+  // 大小写 + 派生动词（`\brain\b` 匹配不到 rainy，必须显式列出）
+  eq(wx("", "Rainy schoolyard after class"), "rain", "大写 Rainy 必须判 rain");
+  eq(wx("", "SNOW falling on the empty yard"), "snow", "全大写 SNOW 必须判 snow");
+  // 桶键层面：Night / nightfall 必须同桶（同一场景不得因大小写被画两次）
+  const night = scene("s1", "A", { bgPrompt: "apartment at Night" });
+  const nightfall = scene("s2", "A", { bgPrompt: "apartment at nightfall" });
+  eq(backgroundBucketKey(night, "locationTimeWeather"), backgroundBucketKey(nightfall, "locationTimeWeather"), "Night 与 nightfall 必须同桶");
+}
+
 /* ---------- ⑥ 复用开启时「每章同地点上限」必须失效 ---------- */
 {
   const ch = { chapter: 0, title: "t", scenes: [scene("s1", "A"), scene("s2", "A"), scene("s3", "A"), scene("s4", "A")] } as unknown as ChapterScript;

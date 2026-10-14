@@ -19,6 +19,8 @@ import { minimaxVoiceLabel, voiceGenderOf } from "../core/minimaxVoices";
 import { useGenerateController } from "../stores/generate";
 import { confirmDialog, promptDialog } from "../composables/useConfirmDialog";
 import Disclosure from "./Disclosure.vue";
+import { shallowCopyCards, cardsSignature, cardsSyncDecision } from "./editCardsSync";
+import { detachSystemAudioTrack, shouldEndRecordingOnTrackEnded } from "./editCardsRecording";
 
 const props = defineProps<{ cards: ExtractionResult }>();
 const emit = defineEmits<{ saved: [cards: ExtractionResult] }>();
@@ -26,7 +28,26 @@ const emit = defineEmits<{ saved: [cards: ExtractionResult] }>();
 // 运行态：卡片保存/识别与管线并发会互相覆盖，操作前必须确认没有在跑的任务
 const { busy: pipelineBusy, assetBusy, queueRunning } = useGenerateController();
 
-const local = ref<ExtractionResult>(JSON.parse(JSON.stringify(props.cards)));
+/* ==================== 卡片本地副本 / 变更检测（F1 + F10） ====================
+ * 两件事必须一起改，它们互为前提：
+ *
+ * 1) 深拷贝改浅拷贝：旧实现 `JSON.parse(JSON.stringify(props.cards))` 是**真实的数据复制**，
+ *    而卡片里的 referenceImage 是内联 base64（单张可达数 MB），于是同一份 base64 在
+ *    projectState.lastResult.cards（reactive）与 local（reactive）各存一份，面板打开期间
+ *    常驻内存翻倍。
+ *
+ * 2) 整份 JSON.stringify 比对改「字段级签名」：旧实现每次 watch 触发都要对两份完整卡片
+ *    （含全部 base64）做 stringify，输入时每次按键都跑一遍，主线程明显卡顿。
+ *
+ * 签名里对 referenceImage 只取长度、绝不取内容：既能发现"参考图被换/被清"这类真实外部变更，
+ * 又不会把几 MB 的 base64 拉进字符串比较。
+ */
+/* 同步判定的纯函数（浅拷贝 / 字段级签名 / cardsSyncDecision）已抽到 ./editCardsSync.ts ——
+ * 它们原先写在本 `<script setup>` 里并被 `export`，而 script setup **不允许 ES module 导出**，
+ * dev server 与 vite build 会直接报错（vue-tsc 与单测都不编译 .vue，所以当时测试全绿）。
+ * 抽成 .ts 后组件与单测 import 同一份实现，测试不再依赖"同名镜像副本"。 */
+
+const local = ref<ExtractionResult>(shallowCopyCards(props.cards));
 const savedMsg = ref("");
 /** 提示级别：失败类消息（保存失败/识别失败/创建声音失败等）必须用错误色，不能一律绿色 */
 const savedMsgLevel = ref<"ok" | "err">("ok");
@@ -81,6 +102,9 @@ const invalidateScript = ref(false);
 const recordingChar = ref<string | null>(null);
 const recorderRef = ref<MediaRecorder | null>(null);
 const recordStreamRef = ref<MediaStream | null>(null);
+/** F3：getDisplayMedia 的原始流（含视频轨）。必须单独持有：音频轨进了 recordStreamRef，
+ *  视频轨只在这里，否则 stopRecordingNow 停不到它，屏幕采集会一直持续。 */
+const recordSourceStreamRef = ref<MediaStream | null>(null);
 const recordChunksRef = ref<Blob[]>([]);
 const recordingSec = ref(0);
 let recordTimer: number | undefined;
@@ -122,22 +146,32 @@ async function recognizeChar(c: CharacterCard): Promise<void> {
 // 但 deep watch 无法区分「外部改了 props」与「用户正在改 local」，会直接把用户尚未保存的
 // 卡片编辑整份覆盖掉（setSavedMsg("") 还会顺手抹掉「未保存」提示）。
 // 主因——视觉守门面板与卡片同 tab 同时挂载、守门的 in-place splice 触发本 watcher——已由
-// 拆成独立 tab 消除；这里保留「快照比对」作为兜底：只要 local 与上次同步的快照不一致，
+// 拆成独立 tab 消除；这里保留「签名比对」作为兜底：只要 local 与上次同步的签名不一致，
 // 就认定用户改过，此时不动 local，只更新基线并提示。
-let lastSyncedJson = JSON.stringify(props.cards);
+//
+// F1 修复：基线必须用**签名**而不是挂载时的 JSON 快照，而且保存成功后要主动同步基线。
+// 旧实现的问题：保存 → emit("saved", local.value) → 父组件把 props.cards 换成等价的新对象
+// （stores/generate.ts: projectState.lastResult.cards = cards）→ 引用变化必然触发本 watcher
+// → 拿"刚保存的内容"和"挂载时的旧内容"比 → 必然不同 → 走进冲突分支，用 err 级别（红色）
+// 覆盖掉刚刚的「已保存」提示。用户会以为保存失败（磁盘上其实已经写成功）。
+let lastSyncedSig = cardsSignature(props.cards);
+/** 保存成功后调用：把基线对齐到当前本地内容，使父组件回写不再被误判为"外部冲突" */
+function markSynced(): void {
+  lastSyncedSig = cardsSignature(local.value);
+}
 watch(
   () => props.cards,
   () => {
-    const nextJson = JSON.stringify(props.cards);
-    if (JSON.stringify(local.value) !== lastSyncedJson) {
+    const decision = cardsSyncDecision(props.cards, local.value, lastSyncedSig);
+    if (decision.action === "conflict") {
       // 有未保存编辑：保留用户改动，只更新基线，避免下次再被误判为「已同步」。
       // 提示用户自行决定是否用新数据覆盖（重新生成后保存仍以 local 为准）。
-      lastSyncedJson = nextJson;
+      lastSyncedSig = decision.sig;
       setSavedMsg(t("卡片有未保存的修改：已保留你的编辑，重新生成的结果需点「保存」才会覆盖"), "err");
       return;
     }
-    local.value = JSON.parse(nextJson);
-    lastSyncedJson = nextJson;
+    local.value = shallowCopyCards(props.cards);
+    lastSyncedSig = decision.sig;
     setSavedMsg("");
   },
   { deep: true },
@@ -233,13 +267,35 @@ async function onVoiceFile(e: Event): Promise<void> {
 /** 停止当前录音，释放媒体流与计时器（并清空引用，避免残留 inactive 实例被下一轮复用） */
 function stopRecordingNow(): void {
   if (recordTimer !== undefined) { window.clearInterval(recordTimer); recordTimer = undefined; }
+  // 先把 recorder 置为 inactive 再停轨：MediaStreamTrack.stop() 会同步派发 ended，
+  // 而 onRecordTrackEnded 的判据是 recorder.state === "recording"——不先置空的话，
+  // 取消/停止录音时这条 ended 会把「已取消录音」之类的提示覆盖成"系统共享已结束"。
   if (recorderRef.value && recorderRef.value.state !== "inactive") {
     try { recorderRef.value.stop(); } catch { /* 已停止 */ }
   }
   recorderRef.value = null;
+  for (const stream of [recordSourceStreamRef.value, recordStreamRef.value]) {
+    if (!stream) continue;
+    for (const track of stream.getTracks()) {
+      track.removeEventListener?.("ended", onRecordTrackEnded);
+    }
+  }
   recordStreamRef.value?.getTracks().forEach((track) => track.stop());
   recordStreamRef.value = null;
+  // F3：原始 getDisplayMedia 流单独持有——它的视频轨不在 recordStreamRef（那里只有音频轨），
+  // 只停 audioOnly 会留下一条一直在采集屏幕的视频轨（系统共享指示灯常亮 + 隐私 + CPU）。
+  stopAllTracks(recordSourceStreamRef.value);
+  recordSourceStreamRef.value = null;
 }
+
+/** 停掉一个媒体流的全部轨道（video 与 audio 都要停：getDisplayMedia 返回的是两轨） */
+function stopAllTracks(stream: MediaStream | null): void {
+  stream?.getTracks().forEach((track) => track.stop());
+}
+
+/* detachSystemAudioTrack / shouldEndRecordingOnTrackEnded 已抽到 ./editCardsRecording.ts ——
+ * 原先写在本 `<script setup>` 里并被 `export`，而 script setup 不允许 ES module 导出
+ * （dev server 与 vite build 会直接报错；vue-tsc 与单测都不编译 .vue，所以当时测试全绿）。 */
 
 /** 停止录音并等待 MediaRecorder 收尾：stop() 的最后一个 dataavailable 是异步派发的，
  *  立即读取 chunks 会拿到空数组（表现为「未录制到音频」，录音克隆功能实际不可用）。 */
@@ -254,6 +310,18 @@ function stopRecordingAndWait(recorder: MediaRecorder): Promise<void> {
       finish();
     }
   });
+}
+
+/* shouldEndRecordingOnTrackEnded 见 ./editCardsRecording.ts（同上一处：script setup 不能 export） */
+
+function onRecordTrackEnded(): void {
+  if (!shouldEndRecordingOnTrackEnded({ recordingChar: recordingChar.value, recorderState: recorderRef.value?.state ?? null })) return;
+  if (recordTimer !== undefined) { window.clearInterval(recordTimer); recordTimer = undefined; }
+  // 采集已结束，两条轨都停掉（幂等：已 ended 的轨再 stop 是空操作）
+  stopAllTracks(recordSourceStreamRef.value);
+  stopAllTracks(recordStreamRef.value);
+  recordSourceStreamRef.value = null;
+  setSavedMsg(t("系统共享已结束（录音已停止计时）：可点「停止并克隆」使用已录到的音频，或点「取消」放弃"));
 }
 
 /** 播放视频时点击录音：捕获系统正在播放的声音（共享屏幕/窗口音频），用于生成克隆音色 */
@@ -286,8 +354,11 @@ async function startSystemAudioRecording(card: CharacterCard): Promise<void> {
       stream.getTracks().forEach((track: MediaStreamTrack) => track.stop());
       throw new Error(t("未捕获到系统音频（请在选择共享内容时勾选「分享音频」）"));
     }
-    // 只要音频轨；视频轨仅供满足捕获要求，立即停止
-    const audioOnly = new MediaStream([audioTrack]);
+    // 只要音频轨；视频轨仅供满足捕获要求，立即停止（F3：这里此前只搬了 audio 轨，
+    // 视频轨再无人持有 → 永不停止，屏幕一直在被采集）
+    const { audioOnly, videoTrack } = detachSystemAudioTrack(stream);
+    // 原始流也留一份引用：异常路径与组件卸载时统一由 stopRecordingNow 停全部轨道
+    recordSourceStreamRef.value = stream;
     recordStreamRef.value = audioOnly;
     recordChunksRef.value = [];
     recordingChar.value = card.id;
@@ -296,6 +367,11 @@ async function startSystemAudioRecording(card: CharacterCard): Promise<void> {
     recorderRef.value = recorder;
     recorder.ondataavailable = (ev) => { if (ev.data.size) recordChunksRef.value.push(ev.data); };
     recorder.start();
+    // F3：用户在系统/浏览器自带的「停止共享」上结束采集时，音视频轨会一起 ended。
+    // 此前没有任何 onended 处理：界面仍显示"正在录音"、计时器一直加，用户只能手点「取消」。
+    // 这里同步结束录音状态（不自动克隆：分片可能不足 10 秒，交给用户决定）。
+    videoTrack?.addEventListener("ended", onRecordTrackEnded);
+    audioTrack.addEventListener("ended", onRecordTrackEnded);
     // 1401：赋值前先清旧 interval（防御性，避免残留计时器与新计时器叠加导致秒数双倍跳）。
     if (recordTimer !== undefined) { window.clearInterval(recordTimer); recordTimer = undefined; }
     recordTimer = window.setInterval(() => { recordingSec.value++; }, 1000);
@@ -458,6 +534,10 @@ async function save(): Promise<void> {
       // 保存回调的 warn 也是失败信号（错误路径抛异常，走下面的 catch）
       setSavedMsg(m, level === "warn" ? "err" : "ok");
     }, invalidateScript.value, !activeConfig("llm")?.apiKey);
+    // F1：先同步基线再 emit。父组件会把 props.cards 换成等价的新对象（引用变化必然触发
+    // deep watcher）；不先对齐基线，watcher 就会把这次自我回写当成"外部数据变了"，
+    // 用红色 err 提示覆盖掉刚显示的「已保存」。
+    markSynced();
     emit("saved", local.value);
   } catch (e) {
     setSavedMsg(t("保存失败：{error}", { error: errMsg(e) }), "err");
@@ -468,7 +548,9 @@ async function save(): Promise<void> {
 
 async function reset(): Promise<void> {
   if (!(await confirmDialog({ title: t("放弃所有未保存的修改，恢复为上次生成时的卡片？"), tone: "danger" }))) return;
-  local.value = JSON.parse(JSON.stringify(props.cards));
+  local.value = shallowCopyCards(props.cards);
+  // 放弃修改后本地内容与外部数据一致，基线也要对齐，否则下一次父组件回写会被误判为冲突
+  markSynced();
   setSavedMsg(t("已恢复为上次生成时的卡片"));
 }
 

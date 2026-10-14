@@ -247,27 +247,45 @@ NovelForge は**設定駆動のユニバーサルアダプターエンジン**�
 
 ## 開発とテスト
 
+以下のコマンドはすべてリポジトリのルートで実行します。**既定のゲートは 1 コマンドです：**
+
 ```bash
-# ユニット & E2E テスト（Node）
-npx tsx tests/unit-render.ts      # レンダリング注入境界
-npx tsx tests/unit-chapters.ts    # 章分割境界
-npx tsx tests/unit-cache.ts       # キャッシュ/再開の一貫性
-npx tsx tests/unit-tasks.ts       # 画像タスク構築
-npx tsx tests/unit-material.ts    # 素材優先マッチング
-npx tsx tests/unit-features.ts    # 紹介カード/表情/BGM/動画スロット
-npx tsx tests/unit-persist.ts     # 状態永続化
-npx tsx tests/unit-retry.ts       # API リトライ機構
-npx tsx tests/unit-dedupe.ts      # シーン id 重複排除
-npx tsx tests/unit-universal.ts   # ユニバーサルアダプターエンジン（全ベンダーテンプレート）
-npx tsx tests/unit-vfs.ts         # IndexedDB 仮想ファイルシステム
-npx tsx tests/e2e-demo.ts         # E2E パイプライン（サンプル小説）
-
-# 実機エンジン検証（ヘッドレスブラウザで生成ゲームをロード）
-npx tsx tests/engine-check.ts <プロジェクトディレクトリ>
-
-# Rust 側テスト（クロマキー切り抜き）
-cd src-tauri && cargo test
+pnpm test        # ユニットテスト（206 ファイル）+ オフライン E2E（1 ファイル）。ネットワーク・API キー不要
 ```
+
+### レイヤー
+
+| コマンド | 実行内容 | 追加要件 |
+|---|---|---|
+| `pnpm test` | ユニット（`tests/unit-*.ts`）+ オフライン E2E（`tests/e2e-demo.ts`） | なし |
+| `pnpm test:e2e` | 上記 **に加えて** ブラウザ E2E（`web-smoke`、`web-i18n-smoke`、`lazy-thumb-acceptance`、`visual-bible-acceptance`） | 事前に `pnpm exec playwright install` |
+| `pnpm test:all` | `test:e2e` と同じ（全レイヤー） | 同上 |
+
+ランナー（`scripts/run-tests.mjs`）はスキップしたレイヤーを**必ず明示的に出力**します（ブラウザ層が黙って緑になることはありません）。
+
+### CI ゲート
+
+`.github/workflows/build.yml` が PR / push ごとに実行します。PR を出す前にローカルでも実行してください：
+
+```bash
+pnpm exec vue-tsc --noEmit                                   # アプリの型チェック
+pnpm typecheck:tests                                         # テストの型チェック（必須ゲート）
+pnpm check:i18n                                              # i18n 辞書の完全性
+cargo test --manifest-path src-tauri/Cargo.toml              # Rust 側（クロマキー切り抜き・ファイル IO）
+```
+
+`tests/engine-check.ts`（ヘッドレスブラウザで生成ゲームを実際のエンジンに読み込む検証）は**自動ゲートに組み込まれました**。手動実行は不要です。
+
+### 単一ファイルのデバッグ
+
+反復作業ではテストファイルを直接実行するのが最短です：
+
+```bash
+npx tsx tests/unit-render.ts        # 任意の tests/unit-*.ts
+npx tsx tests/e2e-demo.ts           # オフライン E2E パイプライン
+npx tsx tests/engine-check.ts <プロジェクトディレクトリ>   # 手動（生成済みゲームに対して）
+```
+
 
 ## アーキテクチャ
 
@@ -287,7 +305,8 @@ cd src-tauri && cargo test
 └───────────────┬────────────────────────────┘
                 ▼ 標準 WebGAL プロジェクト
 ┌────────────────────────────────────────────┐
-│  WebGAL エンジン（MPL-2.0、改変なし）        │
+│  WebGAL エンジン（MPL-2.0、改変あり）        │
+│  改変内容は THIRD_PARTY_MODIFICATIONS.md    │
 │  プレビュー（内蔵）/ exe（Terre）/           │
 │  APK（公式ツール）                          │
 └────────────────────────────────────────────┘
@@ -326,7 +345,7 @@ cd src-tauri && cargo test
 
 ## クレジットとライセンス
 
-- [WebGAL](https://github.com/OpenWebGAL/WebGAL) —— ビジュアルノベルエンジン（MPL-2.0）、[THIRD_PARTY_NOTICE](./THIRD_PARTY_NOTICE) 参照
+- [WebGAL](https://github.com/OpenWebGAL/WebGAL) —— ビジュアルノベルエンジン（MPL-2.0）。同梱テンプレートは**改変済み**（音声中断の既定値、`index.html` の file:// 検出、UI スタイルの上書き）で、テンプレート直下に WebGAL の LICENSE を同梱しています。ファイル単位の改変一覧は [THIRD_PARTY_MODIFICATIONS.md](./THIRD_PARTY_MODIFICATIONS.md)、その他の表示は [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md)
 - NovelForge 本体は[GNU GPL v3](./LICENSE) ライセンス：自由に使用・改変・再配布できますが、改変版は同じライセンスでオープンソース化する必要があります
 - **エクスポートコンテンツ**：NovelForge で生成・エクスポートしたゲーム・シナリオ・小説・画像などのコンテンツは**あなたの所有物**であり、NovelForge のライセンスの対象外です
 - 公開作品には WebGAL の著作権表示を残す必要があります。ゲームコンテンツの著作権は作者に帰属します

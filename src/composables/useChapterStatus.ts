@@ -2,7 +2,7 @@ import { reactive } from "vue";
 import type { ApiConfig, ChapterScript, GenerationOptions, NovelDoc, PipelineResult } from "../core/types";
 import { chapterScopeImageTasks } from "../core/chapterAssets";
 import { buildVoiceJobs } from "../core/voice";
-import { scriptCacheRest, scriptFingerprint, titleHash, cardsFingerprint, isScriptPartFileName } from "../core/cache";
+import { scriptCacheRest, scriptFingerprint, titleHash, cardsFingerprint, isScriptPartFileName, readChapterKeys, chapterSceneIdsFor, chapterPositionFor, applyChapterKeySceneIds, type ChapterKeysFile } from "../core/cache";
 import { parseChapterScript } from "../core/dataValidation";
 import { readAssetMap } from "../core/assetMap";
 import { tauri } from "../utils/tauri";
@@ -161,6 +161,13 @@ export function useChapterStatus(input: ChapterStatusInput) {
     });
     const cacheDir = `${dir}/.novel2vn/cache`;
     const lang = (options.language ?? "").trim();
+    // 章节键映射（novel index → 位置 + 去重后 scene.id）：磁盘剧本缓存里存的是 novel index 与
+    // **去重前**的 scene.id，而 assets 映射的键是「重编号 + 跨章去重后」的。不按映射换算，
+    // 跨章共享场景卡（两章都有「教室」→ 都输出 s3）时本章会用 s3 去查映射，
+    // 命中的是**别章**的背景图 → imageDone >= imageTotal → 判本章"已完成" →
+    // 「顺序生成未完成章节」永不补这一章，成片里这一章沿用上一张背景。
+    const chapterKeys: ChapterKeysFile | null = await readChapterKeys(dir);
+    if (token !== refreshToken) return;
 
     // 各章节期望键（翻译感知）
     const expectedByIndex = new Map<number, string>();
@@ -244,6 +251,10 @@ export function useChapterStatus(input: ChapterStatusInput) {
           script = null;
         }
         if (script) {
+          // 先把磁盘剧本对齐到真实产出键（scene.id 按映射换算；无映射时原样返回）。
+          // 章节灯按 novel index 索引，但配音键里的章节号用的是**位置**，故还要 pos。
+          script = applyChapterKeySceneIds(script, chapterSceneIdsFor(chapterKeys, ch.index));
+          const pos = chapterPositionFor(chapterKeys, ch.index) ?? ch.index;
           // 图像覆盖率：只算本章自己的图（本章背景/CG ＋ 本章出场角色/物品），
           // 与「生成本章」的实际范围一致。旧实现把全书角色的三视图/立绘/动作都算进每一章，
           // 导致每章都是同一个大数字（如 76/91），看不出本章缺什么，还漏掉了物品。
@@ -275,7 +286,10 @@ export function useChapterStatus(input: ChapterStatusInput) {
           // 配音覆盖率：未配置 TTS（无 API Key）则跳过显示
           if (ttsUsable && characters.length) {
             try {
-              const jobs = buildVoiceJobs(ttsCfg, [script], characters as never);
+              // 配音键的章节号是**位置**（voice.ts 的 sceneVocalKey(chapter.chapter, …)），
+              // 磁盘剧本的 chapter 是 novel index：不换算的话，只要前面有停用章（序号≠index），
+              // 本章配音灯恒为 0/N，队列会反复重跑这一章。
+              const jobs = buildVoiceJobs(ttsCfg, [{ ...script, chapter: pos }], characters as never);
               light.voiceTotal = jobs.length;
               light.voiceDone = jobs.filter((j) => Boolean(assets.vocal[j.key])).length;
               light.voiceSkipped = false;

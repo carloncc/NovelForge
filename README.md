@@ -246,27 +246,45 @@ output-dir/
 
 ## Development & Testing
 
+Everything below runs from the repo root. **One command covers the default gate:**
+
 ```bash
-# Unit & end-to-end tests (Node)
-npx tsx tests/unit-render.ts      # render injection boundaries
-npx tsx tests/unit-chapters.ts    # chapter-split boundaries
-npx tsx tests/unit-cache.ts       # cache / resume consistency
-npx tsx tests/unit-tasks.ts       # image task building
-npx tsx tests/unit-material.ts    # material-first matching
-npx tsx tests/unit-features.ts    # intro cards / expressions / BGM / video slots
-npx tsx tests/unit-persist.ts     # state persistence
-npx tsx tests/unit-retry.ts       # API retry mechanism
-npx tsx tests/unit-dedupe.ts      # scene id dedup
-npx tsx tests/unit-universal.ts   # universal adapter engine (all vendor templates)
-npx tsx tests/unit-vfs.ts         # IndexedDB virtual filesystem
-npx tsx tests/e2e-demo.ts         # end-to-end pipeline (demo novel)
-
-# Real-engine check (loads the generated game in a headless browser)
-npx tsx tests/engine-check.ts <project-dir>
-
-# Rust-side tests (chroma-key cutout)
-cd src-tauri && cargo test
+pnpm test        # unit (206 files) + offline e2e (1 file); no network, no API key needed
 ```
+
+### Layers
+
+| Command | What it runs | Extra requirement |
+|---|---|---|
+| `pnpm test` | unit (`tests/unit-*.ts`) + offline end-to-end (`tests/e2e-demo.ts`) | none |
+| `pnpm test:e2e` | the above **plus** browser end-to-end (`web-smoke`, `web-i18n-smoke`, `lazy-thumb-acceptance`, `visual-bible-acceptance`) | `pnpm exec playwright install` first |
+| `pnpm test:all` | same as `test:e2e` (all layers) | same |
+
+The runner (`scripts/run-tests.mjs`) prints every skipped layer explicitly — a skipped browser layer is never silently green.
+
+### CI gates
+
+`.github/workflows/build.yml` runs these on every PR / push; run them locally before opening one:
+
+```bash
+pnpm exec vue-tsc --noEmit                                   # app typecheck
+pnpm typecheck:tests                                         # test typecheck (hard gate)
+pnpm check:i18n                                              # i18n dictionary completeness
+cargo test --manifest-path src-tauri/Cargo.toml              # Rust side (chroma-key cutout, file IO)
+```
+
+`tests/engine-check.ts` — the real-engine check that loads a generated game in a headless browser — is now **part of the automated gate**; it no longer needs to be run by hand.
+
+### Debugging a single file
+
+Any test file can also be run directly, which is the fastest loop while iterating:
+
+```bash
+npx tsx tests/unit-render.ts        # any tests/unit-*.ts
+npx tsx tests/e2e-demo.ts           # offline end-to-end pipeline
+npx tsx tests/engine-check.ts <project-dir>   # manual, against a generated project
+```
+
 
 ## Architecture
 
@@ -286,7 +304,8 @@ cd src-tauri && cargo test
 └───────────────┬────────────────────────────┘
                 ▼ standard WebGAL project
 ┌────────────────────────────────────────────┐
-│  WebGAL engine (MPL-2.0, unmodified)       │
+│  WebGAL engine (MPL-2.0, modified —     │
+│  see THIRD_PARTY_MODIFICATIONS.md)      │
 │  Preview (embedded) / exe (Terre) /        │
 │  APK (official tool)                       │
 └────────────────────────────────────────────┘
@@ -325,7 +344,7 @@ This software is provided "as is" without warranty of any kind. By using NovelFo
 
 ## Credits & License
 
-- [WebGAL](https://github.com/OpenWebGAL/WebGAL) — visual novel engine (MPL-2.0); see [THIRD_PARTY_NOTICE](./THIRD_PARTY_NOTICE)
+- [WebGAL](https://github.com/OpenWebGAL/WebGAL) — visual novel engine (MPL-2.0). The bundled engine template is **modified** by NovelForge (voice-interruption default, `index.html` file:// probe, UI stylesheets) and ships with WebGAL's LICENSE next to it — the per-file list is in [THIRD_PARTY_MODIFICATIONS.md](./THIRD_PARTY_MODIFICATIONS.md); other notices in [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md)
 - NovelForge itself is licensed under the [GNU GPL v3](./LICENSE) — free to use, modify, and redistribute; modified versions must be open-sourced under the same license
 - **Exported content**: the games, scripts, novels, images, and other content you generate or export with NovelForge belong to you and are not covered by NovelForge's license
 - Published works must retain the WebGAL copyright notice; game content belongs to the creator

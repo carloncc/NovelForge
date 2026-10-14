@@ -16,7 +16,7 @@ import { buildVoiceJobs, runVoiceJob } from "./voice";
 import { concurrencyFor } from "../stores/configMigration";
 import { tauri } from "../utils/tauri";
 import { updateAssetMap } from "./assetMap";
-import { cacheHit } from "./cache";
+import { cacheHit, alignChaptersToKeys, readChapterKeys } from "./cache";
 import { dedupeSceneIdsAcrossChapters } from "./pipeline";
 
 /** 单个素材重生成的共享上下文 */
@@ -451,12 +451,24 @@ export function imageTaskIdentity(task: ImageTask): string {
 export async function regenerateVoiceLine(ctx: RegenContext, key: string, isAborted?: () => boolean): Promise<string | null> {
   const tts = ctx.ttsCfg;
   if (!tts) return null;
-  const jobs = buildVoiceJobs(tts, ctx.chapters, ctx.cards.characters);
+  const jobs = buildVoiceJobs(tts, await alignedVoiceChapters(ctx), ctx.cards.characters);
   const job = jobs.find((j) => j.key === key);
   if (!job) return null;
   const path = await runVoiceJob(tts, job, cacheRootFor(ctx.outputDir), ctx.log, true, isAborted);
   if (path) await mergeVocal(ctx.outputDir, key, path);
   return path;
+}
+
+/**
+ * 把 ctx.chapters 对齐到产出键再建配音 job。
+ *
+ * 重启后 `ctx.chapters` 来自磁盘（chapter 是 novel index、scene.id 是去重前的），而 assets.json 里的
+ * 配音键是产出形态 —— 不对齐就会算出不存在的键：素材页点「重配」返回 null（按钮点了没反应）。
+ * 同一会话内（内存形态）由 alignChaptersToKeys 的覆盖判据识别为「已对齐」并原样返回。
+ */
+async function alignedVoiceChapters(ctx: RegenContext): Promise<ChapterScript[]> {
+  const keys = await readChapterKeys(ctx.outputDir);
+  return alignChaptersToKeys(ctx.chapters, keys);
 }
 
 /** 重新生成某个角色的全部配音（并发执行，无依赖）。返回成功与失败句数，供界面如实汇报 */
@@ -468,7 +480,7 @@ export async function regenerateCharacterVoice(
 ): Promise<{ count: number; failed: number }> {
   const tts = ctx.ttsCfg;
   if (!tts) return { count: 0, failed: 0 };
-  const jobs = buildVoiceJobs(tts, ctx.chapters, ctx.cards.characters).filter((j) => j.charId === charId);
+  const jobs = buildVoiceJobs(tts, await alignedVoiceChapters(ctx), ctx.cards.characters).filter((j) => j.charId === charId);
   const total = jobs.length;
   const concurrency = concurrencyFor(ctx.ttsCfg, "tts");
   let done = 0;

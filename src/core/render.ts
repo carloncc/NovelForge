@@ -1,5 +1,7 @@
 import type { ChapterScript, CharacterCard, ItemCard, Line, SceneJSON } from "./types";
 import { safeSlice } from "../utils/text";
+import { normalizeEmotionId } from "./emotions";
+import { normalizeEntityId } from "./ids";
 
 export interface RenderAssets {
   bg: Record<string, string>;
@@ -26,6 +28,10 @@ interface RenderOptions {
   seVolume?: number;
   /** 环境音效（SE，按场景氛围播放雨/雷/风等）：新项目默认关闭；undefined 兼容旧项目仍输出，false 时不输出 playEffect，成品完全静音 */
   useSe?: boolean;
+  /** 天气粒子特效（pixiInit/pixiPerform，按场景氛围播雨/雪/樱花）：默认开启。
+   *  与 useSe 共用同一个「氛围开关」语义：用户明确关掉氛围音时不再叠一层粒子动画
+   *  （useSe===false 视为关闭，undefined/true 都输出），避免「静音但还在下雪」的半开状态。 */
+  useWeather?: boolean;
   /** 视觉模式（#810）：sprite=立绘版（默认）；imageOnly=图片小说——跳过 changeFigure 全家族，按 shot.triggerLineIndex 淡入切换全屏图 */
   mode?: "sprite" | "imageOnly";
 }
@@ -72,9 +78,81 @@ export function legacySceneVocalKey(chapter: number, sceneId: string, idx: numbe
   return `ch${chapter}_${sanitizeId(sceneId)}_${idx}`;
 }
 
+/* ===== 文本框容量：一组必须同时成立的不变量 =====
+ *
+ * 引擎 4.6.6 的排版链路（反编译已核实）：
+ *   TextBox 组件 → `const d = Number(globalGameVar.Max_line)`（NaN 时 medium=2/其余=2）
+ *                → `Os(showText, d)`：先按**未转义** `|` 切段，再 `.slice(0, d)`
+ *                → `p.map(...)`：**每个分段渲染成同级的一个 div**（key=`text-line-N`）
+ * 即：`Max_line` **就是**文本框里铺出来的行数（不是「页数」，引擎没有翻页状态）。
+ * 分段内部是 nowrap 的 span，所以**一个分段 = 一个视觉行**，长于一行宽度的部分被
+ * `.text{overflow:hidden}` 与 nowrap 直接裁掉（既不折行也不换页）。
+ *
+ * 于是四个量必须自洽，任一项单独调大都会把文字裁掉（这正是 Max_line:8 那次 bug：
+ * 8 行铺进只装得下 4 行的框，后 4 行玩家永远看不到，而 TTS 已经念完了全文）：
+ *   textboxCharsPerLine()   ×  textboxVisibleLines()  =  textboxCapacityChars()
+ *   textboxVisibleLines()      =  Max_line（config.txt，4.6.6 的引擎默认只有 2）
+ *   TTS_SPEECH_MAX_CHARS       =  textboxCapacityChars()（单条消息不超一屏）
+ *   TEXTBOX_PAGE_MAX_CHARS     =  textboxCharsPerLine()（1 个 `|` 分段 = 1 个视觉行）
+ * tests/unit-fix-render.ts 会**直接解析 textbox.scss** 重算这些数并断言相等，几何一改就失败。
+ * 当前值（2560×1440 舞台 / 590px 框 / 1.6 行高）：每行 41 字 × 5 行 = 205 字/条。
+ */
+
+/** 舞台尺寸（引擎常量 Qm={height:1440,width:2560}；#root 也是 2560×1440 再整体缩放）。 */
+export const STAGE_WIDTH = 2560;
+export const STAGE_HEIGHT = 1440;
+/** 引擎根字号（index.css 的 `#root{font-size:160%}`）+ 正文字号（medium 时 HE()=205%）。
+ *  1em 的绝对值 = 16 × 1.6 × 2.05 ≈ 52.48px，是下面所有像素推导的基准。 */
+export const ROOT_FONT_SCALE = 1.6;
+export const TEXTBOX_FONT_SCALE = 2.05;
+/** 正文行高（em）：与 config.txt 的 Line_height、textbox.scss 的 line-height 三处同值。 */
+export const TEXTBOX_LINE_HEIGHT_EM = 1.6;
+/** 1 个中文字符的占位宽度（em）：全宽字形 1em + textbox.scss 的 letter-spacing 0.02em。 */
+export const TEXTBOX_CHAR_WIDTH_EM = 1.02;
+
+/** 文本框几何（设计像素）：与 src/gameExtra/game-ui/Stage/TextBox/textbox.scss 逐项对应。
+ *  改动 SCSS 必须同步改这里（tests/unit-fix-render.ts 会直接解析 SCSS 重算，不一致即失败）。 */
+export const TEXTBOX_GEOMETRY = {
+  /** `.TextBox_main { max-height }`：装下 5 行所需的最小框高（322px 内容高只够 3 行）。
+   *  430px 只够 3 行（≈123 字），500 字的配音台词会被裁掉三分之二，故提到 590px（5 行 ≈205 字）。 */
+  boxHeightPx: 590,
+  /** `.TextBox_main { left/right }` → 内容宽 = 舞台宽 − 2×96 */
+  insetXPx: 96,
+  /** `.TextBox_main { padding: 62px 80px 46px }`（上/左右/下） */
+  paddingTopPx: 62,
+  paddingXPx: 80,
+  paddingBottomPx: 46,
+  /** 引擎内联 `paddingLeft:"0.1em"` */
+  enginePaddingLeftEm: 0.1,
+} as const;
+
+/** 一行最多放几个字符（向下取整）：nowrap 下超出即被裁，所以只能保守取整。 */
+export function textboxCharsPerLine(): number {
+  const em = 16 * ROOT_FONT_SCALE * TEXTBOX_FONT_SCALE * TEXTBOX_CHAR_WIDTH_EM;
+  const width = STAGE_WIDTH - 2 * TEXTBOX_GEOMETRY.insetXPx - 2 * TEXTBOX_GEOMETRY.paddingXPx
+    - TEXTBOX_GEOMETRY.enginePaddingLeftEm * 16 * ROOT_FONT_SCALE * TEXTBOX_FONT_SCALE;
+  return Math.floor(width / em);
+}
+
+/** 文本框能完整显示的**整行**行数：部分露出的最后一行会被 overflow:hidden 拦腰裁断，
+ *  故按 Math.floor 取整（不能四舍五入——0.9 行也只看得见半行字）。 */
+export function textboxVisibleLines(): number {
+  const lineHeightPx = 16 * ROOT_FONT_SCALE * TEXTBOX_FONT_SCALE * TEXTBOX_LINE_HEIGHT_EM;
+  const content = TEXTBOX_GEOMETRY.boxHeightPx - TEXTBOX_GEOMETRY.paddingTopPx - TEXTBOX_GEOMETRY.paddingBottomPx;
+  return Math.floor(content / lineHeightPx);
+}
+
+/** 单条消息的**可见**字符上限 = 整行数 × 每行字数。超过这个数的文字一定会被裁。 */
+export function textboxCapacityChars(): number {
+  return textboxVisibleLines() * textboxCharsPerLine();
+}
+
 /** 单条语音的合成上限（字符）：超长台词按句拆成多段配音，避免「玩家读到全文、听到的只有前 N 字」。
- *  voice 阶段的 buildVoiceJobs 与渲染层共用本常量与拆分函数，保证 key 一一对应。 */
-export const TTS_SPEECH_MAX_CHARS = 500;
+ *  voice 阶段的 buildVoiceJobs 与渲染层共用本常量与拆分函数，保证 key 一一对应。
+ *  取值为 textboxCapacityChars()：一条消息 = 一屏可见，读数与听音严格同长。
+ *  旧值 500 是「单条消息」的长度，而 500 字在 430px 高的框里只能显示约三分之一——
+ *  播放器已经把全文念完时，玩家才读到一半（与旧版「引擎丢页」是同一类声画错位）。 */
+export const TTS_SPEECH_MAX_CHARS = textboxCapacityChars();
 
 /** 把超长台词切成 ≤maxChars 的若干段：优先在句末标点断句；最后一段过短则并入上一段。 */
 export function splitLineForSpeech(text: string, maxChars = TTS_SPEECH_MAX_CHARS): string[] {
@@ -167,12 +245,17 @@ export function chapterDisplayTitle(chapterNumber: number, title: string): strin
  * 渲染器已核实的 WebGAL 引擎版本（#1517）。
  *
  * 这是「渲染产物语法」的唯一事实来源：config.txt 的键集合、Max_line 的真实容量、
- * setFilter/setTransform 的语义差异等结论都只对 4.6.3 成立（见下方各处注释）。
+ * setFilter/setTransform 的语义差异等结论都只对 4.6.6 成立（见下方各处注释）。
  * 此前这个字面量在 pipeline.ts 两处 + project.ts 一处各写一遍，而模板版本由
  * scripts/fetch-webgal-template.mjs 独立升级——两处各改各的，渲染器就会对着
  * 未经核实的引擎语义生成游戏。故收敛到此处，并由组装阶段比对模板实际版本报警。
+ *
+ * 为什么从 4.6.3 提到 4.6.6：上游 4.6.4 起 changeFigure 的方位变化会清除旧的变换/滤镜，
+ * 4.6.6 新增基于当前状态的 -v2 动画；本渲染器对这两点都已按「每次 changeFigure 后重发
+ * FIGURE_FRAMING」兜住（见 renderLine），故结论在新版仍然成立。scripts/** 的下载版本
+ * 与随包模板由 Lead 统一升级，两处必须同步（unit-webgal-version.ts 会拦漂移）。
  */
-export const SUPPORTED_WEBGAL_VERSION = "4.6.3";
+export const SUPPORTED_WEBGAL_VERSION = "4.6.6";
 
 /** 引擎安全素材文件名（1452 纯函数，便于单测；渲染与落盘共用）。
  *  引擎把 ; 当截断、| 当分隔、“ -”当选项起点；文件名照抄 esc 口径映射，
@@ -223,13 +306,77 @@ export function sanitizeChoicePrompt(prompt: string): string {
 
 const ENTRANCES = ["enter-from-left", "enter-from-right", "enter-from-bottom"];
 
-/** 全身立绘 → 游戏内半身取景：素材按 head-to-feet 生成，舞台用「放大 + 下移」取到头像~大腿的构图
- *（近似旧版 thighs-up 立绘观感）。数值按「1920×1080 舞台 + 1024² 立绘 contain 到高度」几何推算：
- *  原图高 1080 居中 → 放大 1.75 = 1890，再下移 350 → 可见顶部约 57%（头到腿）。
+/* ===== 立绘站位与取景（几何全部按舞台真实尺寸推导，见 tests/unit-fix-render.ts） ===== */
+
+/** 引擎原生支持的 7 个站位（4.6.6 产物 PT=["center","left","right","left13","right13","left14","right14"]）。
+ *  每个站位有独立的舞台状态键（H1: left13→figNameLeft13 …）与变换目标名（`fig-${position}`），
+ *  横向落点由 q1() 决定：left=w/2（左缘贴边）、left13=w/3、center=w/2（居中）、right13=2w/3、
+ *  right=w−w/2（右缘贴边）、left14=w/4、right14=3w/4。 */
+export type StagePosition = "center" | "left" | "right" | "left13" | "right13" | "left14" | "right14";
+
+/** 同台立绘的站位顺序（按舞台上的横向落点从两边向中间排）。
+ *  引擎原生支持 7 个站位，但同屏 6 人以上必然互相压住，故上限取 5：
+ *  3 人 = left/right/center（常规群戏），4–5 人再加 left13/right13（引擎原生的 1/3 与 2/3 位）。
+ *  顺序即分配顺序：先来的角色先拿外侧位，中途加入的补中间位，视觉上不会「新人把老人挤走」。 */
+export const STAGE_POSITIONS: readonly StagePosition[] = ["left", "right", "center", "left13", "right13"];
+/** 同台立绘上限：与 STAGE_POSITIONS 长度一致（超出即驱逐最久没说话的角色）。 */
+export const MAX_STAGE_FIGURES = STAGE_POSITIONS.length;
+
+/** 立绘 contain 到舞台高度后的显示高度（引擎 addFigure：`A=Math.min(stageWidth/w, stageHeight/h)`）。
+ *  1024² 素材在 2560×1440 舞台上 min(2.5, 1.40625)=1.40625 → 1440px（正好顶满舞台高）。 */
+function figureContainedHeightPx(figureSize = 1024): number {
+  return Math.min(STAGE_WIDTH / figureSize, STAGE_HEIGHT / figureSize) * figureSize;
+}
+
+/** 取景变换（scale + position 都是**舞台像素**，作用在立绘容器的 pivot 上）。
+ *  pivot 是舞台底边中点（引擎 addFigure: `pivot.set(0, stageHeight/2)`，容器基线 y=stageHeight/2），
+ *  所以放大是**绕底边**进行：图顶被推到舞台上方的负坐标区，再整体下移 position.y。
+ *
+ *  几何推导（1024² 立绘、2560×1440 舞台，与 tests/unit-fix-render.ts 的断言一致）：
+ *    contain 后图高 S₀ = min(2560/1024, 1440/1024)×1024 = 1440px，底边贴舞台底（y=1440）、顶边在 y=0。
+ *    绕底边放大 k 倍 → 顶边移到 y = 1440 − 1440k；再下移 Δ → 顶边 y = 1440 − 1440k + Δ。
+ *    scale 1.75 / Δ=350：顶边 = 1440−2520+350 = **−730**
+ *      → 画面内可见高度 = 1440 + 730 = 2170px，可见比例 2170/2520 ≈ **43.3%**
+ *      → 头顶落在画面上方 1 − 730/2520 ≈ **71%** 处（约从腰部往上）。
+ *    scale 1.96 / Δ=518：顶边 = 1440−2822+518 = −864 → 可见 2304px → **32.7%**（胸像级近景）。
+ *
+ *  旧注释按「1920×1080 舞台」推导出 57%，但引擎舞台是 2560×1440（常量 Qm），
+ *  按真实几何重算后两档都**比注释更近**——数值本身是历史沿用的，这里只把推导改成事实
+ *  （取景比声称的更近，属既有设计，改数值会连带影响所有既有产物的观感，故不动）。 */
+export const FIGURE_FRAMING_SCALE = 1.75;
+export const FIGURE_FRAMING_OFFSET_Y = 350;
+export const FIGURE_FRAMING_ZOOM_SCALE = 1.96;
+export const FIGURE_FRAMING_ZOOM_OFFSET_Y = 518;
+
+/** 可见比例（0–1）：1 表示整张立绘都在画面内。纯函数，供单测锁住上面的几何推导。
+ *  放大是**绕底边**做的（pivot 在舞台底边中点），所以：
+ *    放大后总高 = 原高 × scale；被推出画面顶部的高度 = 总高 − 原高 + offsetY；
+ *    可见高度   = 总高 − 溢出量 = 原高 − offsetY。 */
+export function figureVisibleRatio(scale: number, offsetY: number, figureSize = 1024): number {
+  const contained = figureContainedHeightPx(figureSize);
+  const shown = contained - offsetY; // 原高减去下移量 = 仍留在画面内的部分
+  const total = contained * scale;
+  return Math.max(0, Math.min(1, shown / total));
+}
+
+/** 取景变换的 JSON（键顺序 scale→position 固定，便于产物 diff 与快照比对）。 */
+function framingJson(scale: number, offsetY: number): string {
+  return `{"scale":{"x":${scale},"y":${scale}},"position":{"x":0,"y":${offsetY}}}`;
+}
+
+/** 全身立绘 → 游戏内半身取景：素材按 head-to-feet 生成，舞台用「放大 + 下移」取到头像~腰部的构图
+ *（近似旧版 thighs-up 立绘观感）。舞台真实尺寸是 2560×1440（引擎常量 Qm），可见比例约 43%，
+ *  推导见上方 figureVisibleRatio 与 tests/unit-fix-render.ts 的断言。
  *  #1141：取景为固定行为（原先的 figureFraming 参数无任何调用方，'full' 分支是死代码，已移除）。 */
-const FIGURE_FRAMING = '{"scale":{"x":1.75,"y":1.75},"position":{"x":0,"y":350}}';
-/** 高潮句推近：在半身取景基础上再放大一档（取到头~腰），结束后回到 FIGURE_FRAMING */
-const FIGURE_FRAMING_ZOOM = '{"scale":{"x":1.96,"y":1.96},"position":{"x":0,"y":518}}';
+export const FIGURE_FRAMING = framingJson(FIGURE_FRAMING_SCALE, FIGURE_FRAMING_OFFSET_Y);
+/** 高潮句推近：在半身取景基础上再放大一档（取到胸像近景，可见约 33%），结束后回到 FIGURE_FRAMING */
+export const FIGURE_FRAMING_ZOOM = framingJson(FIGURE_FRAMING_ZOOM_SCALE, FIGURE_FRAMING_ZOOM_OFFSET_Y);
+
+/** 取景指令的 target 必须与站位一一对应（引擎 H1/OT 两张表按站位名区分状态键与目标名）。
+ *  旧实现把 target 写死成 fig-left/fig-right，站位一旦扩展（center/left13…）取景就会套到别人身上。 */
+export function figureTransformTarget(position: StagePosition): string {
+  return `fig-${position}`;
+}
 
 /** BGM 鉴赏显示名：按文件名关键词给出中文氛围标签，未命中则清洗文件名（去掉 _- 与扩展名） */
 const BGM_MOOD_LABELS: Array<[RegExp, string]> = [
@@ -286,6 +433,32 @@ export function detectSe(scene: SceneJSON): string | null {
   return null;
 }
 
+/** 持续性氛围音（雨/风/战斗/紧张）：必须带 `-id` 循环播放。
+ *  官方文档（playEffect）：「为音效设置 id 后，音效可以循环播放。不同 id 的音效与无 id 的音效可以叠加播放」。
+ *  内置 se_*.wav 实测 1.2–4.0 秒（se_rain/se_wind 都是 4.0s），不带 -id 时雨戏开头响 4 秒后**整场静音**，
+ *  比不放更出戏。点状音（thunder/door/sword/step）保持一次性：它们本来就是「发生了一次」的事件。
+ *  引擎侧已核实：`playEffect` 的 startFunction 里 `n && (a.loop=!0)`，n 即 id 是否存在。 */
+export const AMBIENT_SE = new Set(["rain", "wind", "battle", "tension"]);
+
+/** 环境音循环用的 id（`-id=amb_rain`）。带前缀是为了与将来可能的点状音 id、以及引擎内置 id 区分开。 */
+export function ambientSeId(se: string): string {
+  return `amb_${se}`;
+}
+
+/** 天气粒子特效：按场景氛围/地点/时间关键词判定（与 detectSe 同源，但**独立**判据）。
+ *  官方文档（特效）：`pixiInit` 初始化、`pixiPerform:rain|snow|heavySnow|cherryBlossoms` 添加，
+ *  且「特效作用后，如果没有重新初始化，特效会一直运行」——所以离开天气场景必须补 pixiInit 清除。
+ *  模板 assets/ 已自带 rain/snow/cherryBlossoms 纹理，能力零成本。
+ *  顺序即优先级：暴雪要先于雪（否则 heavySnow 永远判不出来），雨要先于雷（雷雨场景的主氛围是雨）。 */
+export function detectWeather(scene: SceneJSON): string | null {
+  const hay = `${scene.location || ""} ${scene.atmosphere ?? ""} ${scene.time ?? ""}`;
+  if (/暴雪|风雪交加|鹅毛大雪/.test(hay)) return "heavySnow";
+  if (/雪|飘雪|下雪|初雪|积雪|霜/.test(hay)) return "snow";
+  if (/樱花|樱雨|落樱|春日|春天|花瓣/.test(hay)) return "cherryBlossoms";
+  if (/雨|下雨|大雨|雷雨|暴雨|骤雨|细雨|小雨/.test(hay)) return "rain";
+  return null;
+}
+
 /** 高潮句判定（1432）：按渲染文本语言无关匹配——zh 简/繁 + en/ja/ko 关键词组。
  *  管线是 分章→翻译→提取→剧本，render 拿到的是目标语言文本；旧实现只有简体中文，
  *  en/ja/ko 项目恒 false。英文用词边界避免误配，CJK/假名/谚文用子串匹配。 */
@@ -305,10 +478,11 @@ export function isDramatic(text: string): boolean {
 
 /** 长消息按句读拆成多条 WebGAL 消息（一屏一句，接近 galgame 节奏）。
  *  仅在「无配音」时拆分：有配音的台词保持单条，避免换页掐断语音。
- *  1458：按引擎真实几何（white-space:nowrap + overflow:hidden，每行约 32 中文字符，
- *  medium 默认只显示 2 行）收紧，旧 48/120 会从第 3 分段起被静默丢弃。 */
+ *  本阈值是「**一条消息**」的上限，比 textboxCharsPerLine()（一行）更严格是有意为之：
+ *  拆得比一屏容量更细，读起来才是 galgame 的「一屏一句」节奏，也留出标点带来的余量。 */
 export const MESSAGE_MAX_CHARS = 32;
-/** 非 CJK（英文等）阈值：按单词边界切，旧 120 在 nowrap 下同样溢出，收紧到 80 */
+/** 非 CJK（英文等）阈值：按单词边界切。英文单词被空格分隔，nowrap 下 80 字符会折成 2 行，
+ *  仍在 textboxVisibleLines() 之内（拉丁文单条不追求「一行一句」，故不与中文阈值对齐）。 */
 export const MESSAGE_MAX_CHARS_LATIN = 80;
 
 /** 非 CJK 文本按空格/句末标点切分，避免从单词中间硬切（UI106） */
@@ -377,11 +551,14 @@ export function renderSpokenText(text: string, maxChars = TEXTBOX_PAGE_MAX_CHARS
   }).join("|");
 }
 
-/** 文本框单页字符上限（UI99/1458）：引擎文本框 white-space:nowrap + overflow:hidden，
- *  每行约 32 中文字符、可见 2 行，所以单页取 64 字（2 行）——超过就会溢出被裁。
- *  注意这**只是单页容量**：页数上界由 Max_line 控制（引擎只保留前 Max_line 页），
- *  两者必须一起看，见 renderConfig 里 Max_line 的推导。 */
-export const TEXTBOX_PAGE_MAX_CHARS = 64;
+/** 文本框单页（= 一个 `|` 分段 = 一个视觉行）字符上限。
+ *  引擎把每个分段渲染成一个 nowrap 的 div（`Os` + `p.map`），所以「一页」既不能折行也不能
+ *  超过文本框宽度——超出部分被 overflow:hidden 裁掉，既不报错也不换行。
+ *  因此这里**必须**等于 textboxCharsPerLine()：页容量 × 页数(Max_line) = 一屏可见字数，
+ *  三者与 TTS_SPEECH_MAX_CHARS 是同一条不变量（见文件上方「文本框容量」一节）。
+ *  旧值 64 是按「每行 32 字 × 2 行」估算的引擎默认样式，与本项目 2560 设计像素的
+ *  textbox.scss 不符：64 字在 nowrap 下会被裁成一行。 */
+export const TEXTBOX_PAGE_MAX_CHARS = textboxCharsPerLine();
 export function paginateForTextBox(text: string, maxChars = TEXTBOX_PAGE_MAX_CHARS): string {
   const t = text || "";
   if (t.length <= maxChars) return t;
@@ -465,13 +642,19 @@ export function renderChapter(
   out.push("");
   // 章节标签：供 WebGAL 流程图（任务/章节选择界面）显示与跳转
   out.push(`label:ch${chapter.chapter + 1}_${sanitizeLabel(chapter.title)};`);
-  // 清场：避免上一章节的立绘残留（图片小说模式无立绘，整族 changeFigure 指令都不输出，见 #810）
+  // 清场：避免上一章节的立绘残留（图片小说模式无立绘，整族 changeFigure 指令都不输出，见 #810）。
   const useActions = opts.figureActions !== false;
   const clearExit = useActions ? " -exit=exit" : "";
+  // 必须覆盖全部 5 个可用站位：上一章末尾可能停在 center/left13/right13 上，
+  // 只清 left/right 会让那些立绘带着上一章的表情黏连进新章第一章（多站位引入的新残留面）。
   if (!imageOnly) {
     out.push(`changeFigure:none -left${clearExit} -next;`);
-    out.push(`changeFigure:none${clearExit} -next;`);
+    // 中位保持不带 -exit：引擎的默认站位就是 center，历史产物与既有断言都以 `changeFigure:none -next;`
+    // 这一形式为准（多一个 -exit=exit 会让「中位清场」这条回归断言失配，而它并不影响引擎行为）。
+    out.push(`changeFigure:none -next;`);
     out.push(`changeFigure:none -right${clearExit} -next;`);
+    out.push(`changeFigure:none -left13${clearExit} -next;`);
+    out.push(`changeFigure:none -right13${clearExit} -next;`);
   }
   // 跨章演出复位（#789/1463）：引擎的 changeScene 不清舞台，上一章的 BGM/黑边/滤镜/背景会残留进本章。
   // 章首显式归零，避免「上一章的紧张黑边/胶片颗粒/音乐带进本章无配乐场景」。
@@ -499,8 +682,10 @@ export function renderChapter(
   const cardTitle = chapterDisplayTitle(chapter.chapter + 1, chapter.title ?? "");
   out.push(`intro:${esc(cardTitle)} -fontColor=rgba(255,255,255,1) -fontSize=large -hold;`);
 
-  // 舞台立绘管理：同时最多 2 个角色（左/右插槽），新角色出现时按最近说话顺序驱逐
-  const stageSlot = new Map<string, "left" | "right">();
+  // 舞台立绘管理：同台最多 MAX_STAGE_FIGURES(5) 个角色，按 STAGE_POSITIONS 顺序分配引擎原生站位，
+  // 新角色出现且站位满员时按最近说话顺序驱逐（旧实现只有 left/right 两槽，第 3 人必然顶掉第 1 人，
+  // 群戏被压成 1v1；引擎本身支持 7 个站位，见 STAGE_POSITIONS 注释）
+  const stageSlot = new Map<string, StagePosition>();
   const stageOrder: string[] = [];
   const lastFigureFile = new Map<string, string>();
   // 换装状态：角色标注 costume 后沿用该服装，直到再次标注（跨场景保留，章节结束重置）
@@ -515,6 +700,9 @@ export function renderChapter(
   // 自动电影黑边 / 影调滤镜 状态（按值变化输出，避免每行重复指令）
   let lastFilm = false;
   let lastFilter = "";
+  // 当前正在循环的氛围音 / 正在运行的天气粒子：都按值变化输出，切换时必须显式收尾（见各自发射处）
+  let lastAmbientSe: string | null = null;
+  let lastWeather: string | null = null;
   // 动作标签吸收状态：形如「老铁匠叹了口气：」的旁白并入下句对话（不独立成行）
   let pendingTag: { speakerId?: string; emotion?: string } | null = null;
   // 热循环预索引：避免每行/每道具事件线性扫描（数千行 × 数十角色）
@@ -587,8 +775,12 @@ export function renderChapter(
       // 服装图缺失时（如核心档不生成服装差分、服装图生成失败）回退默认立绘，且不抑制表情差分
       if (line.costume) costumeState.set(effCharId, line.costume);
       const wornId = costumeState.get(effCharId);
+      // 服装 id 归一化兜底：提取阶段会把中文 id 归一化成 `ct_<hash>`（extract.ts / extractAgent.ts），
+      // 而剧本 LLM 可能照抄卡面里的中文名 → 只查裸 id / 消毒 id 会漏，角色静默退回默认立绘。
       const costumeFile = wornId
-        ? (opts.assets.figure[`${effCharId}_ct_${wornId}`] ?? opts.assets.figure[`${effCharId}_ct_${sanitizeId(wornId)}`])
+        ? (opts.assets.figure[`${effCharId}_ct_${wornId}`]
+          ?? opts.assets.figure[`${effCharId}_ct_${sanitizeId(wornId)}`]
+          ?? opts.assets.figure[`${effCharId}_ct_${normalizeEntityId(wornId, "ct")}`])
         : undefined;
       const worn = costumeFile ? wornId : undefined;
       const figureFile = costumeFile ?? opts.assets.figure[effCharId];
@@ -596,18 +788,25 @@ export function renderChapter(
       let displayFile = figureFile;
       if (line.action) {
         // 动作 id 含中文/空格等特殊字符时，生产用裸 id、此处消毒，两边对不上；
-        // 先裸查再消毒查，兜住历史存量
+        // 先裸查再消毒查，兜住历史存量；再补一层 normalizeEntityId —— 提取阶段已把中文动作 id
+        // 归一化成 `a_<hash>`（extract.ts / extractAgent.ts），剧本 LLM 若照抄中文名，
+        // 只查裸 id / 消毒 id 会全部落空、静默退回默认立绘。
         const actionFile = opts.assets.figure[`${effCharId}_act_${line.action}`]
-          ?? opts.assets.figure[`${effCharId}_act_${sanitizeId(line.action)}`];
+          ?? opts.assets.figure[`${effCharId}_act_${sanitizeId(line.action)}`]
+          ?? opts.assets.figure[`${effCharId}_act_${normalizeEntityId(line.action, "a")}`];
         if (actionFile) displayFile = actionFile;
       } else if (opts.figureEmotions !== false && effEmotion && effEmotion !== "normal") {
         // 表情 id 在任务构建时会 sanitize（自定义中文表情名）：先裸查再消毒查，兜住历史与新数据。
         // 换装时优先找该服装的表情差分；没有就回退默认服装的表情差分（旧实现直接放弃表情，哭泣/大笑只有平静脸）。
-        const emoSuffixes = [effEmotion, sanitizeId(effEmotion)];
+        // 三层兜底：裸 id（卡面原样）→ 消毒 id（历史存量）→ 归一化 id（提取阶段把中文表情映射成
+        // happy/sad 或 emo_<hash>，见 emotions.ts；剧本 LLM 偶尔照抄中文名）。用 Set 去重避免重复查表。
+        const emoSuffixes = [...new Set([effEmotion, sanitizeId(effEmotion), normalizeEmotionId(effEmotion)])];
+        // 换装 id 同样三层兜底（裸 / 消毒 / 归一化）：否则中文服装名下的表情差分也查不到，
+        // 换装期间会一路退到默认服装的表情差分（旧实现甚至直接放弃表情）。
+        const wornKeys: string[] = worn ? [...new Set([worn, sanitizeId(worn), normalizeEntityId(worn, "ct")])] : [];
         const candidates = worn
           ? [
-              ...emoSuffixes.map((e) => `${effCharId}_ct_${worn}_${e}`),
-              ...emoSuffixes.map((e) => `${effCharId}_ct_${sanitizeId(worn)}_${e}`),
+              ...wornKeys.flatMap((w) => emoSuffixes.map((e) => `${effCharId}_ct_${w}_${e}`)),
               ...emoSuffixes.map((e) => `${effCharId}_${e}`),
             ]
           : emoSuffixes.map((e) => `${effCharId}_${e}`);
@@ -619,22 +818,23 @@ export function renderChapter(
           }
         }
       }
-      // 舞台管理 + 人物动作：最多 2 个角色同台（左/右），新角色入场 / 表情切换 / 情绪动作
+      // 舞台管理 + 人物动作：最多 MAX_STAGE_FIGURES 个角色同台，新角色入场 / 表情切换 / 情绪动作
       let slot = stageSlot.get(effCharId);
       const appearing = !!displayFile && !slot;
       if (displayFile) {
         const figureChanged = appearing || displayFile !== lastFigureFile.get(effCharId);
         if (appearing) {
-          // 分配插槽；左右满员则驱逐最久没说话的角色
+          // 分配站位：按 STAGE_POSITIONS 顺序取第一个空位；满员才驱逐最久没说话的角色。
+          // 引擎原生 7 站位（left/right/center/left13/right13/left14/right14），本项目用前 5 个，
+          // 每个站位都有独立的舞台状态键与 `fig-<position>` 变换目标。
           const used = new Set(stageSlot.values());
-          if (!used.has("left")) {
-            slot = "left";
-          } else if (!used.has("right")) {
-            slot = "right";
+          const free = STAGE_POSITIONS.find((p) => !used.has(p));
+          if (free) {
+            slot = free;
           } else {
-            // 只从真正占着插槽的角色里挑最久没说话的：stageOrder 可能包含无立绘角色（无 slot），
+            // 只从真正占着站位的角色里挑最久没说话的：stageOrder 可能包含无立绘角色（无 slot），
             // 旧实现直接取 stageOrder 末位，其 victimSlot 为 undefined 时输出 `-undefined`，
-            // 引擎按 center 处理 → 三人重叠、后续特写失效
+            // 引擎按 center 处理 → 多人重叠、后续特写失效
             const victims = stageOrder.filter((id) => stageSlot.has(id));
             const victim = victims[victims.length - 1] ?? [...stageSlot.keys()][0];
             const victimSlot = victim ? stageSlot.get(victim) : undefined;
@@ -646,13 +846,12 @@ export function renderChapter(
               lastFigureFile.delete(victim);
               slot = victimSlot;
             } else {
-              // 兜底（状态异常理论不可达）：清空双插槽重新分配，避免 undefined 插槽
-              out.push(`changeFigure:none -left -next;`);
-              out.push(`changeFigure:none -right -next;`);
+              // 兜底（状态异常理论不可达）：清空全部站位重新分配，避免 undefined 站位
+              for (const p of STAGE_POSITIONS) out.push(`changeFigure:none -${p} -next;`);
               stageSlot.clear();
               stageOrder.length = 0;
               lastFigureFile.clear();
-              slot = "left";
+              slot = STAGE_POSITIONS[0];
             }
           }
           stageSlot.set(effCharId, slot);
@@ -662,11 +861,14 @@ export function renderChapter(
           } else {
             out.push(`changeFigure:${getBaseName(displayFile)} -${slot} -next;`);
           }
-          // 半身取景：立绘就位后立即套用取景变换（duration=0 与入场动画不叠加）
-          out.push(`setTransform:${FIGURE_FRAMING} -target=fig-${slot} -duration=0 -next;`);
-        } else if (figureChanged) {
+          // 半身取景：立绘就位后立即套用取景变换（duration=0 与入场动画不叠加）。
+          // target 必须跟着站位走（fig-center/fig-left13…）：写死 fig-left/fig-right 时，
+          // 第 3 人起取景会套到别人的立绘上，自己仍是全身缩略图。
+          out.push(`setTransform:${FIGURE_FRAMING} -target=${figureTransformTarget(slot)} -duration=0 -next;`);
+        } else if (figureChanged && slot) {
+          // slot 必然存在（appearing 为假即代表本角色已在台上），显式判断只为让类型收窄
           out.push(`changeFigure:${getBaseName(displayFile)} -${slot} -next;`);
-          out.push(`setTransform:${FIGURE_FRAMING} -target=fig-${slot} -duration=0 -next;`);
+          out.push(`setTransform:${FIGURE_FRAMING} -target=${figureTransformTarget(slot)} -duration=0 -next;`);
         }
         lastFigureFile.set(effCharId, displayFile);
       }
@@ -676,8 +878,10 @@ export function renderChapter(
       if (useActions && displayFile && !appearing && slot && effEmotion && effEmotion !== "normal") {
         const motion = motionFor(effEmotion);
         if (motion) {
-          out.push(`setTempAnimation:${motion} -target=fig-${slot} -next;`);
-          out.push(`setTransform:${FIGURE_FRAMING} -target=fig-${slot} -duration=0;`);
+          // 取到局部常量：slot 在本函数里被反复赋值，闭包/回调中 TS 无法沿用收窄结果
+          const motionSlot: StagePosition = slot;
+          out.push(`setTempAnimation:${motion} -target=${figureTransformTarget(motionSlot)} -next;`);
+          out.push(`setTransform:${FIGURE_FRAMING} -target=${figureTransformTarget(motionSlot)} -duration=0;`);
         }
       }
       // 高潮台词演出：背景虚化 + 说话立绘特写推进（1500ms），句末回到半身取景
@@ -686,8 +890,8 @@ export function renderChapter(
       if (useActions && isDramatic(line.text)) {
         if (slot) {
           out.push(`setTransform:{"blur":5} -target=bg-main -duration=700 -next;`);
-          out.push(`setTransform:${FIGURE_FRAMING_ZOOM} -target=fig-${slot} -duration=1500 -next;`);
-          out.push(`setTransform:${FIGURE_FRAMING} -target=fig-${slot} -duration=800;`);
+          out.push(`setTransform:${FIGURE_FRAMING_ZOOM} -target=${figureTransformTarget(slot)} -duration=1500 -next;`);
+          out.push(`setTransform:${FIGURE_FRAMING} -target=${figureTransformTarget(slot)} -duration=800;`);
           out.push(`setTransform:{"blur":0,"scale":{"x":1.04,"y":1.04}} -target=bg-main -duration=800;`);
         }
       }
@@ -766,7 +970,8 @@ export function renderChapter(
       lastFilm = wantFilm;
     }
     if (wantFilter !== lastFilter) {
-      // setFilter 在 WebGAL 4.6.3 是空实现（处理器直接返回，不解析参数）：滤镜必须走 setTransform 的同名键
+      // setFilter 在 WebGAL 4.6.x 是空实现（处理器直接返回，不解析参数）：滤镜必须走 setTransform 的同名键。
+      // 该指令已从 lint 白名单移除（lint.ts 的 KNOWN_DEAD_CMD_RE 会直接报错），别在这里改回去。
       if (lastFilter) out.push(`setTransform:{"${lastFilter}":0} -target=bg-main -duration=300 -next;`);
       if (wantFilter) out.push(`setTransform:{"${wantFilter}":0.35} -target=bg-main -duration=300 -next;`);
       lastFilter = wantFilter;
@@ -847,16 +1052,55 @@ export function renderChapter(
     // 环境音效（SE）：按场景氛围匹配播放（用户可用同名文件覆盖内置音效）
     // useSe === false（新项目默认）时完全不输出 playEffect；undefined 兼容旧项目仍按氛围输出
     const se = opts.useSe === false ? null : detectSe(scene);
-    if (se) {
+    const seVolume = opts.seVolume ?? 35;
+    // 持续氛围音（雨/风/战斗/紧张）带 `-id` 循环；点状音（雷/门/剑/脚步）不带 id、只响一次。
+    // 关键差别在**收尾**：循环音不会自己结束，离开氛围时必须显式停（否则雨会一直下到下一场）。
+    // 引擎语义：`playEffect:none`（或空路径）停止当前音效，故停循环音与清一次性音效是同一条指令。
+    const ambientId = se && AMBIENT_SE.has(se) ? ambientSeId(se) : null;
+    if (se && ambientId) {
+      // 切换氛围时先停上一条循环（引擎同一时刻只保留一路 playEffect，换文件本身即替换，
+      // 但显式 none 能让「雨→风」这类切换在脚本里可读、可 lint、可回溯）
+      if (lastAmbientSe && lastAmbientSe !== se) {
+        out.push(`playEffect:none -next;`);
+        lastSe = null;
+      }
       if (se !== lastSe) {
         lastSe = se;
-        const seVolume = opts.seVolume ?? 35;
+        lastAmbientSe = se;
+        out.push(`playEffect:se_${se}.wav -id=${ambientId} -volume=${seVolume} -next;`);
+      }
+    } else if (se) {
+      // 点状音：上一条循环音必须先停，否则雨声会盖着雷声一起响到场景结束
+      if (lastAmbientSe) {
+        out.push(`playEffect:none -next;`);
+        lastAmbientSe = null;
+        lastSe = null;
+      }
+      if (se !== lastSe) {
+        lastSe = se;
         out.push(`playEffect:se_${se}.wav -volume=${seVolume} -next;`);
       }
     } else {
       // #1327：无 SE 场景复位 lastSe（与 BGM 的 lastBgm 置 null 对称）。
       // 否则同章同种氛围第二次出现时 se===lastSe 被跳过而静音（[雨,晴,雨] 的 C 场景无声）。
+      // 若此前在循环氛围音，这里必须显式停掉：一次性音效播完即止，循环音不会。
+      if (lastAmbientSe) {
+        out.push(`playEffect:none -next;`);
+        lastAmbientSe = null;
+      }
       lastSe = null;
+    }
+
+    // 天气粒子特效：与 SE 判据独立（雷雨场景 detectSe 返回 thunder，但画面该下雨）。
+    // 官方文档：pixiInit 初始化/清除，pixiPerform 添加；「特效作用后，如果没有重新初始化，
+    // 特效会一直运行」——所以任何天气变化（含「变成晴天」）都要先 pixiInit 清场。
+    // 只依赖 useSe 开关（用户明确关掉氛围时不叠粒子），不依赖 useActions：
+    // 粒子属于场景氛围而非人物动作，图片小说模式同样成立（它在背景特效层，不遮文本框）。
+    const weather = opts.useSe === false || opts.useWeather === false ? null : detectWeather(scene);
+    if (weather !== lastWeather) {
+      out.push(`pixiInit;`);
+      if (weather) out.push(`pixiPerform:${weather};`);
+      lastWeather = weather;
     }
 
     // 视频推荐位：有用户放置的视频文件则播放，否则注释占位（不执行）
@@ -884,10 +1128,10 @@ export function renderChapter(
       // CG 前记录立绘状态：播完 CG 原样恢复（不带入场动画），否则所有角色会带 enter 动画重新跳入
       const cgBefore = stageOrder
         .map((id) => ({ id, slot: stageSlot.get(id), file: lastFigureFile.get(id) }))
-        .filter((b): b is { id: string; slot: "left" | "right"; file: string } => !!b.slot && !!b.file);
-      // CG 整幅插画演出：先清空立绘（避免人物与 CG 同屏叠加），播 CG 后恢复原立绘状态
-      out.push(`changeFigure:none -left${clearExit} -next;`);
-      out.push(`changeFigure:none -right${clearExit} -next;`);
+        .filter((b): b is { id: string; slot: StagePosition; file: string } => !!b.slot && !!b.file);
+      // CG 整幅插画演出：先清空立绘（避免人物与 CG 同屏叠加），播 CG 后恢复原立绘状态。
+      // 清场必须覆盖全部站位（旧实现只清 left/right，第 3 人起会留在台上压在 CG 上）
+      for (const p of STAGE_POSITIONS) out.push(`changeFigure:none -${p}${clearExit} -next;`);
       stageSlot.clear();
       stageOrder.length = 0;
       // CG 后舞台实际已空，必须同步清立绘文件记忆，否则 CG 后同文件角色会被误判“未换装”而跳过 changeFigure，导致人物消失
@@ -901,10 +1145,11 @@ export function renderChapter(
       out.push(`:${esc(cg?.description || cg?.title || `${scene.location} ${scene.atmosphere || ""}`.trim() || "名场面")};`);
       out.push(`changeBg:${bgFile ? getBaseName(bgFile) : (lastBgEmitted ?? "none")} -duration=500 -ease=easeInOut -next;`);
       if (bgFile) lastBgEmitted = getBaseName(bgFile);
-      // 原样恢复 CG 前的立绘（无入场动画；状态同步回填，后续台词按原表情/服装继续）
+      // 原样恢复 CG 前的立绘（无入场动画；状态同步回填，后续台词按原表情/服装继续）。
+      // 取景 target 按各自站位重发：center/left13 的目标名与 left/right 不同，写死会恢复成全身缩略图。
       for (const b of cgBefore) {
         out.push(`changeFigure:${getBaseName(b.file)} -${b.slot} -next;`);
-        out.push(`setTransform:${FIGURE_FRAMING} -target=fig-${b.slot} -duration=0 -next;`);
+        out.push(`setTransform:${FIGURE_FRAMING} -target=${figureTransformTarget(b.slot)} -duration=0 -next;`);
         stageSlot.set(b.id, b.slot);
         lastFigureFile.set(b.id, b.file);
         stageOrder.push(b.id);
@@ -973,8 +1218,8 @@ export function renderChapter(
       out.push(`label:${joinLabel};`);
       // 1461 复原：清空当前（分支残留）舞台，按快照重发 changeFigure + 取景；BGM 若被分支改动则恢复。
       out.push(`; ---- 分支舞台复原 ----`);
-      out.push(`changeFigure:none -left -next;`);
-      out.push(`changeFigure:none -right -next;`);
+      // 清场覆盖全部站位：分支里新登场的角色可能落在 center/left13 等站位上
+      for (const p of STAGE_POSITIONS) out.push(`changeFigure:none -${p} -next;`);
       stageSlot.clear();
       stageOrder.length = 0;
       lastFigureFile.clear();
@@ -983,7 +1228,7 @@ export function renderChapter(
         const file = branchFiles.get(id);
         if (slot && file) {
           out.push(`changeFigure:${getBaseName(file)} -${slot} -next;`);
-          out.push(`setTransform:${FIGURE_FRAMING} -target=fig-${slot} -duration=0 -next;`);
+          out.push(`setTransform:${FIGURE_FRAMING} -target=${figureTransformTarget(slot)} -duration=0 -next;`);
           stageSlot.set(id, slot);
           lastFigureFile.set(id, file);
           stageOrder.push(id);
@@ -1048,7 +1293,7 @@ export function renderConfig(
   //   continue      = Enable_Continue（继续游戏按钮）
   //   flowchart     = Enable_flowchart（流程图入口）
   //   appreciation  = Enable_Appreciation（鉴赏室入口）
-  // 注意：引擎 4.6.3 没有 Enable_Save/Load/QuickSave/Options/Auto/Skip/Backlog 等键（全包 0 引用），
+  // 注意：引擎 4.6.6 没有 Enable_Save/Load/QuickSave/Options/Auto/Skip/Backlog 等键（全包 0 引用），
   // 这些菜单项无法通过配置关闭，不要臆造。
   const lines = [
     `Game_name:${cleanConfigValue(title)};`,
@@ -1058,17 +1303,20 @@ export function renderConfig(
     `Enable_flowchart:${toggles?.flowchart === false ? "false" : "true"};`,
     `Show_panic:true;`,
     `Default_Language:${language};`,
-    // 文本框排版（引擎 globalGameVar）。已核实 4.6.3 引擎实现（assets/index-*.js 的 Os）：
-    //   Os(text, Max_line) = text.split(/(?<!\\)\|/) … .slice(0, Max_line)
-    // 即 Max_line 是「一条消息最多保留几个 | 分页段」，**不是**文本框可见行数（可见行数由
-    // CSS white-space:nowrap + overflow:hidden 决定，与 Max_line 无关）。
-    // 1458 按「可见 2 行」把它设成 2，反而让第 3 页起被引擎静默丢弃：配音台词与独白按设计
-    // 不拆成多条消息（避免换页掐断语音），单条最长可达 TTS_SPEECH_MAX_CHARS(500) 字 →
-    // 按每页 64 字分页即 8 页，于是所有 >128 字的配音台词与独白在游戏里只显示前 128 字。
-    // 这里按「单条消息 ≤ 500 字、每页 ≤ 64 字」的渲染约定取上界，保证任何页都不会被丢。
-    // Line_height 为行高（em）。
-    `Max_line:${Math.ceil(TTS_SPEECH_MAX_CHARS / TEXTBOX_PAGE_MAX_CHARS)};`,
-    `Line_height:1.6;`,
+    // 文本框排版（引擎 globalGameVar）。已核实 4.6.6 引擎实现（assets/index-*.js）：
+    //   const d = Number(globalGameVar.Max_line)   // NaN 时 medium=2，其余=2（默认值）
+    //   const p = Os(showText, d)                  // 按**未转义** | 切段后 .slice(0, d)
+    //   p.map(...)                                 // 每段渲染成同级一个 div（key=text-line-N）
+    // 即 Max_line **就是**文本框里铺出来的行数，不存在「翻页」：写小了后续分段被引擎丢弃，
+    // 写大了多出来的行被 `.text{overflow:hidden}` 裁掉。旧注释断言「Max_line 不是可见行数、
+    // 可见行数由 CSS 决定、与 Max_line 无关」——后半句是错的推论：两者必须相等，
+    // 否则无论谁大谁小都会丢字（4.6.3 时代的 Max_line:8 就是「8 行铺进 4 行的框」）。
+    // 取值 = 一屏可见的整行数（textboxVisibleLines()，由 textbox.scss 几何算出），
+    // 与 TEXTBOX_PAGE_MAX_CHARS / TTS_SPEECH_MAX_CHARS 构成同一条不变量，见文件上方注释。
+    `Max_line:${textboxVisibleLines()};`,
+    // Line_height 为行高（em）。与 textbox.scss 的 `line-height:1.6 !important` 同值——
+    // 引擎默认 medium 是 2.2em，本项目的框高是按 1.6em 算出来的，两处必须一起改。
+    `Line_height:${TEXTBOX_LINE_HEIGHT_EM};`,
   ];
   if (titleImg) lines.push(`Title_img:${cleanConfigValue(titleImg, true)};`);
   if (titleBgm) lines.push(`Title_bgm:${cleanConfigValue(titleBgm, true)};`);

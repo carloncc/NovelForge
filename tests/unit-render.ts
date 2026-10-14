@@ -1,4 +1,4 @@
-import { esc, renderChapter, renderConfig, renderSpokenText, sanitizeId } from "../src/core/render";
+import { esc, renderChapter, renderConfig, renderSpokenText, sanitizeId, TEXTBOX_PAGE_MAX_CHARS } from "../src/core/render";
 import type { ChapterScript, ExtractionResult } from "../src/core/types";
 import type { RenderAssets } from "../src/core/render";
 
@@ -74,7 +74,10 @@ function main(): void {
   const outB = renderChapter(sB, { characters: cards.characters, items: cards.items, assets, introCard: false }, 1);
   assert(!outB.includes("[笑](laughing)"), "半角方括号会被引擎当注音语法，必须改全角");
   assert(outB.includes("［笑］"), "半角方括号应改写为全角");
-  assert(nonCommentLines(out1).length === 16, "行数异常（label+清场3+bgm复位+film复位2+章节标题卡+changeBg+推近+changeFigure+取景+2句+end；#1328 后黄昏/夜晚不再误配 playEffect）");
+  // 18 = label + 章首清场5（left/right/center/left13/right13：多站位后必须清全部可用站位）
+  //      + bgm复位 + film复位2 + 章节标题卡 + changeBg + 推近 + changeFigure + 取景 + 2句 + end
+  // （#1328 后黄昏/夜晚不再误配 playEffect；该场景无天气关键词，故不输出 pixiInit/pixiPerform）
+  assert(nonCommentLines(out1).length === 18, "行数异常（label+清场5+bgm复位+film复位2+章节标题卡+changeBg+推近+changeFigure+取景+2句+end）");
 
   // 2) 恶意角色名 → 不产生裸分号注入
   const s2 = makeScript();
@@ -309,9 +312,9 @@ function main(): void {
     // 字面竖线：必须转义（否则被引擎当分页符，后续段落被丢）
     assert(esc("a|b") === "a\\|b", `字面竖线必须转义: ${esc("a|b")}`);
     // 超长句：分页符必须是未转义的 |，且每页内部无未转义 |
-    // 注意 fixture 必须**超过** TEXTBOX_PAGE_MAX_CHARS(64)，否则 paginateForTextBox 按设计不分页
+    // 注意 fixture 必须**超过** TEXTBOX_PAGE_MAX_CHARS，否则 paginateForTextBox 按设计不分页
     const long = "城门前，守夜人林澈握着佩剑，目光如鹰隼般扫视着官道上渐行渐远的人流。他已经在城门口站了整整六个时辰，却始终没有等到那个约定之人，直到晨钟敲响才缓缓转身离去。";
-    assert(long.length > 64, "fixture 必须超过单页上限，否则该用例无效");
+    assert(long.length > TEXTBOX_PAGE_MAX_CHARS, "fixture 必须超过单页上限，否则该用例无效");
     const rendered = renderSpokenText(long);
     const pages = rendered.split("|");
     assert(pages.length >= 2, `超长句应分成多页，实际 ${pages.length}: ${rendered}`);

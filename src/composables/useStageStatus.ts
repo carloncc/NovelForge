@@ -1,9 +1,9 @@
 import { computed, reactive } from "vue";
-import type { ApiConfig, AssetMap, FailedTask, GenerationOptions, NovelDoc, PipelineResult, StageKey } from "../core/types";
+import type { ApiConfig, AssetMap, ChapterScript, FailedTask, GenerationOptions, NovelDoc, PipelineResult, StageKey } from "../core/types";
 import { STAGE_ORDER, STEP_TO_STAGE } from "../core/types";
 import { statusImageTasks, imageTaskHasAsset } from "../core/stageCascade";
 import { buildVoiceJobsOrEmpty } from "../core/voice";
-import { scriptCacheRest, scriptFingerprint, titleHash, cardsFingerprint } from "../core/cache";
+import { scriptCacheRest, scriptFingerprint, titleHash, cardsFingerprint, alignChaptersToKeys, readChapterKeys } from "../core/cache";
 import { tauri } from "../utils/tauri";
 import { parseAssetMap } from "../core/assetMap";
 
@@ -138,13 +138,13 @@ export function useStageStatus(input: StageStatusInput) {
     return statusImageTasks(result.chapters, result.cards, options).every((task) => imageTaskHasAsset(task, map));
   }
 
-  function allExpectedVoicesExist(map: AssetMap, result: PipelineResult, config: ApiConfig): boolean {
+  function allExpectedVoicesExist(map: AssetMap, result: PipelineResult, config: ApiConfig, chapters: ChapterScript[]): boolean {
     // 同上：无剧本时不判完成，避免「0 条配音也全绿」
-    if (!result.chapters.length) return false;
+    if (!chapters.length) return false;
     // #1427：音色库为空时 buildVoiceJobs 会 throw（#1139）；计数路径改用非抛出变体
     // （音色库清空也允许，config.ts:82），否则 refresh() 在最后一行抛异常，
     // base.voice 永不更新（配音灯不绿）且留下未处理 rejection。空库直接判「未完成」。
-    const jobs = buildVoiceJobsOrEmpty(config, result.chapters, result.cards.characters);
+    const jobs = buildVoiceJobsOrEmpty(config, chapters, result.cards.characters);
     if (!jobs.length) return false;
     return jobs.every((job) => Boolean(map.vocal[job.key]));
   }
@@ -212,7 +212,12 @@ export function useStageStatus(input: StageStatusInput) {
     if (token !== refreshToken) return;
     base.image = !options.useImage || Boolean(assets && result && allExpectedImagesExist(assets, result, options));
     const ttsConfig = input.getTtsConfig();
-    base.voice = !options.useTts || Boolean(assets && result && ttsConfig && allExpectedVoicesExist(assets, result, ttsConfig));
+    // 重启后 result.chapters 来自磁盘（chapter 是 novel index、scene.id 是去重前的），而 assets.json 的
+    // 配音键是产出形态 —— 必须先按 chapter-keys.json 对齐，否则已存在的配音被判缺失（配音灯不绿 +
+    // 诱导用户重复付费合成）。读不到映射时 alignChaptersToKeys 原样返回，退化成旧行为。
+    const voiceChapters = result ? alignChaptersToKeys(result.chapters, await readChapterKeys(dir)) : [];
+    if (token !== refreshToken) return;
+    base.voice = !options.useTts || Boolean(assets && result && ttsConfig && allExpectedVoicesExist(assets, result, ttsConfig, voiceChapters));
   }
 
   /** 失败集合：failedTasks（按 step 映射）∪ 日志最后一条为 error 的阶段 */

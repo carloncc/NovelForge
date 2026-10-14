@@ -1,5 +1,7 @@
-﻿import { tauri } from "../utils/tauri";
+import type { ChapterScript, NovelDoc } from "./types";
+import { tauri } from "../utils/tauri";
 import { cleanPath } from "../utils/path";
+import { log as logger } from "../utils/logger";
 
 export function cacheDirFor(cacheRoot: string, section: string): string {
   return cleanPath(`${cacheRoot}/${section}`);
@@ -148,6 +150,176 @@ export function scriptPartFileName(
 /** 是否为段缓存文件（整章缓存扫描必须排除它：它的 rest 带 part 前缀，按整章口径必判 stale，会误删断点） */
 export function isScriptPartFileName(name: string): boolean {
   return /^script(_demo)?_ch\d+_part\d+of\d+_.+\.json$/.test(name || "");
+}
+
+/* ==================== 骨架小说标记（剧本缓存兜底产物） ==================== */
+
+/**
+ * #1509 骨架小说：源文件与 split.json 都不可用时，用剧本缓存的章节标题+序号造出的占位正文。
+ *
+ * 为什么必须有显式标记：`restoreNovelFromScriptCache` 造的正文是
+ * 「（第 N 章：分章缓存缺失，仅保留章节骨架；可重新导入小说以恢复原文）」这类占位串，
+ * 但它和真原文在数据结构上完全一样。没有标记时，用户点「开始生成」会把占位串当成小说正文
+ * 送去做 AI 分章/提取/剧本（真实计费），并把 split.json 整份覆写成垃圾——
+ * 而 split.json 往往是原文正文的最后一处副本。原注释只写了「依赖原文的重新分章仍会提示重新导入」，
+ * 但仓库里没有任何判定，承诺从未落地。
+ *
+ * 标记用 NovelDoc 上的可选字段承载（types.ts 不在本次改动范围内，故在此声明该可选字段的形状；
+ * 待 types.ts 可改时把它并入 NovelDoc 即可，读写口径不变）。
+ */
+export type NovelDocWithSkeleton = NovelDoc & { skeleton?: boolean };
+
+/** 给小说打骨架标记（返回同一对象，便于链式使用） */
+export function markSkeletonNovel(novel: NovelDoc): NovelDoc {
+  (novel as NovelDocWithSkeleton).skeleton = true;
+  return novel;
+}
+
+/** 是否为骨架小说（正文是占位串，不是真原文）。任何依赖原文的生成都必须据此拦截。 */
+export function isSkeletonNovel(novel: NovelDoc | null | undefined): boolean {
+  return !!novel && (novel as NovelDocWithSkeleton).skeleton === true;
+}
+
+/** 骨架小说的拦截文案（管线与界面共用，保证口径一致） */
+export const SKELETON_NOVEL_MESSAGE =
+  "当前小说的正文是「分章缓存缺失」的占位骨架（不是原文），不能用于生成：请重新导入小说后再运行。";
+
+/* ==================== 章节键映射（novel index → 实际 scene/voice 键） ==================== */
+
+/**
+ * 管线只在内存里做「章节重编号 + 跨章场景 id 去重」（pipeline 的
+ * `chapters.forEach((c, i) => c.chapter = i)` 与 `dedupeSceneIdsAcrossChapters`），
+ * 而磁盘上的剧本缓存保存的是**novel index + 去重前的 scene.id**。
+ *
+ * 于是所有「从磁盘重新算键」的下游都会算错键：
+ *   - 素材页单句重配（regenerate.buildVoiceJobs 用恢复出来的 chapter.chapter 重建 job）→ 找不到 job，付费按钮点了没反应；
+ *   - 章节灯（useChapterStatus）用去重前的 id 查映射 → 命中**别章**的背景图，误判「本章已完成」，队列永不补这一章；
+ *   - 停用章剪枝保留集 → 与映射键口径不一致，停用再启用后缺背景/无配音。
+ *
+ * 根因是这份映射没有落盘。本文件负责把它读写为 `.novel2vn/chapter-keys.json`，
+ * 并导出「按映射改写 scene.id」的纯函数，供所有消费者统一取键。
+ */
+export interface ChapterKeysFile {
+  version: 1;
+  /** 生成这份映射时的小说指纹（源路径 + 各章正文哈希）：原文变了映射必须作废 */
+  novelFp: string;
+  /** 是否为演示模式（demo 与正式两套产物键空间不同，必须隔离） */
+  demo: boolean;
+  /** novel index → 该章在本次运行中的位置（0-based，即章节/配音键里的章节号） */
+  posByIndex: Record<string, number>;
+  /** novel index → 该章在内存里去重后的 scene.id 列表（顺序与场景一致） */
+  sceneIdsByIndex: Record<string, string[]>;
+  /** 位置 → 该位置的配音键全集（含长台词分段 _pN），供按键反查的消费者使用 */
+  vocalKeysByPos: Record<string, string[]>;
+  at: string;
+}
+
+export function chapterKeysFile(outputDir: string): string {
+  return cleanPath(`${outputDir}/.novel2vn/chapter-keys.json`);
+}
+
+/** 空映射（读不到文件时的安全默认值）：所有查询都退化为「按磁盘原样」 */
+export function emptyChapterKeys(): ChapterKeysFile {
+  return { version: 1, novelFp: "", demo: false, posByIndex: {}, sceneIdsByIndex: {}, vocalKeysByPos: {}, at: "" };
+}
+
+/**
+ * 读章节键映射：文件不存在返回 null（调用方按「无映射」退化），损坏返回 null 并 warn。
+ * 不抛错：它服务于界面灯具与素材页，读不出来只应退化成旧行为，不该让页面整块失败。
+ */
+export async function readChapterKeys(outputDir: string): Promise<ChapterKeysFile | null> {
+  try {
+    const file = chapterKeysFile(outputDir);
+    if (!(await tauri.pathExists(file))) return null;
+    const { text } = await tauri.readTextFile(file);
+    const parsed = JSON.parse(text) as Partial<ChapterKeysFile> | null;
+    if (!parsed || typeof parsed !== "object" || !parsed.posByIndex || typeof parsed.posByIndex !== "object") return null;
+    return {
+      version: 1,
+      novelFp: typeof parsed.novelFp === "string" ? parsed.novelFp : "",
+      demo: parsed.demo === true,
+      posByIndex: parsed.posByIndex as Record<string, number>,
+      sceneIdsByIndex: (parsed.sceneIdsByIndex ?? {}) as Record<string, string[]>,
+      vocalKeysByPos: (parsed.vocalKeysByPos ?? {}) as Record<string, string[]>,
+      at: typeof parsed.at === "string" ? parsed.at : "",
+    };
+  } catch (e) {
+    logger.warn("cache", "chapter-keys.json 解析失败，本次按「无映射」处理（键可能错位，重跑一次剧本阶段即可重建）", {
+      outputDir,
+      error: String(e).slice(0, 160),
+    });
+    return null;
+  }
+}
+
+export async function writeChapterKeys(outputDir: string, keys: ChapterKeysFile): Promise<void> {
+  await tauri.writeTextFile(chapterKeysFile(outputDir), JSON.stringify(keys, null, 2));
+}
+
+/** 取某章的落盘场景 id 列表（无映射时返回 undefined，调用方保持原样） */
+export function chapterSceneIdsFor(keys: ChapterKeysFile | null, novelIndex: number): string[] | undefined {
+  if (!keys) return undefined;
+  const ids = keys.sceneIdsByIndex?.[String(novelIndex)];
+  return Array.isArray(ids) ? ids : undefined;
+}
+
+/** 取某章在本次运行中的位置（配音/章节键里的章节号）；无映射返回 undefined */
+export function chapterPositionFor(keys: ChapterKeysFile | null, novelIndex: number): number | undefined {
+  if (!keys) return undefined;
+  const pos = keys.posByIndex?.[String(novelIndex)];
+  return Number.isInteger(pos) ? pos : undefined;
+}
+
+/**
+ * 按映射改写 scene.id（纯函数，不改入参）。
+ *
+ * 只按**顺序**替换，不按 id 值匹配：磁盘剧本里的 s3 与内存去重后的 s3_2 是同一场景，
+ * 位置是两者唯一可靠的对应关系（LLM 输出的场景顺序不会在去重时变化）。
+ * 数量不一致（映射比剧本旧/新）时整章放弃改写——宁可退化成旧行为，也不要错位覆盖，
+ * 那会把别章的背景图当成自己的（正是本映射要修的故障）。
+ */
+export function applyChapterKeySceneIds(
+  chapter: ChapterScript,
+  sceneIds: string[] | undefined,
+): ChapterScript {
+  if (!sceneIds || sceneIds.length !== chapter.scenes.length) return chapter;
+  return {
+    ...chapter,
+    scenes: chapter.scenes.map((scene, i) => (scene.id === sceneIds[i] ? scene : { ...scene, id: sceneIds[i] })),
+  };
+}
+
+/**
+ * 把「磁盘形态」的章节列表对齐到产出键（位置 + 去重后 scene.id）；不适用时**原样返回**。
+ *
+ * 为什么需要它：从磁盘恢复的剧本里 `chapter` 是 novel index、`scene.id` 是去重前的（LLM 每章都输出
+ * s1/s2…，去重后第 2 章的 s1 实际是 s1_2），而 `assets.json` 里的配音/图片键是**产出形态**。
+ * 直接用磁盘形态建 job 会算出不存在的键 → 素材页「重配」返回 null（点了没反应）、
+ * 看板把已存在的配音判成缺失（诱导用户重复付费合成）。
+ *
+ * 适用判据：`posByIndex` 必须覆盖**每一个** chapter 值。磁盘形态一定被覆盖（键就是 novel index）；
+ * 而已经对齐过的形态里 chapter 是位置，只要有停用章就会出现「某个位置值不在 posByIndex 里」的缺口，
+ * 此时整体放弃 —— 宁可退化成旧行为，也不要二次映射把键错到别章（那正是本映射要修的故障）。
+ */
+export function alignChaptersToKeys(
+  chapters: ChapterScript[],
+  keys: ChapterKeysFile | null,
+): ChapterScript[] {
+  if (!keys || !chapters.length) return chapters;
+  const covered = chapters.every((c) => Number.isInteger(keys.posByIndex?.[String(c.chapter)]));
+  if (!covered) return chapters;
+  // 恒等映射（位置 == novel index 且场景 id 也一致）时直接返回原数组，避免无谓的对象拷贝
+  const identity = chapters.every((c) => keys.posByIndex[String(c.chapter)] === c.chapter)
+    && chapters.every((c) => {
+      const ids = keys.sceneIdsByIndex?.[String(c.chapter)];
+      return !Array.isArray(ids) || (ids.length === c.scenes.length && ids.every((id, i) => id === c.scenes[i].id));
+    });
+  if (identity) return chapters;
+  return chapters.map((c) => {
+    const pos = chapterPositionFor(keys, c.chapter);
+    const aligned = applyChapterKeySceneIds(c, chapterSceneIdsFor(keys, c.chapter));
+    return pos === undefined || pos === c.chapter ? aligned : { ...aligned, chapter: pos };
+  });
 }
 
 /** 解析段缓存文件名（纯函数，供单测与断点扫描）：失败返回 null */

@@ -119,11 +119,24 @@ function main(): void {
   /* ---------- 3) 三份清单按使用集合出图 ---------- */
   {
     const alice = card({ imageUsage: { emotions: ["happy"], costumes: ["bikini"], actions: ["walk", "hold_phone"], chapters: 1 } });
+    // 【2026-10-13 修复：使用集合是**排序提示**而不是白名单】
+    // 旧断言 `normal,happy` 把「卡片里存在但上次统计没用过」的表情全部裁掉，后果是用户在卡片编辑里
+    // 新补的 sad/angry 永远不出图（哪怕剧本里已经标注了它们，渲染端只能回退默认立绘），且毫无提示。
+    // 现在口径：用过的按用量降序排在前，其余卡片表情接在后面，最后由档位预算裁剪——
+    // 主要角色表情预算不限，故这里是「normal + 用过的 happy + 卡片其余 10 个」。
+    // 「统计过且剧本一次没用 → 只留 normal」的省图口径**没有放宽**，见下面 analyzedEmpty 的断言。
     const emos = figureEmotionEntries(alice, { figureEmotions: true, detail: "full" }).map((e) => e.id);
-    assert(emos.join(",") === "normal,happy", `表情应只出 normal + 剧本用到的，实际 ${emos.join(",")}`);
-    assert(figureCostumeEntries(alice, { detail: "full", threeView: true }).map((c) => c.id).join(",") === "bikini", "服装应只出剧情真穿的");
+    assert(
+      emos.slice(0, 2).join(",") === "normal,happy",
+      `用过的表情必须排在最前（其余卡片表情接在后面），实际 ${emos.join(",")}`,
+    );
+    assert(emos.length === 11, `主要角色表情预算不限，应出卡片全量 + normal，实际 ${emos.length}`);
+    assert(emos.includes("sad") && emos.includes("angry"), "卡片里存在但上次没用过的表情也必须出图（否则用户后加的永远不构建）");
+    const costumes = figureCostumeEntries(alice, { detail: "full", threeView: true }).map((c) => c.id);
+    assert(costumes[0] === "bikini", `剧情真穿过的服装必须排在最前，实际 ${costumes.join(",")}`);
+    assert(costumes.length === 3, `主要角色服装预算不限，应出卡片全量，实际 ${costumes.join(",")}`);
     const acts = figureActionEntries(alice, { actions: true, threeView: true });
-    assert(acts.map((a) => a.id).join(",") === "walk,hold_phone", "动作应按剧本用量出图（不再取卡面前 2 个）");
+    assert(acts.map((a) => a.id).join(",") === "walk,hold_phone,stand,sit,run,sleep", `动作应按剧本用量在前、卡片其余在后，实际 ${acts.map((a) => a.id).join(",")}`);
     // 没有使用记录时退回旧行为：卡面前 2 个动作、卡片全量表情/服装
     const bare = card();
     assert(figureActionEntries(bare, { actions: true, threeView: true }).map((a) => a.id).join(",") === "stand,walk", "无使用记录时沿用卡面前 2 个动作");

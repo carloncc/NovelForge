@@ -1,7 +1,8 @@
-import type { CharacterCard, ExtractionResult, ItemCard, LoreCard } from "./types";
+import type { AssetMap, CharacterCard, ExtractionResult, ItemCard, LoreCard } from "./types";
 import { sanitizeId } from "./render";
 import { tauri } from "../utils/tauri";
 import { stripImageExt } from "../core/cache";
+import { updateAssetMap } from "./assetMap";
 
 interface CardsSaveResult {
   scriptCacheCleared: number;
@@ -41,6 +42,93 @@ interface CardSaveMutexState {
 
 export function shouldBlockCardSave(state: CardSaveMutexState): boolean {
   return state.saving || state.recognizing || state.voiceBusy || state.castBusy || state.recording;
+}
+
+/* ---------- 删除缓存文件时必须同步摘除 assets.json 映射 ---------- */
+
+/**
+ * 被删掉的缓存文件名 → assets.json 里的映射键（反向查表）。
+ *
+ * 为什么要反查而不是「文件名去掉 figure_ 前缀」：映射键与文件名**不同名**。
+ *   · 表情/默认立绘：键 = 任务 id（`alice` / `alice_happy`），文件名 = `figure_alice_happy.png`；
+ *   · 服装：键 = `alice_ct_bikini`，文件名 = `figure_alice_ct_bikini_normal.png`（**多一个 _normal**）；
+ *   · 动作：键 = `alice_act_wave`，文件名 = `figure_alice_act_wave.png`；
+ *   · 三视图：键 = `alice_threeview`，文件名 = `threeview_alice.png`；
+ *   · 物品：键 = 物品 id，文件名 = `item_<消毒 id>.png`。
+ * 直接按前缀拼会把服装键拼成 `alice_ct_bikini_normal`（错），而错误的键摘不掉真键——
+ * 于是文件没了、映射还指着它，看板/级联判定仍显示"已完成"（绿灯假象，用户点「补全缺失」也补不回来）。
+ * 故这里按「已知角色/物品 → 可能出现在映射里的全部键」逐一反查（纯函数，供单测）。
+ *
+ * 用**旧卡片**（保存前的卡片）算：被删掉的正是旧卡里那些角色/物品。
+ */
+export function assetKeysForDeletedFiles(
+  entries: readonly { name: string; isDir: boolean }[],
+  oldCards: Pick<ExtractionResult, "characters" | "items"> | null | undefined,
+): Set<string> {
+  const keys = new Set<string>();
+  if (!oldCards) return keys;
+  const figures = new Set<string>();
+  const threeviews = new Set<string>();
+  const items = new Set<string>();
+  for (const c of oldCards.characters ?? []) {
+    const sid = sanitizeId(c.id).toLowerCase();
+    // 角色 id 本身（默认立绘）与 threeview 任务 id
+    figures.add(String(c.id));
+    figures.add(`${c.id}_threeview`);
+    threeviews.add(`threeview_${sid}`);
+    for (const ct of c.costumes ?? []) {
+      figures.add(`${c.id}_ct_${ct.id}`);
+      figures.add(`${c.id}_ct_${sanitizeId(String(ct.id))}`);
+    }
+    for (const a of c.actions ?? []) {
+      figures.add(`${c.id}_act_${a.id}`);
+      figures.add(`${c.id}_act_${sanitizeId(String(a.id))}`);
+    }
+    for (const e of c.emotions ?? []) {
+      figures.add(`${c.id}_${e}`);
+      figures.add(`${c.id}_${sanitizeId(String(e))}`);
+    }
+  }
+  for (const i of oldCards.items ?? []) items.add(`item_${sanitizeId(i.id).toLowerCase()}`);
+  // 反向查表：文件名比映射键多出后缀（服装 `_normal`、换装期间的表情 `_ct_<服装>_<表情>`），
+  // 所以用「键是文件名的前缀且边界是 `_`」匹配，**长键优先**。
+  // 为什么不按「砍掉最后一段再看」：角色 id 自身可以含下划线（`hero_alt`），
+  // 逐个砍会先把 `figure_hero_alt_normal.png` 砍成 `hero`（另一个角色的键）而摘错。
+  // 长键优先则 `hero_alt` 先命中；同时 `hero` 也命中时一并摘掉也无害——
+  // 删除侧已有「存活角色前缀保护」，存活角色的文件根本不会被删。
+  const figureKeysByLength = [...figures].sort((a, b) => b.length - a.length);
+  for (const e of entries) {
+    if (e.isDir) continue;
+    const lower = e.name.toLowerCase();
+    const base = stripImageExt(lower);
+    if (lower.startsWith("figure_")) {
+      const candidate = base.slice("figure_".length);
+      for (const key of figureKeysByLength) {
+        if (candidate === key || candidate.startsWith(`${key}_`)) keys.add(key);
+      }
+    } else if (lower.startsWith("threeview_")) {
+      if (threeviews.has(base)) keys.add(`${base.slice("threeview_".length)}_threeview`);
+    } else if (lower.startsWith("item_")) {
+      if (items.has(base)) keys.add(base.slice("item_".length));
+    }
+  }
+  return keys;
+}
+
+/** 从映射里摘掉这些键（**不猜桶/别名**：只摘删除逻辑自己能证明属于被删文件的那部分） */
+function removeAssetKeys(assets: AssetMap, keys: ReadonlySet<string>): number {
+  let removed = 0;
+  const drop = (map: Record<string, string>): void => {
+    for (const key of keys) {
+      if (key in map) {
+        delete map[key];
+        removed++;
+      }
+    }
+  };
+  drop(assets.figure);
+  drop(assets.item);
+  return removed;
 }
 
 /**
@@ -145,6 +233,8 @@ export async function saveEditedCards(
       (cards.items ?? []).filter((i) => !deadItemIds.has(i.id)).map((i) => `item_${sanitizeId(i.id).toLowerCase()}`),
     );
     const baseNoExt = (name: string): string => stripImageExt(name);
+    /** 真正被删掉的文件名（用于反查映射键；只有删成功的才摘映射，删失败时映射必须留着） */
+    const deletedEntries: { name: string; isDir: boolean }[] = [];
     for (const e of entries) {
       if (e.isDir) continue;
       const lower = e.name.toLowerCase();
@@ -164,6 +254,29 @@ export async function saveEditedCards(
       if (dead) {
         await tauri.removePath(e.path).catch(() => {});
         imageCleared++;
+        deletedEntries.push({ name: e.name, isDir: false });
+      }
+    }
+    // 文件删了、映射还在 = 看板/级联仍判「已完成」（绿灯假象）：判定只看映射
+    // （stageCascade.imageTaskHasAsset / useStageStatus.allExpectedImagesExist），
+    // 于是用户点「补全缺失图片」也补不回来——缺失数算出来是 0。
+    // 故删除文件后必须同步摘除对应的映射键。
+    if (deletedEntries.length) {
+      try {
+        const deadKeys = assetKeysForDeletedFiles(deletedEntries, oldCards);
+        // updateAssetMap 内部自己读改写（并经串行链避免与其它写入者互相覆盖），
+        // 这里只在它的 mutate 里数一次真正摘掉的键数，不额外读一遍 assets.json。
+        let removed = 0;
+        await updateAssetMap(outputDir, (map) => {
+          removed = removeAssetKeys(map, deadKeys);
+        });
+        if (deadKeys.size > removed) {
+          log(`卡片已保存：${deletedEntries.length} 个图缓存已删，其中 ${deadKeys.size - removed} 个映射键本就不在 assets.json 里（无需摘除）`, "info");
+        }
+      } catch (e) {
+        // 映射写失败不能静默：文件已删而映射还指着它 → 看板会一直显示"已完成"。
+        // 如实告警并告诉用户怎么修（下一次保存卡片或跑一次图像阶段会重建映射）。
+        log(`卡片已保存，但 assets.json 映射摘除失败（看板可能仍显示已完成，请重跑一次图像阶段修正）：${String(e).slice(0, 120)}`, "warn");
       }
     }
   } catch {

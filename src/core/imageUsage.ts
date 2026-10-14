@@ -16,6 +16,8 @@
  */
 import type { ChapterScript, CharacterCard, CharacterImageUsage, ExtractionResult } from "./types";
 import { sanitizeId } from "./render";
+import { normalizeEntityId } from "./ids";
+import { normalizeEmotionId } from "./emotions";
 
 /** 单角色计数：使用次数 → id */
 type Counts = Map<string, number>;
@@ -37,6 +39,33 @@ function bump(counts: Counts, id: string): void {
   counts.set(id, (counts.get(id) ?? 0) + 1);
 }
 
+/**
+ * 剧本里写的 id → 候选 key 列表（按优先级）。
+ *
+ * 为什么要多个候选：卡片侧的 id 与剧本侧的写法**本来就不是同一口径**。
+ *   · 表情：卡片侧在提取阶段已归一化成英文 id（emotions.ts 的 normalizeEmotionId，
+ *     「微笑」→"happy"），而剧本 LLM 偶尔不守格式、把 emotion 直接写成中文；
+ *     旧实现两侧都用 sanitizeId 比较，「微笑」→"____" 与卡片里的 "happy" 不相等 →
+ *     该表情被 filter 丢掉 → figureEmotionEntries 永远不构建这张差分（表情静默消失）。
+ *   · 服装/动作：卡片侧走 normalizeEntityId(prefix)（extract.ts 的 "ct"/"a" 前缀），
+ *     中文 id 变成 `<prefix>_<hash>`；剧本侧此前用 sanitizeId（中文 → 一串下划线），同样对不上。
+ *
+ * 三个候选都保留：normalized 是新口径（先命中），raw 与 sanitized 兜住旧项目里
+ * 「卡片还存着原始中文 id」的存量数据（render.ts 的裸查/消毒查也是这个思路）。
+ * 统计阶段对**每个候选各记一票**：到底哪个形态才是卡片里真正存在的 key，
+ * 只有到 collectCharacterImageUsage 查卡片时才知道，这里不预判；多记的形态不会被采用。
+ */
+function usageIdCandidates(kind: "emotion" | "costume" | "action", raw: string): string[] {
+  const text = String(raw ?? "").trim();
+  if (!text) return [];
+  const normalized = kind === "emotion" ? normalizeEmotionId(text) : normalizeEntityId(text, kind === "costume" ? "ct" : "a");
+  const out: string[] = [];
+  for (const candidate of [normalized, text, sanitizeId(text)]) {
+    if (candidate && !out.includes(candidate)) out.push(candidate);
+  }
+  return out;
+}
+
 /** 统计一份剧本里各角色的表情/服装/动作使用次数（纯函数，供单测） */
 export function countCharacterUsage(chapters: ChapterScript[]): Map<string, { emotions: Counts; costumes: Counts; actions: Counts }> {
   const out = new Map<string, { emotions: Counts; costumes: Counts; actions: Counts }>();
@@ -44,9 +73,16 @@ export function countCharacterUsage(chapters: ChapterScript[]): Map<string, { em
     const id = line?.characterId;
     if (!id) return;
     const rec = out.get(id) ?? { emotions: new Map(), costumes: new Map(), actions: new Map() };
-    if (line!.emotion) bump(rec.emotions, sanitizeId(String(line!.emotion)));
-    if (line!.costume) bump(rec.costumes, sanitizeId(String(line!.costume)));
-    if (line!.action) bump(rec.actions, sanitizeId(String(line!.action)));
+    // 每个候选形态各记一票：卡片里到底存的是哪一种（新口径的归一化 id，还是旧项目的原始中文 id）
+    // 只有到 collectCharacterImageUsage 查卡片时才知道，这里不预判。
+    // 多记的形态不会被采用——toOrderedIds 只保留「卡片里确实存在」的 key；
+    // 同一形态在同一行里只记一次（候选列表已去重），用量降序不会被虚高带偏。
+    const bumpAll = (counts: Counts, kind: "emotion" | "costume" | "action", raw?: string): void => {
+      for (const candidate of usageIdCandidates(kind, String(raw ?? ""))) bump(counts, candidate);
+    };
+    if (line!.emotion) bumpAll(rec.emotions, "emotion", line!.emotion);
+    if (line!.costume) bumpAll(rec.costumes, "costume", line!.costume);
+    if (line!.action) bumpAll(rec.actions, "action", line!.action);
     out.set(id, rec);
   };
   for (const chapter of chapters) {
@@ -71,6 +107,25 @@ function toOrderedIds(counts: Counts | undefined, known: Map<string, string>): s
     .map(([id]) => known.get(id)!);
 }
 
+/**
+ * 卡内某项（表情值 / 服装 / 动作）→ 它在使用集合里可能出现的所有形态。
+ *
+ * 返回值第一个是**卡片自己的 id**（新口径：提取阶段已归一化），后面是 raw 与 sanitizeId 形态，
+ * 兜住旧项目里「卡片还存着原始中文 id」的存量数据——那时剧本侧与卡片侧都是 sanitizeId，
+ * 只保留归一化形态会让这些角色的使用集合整体变空（下游按「剧本确实没用过」处理 → 差分全丢）。
+ */
+function knownKeysOf(kind: "emotion" | "costume" | "action", id: string): string[] {
+  const text = String(id);
+  // 空 id 直接丢弃：sanitizeId("") 返回 "unnamed"，留着会凭空造出一个叫 unnamed 的别名，
+  // 让剧本里恰好叫 unnamed 的项错误地映射到这张空卡上。
+  if (!text.trim()) return [];
+  const out: string[] = [];
+  for (const candidate of [text, ...usageIdCandidates(kind, text), sanitizeId(text)]) {
+    if (candidate && !out.includes(candidate)) out.push(candidate);
+  }
+  return out;
+}
+
 /** 统计每个角色的使用集合（**每个角色都有一条**，含"统计过但一次没用"的空记录；纯函数，供单测） */
 export function collectCharacterImageUsage(
   chapters: ChapterScript[],
@@ -80,26 +135,29 @@ export function collectCharacterImageUsage(
   const out = new Map<string, CharacterImageUsage>();
   for (const card of cards.characters ?? []) {
     const rec = raw.get(card.id);
-    // 卡内 id → 消毒后的 key（文件名用的就是消毒后的形态）
-    const known = (list: { id: string }[] | undefined): Map<string, string> => {
+    // 卡内 id → 该 id 的**全部可能形态**都指向卡片自己的 id。
+    // 于是剧本写「微笑」还是 "happy"、写「拔剑」还是 "a_xxx"，都能落到同一张差分上。
+    const known = (kind: "costume" | "action", list: { id: string }[] | undefined): Map<string, string> => {
       const m = new Map<string, string>();
       for (const item of list ?? []) {
-        const key = sanitizeId(String(item.id));
-        if (key && !m.has(key)) m.set(key, String(item.id));
+        for (const key of knownKeysOf(kind, String(item.id))) {
+          if (!m.has(key)) m.set(key, String(item.id));
+        }
       }
       return m;
     };
     const emoKnown = new Map<string, string>();
     for (const e of card.emotions ?? []) {
-      const key = sanitizeId(String(e));
-      if (key && !emoKnown.has(key)) emoKnown.set(key, String(e));
+      for (const key of knownKeysOf("emotion", String(e))) {
+        if (!emoKnown.has(key)) emoKnown.set(key, String(e));
+      }
     }
     // 没有台词记录的角色也要写一条空记录：否则下游无法区分
     // 「剧本确实没用过」与「剧本阶段还没统计」，只能回退卡片全量 → 白出图。
     out.set(card.id, {
       emotions: toOrderedIds(rec?.emotions, emoKnown),
-      costumes: toOrderedIds(rec?.costumes, known(card.costumes)),
-      actions: toOrderedIds(rec?.actions, known(card.actions)),
+      costumes: toOrderedIds(rec?.costumes, known("costume", card.costumes)),
+      actions: toOrderedIds(rec?.actions, known("action", card.actions)),
       chapters: chapters.length,
     });
   }

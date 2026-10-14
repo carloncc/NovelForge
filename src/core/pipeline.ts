@@ -32,7 +32,19 @@ import type { AiSplitOptions, SplitStats } from "./split";
 import { generateImages } from "./images";
 import { generateVoice, vocalKeysForChapters } from "./voice";
 import { assembleProject, gameKeyFor } from "./project";
-import { cacheDirFor, titleHash, scriptCacheRest, scriptCacheFileName, scriptFingerprint, cardsFingerprint, isScriptPartFileName } from "./cache";
+import {
+  cacheDirFor,
+  titleHash,
+  scriptCacheRest,
+  scriptCacheFileName,
+  scriptFingerprint,
+  cardsFingerprint,
+  isScriptPartFileName,
+  writeChapterKeys,
+  isSkeletonNovel,
+  SKELETON_NOVEL_MESSAGE,
+  type ChapterKeysFile,
+} from "./cache";
 import { attachCharacterImageUsage, imageUsageReport } from "./imageUsage";
 import { resolveProjectTitle } from "./title";
 export { titleHash, scriptCacheRest, scriptCacheFileName };
@@ -176,6 +188,20 @@ function normalizeTitle(title: string): string {
   return (title || "").trim().replace(/\s+/g, "").toLowerCase();
 }
 
+/**
+ * 把小说指纹写进**内存**卡片对象（导出以便单测直接钉住）。
+ *
+ * 为什么必须落到对象上而不是序列化时现拼：卡片对象会被多条路径整份写盘
+ * （提取写盘、剧本使用情况写回 cards.json、组装阶段覆写 cards.json），
+ * 任何一条忘记带上 _novelFp，下一次运行就会把整本重新提取（付费）+ 重画立绘。
+ * 字段放在对象上，写盘路径无论怎么写都保留它。
+ */
+export function setCardsNovelFp<T extends object>(cards: T | undefined | null, novelFp: string | undefined): T | undefined {
+  if (!cards || !novelFp) return cards ?? undefined;
+  (cards as T & { _novelFp?: string })._novelFp = novelFp;
+  return cards;
+}
+
 /** 分章入口：有 LLM 用 AI 分章，无 LLM 用规则回退（调用方据此记录分章来源） */
 export type SplitMethod = "ai" | "fallback";
 async function splitNovelForPipeline(
@@ -302,8 +328,18 @@ export function pruneAssetRefs(
 }
 
 /** 剪枝保留集：启用章剧本 + 停用章缓存剧本（只贡献 scene/cg/vocal 键，不参与组装）。
- * 停用章不进 chapters（防组装写回），但其映射必须保留——否则重启用后只跑组装，背景/配音缺失。 */
-export function buildPruneKeepChapters(chapters: ChapterScript[], disabledScripts: ChapterScript[]): ChapterScript[] {
+ * 停用章不进 chapters（防组装写回），但其映射必须保留——否则重启用后只跑组装，背景/配音缺失。
+ *
+ * keys：本轮的章节键映射（novel index → 位置 + 去重后 scene.id）。停用章剧本来自**磁盘缓存**，
+ * 里面存的是 novel index 与**去重前**的 scene.id；而 assets 映射的键是「重编号 + 跨章去重后」的。
+ * 两个口径不一致时保留集就保护不住真实键：同地点跨章共享场景卡（网文常态）下，
+ * 第 5 章缓存里的 s3 在产出侧是 s3_2，保留集里只有 s3 → 剪枝把 assets.bg.s3_2 当过期删掉
+ * → 重启用第 5 章后只跑组装即缺背景、台词无声。传入映射后按产出键对齐（无映射的章原样保留）。 */
+export function buildPruneKeepChapters(
+  chapters: ChapterScript[],
+  disabledScripts: ChapterScript[],
+  keys?: Pick<ChapterKeysFile, "posByIndex" | "sceneIdsByIndex"> | null,
+): ChapterScript[] {
   if (!disabledScripts.length) return chapters;
   // 不能按 c.chapter 去重：进到这里时启用章已被原地重编号为 0..k-1（pipeline 的
   // chapters.forEach((c, i) => c.chapter = i)），而停用章剧本仍带**原始** novel index
@@ -311,7 +347,27 @@ export function buildPruneKeepChapters(chapters: ChapterScript[], disabledScript
   // 旧实现用重编号后的集合去过滤，任何「原始 index ≤ k」的停用章都会被当成重复项丢掉，
   // 只有排在末尾的停用章侥幸留下 → 剪枝会删掉中间停用章的 bg/cg/vocal 映射，
   // 重新启用后只跑组装就背景缺失、台词没声。保留集重复项本身无害（Set 并集），直接合并。
-  return [...chapters, ...disabledScripts];
+  const mapped = keys ? disabledScripts.map((s) => alignDisabledScriptToKeys(s, keys)) : disabledScripts;
+  return [...chapters, ...mapped];
+}
+
+/** 把停用章的磁盘剧本对齐到真实产出键（纯函数，返回新对象）：
+ * ① chapter 换成「启用章序号」——配音键 sceneVocalKey(chapter, scene.id, i) 里的章节号用的是**位置**，
+ *    而磁盘剧本里存的是 novel index（缓存写在重编号之前）；停用章不进组装，改写它不影响产物。
+ * ② scene.id 按顺序换成去重后的 id（数量不符时不动，宁可退化成旧行为也不错位覆盖）。 */
+export function alignDisabledScriptToKeys(
+  script: ChapterScript,
+  keys: Pick<ChapterKeysFile, "posByIndex" | "sceneIdsByIndex">,
+): ChapterScript {
+  const novelIndex = script.chapter;
+  const pos = keys.posByIndex?.[String(novelIndex)];
+  const ids = keys.sceneIdsByIndex?.[String(novelIndex)];
+  const next = { ...script };
+  if (Number.isInteger(pos)) next.chapter = pos;
+  if (Array.isArray(ids) && ids.length === script.scenes.length) {
+    next.scenes = script.scenes.map((scene, i) => (scene.id === ids[i] ? scene : { ...scene, id: ids[i] }));
+  }
+  return next;
 }
 
 /** 重提 id 对齐（纯函数）：新卡片按归一化姓名认领老 id，避免视觉守门/人物图/配音因 id  churn 全废。
@@ -530,6 +586,12 @@ export class Pipeline {
     ttsCostYuan: 0,
   };
   private cacheRoot = "";
+  /** 本次运行的小说指纹（源路径 + 正文哈希）：提取阶段算出后挂在这里，
+   *  供剧本使用情况写回卡片时原样保留 _novelFp（丢了会被当成过期缓存重新提取，付费）。 */
+  private novelFp = "";
+  /** 本次运行的章节键映射（novel index → 位置 + 去重后 scene.id + 配音键），剧本阶段收集完后统计。
+   *  同一份映射被三处复用：落盘 chapter-keys.json、剪枝保留集（与产出键同口径）、停用章对齐。 */
+  private chapterKeys: ChapterKeysFile | null = null;
   private aborted = false;
   /** #784：在途请求的中止桥——stop 时 abort，让 API 层（Tauri/Web 两条传输）中断已发出的请求 */
   private abortController = new AbortController();
@@ -834,6 +896,56 @@ export class Pipeline {
     }
   }
 
+  /**
+   * 章节键映射统计（纯计算，供落盘与剪枝/核对复用）：
+   * novel index → 位置（启用章序号）、该章去重后的 scene.id 列表、该位置的配音键全集。
+   *
+   * 三个口径必须与产出侧完全一致，否则下游按键反查全部落空：
+   * ① 位置 = 该章在「启用章按 novel 顺序」里的序号（产出侧的重编号就是这个顺序，与本次实际处理了哪些章无关）；
+   * ② scene.id = 把所有章节按 novel 顺序一起跑一次 dedupeSceneIdsAcrossChapters 的结果——
+   *    产出侧也是按这个顺序逐章 dedupe 的，所以对同一份小说这份结果可复现；
+   * ③ 配音键 = vocalKeysForChapters（含长台词分段 _pN），章节号用位置。
+   *
+   * 传入的 `produced` 是本次实际产出的章节（已重编号 + 已去重，chapter 字段＝位置），
+   * 它的 scene.id 直接取用，保证映射与真实产物零漂移。
+   */
+  private buildChapterKeysForRun(
+    working: { index: number; title: string; text: string; enabled?: boolean }[],
+    produced: ChapterScript[],
+    disabledScripts: ChapterScript[] = [],
+  ): ChapterKeysFile | null {
+    const active = working.filter((c) => c.enabled !== false);
+    if (!active.length) return null;
+    const posByIndex: Record<string, number> = {};
+    active.forEach((c, i) => { posByIndex[String(c.index)] = i; });
+    // 产出侧场景：启用章用本次真实产出的（已去重），停用章用磁盘缓存里的（去重前），
+    // 两者拼成**完整章节序**后再跑一次去重——这样停用章也能拿到它在产出侧本该有的 id
+    // （如 s3_2），否则剪枝保留集保护不住它的真实键（停用再启用后缺背景/无配音）。
+    const byIndex = new Map<number, ChapterScript["scenes"]>();
+    for (const c of produced) {
+      const idx = active[c.chapter]?.index;
+      if (idx !== undefined) byIndex.set(idx, c.scenes);
+    }
+    for (const s of disabledScripts) if (!byIndex.has(s.chapter)) byIndex.set(s.chapter, s.scenes);
+    const deduped: { chapter: number; scenes: ChapterScript["scenes"] }[] = [...byIndex.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([index, scenes]) => ({ chapter: index, scenes }));
+    dedupeSceneIdsAcrossChapters(deduped as unknown as ChapterScript[]);
+    const sceneIdsByIndex: Record<string, string[]> = {};
+    for (const c of deduped) sceneIdsByIndex[String(c.chapter)] = c.scenes.map((s) => s.id);
+    const vocalKeysByPos: Record<string, string[]> = {};
+    for (const c of produced) vocalKeysByPos[String(c.chapter)] = vocalKeysForChapters([c]);
+    return {
+      version: 1,
+      novelFp: this.novelFp,
+      demo: !this.input.llm?.apiKey,
+      posByIndex,
+      sceneIdsByIndex,
+      vocalKeysByPos,
+      at: "",
+    };
+  }
+
   /** 剪枝保留集补全：读回停用章的缓存剧本（只读 scene/cg/vocal 键，不参与组装）。
    * 停用章剧本不在 chapters 里，不补则其 bg/cg/vocal 映射被当过期删掉（重启用后只跑组装即缺背景/配音）。
    * 读失败返回 null（未知即不剪，宁可误留——剪前有备份 + 素材页一键清理可收尾）。 */
@@ -851,8 +963,7 @@ export class Pipeline {
     }
   }
 
-  /** 清理过期剧本缓存（重分章/重翻译/改标题正文/换文风后残留的失配文件），返回删除数；旧版无指纹文件保留 */
-  private async pruneStaleScriptCache(
+  /** 清理过期剧本缓存（重分章/重翻译/改标题正文/换文风后残留的失配文件），返回删除数；旧版无指纹文件保留 */  private async pruneStaleScriptCache(
     working: { index: number; title: string; text: string }[],
     styleFrag: string,
     demo?: boolean,
@@ -1122,7 +1233,14 @@ export class Pipeline {
       textFp: expectedFp,
       at: new Date().toISOString(),
       result: vr,
-      ignored: prev?.ignored ?? [],
+      // 忽略表必须随重算清空：verifyIssueKey 是**位置键**（场景序号:行序号:原因），
+      // 剧本重写（保真不足自动重写、带意见重写、单章强制重写）后场景/行号整体位移，
+      // 沿用旧 ignored 会把新剧本同一坐标上的真实存疑项当成"已忽略"从界面隐藏
+      // （用户以为处理干净了，说话人张冠李戴进成片）。注意核对文件名只含原文/标题/文风指纹，
+      // 剧本正文变化不会换文件，所以旧 ignored 一定会跨剧本版本继承——不能靠文件名区分。
+      // 走到这里说明 result 是重算的（force，或指纹变了但剧本正文一致）；
+      // 未 force 且指纹一致的情况在上面已经提前返回并保留了 ignored。
+      ignored: [],
     }).catch(() => {});
     return vr;
   }
@@ -1622,6 +1740,13 @@ export class Pipeline {
     };
     this.onUsageCb = onUsage;
 
+    // 骨架小说（正文是「分章缓存缺失」占位串）绝不允许进入生成：
+    // 旧实现没有任何判定，占位正文会被当真原文送去 AI 分章/提取/剧本（真实计费），
+    // 并把 split.json 整份覆写成占位串——而它往往是原文正文的最后一处副本。
+    // 逐章重跑/单素材重生成不走本入口（它们不依赖原文），故此处拦截不削弱「继续未完成部分」的能力。
+    if (isSkeletonNovel(input.novel)) {
+      throw new Error(SKELETON_NOVEL_MESSAGE);
+    }
     const demo = !input.llm?.apiKey;
     if (demo && stages.has("extract")) {
       log({
@@ -1724,6 +1849,18 @@ export class Pipeline {
       // 小说指纹：源文件路径 + 各章正文拼接哈希（分隔符不敏感；不含章节标题；
       // 重分章只改切分点时指纹不变，不会误删图片/配音缓存）
       const novelFp = `${input.novel.sourcePath}:${novelBodyFingerprint(workingChapters.map((c) => c.text))}`;
+      // 记录到实例字段：剧本阶段写回卡片时要原样带上它（novelFp 的块级作用域到此为止，
+      // 旧实现因此只能在剧本阶段重新读盘取指纹——那条路径同样会丢）。
+      this.novelFp = novelFp;
+      // #FP：算出来就**立刻写进内存卡片对象**，而不是只在序列化时拼一下。
+      // 旧实现只在两处 writeTextFile 里 `{...cards, _novelFp: novelFp}`，内存 cards 始终没有该字段；
+      // 而组装阶段（project.ts 的 assembleProject）会把**内存 cards** 整份覆写 cards.json，
+      // 于是刚生成的指纹被抹掉 → 下一次运行读回 cards.json 判 `undefined !== novelFp` →
+      // 打印「检测到小说内容变化…正在重新提取」→ 整本重新提取（LLM 付费），
+      // 且 invalidateAfterCardsChange 按新旧 imagePrompt 差分把立绘/三视图移入回收站重画（图像付费），
+      // 且每轮组装再抹一次 → 永不收敛。
+      // 写进内存对象后，所有写盘路径（提取写盘、剧本使用情况写回、组装覆写）自然保留该字段。
+      setCardsNovelFp(cards, novelFp);
       const appendTail = input.append?.tailText?.trim() ? input.append.tailText : "";
       if (appendTail) {
         // 纯追加提取：老卡片为底，只对新增文本提取后合并；老剧本/老图一个不动，不做任何失效清理
@@ -1770,7 +1907,9 @@ export class Pipeline {
               });
           const { merged, addedCharacters, addedScenes, addedItems } = mergeAppendedCards(oldCards, fresh);
           cards = merged;
-        await tauri.writeTextFile(cardsCache, JSON.stringify({ ...cards, _novelFp: novelFp }, null, 2));
+        // 指纹已由 setCardsNovelFp 挂在内存卡片上（此处再显式设一次：mergeAppendedCards 可能换对象）
+        setCardsNovelFp(cards, novelFp);
+        await tauri.writeTextFile(cardsCache, JSON.stringify(cards, null, 2));
         // 提取成功也登记销账：否则历史 extract 失败项会永久留在 failed.json（成功不销账→徽标只增不减）
         this.succeededTaskIds.add("extract");
           log({
@@ -1865,7 +2004,9 @@ export class Pipeline {
             throw new Error(msg);
           }
         }
-        await tauri.writeTextFile(cardsCache, JSON.stringify({ ...cards, _novelFp: novelFp }, null, 2));
+        // 指纹挂在内存卡片上（组装阶段会整份覆写 cards.json，见 setCardsNovelFp 注释）
+        setCardsNovelFp(cards, novelFp);
+        await tauri.writeTextFile(cardsCache, JSON.stringify(cards, null, 2));
         // 新提取（指纹失配/意见/强制/首跑）后分级失效下游：有新旧卡片时只清被删/外貌变化者的图，
         // 剧本缓存保留（与卡片编辑页同策略）；无旧卡片时沿用全量清理。首跑时目录为空，调用无害。
         {
@@ -2328,6 +2469,29 @@ export class Pipeline {
     }
     logger.info("pipeline", "剧本阶段完成", { totalChapters: chapters.length });
 
+    // 章节键映射（根因修复，与下一行的重编号同一处）：把「novel index → 位置 + 去重后 scene.id」
+    // 算出来并落盘 .novel2vn/chapter-keys.json。旧实现只在内存里重编号/去重，
+    // 于是所有「从磁盘重新算键」的下游（素材页单句重配、章节灯、停用章剪枝保留集）都算错键。
+    // 停用章的剧本要一并读回参与统计：它们不在 chapters 里，但它们的映射同样必须落盘——
+    // 否则「停用第 5 章 → 重启用 → 只跑组装」时下游拿不到它的真实键。
+    // 必须在重编号与去重**之后**统计，得到的才是真实产出键。
+    const demoRun = !input.llm?.apiKey;
+    const disabledForKeys = await this.loadDisabledScriptsForPrune(workingChapters, demoRun);
+    this.chapterKeys = this.buildChapterKeysForRun(workingChapters, chapters, disabledForKeys ?? []);
+    if (this.chapterKeys) {
+      try {
+        await writeChapterKeys(input.outputDir, {
+          ...this.chapterKeys,
+          at: new Date().toISOString(),
+        });
+      } catch (e) {
+        // 落盘失败不阻断生成：下游退化成旧行为（按磁盘原样算键），只是键可能错位
+        logger.warn("pipeline", "章节键映射落盘失败（生成不受影响，素材页/章节灯可能按旧口径算键）", {
+          error: errMsg(e).slice(0, 200),
+        });
+      }
+    }
+
     // 章节重新编号（过滤未启用的章节后）→ 图像/配音/组装使用统一编号，保证素材键一致
     chapters.forEach((c, i) => {
       c.chapter = i;
@@ -2347,13 +2511,15 @@ export class Pipeline {
         // 落盘工作副本：重启/切换项目后素材页与重生成路径读的是这份文件，
         // 不落盘就会出现"这次按使用集合出图、下次按全量出图"的来回。
         // _novelFp 必须原样保留：它是"这份卡片对应哪版原文"的判据，丢了会被当成过期缓存重新提取（付费）。
+        // 优先用本次运行记下的指纹（this.novelFp），它由 setCardsNovelFp 挂在内存卡片上，
+        // 写盘自然带上；这里只做兜底（卡片来自磁盘缓存、本轮没跑提取时 this.novelFp 为空，
+        // 此时沿用文件里已有的指纹）。
         const cardsFile = `${input.outputDir}/.novel2vn/${demo ? "cards_demo" : "cards"}.json`;
         const prevFp = (await this.readCachedJson<ExtractionResult & { _novelFp?: string }>(cardsFile))?._novelFp;
+        const fpToKeep = this.novelFp || prevFp;
+        setCardsNovelFp(cards, fpToKeep);
         try {
-          await tauri.writeTextFile(
-            cardsFile,
-            JSON.stringify({ ...cards, ...(prevFp ? { _novelFp: prevFp } : {}) }, null, 2),
-          );
+          await tauri.writeTextFile(cardsFile, JSON.stringify(cards, null, 2));
         } catch (e) {
           logger.warn("pipeline", "剧本使用情况写回 cards.json 失败（本次运行不受影响，下次可能多生成一些用不上的差分）", {
             error: errMsg(e).slice(0, 200),
@@ -2401,7 +2567,9 @@ export class Pipeline {
         if (disabledScripts === null) {
           logger.debug("pipeline", "跳过映射剪枝：停用章缓存读取失败，未知即不剪", {});
         } else {
-          const stat = pruneAssetRefs(assets, buildPruneKeepChapters(chapters, disabledScripts));
+          // 保留集必须与**映射键同口径**：传本轮章节键映射，让停用章的 scene.id/chapter
+          // 对齐到去重后与位置口径（否则跨章共享场景卡时 s3_2 被当过期删掉）。
+          const stat = pruneAssetRefs(assets, buildPruneKeepChapters(chapters, disabledScripts, this.chapterKeys));
           const total = stat.bg + stat.cg + stat.vocal;
           if (total > 0 || stat.cgMigrated > 0) {
             // #1516：剪枝是破坏性写，必须先有回滚点。备份失败就整个跳过剪枝——
@@ -2709,6 +2877,9 @@ export class Pipeline {
         chapters,
         cards: cards!,
         assets,
+        // 文本通道透传（只读 apiKey）：组装据此判定 demo 模式，决定卡片工作副本写 cards.json 还是
+        // cards_demo.json。不透传会让组装恒判"演示模式"，把演示卡片写进正式工作副本（跨模式污染）。
+        llm: input.llm,
         introCard: this.options.characterIntroCard,
         figureEmotions: this.options.figureEmotions,
         figureActions: this.options.figureActions,

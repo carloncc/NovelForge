@@ -57,10 +57,17 @@ const PRESET_TEMPLATES: AdapterTemplate[] = [
       input: "$text",
       voice: "$voice",
       response_format: "$format",
+      // 语速：官方 /v1/audio/speech 支持 speed（0.25~4.0，默认 1.0），本预设的默认 base_url
+      // 智谱 /paas/v4/audio/speech 同样支持 speed（0.5~2，默认 1.0）——两家都能吃下剧本的每句语速，
+      // 所以这里映射它。此前未映射 → 剧本标注的 speed 在 buildRequestBody 处被静默丢弃。
+      // 情绪**故意不映射**：两家都没有 emotion 字段（OpenAI 只有 gpt-4o-mini-tts 的自由文本
+      // instructions，不是情绪枚举），臆造字段会让整条线路 400；改由 universal.ts 的
+      // 「未消费变量」告警明确告知「当前线路不支持每句情绪，已忽略」。
+      speed: "$speed",
     },
     response: { mime: "audio/mpeg" },
     voices: ["alloy", "echo", "fable", "onyx", "nova", "shimmer", "zhipu_lin", "zhipu_ling"],
-    description: "OpenAI 兼容语音合成：POST /v1/audio/speech，响应为原始音频",
+    description: "OpenAI 兼容语音合成：POST /v1/audio/speech，响应为原始音频；支持 speed（语速），不支持情绪字段",
   },
   {
     id: "minimax-image",
@@ -168,6 +175,13 @@ const PRESET_TEMPLATES: AdapterTemplate[] = [
       "input.text": "$text",
       "parameters.voice": "$voice",
       "parameters.format": "$format",
+      // 语速/情绪**故意不映射**（2026-10 查证结论）：本模板走的是百炼旧版异步端点
+      // /api/v1/services/audio/tts/speech-synthesis（parameters.* 结构），而官方现行文档只覆盖
+      // 新端点 /api/v1/services/audio/tts/SpeechSynthesizer —— 那里语速是 input.rate（[0.5,2]，
+      // 默认 1.0），情感靠 input.instruction 自然语言指令，与 parameters.* 不同源、也不同层级。
+      // 旧端点是否接受 parameters.rate 查无权威依据（官方文档已不再描述该端点），
+      // 而 DashScope 对未知字段通常直接 400 —— 臆造字段会让整条付费线路全废。
+      // 因此保持不映射，由 universal.ts 的「未消费变量」告警明确告知用户「已忽略每句语速/情绪」。
     },
     poll: {
       endpoint: "/api/v1/tasks/{taskId}",
@@ -193,7 +207,7 @@ const PRESET_TEMPLATES: AdapterTemplate[] = [
       "longzhou",
       "longxiang",
     ],
-    description: "阿里百炼任务式语音合成：提交 speech-synthesis → 轮询 → audio_url。模型示例 cosyvoice-v2 / cosyvoice-v1；如字段有差异可在自定义模板中调整",
+    description: "阿里百炼任务式语音合成：提交 speech-synthesis → 轮询 → audio_url。模型示例 cosyvoice-v2 / cosyvoice-v1；如字段有差异可在自定义模板中调整。注意：该旧版端点未映射语速/情绪，剧本标注的每句 speed/ttsEmotion 在此线路上会被忽略（日志会给出提示）",
   },
   {
     id: "gemini-image",

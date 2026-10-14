@@ -82,15 +82,6 @@ async function txPut(key: string, node: VfsNode): Promise<void> {
   });
 }
 
-async function txDelete(key: string): Promise<void> {
-  const db = await openDb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE, "readwrite");
-    watchTx(tx, resolve, reject);
-    tx.objectStore(STORE).delete(key);
-  });
-}
-
 async function txKeys(): Promise<string[]> {
   const db = await openDb();
   return new Promise((resolve, reject) => {
@@ -98,6 +89,9 @@ async function txKeys(): Promise<string[]> {
     const req = tx.objectStore(STORE).getAllKeys();
     req.onsuccess = () => resolve(req.result as string[]);
     req.onerror = () => reject(req.error);
+    // #1505 同口径：只读事务也可能在没有请求级 error 的情况下中止（外部 abort、连接被强制
+    // 关闭）。漏挂 onabort 时 Promise 既不 resolve 也不 reject，调用方的 await 永久悬挂。
+    tx.onabort = () => reject(tx.error ?? new Error("IndexedDB 事务中止"));
   });
 }
 
@@ -115,9 +109,8 @@ async function txGetMany(keys: string[]): Promise<Map<string, VfsNode | undefine
       req.onsuccess = () => out.set(key, req.result as VfsNode | undefined);
       req.onerror = () => reject(req.error);
     }
-    tx.oncomplete = () => resolve(out);
-    tx.onerror = () => reject(tx.error);
-    tx.onabort = () => reject(tx.error ?? new Error("IndexedDB 事务中止"));
+    // 与写路径共用同一套结算口径（oncomplete/onerror/onabort 三者齐全）
+    watchTx(tx, () => resolve(out), reject);
   });
 }
 
@@ -292,11 +285,19 @@ export async function vfsExists(path: string): Promise<boolean> {
 export async function vfsRemove(path: string): Promise<void> {
   const normalized = normalizeVfsPath(path);
   const keys = await txKeys();
-  for (const key of keys) {
-    if (key === normalized || key.startsWith(normalized + "/")) {
-      await txDelete(key);
-    }
-  }
+  const doomed = keys.filter((key) => key === normalized || key.startsWith(normalized + "/"));
+  if (!doomed.length) return;
+  // #1490 同口径：旧实现逐个 txDelete，每次一个独立 readwrite 事务——中途撞上配额
+  // （QuotaExceededError）或事务 abort 时，前面的删除已经提交，目录只删了一半，
+  // 调用方只看到一次失败，重试基于不一致状态继续（大项目删 cache/images 还要 N 次往返）。
+  // IndexedDB 事务本身是原子的：删除全部放进同一个事务，任一步失败整体 abort，状态回到删除前。
+  const db = await openDb();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(STORE, "readwrite");
+    watchTx(tx, resolve, reject);
+    const store = tx.objectStore(STORE);
+    for (const key of doomed) store.delete(key);
+  });
 }
 
 export async function vfsCopyFile(src: string, dst: string): Promise<void> {
@@ -307,17 +308,29 @@ export async function vfsCopyFile(src: string, dst: string): Promise<void> {
 
 export async function vfsCopyDirAll(src: string, dst: string): Promise<void> {
   const prefix = normalizeVfsPath(src);
+  const target = normalizeVfsPath(dst);
   const keys = await txKeys();
-  await vfsMkdirAll(dst);
-  for (const key of keys) {
-    if (key.startsWith(prefix + "/")) {
+  const sourceKeys = keys.filter((key) => key.startsWith(prefix + "/"));
+  // 先一次性取回全部源节点（1 次事务），再一次性写入目标——旧实现每个键各自
+  // vfsWriteFile（各自 ensureDir + 各自 readwrite 事务），既慢又非原子。
+  const nodes = await txGetMany(sourceKeys);
+  await vfsMkdirAll(target);
+  // #1490 同口径：写入全部合并进同一个 readwrite 事务。旧实现逐键独立事务，中途配额耗尽
+  // 只拷了一半就 reject，目标目录处于半成品状态；事务原子性保证失败时目标目录不被写入。
+  const db = await openDb();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(STORE, "readwrite");
+    watchTx(tx, resolve, reject);
+    const store = tx.objectStore(STORE);
+    for (const key of sourceKeys) {
+      const node = nodes.get(key);
+      if (!node) continue;
       const rel = key.slice(prefix.length);
-      const node = await txGet(key);
-      if (node?.kind === "file") {
-        await vfsWriteFile(normalizeVfsPath(dst + rel), node.data);
-      }
+      const dest = `${target}${rel}`;
+      // 目录项也要落到目标（旧实现只写 file，空目录在拷贝后消失）
+      store.put(node.kind === "dir" ? { kind: "dir" } : node, dest);
     }
-  }
+  });
 }
 
 export async function vfsReplacePath(src: string, dst: string): Promise<void> {

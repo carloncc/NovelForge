@@ -70,7 +70,12 @@ function main(): void {
       { characters: [], items: [], assets: ASSETS, useSe: true, seVolume: 12 },
       1,
     );
-    assert(out.includes("playEffect:se_rain.wav -volume=12"), "seVolume 应透传到 playEffect -volume");
+    // 雨属持续氛围音：带 `-id=amb_rain` 循环播放（否则内置 4 秒素材响完即静音，见核查报告 F2）。
+    // 断言按「同一行内同时含文件、音量、循环 id」写，不绑定参数顺序（-id 与 -volume 谁在前都成立）。
+    const rainLine = out.split("\n").find((l) => l.startsWith("playEffect:se_rain.wav"));
+    assert(!!rainLine, "useSe=true 且氛围为雨时应输出雨声 playEffect");
+    assert(rainLine!.includes("-volume=12"), `seVolume 应透传到 playEffect -volume，实际：${rainLine}`);
+    assert(rainLine!.includes("-id=amb_rain"), `持续氛围音必须带 -id 循环，实际：${rainLine}`);
     const pipelineSrc = readSrc("src/core/pipeline.ts");
     assert(pipelineSrc.includes("seVolume:"), "pipeline 组装调用应传入 seVolume（不再是死参数）");
   }

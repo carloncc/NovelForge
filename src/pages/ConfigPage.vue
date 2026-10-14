@@ -789,8 +789,10 @@ watch(
                   <option value="happy">{{ t("高兴") }}</option>
                   <option value="sad">{{ t("悲伤") }}</option>
                   <option value="angry">{{ t("愤怒") }}</option>
-                  <option value="calm">{{ t("平静") }}</option>
-                  <option value="whisper">{{ t("耳语") }}</option>
+                  <!-- 2026-10-14：原选项是 calm / whisper，但 MiniMax speech-2.x 不支持这两个值
+                       （实测 400 `don't support whisper`，code 2013），会让每句合成都失败。
+                       改为厂商文档里的情绪集；平静用 neutral。 -->
+                  <option value="neutral">{{ t("平静") }}</option>
                   <option value="surprised">{{ t("惊讶") }}</option>
                 </select>
               </label>

@@ -111,12 +111,33 @@ function pickNonEmpty<T extends Record<string, unknown>>(o: T): Partial<T> {
   return out as Partial<T>;
 }
 
-/** 卡片数组字段并集：按 id 去重，后出现的同 id 项覆盖先出现的（模型后给的更完整） */
-function unionById<T extends { id?: string }>(base?: T[], patch?: T[]): T[] | undefined {
+/** 实体 id 归一化前缀：与 extract.ts（单次提取路径）以及文件名层保持同一口径 */
+const ACTION_ID_PREFIX = "a";
+const COSTUME_ID_PREFIX = "ct";
+
+/**
+ * 归一化一个动作/服装项：id 走 normalizeEntityId（非 ASCII → `<prefix>_<稳定哈希>`），
+ * name 缺省时用原始 id 兜底（与 extract.ts 同一写法）。无 id 的项原样返回，由调用方决定去留。
+ */
+function normalizeEntityItem<T extends { id?: string; name?: string }>(item: T, prefix: string): T {
+  const id = normalizeEntityId(item.id, prefix);
+  if (!id) return item;
+  return { ...item, id, name: item.name || item.id || id };
+}
+
+/** 卡片数组字段并集：按**归一化后**的 id 去重，后出现的同 id 项覆盖先出现的（模型后给的更完整） */
+function unionById<T extends { id?: string; name?: string }>(base?: T[], patch?: T[], prefix?: string): T[] | undefined {
   if (!base && !patch) return base;
   const map = new Map<string, T>();
   for (const item of [...(base ?? []), ...(patch ?? [])]) {
-    if (item?.id) map.set(item.id, item);
+    if (!item?.id) continue;
+    // 归一化必须发生在**去重之前**：旧实现按原始 id 去重，Agent 模型给出「拔剑」「挥手」两个中文 id 时
+    // 它们被当成两项各建一个任务，而文件名层只做 sanitizeId（每个汉字 → 一个下划线），
+    // 两个等长中文 id 会消毒成同一个文件名 → 两张图互相覆盖（B77 的 ImageTaskKeyConflictError
+    // 只查任务 id，`alice_act_拔剑` 与 `alice_act_挥手` 不同，拦不住）。
+    // 与 extract.ts 的 `.map((a) => ({ id: normalizeEntityId(a.id, "a") }))` 同一口径。
+    const item2 = prefix ? normalizeEntityItem(item, prefix) : item;
+    map.set(item2.id!, item2);
   }
   return [...map.values()];
 }
@@ -145,11 +166,11 @@ function mergeCharacterPatch(target: CharacterCard, patch: Record<string, unknow
     if (k === "id" || k === "name") continue;
     // 非数组垃圾值直接忽略，避免展开失败或把已有数组清空（模型偶尔把数组写成字符串）
     if (k === "actions") {
-      if (Array.isArray(v)) target.actions = unionById(target.actions, v as CharacterAction[]);
+      if (Array.isArray(v)) target.actions = unionById(target.actions, v as CharacterAction[], ACTION_ID_PREFIX);
       continue;
     }
     if (k === "costumes") {
-      if (Array.isArray(v)) target.costumes = unionById(target.costumes, v as CharacterCostume[]);
+      if (Array.isArray(v)) target.costumes = unionById(target.costumes, v as CharacterCostume[], COSTUME_ID_PREFIX);
       continue;
     }
     if (k === "emotions") {
@@ -638,13 +659,19 @@ export function mergeCharacter(target: CharacterCard, source: CharacterCard): vo
   if (target.figureTier == null && source.figureTier != null) target.figureTier = source.figureTier;
   const actionMap = new Map<string, CharacterAction>();
   for (const a of [...(target.actions ?? []), ...(source.actions ?? [])]) {
-    if (a?.id && !actionMap.has(a.id)) actionMap.set(a.id, a);
+    if (!a?.id) continue;
+    // 同 unionById：先归一化再按 id 去重，否则两个中文动作 id 会各建一个任务、
+    // 却在文件名层消毒成同一个文件互相覆盖（extract.ts 的单次提取路径早已如此）。
+    const normalized = normalizeEntityItem(a, ACTION_ID_PREFIX);
+    if (!actionMap.has(normalized.id!)) actionMap.set(normalized.id!, normalized);
   }
   target.actions = [...actionMap.values()];
   // 服装差分（旧人物新形态：换装）按 id 并集；同 id 同样已有卡优先
   const costumeMap = new Map<string, CharacterCostume>();
   for (const c of [...(target.costumes ?? []), ...(source.costumes ?? [])]) {
-    if (c?.id && !costumeMap.has(c.id)) costumeMap.set(c.id, c);
+    if (!c?.id) continue;
+    const normalized = normalizeEntityItem(c, COSTUME_ID_PREFIX);
+    if (!costumeMap.has(normalized.id!)) costumeMap.set(normalized.id!, normalized);
   }
   const mergedCostumes = [...costumeMap.values()];
   if (mergedCostumes.length || target.costumes || source.costumes) target.costumes = mergedCostumes;

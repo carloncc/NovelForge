@@ -604,14 +604,24 @@ export const tauri = {
     if (isWebRuntime()) return webRuntime().then((web) => web.webWriteConfig(content));
     return Promise.resolve();
   }),
+  // F10：Web 分支不再"静默退化"到明文槽位，改为显式失败。
+  // 旧实现经 webRuntime().webReadApiSecrets/webWriteApiSecrets 直接读写 sessionStorage 的
+  // `novelforge:api-secrets` 明文 JSON（webKeys.ts 里标为 LEGACY_PLAINTEXT_KEY 的那个槽位，
+  // 同源脚本可读）。这条路当前不可达（stores/config.ts 在浏览器环境一律走
+  // readWebSecrets/writeWebSecretsAsync：内存态 + opt-in 才 AES-GCM 加密落盘），但留着就等于
+  // 给未来留一个"密钥悄悄明文进 storage"的缺口。明确抛错比静默降级安全。
   readApiSecrets: wrap("readApiSecrets", (ids: string[]): Promise<Record<string, string>> => {
     if (isTauri()) return invoke("read_api_secrets", { ids });
-    if (isWebRuntime()) return webRuntime().then((web) => web.webReadApiSecrets(ids));
+    if (isWebRuntime()) {
+      return Promise.reject(new Error("Web 版不支持持久化 API Key：请使用 webKeys 的内存/加密存储（stores/config.ts 的 readWebSecrets）"));
+    }
     return Promise.resolve({});
   }),
   writeApiSecrets: wrap("writeApiSecrets", (secrets: Record<string, string>): Promise<void> => {
     if (isTauri()) return invoke("write_api_secrets", { secrets });
-    if (isWebRuntime()) return webRuntime().then((web) => web.webWriteApiSecrets(secrets));
+    if (isWebRuntime()) {
+      return Promise.reject(new Error("Web 版不支持持久化 API Key：请使用 webKeys 的内存/加密存储（stores/config.ts 的 writeWebSecretsAsync）"));
+    }
     return Promise.resolve();
   }),
   startPreviewServer: wrap("startPreviewServer", (root: string): Promise<{ url: string; port: number }> => {

@@ -1,33 +1,28 @@
 # Third-Party Notices
 
-本文件记录 NovelForge 直接借鉴的第三方开源项目（许可证要求署名与说明）。
+本文件记录 NovelForge 直接借鉴或随包分发的第三方开源项目（许可证要求署名与说明）。
+
+## WebGAL（随包分发的引擎）
+
+- 项目名：OpenWebGAL/WebGAL
+- 地址：https://github.com/OpenWebGAL/WebGAL
+- 许可证：Mozilla Public License 2.0（MPL-2.0）
+- 随包版本：**4.6.6**（官方 Release 资产 `WebGAL-4.6.6-web.zip`，sha256
+  `d8011933005f62397b3d1ea6cd14b8a7f58ce34a390000afa48f12a2d8f0349a`）
+- 随包位置：`src-tauri/templates/webgal/`（由 `pnpm prepare:template` 下载生成，不在版本库内）
+- 分发形态：① `src-tauri/src/lib.rs` 的 `include_dir!` 静态编入桌面端二进制；
+  ② `src-tauri/tauri.conf.json` 的 `bundle.resources` 随安装包分发；
+  ③ 组装生成游戏时复制进每个导出的游戏目录
+- 许可证副本：随包放在 `src-tauri/templates/webgal/LICENSE`
+  （由 `scripts/fetch-webgal-template.mjs` 从上游拉取，sha256
+  `1f256ecad192880510e84ad60474eab7589218784b9a50bc7ceee34c2b91f1d5`；
+  上游 web 包根目录本身不含 LICENSE）
+- **修改说明**：随包分发的引擎产物**并非上游原样**——`scripts/fetch-webgal-template.mjs`
+  会改写引擎入口 JS（`voiceInterruption` 默认值）、在 `index.html` 注入 file:// 协议探测脚本、
+  用本项目文件覆盖 4 个界面样式文件，并新增鉴赏室页面与内置音效。
+  逐文件、逐项说明见 [`THIRD_PARTY_MODIFICATIONS.md`](./THIRD_PARTY_MODIFICATIONS.md)；
+  施加改动的脚本与源文件均在本仓库内（`scripts/fetch-webgal-template.mjs`、`src/gameExtra/`）
+- 发布要求（来自上游官方下载页）：使用 WebGAL 制作的游戏在发布时须保留 WebGAL 相关版权声明；
+  使用本软件产生的所有风险由使用者自行承担
 
 ## TongjiAI4E / VN_Sprite_Expression_Workflow
-
-- 项目名：TongjiAI4E/VN_Sprite_Expression_Workflow
-- 地址：https://github.com/TongjiAI4E/VN_Sprite_Expression_Workflow
-- 许可证：MIT License（原项目所有权利归其作者所有）
-- 参考版本：v0.1.0（JS + Python）
-- 借鉴性质：算法与参数参考 + 自研重新实现（TypeScript）。未复制其源代码文件；
-  生图候选、rig 自动标定、管线接入均为 NovelForge 自研。
-
-### 参考的算法与参数（详见其 rig.json / verify.py / README / AGENTS.md）
-
-- 固定原图 alpha 与允许区外像素，只合成眉/眼/嘴（+红晕）独立图层。
-- 允许区：五官椭圆选区 `[cx,cy,rx,ry]` 并集，扩大 **1.08** 倍后按
-  `(1-q) * min(rx,ry) / feather` 羽化，其中 `q = hypot((x-cx)/(rx*1.08), (y-cy)/(ry*1.08))`。
-- 笔触提取：以「净脸候选 vs 表情候选」的通道差提取；
-  眉/嘴只用变暗 `dark`，眼睛用 `max(dark,light)`；软阈值 `(delta - 7) / 24`。
-- 肤色对齐：低色差样本的通道中位差（median of `clean - cand`），跳过高饱和像素。
-- 眼球区域乘 `(1 - hairMask)` 解决刘海穿眼；眉毛不受头发遮挡影响。
-- 核验：`outside_mask_exact`（允许区外逐像素完全一致）+
-  `alpha_exact`（整幅 alpha 通道完全一致）；不合格 exit 1 / 记失败项。
-- 纪律：不得为了让校验通过而放宽掩膜；掩膜参数与校验阈值分开放置。
-
-### NovelForge 内对应实现
-
-- `src/core/spriteVerify.ts`（#1084）：允许区掩膜 + 三项校验 + 差异像素数/bbox。
-- `src/core/faceRig.ts`（#1085）：rig 结构（crop / parts / skinSamples / feather /
-  hairMask）+ base 指纹；bbox 由 vision 模型自动标定（原项目为人工量测）。
-- `src/core/faceComposite.ts`（#1086）：裁脸 → 表情编辑 → 上述算法合成回原图 →
-  #1084 核验；经 `ImageTask.faceComposite` 可选标记接入（默认关闭）。

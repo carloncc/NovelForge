@@ -181,6 +181,33 @@ async function directFetch(args: {
 
 /* ============ 模板资源同步（dev server → IndexedDB 缓存） ============ */
 
+/**
+ * in-flight 去重（F9）：同一 key 的并发调用只跑一次任务，其余复用同一个 Promise。
+ *
+ * 为什么必须有：模板路径的读取入口全都先调 ensureTemplateLocal（webReadTextFile /
+ * webReadFileBase64 / webListDir / webPathExists / webCopyFile / webCopyDirAll /
+ * ensureTemplateTree），而它只有"已缓存就返回"这一道检查。当同一路径被两处并发请求
+ * （组装阶段拷贝模板树的同时 validateTemplateFill 读 game/userStyleSheet.css 并
+ * listDir game/vocal，或用户先点「预览」再立刻点「组装/导出」）时，两边都会看到"不存在"
+ * → 各发一次 dev server 请求 → 各写一次 IndexedDB（同一 key 重复写、base64 重复解码）。
+ *
+ * 任务失败也必须结算并**立刻**清表：否则失败被永久缓存，用户修好问题后重试也拿不到新结果
+ * （与 webSessionToken 的失败清缓存同口径）。
+ */
+export function runExclusive<T>(inflight: Map<string, Promise<T>>, key: string, task: () => Promise<T>): Promise<T> {
+  const existing = inflight.get(key);
+  if (existing) return existing;
+  const run = task().finally(() => {
+    // 只在仍是自己时删除：极端情况下（任务内部同步重入同一 key）不能误删后注册的 Promise
+    if (inflight.get(key) === run) inflight.delete(key);
+  });
+  inflight.set(key, run);
+  return run;
+}
+
+/** 模板路径的 in-flight 表（key = 归一化后的 VFS 路径） */
+const templateInflight = new Map<string, Promise<void>>();
+
 async function fetchTemplateNode(rel: string): Promise<{ kind: "file"; base64: string } | { kind: "dir"; entries: FsEntry[] } | undefined> {
   let token = ""; try { token = await webSessionToken(); } catch { return undefined; } const resp = await fetch(`${TEMPLATE_URL}?path=${encodeURIComponent(rel)}`, { method: "GET", headers: { "X-NovelForge-Token": token } });
   if (!resp.ok) return undefined;
@@ -191,18 +218,21 @@ async function fetchTemplateNode(rel: string): Promise<{ kind: "file"; base64: s
 async function ensureTemplateLocal(path: string): Promise<void> {
   const normalized = path.replace(/\/+$/, "");
   if (!normalized.startsWith(TEMPLATE_ROOT)) return;
-  if (await vfs.vfsExists(normalized)) return;
-  const rel = normalized.slice(TEMPLATE_ROOT.length + 1);
-  const node = await fetchTemplateNode(rel);
-  if (!node) return;
-  if (node.kind === "dir") {
-    await vfs.vfsMkdirAll(normalized);
-    for (const e of node.entries) {
-      await ensureTemplateLocal(`${normalized}/${e.name}`);
+  return runExclusive(templateInflight, normalized, async () => {
+    // 命中判定放进临界区：并发调用只有第一个真正去拉，其余复用同一个 Promise
+    if (await vfs.vfsExists(normalized)) return;
+    const rel = normalized.slice(TEMPLATE_ROOT.length + 1);
+    const node = await fetchTemplateNode(rel);
+    if (!node) return;
+    if (node.kind === "dir") {
+      await vfs.vfsMkdirAll(normalized);
+      for (const e of node.entries) {
+        await ensureTemplateLocal(`${normalized}/${e.name}`);
+      }
+    } else {
+      await vfs.vfsWriteFileBase64(normalized, node.base64);
     }
-  } else {
-    await vfs.vfsWriteFileBase64(normalized, node.base64);
-  }
+  });
 }
 
 /** 确保整个模板树已缓存（目录遍历） */
@@ -315,7 +345,6 @@ export async function webRemovePath(path: string): Promise<void> {
 /* ============ 配置（localStorage 持久化） ============ */
 
 const CONFIG_KEY = "novelforge:config";
-const SECRET_KEY = "novelforge:api-secrets";
 
 export async function webReadConfig(): Promise<string> {
   return localStorage.getItem(CONFIG_KEY) ?? "{}";
@@ -325,31 +354,18 @@ export async function webWriteConfig(content: string): Promise<void> {
   localStorage.setItem(CONFIG_KEY, content);
 }
 
-export async function webReadApiSecrets(ids: string[]): Promise<Record<string, string>> {
-  let stored: Record<string, string> = {};
-  try {
-    stored = JSON.parse(sessionStorage.getItem(SECRET_KEY) ?? "{}") as Record<string, string>;
-  } catch {
-    sessionStorage.removeItem(SECRET_KEY);
-  }
-  return Object.fromEntries(
-    ids.filter((id) => Object.prototype.hasOwnProperty.call(stored, id)).map((id) => [id, stored[id]]),
-  );
-}
-
-export async function webWriteApiSecrets(secrets: Record<string, string>): Promise<void> {
-  let stored: Record<string, string> = {};
-  try {
-    stored = JSON.parse(sessionStorage.getItem(SECRET_KEY) ?? "{}") as Record<string, string>;
-  } catch {
-    stored = {};
-  }
-  for (const [id, secret] of Object.entries(secrets)) {
-    if (secret) stored[id] = secret;
-    else delete stored[id];
-  }
-  sessionStorage.setItem(SECRET_KEY, JSON.stringify(stored));
-}
+/* Web 版没有"明文 API Key 槽位"了（F10）。
+ *
+ * 旧实现 webReadApiSecrets / webWriteApiSecrets 直接读写 sessionStorage 的
+ * `novelforge:api-secrets` 明文 JSON —— 正是 webKeys.ts 里标为 LEGACY_PLAINTEXT_KEY
+ * 并专门写了迁移去清除的那个槽位。它们当前不可达（stores/config.ts 在浏览器环境一律走
+ * readWebSecrets/writeWebSecretsAsync：内存态 + opt-in 才 AES-GCM 加密落盘），但保留
+ * 明文读写分支就是"静默退化"的隐患：任何人把 config.ts 的分支改回 tauri.readApiSecrets，
+ * 密钥就会重新明文进 storage，而同源脚本可读。这里直接删掉，让这条路不存在。
+ *
+ * 调用方（tauri.ts 的 readApiSecrets/writeApiSecrets 的 Web 分支）改为显式抛错：
+ * Web 版不支持持久化密钥，请走 webKeys.ts 的内存/加密存储。
+ */
 
 /* ============ 预览（zip 上传 → dev server 解压静态服务） ============ */
 

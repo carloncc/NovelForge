@@ -29,7 +29,9 @@ static ATOMIC_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// 允许根 = 当前工作目录 / 系统临时目录 / 用户家目录 / 前端登记的用户自选目录
 /// （项目输出目录、对话框选中的小说/素材/保存路径——选目录/文件行为本身经系统对话框
 /// 或项目切换确认，用户已明示授权）。此处拦截 UNC/设备路径、NUL、file: scheme 与
-/// 系统敏感目录；破坏性操作另经 guard_against_wipe 拒绝盘符根/允许根自身。
+/// 系统敏感目录（#1549：Program Files/ProgramData/Windows、/etc/usr/var 等，见
+/// system_sensitive_dirs）；破坏性操作另经 guard_against_destructive_wipe 拒绝盘符根
+/// 与**任何登记根自身**（登记只授权目录内部，不授权删除该目录）。
 /// 去掉 Windows verbatim 前缀再做语法检查：`canonicalize()` 产出（及前端回传）的
 /// `\\?\D:\...` 否则会被下行的 UNC 检查误杀，形成"自己产出、自己拒绝"的互斥。
 /// 真正的 UNC（`\\host\...`、`\\?\UNC\...`）仍拒绝。
@@ -182,16 +184,112 @@ fn path_within_home_credential_dir(canon: &Path, home: &Path) -> bool {
     })
 }
 
-fn is_sensitive_system_path(canon: &Path) -> bool {
+/// #1549（本轮安全修复）：系统目录黑名单。
+///
+/// 为什么必须补：此前 Windows 只拦 `%SystemRoot%`、POSIX 只拦 `/`，于是
+/// `bless_project_dir("C:\\Program Files\\X")`（或 `/etc`）能把系统目录登记成允许根，
+/// 紧接着 `remove_path(同一路径)` 就把它整棵递归删掉。登记闸门只靠"敏感目录"这一层，
+/// 这层又几乎没内容，等于把删除权交给了调用方。
+/// 现在按平台列出系统目录，判定同时作用于「登记」与「读写/删除」两条入口。
+fn system_sensitive_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
     #[cfg(target_os = "windows")]
     {
-        if let Ok(windir) = std::env::var("SystemRoot").or_else(|_| std::env::var("windir")) {
-            let sys = PathBuf::from(&windir);
-            let canon_sys = sys.canonicalize().unwrap_or(sys);
-            if *canon == canon_sys || canon.starts_with(&canon_sys) {
-                return true;
+        for key in ["SystemRoot", "windir", "ProgramFiles", "ProgramFiles(x86)", "ProgramData"] {
+            if let Ok(value) = std::env::var(key) {
+                let value = value.trim();
+                if !value.is_empty() {
+                    dirs.push(PathBuf::from(value));
+                }
             }
         }
+        // 环境变量缺失（精简的服务/容器环境）时用 SystemDrive 兜底：否则整条黑名单静默失效
+        if let Ok(drive) = std::env::var("SystemDrive") {
+            let drive = drive.trim().trim_end_matches('\\');
+            if !drive.is_empty() {
+                for suffix in [r"\Program Files", r"\Program Files (x86)", r"\ProgramData", r"\Windows"] {
+                    dirs.push(PathBuf::from(format!("{drive}{suffix}")));
+                }
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        dirs.extend(
+            ["/etc", "/usr", "/var", "/bin", "/sbin", "/boot", "/opt", "/lib", "/lib64", "/sys", "/proc", "/dev"]
+                .iter()
+                .map(PathBuf::from),
+        );
+        // macOS 的系统区（/etc、/var 在 macOS 是指向 /private/* 的符号链接，
+        // path_within_dir 会再按 canonicalize 后的形态比一次）
+        #[cfg(target_os = "macos")]
+        dirs.extend(["/System", "/Library"].iter().map(PathBuf::from));
+    }
+    dirs
+}
+
+/// 免检根：进程临时目录 + 本程序自身安装目录（exe 所在目录）。
+///
+/// 为什么临时目录必须免检：macOS 的临时目录是 `/private/var/folders/...`（`/var` 符号链接的
+/// 展开形态），Linux 上 TMPDIR 也可能是 `/var/tmp` —— 二者都落在上面的 `/var` 黑名单里，
+/// 而临时目录本身是允许根（atomic_write / 预览 / 各类中间产物全依赖它）。
+/// 不做例外会把自己的核心功能打死（自锁）。
+///
+/// 为什么自身安装目录必须免检：Tauri 的 resource_dir 在 Windows/Linux 就是 exe 所在目录，
+/// 随包模板 `<install>/templates/webgal/**` 要经 read_text_file / list_dir / copy_dir_all
+/// 读出来组装游戏。MSI 与 perMachine NSIS 会把程序装进 `C:\Program Files\NovelForge`，
+/// 若这里不放行，这些用户的「组装/导出」会全线报「系统敏感目录不可操作」。
+/// 免检范围只有我们自己的文件；删除这些文件由 guard_against_destructive_wipe 另行兜住。
+fn sensitive_exempt_roots() -> Vec<PathBuf> {
+    let mut roots = vec![std::env::temp_dir()];
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            roots.push(dir.to_path_buf());
+        }
+    }
+    roots
+}
+
+/// canon 是否落在 dir 内（含 dir 自身）。
+/// dir 存在符号链接时（macOS `/etc` → `/private/etc`）再按规范化形态比一次：
+/// 否则 `/etc/hosts` 规范化成 `/private/etc/hosts` 就绕过了 `/etc` 黑名单。
+fn path_within_dir(canon: &Path, dir: &Path) -> bool {
+    if canon == dir || canon.starts_with(dir) {
+        return true;
+    }
+    match dir.canonicalize() {
+        Ok(real) => canon == real || canon.starts_with(&real),
+        Err(_) => false,
+    }
+}
+
+fn path_within_any(canon: &Path, dirs: &[PathBuf]) -> bool {
+    dirs.iter().any(|dir| path_within_dir(canon, dir))
+}
+
+/// 随包分发的安装资源（exe 自身与 `<install>/templates/**`）：只读不删。
+/// 这些文件在 perMachine 安装下位于 Program Files（已被系统黑名单覆盖），
+/// 但在「便携版/用户目录安装」下会落进免检区，故破坏性操作单独再拦一次。
+fn is_protected_install_asset(canon: &Path) -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    if canon == exe {
+        return true;
+    }
+    match exe.parent() {
+        Some(dir) => path_within_dir(canon, &dir.join("templates")),
+        None => false,
+    }
+}
+
+fn is_sensitive_system_path(canon: &Path) -> bool {
+    // 免检根优先：临时目录 / 自身安装目录即使位于系统目录下也照常放行（原因见 sensitive_exempt_roots）
+    if path_within_any(canon, &sensitive_exempt_roots()) {
+        return false;
+    }
+    if path_within_any(canon, &system_sensitive_dirs()) {
+        return true;
     }
     // #1416：凭据目录检查移出 Windows cfg，全平台生效
     // （家目录整体仍放行用户工程，仅直属凭据目录除外）
@@ -236,18 +334,46 @@ fn resolve_safe_path(raw: &str) -> Result<PathBuf, String> {
     Ok(canon)
 }
 
-/// 破坏性操作（删除/替换/清理）不得指向盘符根、文件系统根或**环境根**自身。
+/// 崩溃残留清理专用的宽松守卫：只拒绝盘符根/文件系统根与环境根自身。
 ///
 /// #1516：这里比对 ambient_roots()，**不含** blessed_dirs()。此前用 canonical_roots()，
 /// 于是 App.vue 启动流程「先 blessProjectDir(项目目录) → 再 cleanupStaleFiles(同一目录)」
 /// 必然自锁：该目录此刻已是"根"，守卫一律拒绝。实测日志里 74 次
 /// 「拒绝操作目录根自身，请指定其子路径」——崩溃残留清理从未真正执行过一次。
 /// 用户 bless 过的项目目录是他自己明示授权的工程目录，清理其崩溃残留正是本命令的用途。
+///
+/// 注意：本函数只给 cleanup_stale_files 用（它只删本程序命名的 .tmp/.replace-backup，
+/// 且 plain `<name>.tmp` 仅限 .novel2vn/ 与 cache 目录内，见 cleanup_stale_dir）。
+/// 删除类命令必须走下面的 guard_against_destructive_wipe。
 fn guard_against_wipe(canon: &Path) -> Result<(), String> {
     if canon.parent().is_none() {
         return Err("拒绝操作文件系统根目录".to_string());
     }
     for root in ambient_roots() {
+        if *canon == root {
+            return Err("拒绝操作目录根自身，请指定其子路径".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// #1549（本轮安全修复）：破坏性操作（remove_path / replace_path）的守卫。
+///
+/// 规则：只允许删除**登记根之下**的路径，登记根本身一律拒绝。
+/// 为什么必须这样：旧实现只比 ambient_roots()，于是「bless_project_dir(X) → remove_path(X)」
+/// 就能递归删除任意已登记目录 X —— 授权只该让调用方在目录**内部**工作，
+/// 不该顺带把「删除这个目录本身」也一并授权（一次误调用/一次注入就是不可逆的数据损失）。
+/// 例：bless("C:\Program Files\X") + remove_path(同) 曾可整棵删除程序目录（现由系统目录黑名单再拦一层）。
+fn guard_against_destructive_wipe(canon: &Path) -> Result<(), String> {
+    if canon.parent().is_none() {
+        return Err("拒绝操作文件系统根目录".to_string());
+    }
+    // 随包资源（exe 自身 / <install>/templates/**）：只读不删，见 is_protected_install_asset
+    if is_protected_install_asset(canon) {
+        return Err("拒绝删除本程序安装目录内的随包资源".to_string());
+    }
+    // 登记根（环境根 + 用户登记根）自身：拒绝；其子路径放行
+    for root in canonical_roots() {
         if *canon == root {
             return Err("拒绝操作目录根自身，请指定其子路径".to_string());
         }
@@ -529,6 +655,13 @@ async fn do_http_request(
     request_id: Option<u64>,
 ) -> Result<Value, String> {
     let target = http_target(&args)?;
+    // #1549（⑤ reqwest 双版本）：**网络策略只在本命令内生效**。
+    // 下面这套加固（SSRF 判定、禁重定向、连接/总超时、64MB 上限、禁止头）全部挂在
+    // 这个 reqwest 0.12 客户端上。Cargo.lock 里的 reqwest 0.13.4 是 tauri 的
+    // target-gated 依赖（cfg(android | apple-non-macos)），桌面目标不编译它，
+    // 故桌面上不存在「第二个绕过策略的 HTTP 栈」；但一旦有人启用 tauri 的 http/reqwest
+    // 特性或把直用依赖升级到 0.13，就必须把这里的策略同步过去
+    // （单测 outbound_http_only_through_hardened_clients 钉住这条前提）。
     let client = reqwest::Client::builder()
         // 上限与前端 requestTimeoutSecs 对齐（1800s）：32K 输出在 30 tok/s 后端上要约 1090s，
         // 旧上限 600s 会把「慢但在出字」的大请求掐掉，掐掉后拆小重跑更慢更贵
@@ -903,7 +1036,8 @@ pub async fn replace_path(src: String, dst: String) -> Result<(), String> {
     // #1413：改名/备份/清理是阻塞 IO，放阻塞线程池
     let source = resolve_safe_path(&src)?;
     let destination = resolve_safe_path(&dst)?;
-    guard_against_wipe(&destination)?;
+    // #1549：破坏性操作走严格守卫（登记根本身不可被替换/删除），见 guard_against_destructive_wipe
+    guard_against_destructive_wipe(&destination)?;
     let src_display = src.clone();
     tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
         let backup = PathBuf::from(format!("{}.replace-backup", destination.to_string_lossy()));
@@ -948,7 +1082,8 @@ pub async fn replace_path(src: String, dst: String) -> Result<(), String> {
     .map_err(|e| format!("替换任务执行失败: {e}"))?
 }
 
-/// 原子写临时文件名：`<name>.<pid>.<seq>.tmp`（与本文件 atomic_write_temp_path 同构）
+/// 原子写临时文件名：`<name>.<pid>.<seq>.tmp`（与本文件 atomic_write_temp_path 同构）。
+/// 这个形状只有本程序会产出，因此在**任意目录**都允许清理。
 fn is_atomic_tmp_name(name: &str) -> bool {
     let Some(stem) = name.strip_suffix(".tmp") else {
         return false;
@@ -969,10 +1104,35 @@ fn is_atomic_tmp_name(name: &str) -> bool {
     }
 }
 
+/// TS 侧原子写留下的临时文件名：`<name>.tmp`。
+///
+/// 为什么需要：TS 侧（`src/utils/persist.ts:277` 的 project_state.json、
+/// `visualBible.ts` 的清单、`script.ts` 的剧本缓存）写的是 `${target}.tmp`，
+/// 而清理器此前只认 Rust 侧的 `<name>.<pid>.<seq>.tmp` → 启动清理永远扫不到 TS 侧残留
+/// （半截 JSON 留在盘上，下次读取解析失败）。
+///
+/// 为什么不直接放宽 is_atomic_tmp_name：`<name>.tmp` 太普通，用户自己的 `notes.tmp`
+/// 也是这个形状，在任意目录按它删就是误删用户文件。故本判定只在本程序自管目录内使用
+/// （见 is_managed_dir_name 与 cleanup_stale_dir）。
+/// 单测 `!is_atomic_tmp_name("assets.json.tmp")` 因此依然成立、也必须成立：
+/// 严格判定仍是「任意目录可删」的唯一依据。
+fn is_plain_tmp_name(name: &str) -> bool {
+    name.strip_suffix(".tmp").is_some_and(|stem| !stem.is_empty())
+}
+
+/// 本程序自管目录：`.novel2vn/`（工程元数据与缓存根）与 `cache/`（缓存目录）。
+/// 只在这些目录内才认 `<name>.tmp`，把清理范围收窄到「确实是我们写的」那些文件。
+fn is_managed_dir_name(name: &str) -> bool {
+    name == ".novel2vn" || name.eq_ignore_ascii_case("cache")
+}
+
 /// 递归清理崩溃残留（#783）：删除本程序产生的 .tmp，恢复/清理 .replace-backup。
 /// - `.replace-backup`：原路径缺失说明替换在「已备份、未发布」处中断 → 恢复备份；
 ///   原路径存在说明发布已完成、只是备份没清掉 → 删除备份（以新内容为准）。
-fn cleanup_stale_dir(dir: &Path, depth: usize, removed: &mut u64, restored: &mut u64) {
+/// - `in_managed`：当前目录是否位于本程序自管目录（.novel2vn/cache）内。
+///   `<pid>.<seq>.tmp` 在任意目录都删（名字唯一归我们）；`<name>.tmp` 只在自管目录内删
+///   （#1549 本轮），避免把用户自己的 `xxx.tmp` 当残留清掉。
+fn cleanup_stale_dir(dir: &Path, depth: usize, in_managed: bool, removed: &mut u64, restored: &mut u64) {
     if depth == 0 {
         return;
     }
@@ -984,11 +1144,13 @@ fn cleanup_stale_dir(dir: &Path, depth: usize, removed: &mut u64, restored: &mut
         let path = entry.path();
         // 不跟随符号链接：只处理真实目录/文件
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let name = entry.file_name().to_string_lossy().to_string();
         if is_dir {
-            cleanup_stale_dir(&path, depth - 1, removed, restored);
+            // 进入子目录时更新「是否自管目录」状态：.novel2vn 与 cache 之下的整棵子树都算自管
+            let child_managed = in_managed || is_managed_dir_name(&name);
+            cleanup_stale_dir(&path, depth - 1, child_managed, removed, restored);
             continue;
         }
-        let name = entry.file_name().to_string_lossy().to_string();
         if let Some(target) = name.strip_suffix(".replace-backup") {
             let original = path.with_file_name(target);
             if original.exists() {
@@ -1000,7 +1162,8 @@ fn cleanup_stale_dir(dir: &Path, depth: usize, removed: &mut u64, restored: &mut
             }
             continue;
         }
-        if is_atomic_tmp_name(&name) && std::fs::remove_file(&path).is_ok() {
+        let own_tmp = is_atomic_tmp_name(&name) || (in_managed && is_plain_tmp_name(&name));
+        if own_tmp && std::fs::remove_file(&path).is_ok() {
             *removed += 1;
         }
     }
@@ -1018,7 +1181,8 @@ pub async fn cleanup_stale_files(root: String, max_depth: Option<usize>) -> Resu
         }
         let mut removed = 0u64;
         let mut restored = 0u64;
-        cleanup_stale_dir(&path, max_depth.unwrap_or(6).clamp(1, 16), &mut removed, &mut restored);
+        // in_managed=false：根目录本身不是自管目录；.novel2vn/ 与 cache/ 由递归过程中判定
+        cleanup_stale_dir(&path, max_depth.unwrap_or(6).clamp(1, 16), false, &mut removed, &mut restored);
         Ok(serde_json::json!({ "removed": removed, "restored": restored }))
     })
     .await
@@ -1067,7 +1231,8 @@ pub async fn remove_path(path: String) -> Result<(), String> {
     // 阻塞 IO 命令早已按 #1413 走 spawn_blocking，这里补齐。
     let p = resolve_safe_path(&path)?;
     tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
-        guard_against_wipe(&p)?;
+        // #1549：严格守卫 —— 「先登记、再删除同一目录」不再可行（登记只授权目录内部）
+        guard_against_destructive_wipe(&p)?;
         if p.is_dir() {
             std::fs::remove_dir_all(&p).map_err(|e| format!("删除目录失败: {e}"))
         } else if p.exists() {
@@ -1715,7 +1880,7 @@ fn write_zip_contents(
 
 #[cfg(test)]
 mod atomic_write_tests {
-    use super::{append_text_file, atomic_write, atomic_write_temp_path, bless_project_dir, cancel_http_request, cleanup_stale_dir, write_api_secrets_blocking, cleanup_stale_files, copy_file, display_path, guard_against_wipe, has_transparency, http_aborts, http_target, is_atomic_tmp_name, linux_open_args, linux_open_failed, list_dir, path_exists, path_within_home_credential_dir, reject_unsafe_path_syntax, replace_path, resolve_safe_path, ssrf_reject_reason, strip_verbatim_prefix, validate_secret_id, write_text_file, HttpRequestArgs};
+    use super::{append_text_file, atomic_write, atomic_write_temp_path, bless_project_dir, cancel_http_request, cleanup_stale_dir, write_api_secrets_blocking, cleanup_stale_files, copy_file, display_path, guard_against_wipe, guard_against_destructive_wipe, has_transparency, http_aborts, http_target, is_atomic_tmp_name, is_managed_dir_name, is_plain_tmp_name, is_sensitive_system_path, linux_open_args, linux_open_failed, list_dir, path_exists, path_within_home_credential_dir, remove_path, reject_unsafe_path_syntax, replace_path, resolve_safe_path, ssrf_reject_reason, strip_verbatim_prefix, system_sensitive_dirs, validate_secret_id, write_text_file, HttpRequestArgs};
     use std::path::Path;
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use image::ImageEncoder as _;
@@ -1755,10 +1920,20 @@ mod atomic_write_tests {
     fn atomic_tmp_name_matches_only_own_pattern() {
         assert!(is_atomic_tmp_name("assets.json.1234.5.tmp"));
         assert!(is_atomic_tmp_name("project_state.json.99.0.tmp"));
+        // #1549：这条断言保持不变 —— 严格判定仍是「任意目录可删」的唯一依据，
+        // `<name>.tmp` 由 is_plain_tmp_name 另行识别，且只在本程序自管目录内生效
         assert!(!is_atomic_tmp_name("assets.json.tmp"));
         assert!(!is_atomic_tmp_name("notes.tmp"));
         assert!(!is_atomic_tmp_name("assets.json.abc.5.tmp"));
         assert!(!is_atomic_tmp_name("assets.json.1234.5.bak"));
+        // TS 侧形态（persist.ts / visualBible.ts / script.ts 写的就是 `<name>.tmp`）
+        assert!(is_plain_tmp_name("assets.json.tmp"));
+        assert!(is_plain_tmp_name("project_state.json.tmp"));
+        assert!(!is_plain_tmp_name(".tmp"));
+        assert!(!is_plain_tmp_name("assets.json"));
+        assert!(is_managed_dir_name(".novel2vn"));
+        assert!(is_managed_dir_name("cache"));
+        assert!(!is_managed_dir_name("assets"));
     }
 
     #[test]
@@ -1776,13 +1951,49 @@ mod atomic_write_tests {
 
         let mut removed = 0u64;
         let mut restored = 0u64;
-        cleanup_stale_dir(&dir, 6, &mut removed, &mut restored);
+        cleanup_stale_dir(&dir, 6, false, &mut removed, &mut restored);
 
         assert_eq!(removed, 2, "应删除 1 个 .tmp 与 1 个已完成替换的备份");
         assert_eq!(restored, 1, "应恢复 1 个中断替换的备份");
         assert!(!dir.join("cache").join("assets.json.1234.5.tmp").exists());
         assert_eq!(std::fs::read_to_string(dir.join("game.txt")).unwrap(), "new");
         assert!(!dir.join("game.txt.replace-backup").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cleanup_removes_ts_plain_tmp_only_inside_managed_dirs() {
+        // #1549：TS 侧原子写留下的是 `<name>.tmp`（persist.ts:277 / visualBible.ts / script.ts），
+        // 旧清理器只认 `<pid>.<seq>.tmp` → 这些半截 JSON 永远留在盘上。
+        // 现在同时识别，但**只在 .novel2vn/ 与 cache/ 内**，避免误删用户自己的 `xxx.tmp`。
+        let dir = std::env::temp_dir().join("novelforge_cleanup_plain_tmp_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".novel2vn").join("cache")).unwrap();
+        std::fs::create_dir_all(dir.join("cache")).unwrap();
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        // TS 侧残留（工程状态快照）→ 应删
+        std::fs::write(dir.join(".novel2vn").join("project_state.json.tmp"), b"half").unwrap();
+        // TS 侧残留（.novel2vn/cache 下的剧本缓存、cache 下的清单）→ 应删
+        std::fs::write(dir.join(".novel2vn").join("cache").join("script_1.json.tmp"), b"half").unwrap();
+        std::fs::write(dir.join("cache").join("assets.json.tmp"), b"half").unwrap();
+        // 用户自己在素材目录里的同名形态文件 → 必须保留
+        std::fs::write(dir.join("assets").join("notes.tmp"), b"user").unwrap();
+        // Rust 侧原子写残留：形状唯一归我们，任意目录都删
+        std::fs::write(dir.join("assets").join("cover.png.4242.7.tmp"), b"half").unwrap();
+
+        let mut removed = 0u64;
+        let mut restored = 0u64;
+        cleanup_stale_dir(&dir, 6, false, &mut removed, &mut restored);
+
+        assert_eq!(removed, 4, "应删 3 个 TS 侧 .tmp 与 1 个 Rust 侧 .tmp");
+        assert_eq!(restored, 0);
+        assert!(
+            dir.join("assets").join("notes.tmp").exists(),
+            "自管目录之外的用户 .tmp 不得被误删"
+        );
+        assert!(!dir.join(".novel2vn").join("project_state.json.tmp").exists());
+        assert!(!dir.join("cache").join("assets.json.tmp").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1812,6 +2023,154 @@ mod atomic_write_tests {
             !path_within_home_credential_dir(&home.join(".ssh-backup/key"), home),
             "相似名前缀不得误伤"
         );
+    }
+
+    #[test]
+    fn system_dirs_are_sensitive_and_never_blessable() {
+        // #1549：黑名单必须真的产出条目（否则整条防线静默失效）
+        assert!(!system_sensitive_dirs().is_empty(), "系统目录黑名单不得为空");
+
+        // 全平台：自身安装目录（exe 所在目录）必须免检 —— 否则 MSI / perMachine 安装到
+        // Program Files 的用户，模板（<install>/templates/webgal）经 read_text_file /
+        // list_dir / copy_dir_all 全部读不出来，组装与导出会全线失败。
+        let exe = std::env::current_exe().unwrap();
+        assert!(
+            !is_sensitive_system_path(exe.parent().unwrap()),
+            "自身安装目录必须免检，否则随包模板读不出来"
+        );
+
+        #[cfg(target_os = "windows")]
+        {
+            // 任务要求的断言：C:\Program Files 必须被拒绝
+            assert!(
+                bless_project_dir(r"C:\Program Files".to_string()).is_err(),
+                "Program Files 不得被登记为允许根"
+            );
+            let pf = std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".to_string());
+            let probe = std::path::PathBuf::from(&pf).join("SomeApp");
+            assert!(is_sensitive_system_path(&probe), "Program Files 子目录必须敏感");
+            assert!(
+                bless_project_dir(probe.to_string_lossy().to_string()).is_err(),
+                "Program Files 下的目录不得被登记"
+            );
+            // 反向：用户家目录下的普通工程目录不受影响
+            let home = std::env::var("USERPROFILE").unwrap_or_default();
+            if !home.trim().is_empty() {
+                assert!(!is_sensitive_system_path(&std::path::PathBuf::from(home).join("NovelForge")));
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            // 任务要求的断言：/etc 必须被拒绝
+            assert!(bless_project_dir("/etc".to_string()).is_err(), "/etc 不得被登记为允许根");
+            assert!(is_sensitive_system_path(Path::new("/etc/hosts")), "/etc 下路径必须敏感");
+            assert!(is_sensitive_system_path(Path::new("/usr/bin")), "/usr 下路径必须敏感");
+            assert!(is_sensitive_system_path(Path::new("/opt/app")), "/opt 下路径必须敏感");
+            assert!(!is_sensitive_system_path(Path::new("/home/user/project")), "普通工程目录不得误伤");
+            // 反向：临时目录必须免检（macOS 是 /private/var/folders/...，Linux 可能是 /var/tmp）
+            let tmp = std::env::temp_dir()
+                .canonicalize()
+                .unwrap_or_else(|_| std::env::temp_dir());
+            assert!(!is_sensitive_system_path(&tmp), "临时目录必须免检，否则自锁");
+            assert!(
+                resolve_safe_path(&tmp.join("novelforge_probe.txt").to_string_lossy()).is_ok(),
+                "临时目录下的写入不得被黑名单打死"
+            );
+        }
+    }
+
+    #[test]
+    fn destructive_guard_rejects_registered_root_but_allows_children() {
+        // #1549：登记 = 授权在目录**内部**工作，不等于授权删除该目录本身
+        let proj = std::env::temp_dir().join("novelforge_destructive_guard_test");
+        let _ = std::fs::remove_dir_all(&proj);
+        std::fs::create_dir_all(proj.join("inner")).unwrap();
+        bless_project_dir(proj.to_string_lossy().to_string()).unwrap();
+        let canon = proj.canonicalize().unwrap();
+        assert!(
+            guard_against_destructive_wipe(&canon).is_err(),
+            "登记根本身不得被删除/替换"
+        );
+        assert!(
+            guard_against_destructive_wipe(&canon.join("inner")).is_ok(),
+            "登记根之下的路径必须放行（正常业务：删工程内部产物）"
+        );
+        // 宽松守卫（cleanup_stale_files 专用）对登记根仍然放行：#1516 的启动清理不能自锁
+        assert!(guard_against_wipe(&canon).is_ok());
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    #[tokio::test]
+    async fn remove_path_rejects_registered_root_itself() {
+        // #1549 攻击路径回归：bless(X) → remove_path(X) 曾可递归删除任意已登记目录
+        let proj = std::env::temp_dir().join("novelforge_remove_root_test");
+        let _ = std::fs::remove_dir_all(&proj);
+        std::fs::create_dir_all(proj.join("inner")).unwrap();
+        std::fs::write(proj.join("inner").join("a.txt"), b"x").unwrap();
+        bless_project_dir(proj.to_string_lossy().to_string()).unwrap();
+
+        let rejected = remove_path(proj.to_string_lossy().to_string()).await;
+        assert!(rejected.is_err(), "登记根本身必须被 remove_path 拒绝");
+        assert!(proj.exists(), "被拒绝后目录必须原样保留");
+
+        // 其子路径仍然可删（工程内部清理是正常业务）
+        remove_path(proj.join("inner").join("a.txt").to_string_lossy().to_string())
+            .await
+            .unwrap();
+        assert!(!proj.join("inner").join("a.txt").exists());
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    #[test]
+    fn outbound_http_only_through_hardened_clients() {
+        // #1549（⑤ reqwest 双版本）：直用依赖保持 0.12。Cargo.lock 里的 reqwest 0.13.4
+        // 是 tauri 的 **target-gated** 依赖（cfg(android | apple-non-macos)），
+        // `cargo tree -i reqwest@0.13.4` 在桌面目标上什么都不打印 —— 桌面构建根本不编译它，
+        // 所以「两套 HTTP/TLS 栈编进二进制」在 Windows/macOS/Linux 上不成立，升级 0.13
+        // 也换不来策略统一（反而要换 TLS provider：0.13 无 rustls-tls 特性，rustls 特性
+        // 拉 aws-lc-rs，需要 CMake —— 本机没有）。结论钉在这里：谁改版本，谁必须同步复核
+        // 「网络策略只在 http_request 命令内生效」这条前提（见 do_http_request 的注释）。
+        let cargo = include_str!("../Cargo.toml");
+        assert!(
+            cargo.contains("reqwest = { version = \"0.12\""),
+            "reqwest 直用版本变更：必须同步复核 SSRF/禁重定向/超时/64MB 上限的覆盖范围"
+        );
+        // 出网客户端只允许出现在两处：commands.rs 的 http_request（通用通道，全套加固）
+        // 与 models.rs 的模型下载（主机白名单 + 自定义重定向策略）。新增任何客户端
+        // 都必须自带同样的策略，否则就是绕过加固的暗门。
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let forbidden = concat!("reqwest::Client", "::new(");
+        let mut files: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(&src).unwrap().flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                !text.contains(forbidden),
+                "{} 使用了 Client::new()：会绕过 builder 上的 SSRF/重定向/超时策略",
+                path.display()
+            );
+            if text.contains("Client::builder()") {
+                files.push(entry.file_name().to_string_lossy().to_string());
+            }
+        }
+        files.sort();
+        assert_eq!(
+            files,
+            vec!["commands.rs".to_string(), "models.rs".to_string()],
+            "出网客户端只允许出现在 commands.rs 与 models.rs"
+        );
+        // 两处都必须显式关闭重定向并设置连接超时（策略存在的证据，不靠默认值）。
+        // 只看 `#[cfg(test)]` 之前的**生产代码**：否则本测试自身源码里的字面量
+        // （"redirect(" / "connect_timeout("）会让断言永远为真，钉不住任何东西。
+        for file in ["commands.rs", "models.rs"] {
+            let text = std::fs::read_to_string(src.join(file)).unwrap();
+            let production = text.split("#[cfg(test)]").next().unwrap_or(&text);
+            assert!(production.contains("redirect("), "{file} 生产代码缺少重定向策略");
+            assert!(production.contains("connect_timeout("), "{file} 生产代码缺少连接超时");
+        }
     }
 
     #[test]

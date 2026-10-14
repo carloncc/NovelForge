@@ -28,12 +28,17 @@ async function main(): Promise<void> {
       `changeBg:missing_bg.png -next;`,
       `林澈:你好 -missing_voice.mp3;`,
       `:正常旁白;`,
+      // 天气粒子特效（pixiInit/pixiPerform）是 4.6.6 的正式指令，必须被白名单识别为指令：
+      // 若落进台词分支会多算一句台词，落进错误分支会直接挡导出。
+      `pixiInit;`,
+      `pixiPerform:rain;`,
       `bad syntax line without semicolon`,
       ``,
     ].join("\n"),
   );
   await tauri.writeTextFile(`${DIR}/game/scene/ch2.txt`, `label:ch2_第二章;\nchangeBg:none;`);
-  // 演出指令回归：filmMode / setFilter 必须被识别为指令（此前会被当台词且不校验）
+  // 演出指令回归：filmMode 必须被识别为指令；setFilter 已从白名单移除（4.6.x 空实现且未文档化），
+  // 必须报出「指令无效」而不是被当台词放行，也不能只落到泛化的「无法解析」。
   await tauri.writeTextFile(
     `${DIR}/game/scene/ch3.txt`,
     [`label:ch3_第三章;`, `filmMode:true;`, `setFilter:{"oldFilm":0.35} -target=bg-main -next;`, `:旁白;`].join("\n"),
@@ -52,8 +57,17 @@ async function main(): Promise<void> {
   assert(report.errors.some((e) => e.message.includes("无法解析")), "应检出坏语法");
   // 空章警告
   assert(report.warnings.some((w) => w.message.includes("没有任何台词")), "应警告空章节");
-  // 演出指令识别：filmMode / setFilter 不得报错、不得计入台词
-  assert(!report.errors.some((e) => e.scope.includes("ch3.txt")), "filmMode/setFilter 不应报错");
+  // 演出指令识别：filmMode 与天气特效指令不得报错、不得计入台词
+  assert(!report.errors.some((e) => e.scope.includes("ch3.txt") && e.message.includes("filmMode")), "filmMode 不应报错");
+  assert(
+    !report.errors.some((e) => e.message.includes("pixiInit") || e.message.includes("pixiPerform")),
+    "pixiInit/pixiPerform 必须被白名单识别为指令（4.6.6 正式指令，否则会被当台词或直接挡导出）",
+  );
+  // setFilter 必须被拦下（4.6.x 空实现 + 未文档化）：既不能当台词，也不能只报「无法解析」
+  assert(
+    report.errors.some((e) => e.scope.includes("ch3.txt") && e.message.includes("setFilter") && e.message.includes("指令无效")),
+    `setFilter 应报「指令无效」（滤镜请改 setTransform 同名键），实际：${report.errors.map((e) => e.message).join(" / ")}`,
+  );
   assert(report.summary.lines === 3, `台词计数应为 3（ch1×2 + ch3×1），实际 ${report.summary.lines}`);
 
   // 修复后通过

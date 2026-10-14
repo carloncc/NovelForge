@@ -17,6 +17,7 @@ import { clearThumbCache } from "../composables/useAssetThumbs";
 import { activeConfig } from "./config";
 import { STEP_TO_STAGE, DEFAULT_BACKGROUND_REUSE, type StageKey } from "../core/types";
 import { parseChapterScript } from "../core/dataValidation";
+import { isScriptPartFileName } from "../core/cache";
 import { runStatusSetFailed } from "./runStatus";
 
 interface ProjectState {
@@ -198,6 +199,81 @@ export async function flushPendingProjectSave(): Promise<boolean> {
   return persistCurrentProjectState();
 }
 
+/** 关闭前落盘钩子是否已注册（幂等标记） */
+let unloadFlushRegistered = false;
+
+/** 同步可用的「立即落盘」尝试：beforeunload 里 await 不可靠，先触发一次不等结果的写。 */
+function flushPendingProjectSaveSync(): void {
+  if (saveTimer === undefined) return;
+  clearTimeout(saveTimer);
+  saveTimer = undefined;
+  const snapshot = snapshotProjectState();
+  // 不 await：beforeunload/pagehide 阶段浏览器只给极短时间。
+  // 但**必须**先把计时器清掉并把快照交给写盘路径——能写完就写完，写不完下次打开仍走磁盘旧值，
+  // 不会比"整段防抖回调根本没跑"更差。
+  void persistSnapshot(snapshot).catch(() => undefined);
+}
+
+/**
+ * 注册关闭前落盘（Web 的 beforeunload/pagehide + Tauri 窗口关闭事件）。
+ *
+ * 为什么需要：保存有 800ms 防抖，而全仓此前**没有任何**关闭钩子调用 flush
+ * （grep beforeunload|pagehide|visibilitychange 无命中）。用户在设置页改完选项、
+ * 或加了一个素材后 800ms 内关窗，防抖回调没执行 → project_state.json 里还是旧值，
+ * 下次打开改动回退，用户以为已保存。
+ *
+ * 幂等；在项目加载完成（restoreProject 的 finally）时自动注册，无需 App.vue 改动。
+ */
+export function registerProjectSaveFlush(): void {
+  if (unloadFlushRegistered) return;
+  unloadFlushRegistered = true;
+  if (typeof window === "undefined" || typeof window.addEventListener !== "function") return;
+  const handler = (): void => {
+    flushPendingProjectSaveSync();
+  };
+  // pagehide 比 beforeunload 可靠（移动端/bfcache 场景 beforeunload 可能不触发），两个都注册
+  window.addEventListener("pagehide", handler);
+  window.addEventListener("beforeunload", handler);
+  // Tauri 桌面端：窗口关闭不会触发上面的 Web 事件，必须走 CloseRequested。
+  // 动态 import 避免 Web/Node 环境（无 @tauri-apps/api 窗口上下文）在模块加载期报错。
+  void (async () => {
+    try {
+      const { isTauri } = await import("../utils/tauri");
+      if (!isTauri()) return;
+      const { getCurrentWindow } = await import("@tauri-apps/api/window");
+      await getCurrentWindow().onCloseRequested(async (event) => {
+        event.preventDefault();
+        try {
+          // flush 可能因 IPC 卡住而不返回：加一个上限，否则窗口永远关不掉（用户只能杀进程）。
+          // 代价是极端情况下最后一次改动可能没落盘——比"关不掉窗口"轻得多（saveError 会记录）。
+          await Promise.race([
+            flushPendingProjectSave(),
+            new Promise((resolve) => setTimeout(resolve, 3000)),
+          ]);
+        } catch (e) {
+          log.warn("store", "关闭前保存失败（继续关闭窗口）", { error: e instanceof Error ? e.message : String(e) });
+        } finally {
+          // flush 失败也必须让窗口关掉：卡住用户关窗比丢一次改动更糟（失败已记 saveError）。
+          // 注意：destroy() 需要 capabilities 里的 core:window:allow-destroy —— 缺权限时它会被拒绝，
+          // 而 preventDefault() 已经把系统默认关闭拦掉了，于是「点 × 毫无反应」（2026-10-14 用户实测）。
+          // 这里必须 catch 并留痕，不能再让异常静默吞掉关窗动作。
+          try {
+            await getCurrentWindow().destroy();
+          } catch (e) {
+            log.warn("store", "关闭窗口失败：请检查 capabilities 是否缺少 core:window:allow-destroy", {
+              error: e instanceof Error ? e.message : String(e),
+            });
+          }
+        }
+      });
+    } catch (e) {
+      log.warn("store", "注册窗口关闭前保存钩子失败（不影响其它功能）", {
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  })();
+}
+
 export async function restoreProject(outputDir: string): Promise<void> {
   // #1292：先登记项目目录进桌面端文件白名单——用户工程可位于任意盘符（D 盘等），
   // 不登记则后续读写一律被拒，项目打不开。登记失败不阻断（读到明确拒绝再报）。
@@ -281,6 +357,8 @@ export async function restoreProject(outputDir: string): Promise<void> {
     runStatusSetFailed(projectState.lastResult?.failedTasks.length ?? 0);
   } finally {
     suspendProjectSave(false);
+    // 项目加载完成即注册关闭前落盘钩子（幂等）：这是应用里"确定有项目可保存"的第一个可靠时点。
+    registerProjectSaveFlush();
   }
 }
 
@@ -348,44 +426,63 @@ async function loadCachedChapters(outputDir: string): Promise<ChapterScript[]> {
     // 演示内容（管线侧 loadChaptersFiltered 本就有这层隔离，store 侧漏做）。
     // 判定口径与管线一致：没有可用的文本 API key 才算演示模式。
     const demo = !activeConfig("llm")?.apiKey;
-    // 每章分别记录两种变体，先按当前模式取，缺了才回退另一种（避免整章凭空消失）
-    const perChapter = new Map<number, { real?: (typeof entries)[number]; demo?: (typeof entries)[number] }>();
-    const keepNewest = (
-      slot: { real?: (typeof entries)[number]; demo?: (typeof entries)[number] },
-      key: "real" | "demo",
-      entry: (typeof entries)[number],
-    ): void => {
-      const current = slot[key];
-      if (!current || entry.name.localeCompare(current.name) > 0) slot[key] = entry;
-    };
+    // 每章分别收集两种变体的**全部**候选（同名多指纹版本可能是残留或损坏），
+    // 先按当前模式取，缺了才回退另一种（避免整章凭空消失）。
+    const perChapter = new Map<number, { real: (typeof entries)[number][]; demo: (typeof entries)[number][] }>();
     for (const entry of entries) {
       if (entry.isDir) continue;
+      // 段缓存（script_ch5_part1of3_*.json）必须显式排除，与 pipeline.loadChaptersFiltered 同口径。
+      // 旧实现只按 /^script(_demo)?_ch(\d+)_/ 匹配，段文件同样命中，而 keepNewest 用 localeCompare
+      // 取「更大」的名字：段文件名里 part… 的 'p' 大于真实 rest 的首字符（titleHash 以数字或 a–o 开头），
+      // **段文件恒胜** → 只读段文件 → parseChapterScript 因缺 chapter/scenes 抛错 → 整章从
+      // lastResult.chapters 消失（章节列表、单阶段重跑勾选、角色出场统计、imageStats 总账一起少一章），
+      // 且没有任何提示。
+      if (isScriptPartFileName(entry.name)) continue;
       const match = entry.name.match(/^script(_demo)?_ch(\d+)_/);
       if (!match) continue;
       const chapterNumber = Number(match[2]);
-      const slot = perChapter.get(chapterNumber) ?? {};
-      keepNewest(slot, match[1] ? "demo" : "real", entry);
+      const slot = perChapter.get(chapterNumber) ?? { real: [], demo: [] };
+      slot[match[1] ? "demo" : "real"].push(entry);
       perChapter.set(chapterNumber, slot);
     }
-    const latestByChapter = new Map<number, (typeof entries)[number]>();
+    // 每章排出候选顺序，逐个尝试：
+    // 旧实现每章只读一个候选，解析失败即整章丢弃。缓存文件损坏/半截 JSON 时，
+    // 明明还有另一个可用候选（同模式更旧的版本、或另一模式），却让整章凭空消失。
+    const candidatesByChapter = new Map<number, (typeof entries)[number][]>();
     for (const [chapterNumber, slot] of perChapter) {
+      // 同模式内按文件名降序（与旧 keepNewest 的 localeCompare「取最新」同序）
+      const byNameDesc = (a: (typeof entries)[number], b: (typeof entries)[number]): number => b.name.localeCompare(a.name);
+      slot.real.sort(byNameDesc);
+      slot.demo.sort(byNameDesc);
       // #1501：隔离是单向的——正式模式绝不允许用演示剧本兜底（演示剧本是"未配置文本 API 时的
       // 占位内容"，灌进正式项目会让整本恢复成演示内容）；演示模式允许用正式缓存兜底。
-      const preferred = demo ? (slot.demo ?? slot.real) : slot.real;
-      if (preferred) latestByChapter.set(chapterNumber, preferred);
+      const ordered = demo ? [...slot.demo, ...slot.real] : [...slot.real, ...slot.demo];
+      if (ordered.length) candidatesByChapter.set(chapterNumber, ordered);
     }
-    const loaded = await Promise.all([...latestByChapter.values()].map(async (file) => {
-      try {
-        const { text } = await tauri.readTextFile(file.path);
-        return parseChapterScript(JSON.parse(text));
-      } catch {
-        return undefined;
+    const loaded = await Promise.all([...candidatesByChapter.values()].map(async (files) => {
+      for (const file of files) {
+        try {
+          const { text } = await tauri.readTextFile(file.path);
+          return parseChapterScript(JSON.parse(text));
+        } catch (e) {
+          // 单个候选损坏不再静默：说明是哪一章的哪个文件坏了（否则用户只看到章节少一章）
+          log.warn("store", `剧本缓存候选不可用，尝试下一个：${file.name}`, {
+            error: e instanceof Error ? e.message : String(e),
+          });
+        }
       }
+      return undefined;
     }));
     return loaded
       .filter((chapter): chapter is ChapterScript => chapter !== undefined)
       .sort((a, b) => a.chapter - b.chapter);
-  } catch {
+  } catch (e) {
+    // 目录不存在是正常情况（新项目），但其它失败（权限/IO）此前被一并吞成空列表，
+    // 表现为「重启后章节全没了」而日志里什么都没有。
+    log.warn("store", "读取剧本缓存目录失败（本次按无缓存章节恢复）", {
+      outputDir,
+      error: e instanceof Error ? e.message : String(e),
+    });
     return [];
   }
 }
