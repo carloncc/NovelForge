@@ -1,0 +1,33 @@
+NovelForge 宣传 demo —— 启动说明
+================================
+
+【怎么启动】
+  双击「启动游戏.bat」。
+  它会：另开一个窗口跑本地静态服务器 → 等 2 秒 → 用默认浏览器打开
+  http://127.0.0.1:8080/
+
+【怎么停止】
+  关掉标题为「NovelForge promo demo server」的那个窗口，或在那个窗口里按 Ctrl+C。
+
+【为什么不能双击 index.html】
+  WebGAL 引擎的入口是 `<script type="module">`。用 file:// 打开时页面 origin 是 null，
+  浏览器会以 CORS 为由拒绝加载模块，引擎自己也会弹「无法直接双击打开本游戏」提示页。
+  这是引擎架构决定的，改任何配置都绕不过去 —— 必须走 http://127.0.0.1:8080/。
+
+【为什么不用 python -m http.server】
+  本机的 Python 安装已损坏（Python314 目录下缺 Lib 文件夹，
+  `python -c "import sys"` 会直接 Fatal Python error）。
+  所以服务器改用 Node（serve.cjs，零依赖，只用 Node 内置模块）。
+
+【bat 里的提示为什么是英文】
+  cmd.exe 解析 .bat 时会按当前代码页重新定位文件偏移；文件里一旦出现 UTF-8 中文，
+  偏移就会错位，中文行会被当成命令执行（本机实测：加 UTF-8 BOM 也无效）。
+  所以 .bat 本体保持纯 ASCII，中文说明放在本文件里，由 bat 用 `type` 打印。
+
+【如果 index.html 不存在】
+  说明游戏还没组装到本文件夹。请先按同目录下的「生成步骤.md」在 NovelForge 里
+  生成并组装，或把组装好的游戏目录内容复制到本文件夹下。
+
+【换端口】
+  node serve.cjs 8081
+  然后浏览器访问 http://127.0.0.1:8081/
